@@ -1,0 +1,291 @@
+syntax = "proto3";
+package astravector.embedding.v1;
+
+service AstraVectorRuntime {
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+  rpc EncodeBatch(EncodeBatchRequest) returns (EncodeBatchResponse);
+  rpc GetContract(GetContractRequest) returns (GetContractResponse);
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc DeleteDocumentVectors(DeleteDocumentVectorsRequest) returns (DeleteDocumentVectorsResponse);
+  rpc UpdateVectorMetadata(UpdateVectorMetadataRequest) returns (UpdateVectorMetadataResponse);
+  rpc ExtendVectorTtl(ExtendVectorTtlRequest) returns (ExtendVectorTtlResponse);
+  rpc GetVectorSyncStatus(GetVectorSyncStatusRequest) returns (GetVectorSyncStatusResponse);
+  rpc EvaluateRelevance(EvaluateRelevanceRequest) returns (EvaluateRelevanceResponse);
+}
+
+enum EncodingPurpose {
+  ENCODING_PURPOSE_UNSPECIFIED = 0;
+  QUERY = 1;
+  DOCUMENT_CHUNK = 2;
+}
+
+enum ChunkType {
+  CHUNK_TYPE_UNSPECIFIED = 0;
+  PARENT = 1;
+  CHILD = 2;
+}
+
+enum RepresentationType {
+  REPRESENTATION_TYPE_UNSPECIFIED = 0;
+  DENSE = 1;
+  BGE_LEARNED_SPARSE = 2;
+}
+
+enum AccessLevel {
+  ACCESS_LEVEL_UNSPECIFIED = 0;
+  PUBLIC = 1;
+  INTERNAL = 2;
+  CONFIDENTIAL = 3;
+  RESTRICTED = 4;
+}
+
+enum SearchRepresentationType {
+  SEARCH_REPRESENTATION_UNSPECIFIED = 0;
+  ORIGINAL = 1;
+  SUMMARY = 2;
+  SYNTHETIC_QUESTION = 3;
+  KEY_FACT = 4;
+  ENTITY = 5;
+  TERM = 6;
+  DEFINITION = 7;
+  FAQ = 8;
+}
+
+enum PersistenceMode {
+  PERSISTENCE_MODE_UNSPECIFIED = 0;
+  NONE = 1;
+  BEST_EFFORT = 2;
+  REQUIRED = 3;
+}
+
+enum ItemStatus {
+  ITEM_STATUS_UNSPECIFIED = 0;
+  ITEM_COMPLETED = 1;
+  ITEM_FAILED = 2;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_COMPLETED = 1;
+  TASK_PARTIALLY_COMPLETED = 2;
+  TASK_FAILED = 3;
+}
+
+message EncodeItem {
+  string chunk_id = 1;
+  ChunkType chunk_type = 2;
+  string text = 3;
+  optional string parent_chunk_id = 4;
+  optional string content_hash = 5;
+  optional string document_id = 6;
+  optional uint64 document_version = 7;
+  AccessLevel access_level = 8;
+  optional uint32 ttl_days = 9;
+  SearchRepresentationType representation_type = 10;
+  optional string source_chunk_id = 11;
+  map<string, string> metadata = 12;
+}
+
+message EncodeRequest {
+  string emb_task_id = 1;
+  string correlation_id = 2;
+  string idempotency_key = 3;
+  string tenant_id = 4;
+  string workspace_id = 5;
+  string caller_service = 6;
+  AccessLevel access_level = 7;
+  EncodingPurpose purpose = 8;
+  repeated RepresentationType requested_representations = 9;
+  EncodeItem item = 10;
+  string expected_contract_version = 11;
+  string expected_tokenizer_version = 12;
+  string expected_embedding_version = 13;
+  PersistenceMode persistence_mode = 14;
+}
+
+message EncodeBatchRequest {
+  string emb_task_id = 1;
+  string correlation_id = 2;
+  string idempotency_key = 3;
+  string tenant_id = 4;
+  string workspace_id = 5;
+  string caller_service = 6;
+  AccessLevel access_level = 7;
+  EncodingPurpose purpose = 8;
+  repeated RepresentationType requested_representations = 9;
+  repeated EncodeItem items = 10;
+  string expected_contract_version = 11;
+  string expected_tokenizer_version = 12;
+  string expected_embedding_version = 13;
+  PersistenceMode persistence_mode = 14;
+}
+
+message DenseRepresentation {
+  string name = 1;
+  repeated float values = 2;
+  uint32 dimension = 3;
+  bool normalized = 4;
+  string distance = 5;
+  string version = 6;
+}
+
+message SparseRepresentation {
+  string name = 1;
+  repeated uint32 indices = 2;
+  repeated float values = 3;
+  string version = 4;
+}
+
+message EncodeItemResponse {
+  string chunk_id = 1;
+  ChunkType chunk_type = 2;
+  optional string parent_chunk_id = 3;
+  ItemStatus status = 4;
+  optional DenseRepresentation dense = 5;
+  optional SparseRepresentation learned_sparse = 6;
+  uint32 model_input_token_count = 7;
+  bool truncated = 8;
+  bool l1_cache_hit = 9;
+  bool l2_cache_hit = 10;
+  optional string error_code = 11;
+  optional string error_message = 12;
+}
+
+message ContractVersions {
+  string contract_version = 1;
+  string model_version = 2;
+  string tokenizer_version = 3;
+  string dense_version = 4;
+  string sparse_version = 5;
+  string pooling_version = 6;
+  string normalization_version = 7;
+}
+
+message RuntimeMetadata {
+  string execution_provider = 1;
+  string onnxruntime_version = 2;
+  string device_name = 3;
+  bool fallback_used = 4;
+}
+
+message PersistenceResult {
+  string mode = 1;
+  string status = 2;
+  optional string error_code = 3;
+  optional string error_message = 4;
+}
+
+message EncodeResponse {
+  string emb_task_id = 1;
+  string correlation_id = 2;
+  EncodeItemResponse item = 3;
+  PersistenceResult persistence = 4;
+  ContractVersions versions = 5;
+  RuntimeMetadata runtime = 6;
+}
+
+message EncodeBatchResponse {
+  string emb_task_id = 1;
+  string correlation_id = 2;
+  TaskStatus status = 3;
+  repeated EncodeItemResponse items = 4;
+  PersistenceResult persistence = 5;
+  ContractVersions versions = 6;
+  RuntimeMetadata runtime = 7;
+}
+
+message GetContractRequest {}
+message GetContractResponse {
+  ContractVersions versions = 1;
+  string model_id = 2;
+  uint32 dense_dimension = 3;
+  string dense_distance = 4;
+}
+
+message GetCapabilitiesRequest {}
+message GetCapabilitiesResponse {
+  repeated EncodingPurpose purposes = 1;
+  repeated ChunkType chunk_types = 2;
+  repeated RepresentationType representations = 3;
+  uint32 dense_dimension = 4;
+  uint32 max_query_tokens = 5;
+  uint32 max_child_tokens = 6;
+  bool parent_embedding_enabled = 7;
+  RuntimeMetadata runtime = 8;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  string status = 1;
+  bool ready = 2;
+  string details = 3;
+}
+
+message DeleteDocumentVectorsRequest { string tenant_id = 1; string workspace_id = 2; string document_id = 3; optional uint64 document_version = 4; string correlation_id = 5; }
+message DeleteDocumentVectorsResponse { uint64 affected_bindings = 1; string status = 2; }
+message UpdateVectorMetadataRequest { string tenant_id = 1; string workspace_id = 2; string binding_id = 3; AccessLevel access_level = 4; optional uint32 ttl_days = 5; map<string,string> metadata = 6; }
+message UpdateVectorMetadataResponse { string binding_id = 1; string status = 2; }
+message ExtendVectorTtlRequest { string tenant_id = 1; string workspace_id = 2; string binding_id = 3; uint32 ttl_days = 4; bool replace = 5; }
+message ExtendVectorTtlResponse { string binding_id = 1; string expires_at = 2; string status = 3; }
+message GetVectorSyncStatusRequest { string tenant_id = 1; string workspace_id = 2; string binding_id = 3; }
+message GetVectorSyncStatusResponse { string binding_id = 1; string lifecycle_status = 2; string qdrant_sync_status = 3; optional string last_error = 4; }
+message EvaluateRelevanceRequest { string tenant_id = 1; string workspace_id = 2; string question = 3; string candidate_text = 4; optional string answer = 5; repeated string source_texts = 6; }
+message EvaluateRelevanceResponse { float dense_score = 1; float lexical_score = 2; float consistency_score = 3; float final_score = 4; string decision = 5; string evaluation_id = 6; }
+
+
+// v004 control plane. The v1 runtime service remains wire-compatible during migration.
+service AstraVectorV004Control {
+  rpc Search(SearchRequestV004) returns (SearchResponseV004);
+  rpc CreateMultiGranularityChunks(CreateMultiGranularityChunksRequest) returns (CreateMultiGranularityChunksResponse);
+  rpc GetChunkGroup(GetChunkGroupRequest) returns (GetChunkGroupResponse);
+  rpc ResolveParentContext(ResolveParentContextRequest) returns (ResolveParentContextResponse);
+  rpc RegisterDocumentVersion(RegisterDocumentVersionRequest) returns (DocumentVersionResponse);
+  rpc ActivateDocumentVersion(ActivateDocumentVersionRequest) returns (DocumentVersionResponse);
+  rpc DeleteChunkGroup(DeleteChunkGroupRequest) returns (DeleteChunkGroupResponse);
+  rpc UpdateChunkGroupTtl(UpdateChunkGroupTtlRequest) returns (UpdateChunkGroupTtlResponse);
+  rpc SetChunkGroupLegalHold(SetChunkGroupLegalHoldRequest) returns (SetChunkGroupLegalHoldResponse);
+  rpc GetRelevanceEvaluationV004(GetRelevanceEvaluationRequest) returns (GetRelevanceEvaluationResponse);
+  rpc SubmitRelevanceFeedbackV004(SubmitRelevanceFeedbackRequest) returns (SubmitRelevanceFeedbackResponse);
+  rpc ListQuarantinedPoints(ListQuarantinedPointsRequest) returns (ListQuarantinedPointsResponse);
+  rpc ResolveQuarantinedPoint(ResolveQuarantinedPointRequest) returns (ResolveQuarantinedPointResponse);
+}
+
+enum ChunkGranularityV004 { CHUNK_GRANULARITY_V004_UNSPECIFIED=0; SOURCE_V004=1; PARENT_V004=2; SUB_180_V004=3; SUB_260_V004=4; }
+enum TtlUpdateModeV004 { TTL_UPDATE_MODE_V004_UNSPECIFIED=0; REPLACE_FROM_NOW_V004=1; EXTEND_FROM_CURRENT_V004=2; KEEP_LONGEST_V004=3; REMOVE_TTL_V004=4; }
+message ChunkSizeProfileV004 { ChunkGranularityV004 granularity=1; uint32 target_tokens=2; uint32 min_tokens=3; uint32 max_tokens=4; uint32 overlap_tokens=5; }
+message ChunkingProfileV004 { ChunkSizeProfileV004 parent=1; repeated ChunkSizeProfileV004 granularities=2; bool preserve_headings=3; bool preserve_paragraphs=4; bool preserve_sentences=5; string profile_version=6; }
+message CreateMultiGranularityChunksRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string source_text=4; AccessLevel access_level=5; optional uint32 ttl_days=6; ChunkingProfileV004 profile=7; map<string,string> metadata=8; string idempotency_key=9; string correlation_id=10; }
+message CreatedChunkV004 { string chunk_id=1; string root_chunk_id=2; string source_chunk_id=3; optional string parent_chunk_id=4; ChunkGranularityV004 granularity=5; uint32 sequence_no=6; uint32 token_count=7; string content_hash=8; }
+message CreateMultiGranularityChunksResponse { string root_chunk_id=1; repeated CreatedChunkV004 parent_chunks=2; repeated CreatedChunkV004 sub_chunks_180=3; repeated CreatedChunkV004 sub_chunks_260=4; uint32 total_chunks=5; string status=6; }
+message GetChunkGroupRequest { string access_zone_id=1; string root_chunk_id=2; AccessLevel caller_access_level=3; }
+message ChunkContentV004 { CreatedChunkV004 chunk=1; string content=2; SearchRepresentationType representation_type=3; }
+message GetChunkGroupResponse { repeated ChunkContentV004 chunks=1; }
+message ResolveParentContextRequest { string access_zone_id=1; repeated string chunk_ids=2; uint32 max_context_tokens=3; AccessLevel caller_access_level=4; }
+message ResolveParentContextResponse { repeated ChunkContentV004 contexts=1; }
+message SearchFilterV004 { string key=1; string value=2; }
+message SearchRequestV004 { string correlation_id=1; string access_zone_id=2; AccessLevel caller_access_level=3; string query=4; uint32 top_k=5; uint32 candidate_limit=6; uint32 parent_limit=7; repeated SearchFilterV004 filters=8; uint32 timeout_ms=9; }
+message SearchScoresV004 { float dense_score=1; float final_score=2; }
+message SearchCitationV004 { map<string,string> metadata=1; }
+message SearchResultV004 { string document_id=1; uint64 document_version=2; string root_chunk_id=3; string source_chunk_id=4; string parent_chunk_id=5; string matched_chunk_id=6; ChunkGranularityV004 matched_granularity=7; string parent_text=8; SearchScoresV004 scores=9; SearchCitationV004 citation=10; string access_zone_id=11; AccessLevel access_level=12; }
+message SearchDiagnosticsV004 { uint64 query_embedding_ms=1; uint64 qdrant_search_ms=2; uint64 parent_fetch_ms=3; uint64 total_ms=4; uint32 candidate_count=5; uint32 parent_group_count=6; }
+message SearchResponseV004 { repeated SearchResultV004 results=1; SearchDiagnosticsV004 diagnostics=2; }
+message RegisterDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string content_hash=4; string activation_policy=5; string idempotency_key=6; }
+message ActivateDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; }
+message DocumentVersionResponse { string document_id=1; uint64 document_version=2; string status=3; }
+message DeleteChunkGroupRequest { string access_zone_id=1; string root_chunk_id=2; string correlation_id=3; }
+message DeleteChunkGroupResponse { uint64 affected_bindings=1; string status=2; }
+message UpdateChunkGroupTtlRequest { string access_zone_id=1; string root_chunk_id=2; optional uint32 ttl_days=3; TtlUpdateModeV004 update_mode=4; }
+message UpdateChunkGroupTtlResponse { uint64 affected_bindings=1; string status=2; }
+message SetChunkGroupLegalHoldRequest { string access_zone_id=1; string root_chunk_id=2; bool enabled=3; string reason=4; optional string legal_hold_until=5; }
+message SetChunkGroupLegalHoldResponse { uint64 affected_bindings=1; string status=2; }
+message GetRelevanceEvaluationRequest { string access_zone_id=1; string evaluation_id=2; }
+message RelevanceEvaluationV004 { string evaluation_id=1; float dense_score=2; float sparse_score=3; float lexical_score=4; float fused_score=5; float consistency_score=6; float final_score=7; string decision=8; }
+message GetRelevanceEvaluationResponse { RelevanceEvaluationV004 evaluation=1; }
+message SubmitRelevanceFeedbackRequest { string access_zone_id=1; string evaluation_id=2; string feedback_type=3; optional string comment=4; }
+message SubmitRelevanceFeedbackResponse { string feedback_id=1; string status=2; }
+message ListQuarantinedPointsRequest { string access_zone_id=1; uint32 limit=2; optional string page_token=3; }
+message QuarantinedPointV004 { string point_id=1; optional string binding_id=2; string reason=3; string quarantined_at=4; }
+message ListQuarantinedPointsResponse { repeated QuarantinedPointV004 points=1; optional string next_page_token=2; }
+message ResolveQuarantinedPointRequest { string access_zone_id=1; string point_id=2; string resolution=3; optional string binding_id=4; }
+message ResolveQuarantinedPointResponse { string status=1; }

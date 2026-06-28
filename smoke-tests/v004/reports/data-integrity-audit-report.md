@@ -1,0 +1,18 @@
+# Data Integrity Audit v004
+
+| Check | Violations |
+|---|---:|
+| `bindings_without_chunk` | 0 |
+| `active_searchable_chunks_without_document_version` | 0 |
+| `synced_bindings_without_completed_outbox` | 0 |
+| `active_document_without_searchable_synced_bindings` | 0 |
+| `orphan_parent_chunk_id` | 0 |
+| `orphan_source_chunk_id` | 0 |
+| `duplicate_searchable_binding_logical_keys` | 0 |
+| `permanently_processing_outbox_events` | 0 |
+| `failed_dead_letter_events_for_active_documents` | 0 |
+| `active_expired_chunks_without_legal_hold` | 0 |
+
+- Synced searchable bindings: 1517
+- Qdrant points for Civil Code: 1517
+- Qdrant payload missing required fields: 0

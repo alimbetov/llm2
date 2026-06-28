@@ -1,0 +1,26 @@
+# Acceptance checklist
+
+- [ ] Real ONNX session starts on CPU.
+- [ ] AUTO provider fallback is validated on target infrastructure.
+- [ ] Dense dimension is 1024 and normalized.
+- [ ] Sparse capability is false for a dense-only graph.
+- [ ] Sparse request against dense-only graph returns FAILED_PRECONDITION.
+- [ ] Claim is created before inference.
+- [ ] Two pods produce one inference for the same cache key.
+- [ ] Expired lease can be atomically taken over.
+- [ ] Stale owner is rejected by fencing token.
+- [ ] Same idempotency key/hash replays persisted results.
+- [ ] Same idempotency key/different hash fails.
+- [ ] REQUIRED returns success only after commit.
+- [ ] All items from one RPC are submitted concurrently.
+- [ ] Deadline and queue overflow scenarios pass.
+- [ ] L2 replay preserves token_count/truncated.
+- [ ] Request/item audit statuses are correct.
+- [ ] Recovery and retention workers pass integration tests.
+- [ ] API key is required in production.
+- [ ] Readiness remains false until self-test succeeds.
+- [ ] SIGTERM stops readiness and performs graceful shutdown.
+- [ ] Prometheus metrics are emitted without high-cardinality labels.
+- [ ] Cargo quality gates pass.
+- [ ] Docker image builds.
+- [ ] Kubernetes migration Job and probes pass.

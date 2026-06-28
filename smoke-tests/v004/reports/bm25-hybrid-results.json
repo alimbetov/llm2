@@ -1,0 +1,388 @@
+{
+  "verdict": "BM25_RETRIEVAL_BLOCKED",
+  "detection": {
+    "proto_has_retrieval_mode": false,
+    "proto_has_sparse_or_lexical_scores": false,
+    "search_query_requests_sparse_embedding": false,
+    "qdrant_sparse_search_implemented": false,
+    "hybrid_fusion_implemented": false,
+    "sql_available": true,
+    "embedding_sparse_rows": 0,
+    "active_civil_versions": 9
+  },
+  "dense_only": {
+    "passed": 0,
+    "failed": 0
+  },
+  "bm25_only": {
+    "status": "BLOCKED"
+  },
+  "hybrid": {
+    "status": "BLOCKED"
+  },
+  "zone_b_leakage": {
+    "status": "BLOCKED"
+  },
+  "blocked_reasons": [
+    "SearchRequestV004 has no retrieval/search mode field",
+    "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+    "Search query embedding uses want_sparse=false",
+    "Qdrant client has no sparse/BM25 search method",
+    "No hybrid fusion path found in src",
+    "embedding_sparse has no indexed rows"
+  ],
+  "candidates": [
+    {
+      "mode": "dense_only",
+      "question_id": "article-223",
+      "query": "статья 223",
+      "expected_parent_hint": "Статья 223",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "spouses-property",
+      "query": "общая собственность супругов",
+      "expected_parent_hint": "общая собственность супругов",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "article-143",
+      "query": "статья 143",
+      "expected_parent_hint": "Статья 143",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "honor-dignity",
+      "query": "защита чести достоинства и деловой репутации",
+      "expected_parent_hint": "чести, достоинства и деловой репутации",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "article-167",
+      "query": "статья 167",
+      "expected_parent_hint": "Статья 167",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "power-of-attorney",
+      "query": "доверенность письменное уполномочие",
+      "expected_parent_hint": "письменное уполномочие",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "article-246",
+      "query": "статья 246",
+      "expected_parent_hint": "Статья 246",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "dense_only",
+      "question_id": "stray-animals",
+      "query": "безнадзорные животные",
+      "expected_parent_hint": "безнадзорные животные",
+      "status": "BLOCKED",
+      "reason": "AstraVectorV004Control gRPC service is not reachable"
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "article-223",
+      "query": "статья 223",
+      "expected_parent_hint": "Статья 223",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "spouses-property",
+      "query": "общая собственность супругов",
+      "expected_parent_hint": "общая собственность супругов",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "article-143",
+      "query": "статья 143",
+      "expected_parent_hint": "Статья 143",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "honor-dignity",
+      "query": "защита чести достоинства и деловой репутации",
+      "expected_parent_hint": "чести, достоинства и деловой репутации",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "article-167",
+      "query": "статья 167",
+      "expected_parent_hint": "Статья 167",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "power-of-attorney",
+      "query": "доверенность письменное уполномочие",
+      "expected_parent_hint": "письменное уполномочие",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "article-246",
+      "query": "статья 246",
+      "expected_parent_hint": "Статья 246",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "question_id": "stray-animals",
+      "query": "безнадзорные животные",
+      "expected_parent_hint": "безнадзорные животные",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "article-223",
+      "query": "статья 223",
+      "expected_parent_hint": "Статья 223",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "spouses-property",
+      "query": "общая собственность супругов",
+      "expected_parent_hint": "общая собственность супругов",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "article-143",
+      "query": "статья 143",
+      "expected_parent_hint": "Статья 143",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "honor-dignity",
+      "query": "защита чести достоинства и деловой репутации",
+      "expected_parent_hint": "чести, достоинства и деловой репутации",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "article-167",
+      "query": "статья 167",
+      "expected_parent_hint": "Статья 167",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "power-of-attorney",
+      "query": "доверенность письменное уполномочие",
+      "expected_parent_hint": "письменное уполномочие",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "article-246",
+      "query": "статья 246",
+      "expected_parent_hint": "Статья 246",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "question_id": "stray-animals",
+      "query": "безнадзорные животные",
+      "expected_parent_hint": "безнадзорные животные",
+      "status": "BLOCKED",
+      "reason": "BM25/sparse/hybrid retrieval path is absent",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "bm25_only",
+      "test_id": "zone_b_lexical_secret_leakage",
+      "status": "BLOCKED",
+      "access_zone_a": "11111111-1111-4111-8111-111111111111",
+      "access_zone_b": "22222222-2222-4222-8222-222222222222",
+      "reason": "Zone B lexical leakage test requires BM25/hybrid retrieval execution path",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    },
+    {
+      "mode": "hybrid",
+      "test_id": "zone_b_lexical_secret_leakage",
+      "status": "BLOCKED",
+      "access_zone_a": "11111111-1111-4111-8111-111111111111",
+      "access_zone_b": "22222222-2222-4222-8222-222222222222",
+      "reason": "Zone B lexical leakage test requires BM25/hybrid retrieval execution path",
+      "blocked_reasons": [
+        "SearchRequestV004 has no retrieval/search mode field",
+        "SearchResponseV004 has no sparse/lexical/BM25 score fields",
+        "Search query embedding uses want_sparse=false",
+        "Qdrant client has no sparse/BM25 search method",
+        "No hybrid fusion path found in src",
+        "embedding_sparse has no indexed rows"
+      ]
+    }
+  ]
+}

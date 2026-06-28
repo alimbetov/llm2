@@ -1,0 +1,84 @@
+{
+  "verdict": "SECURE_RAG_CORE_CANDIDATE + CONSISTENCY_PARTIAL",
+  "previous": {
+    "verdict": "SECURE_RAG_CORE_CANDIDATE",
+    "wave1": {
+      "verdict": "RAG_CORE_E2E_CANDIDATE",
+      "civil_code": {
+        "document_id": "72fd8953-9f11-5eef-a03c-ef47c3d40daa",
+        "chunks": {
+          "SUB_260": 562,
+          "SUB_180": 629,
+          "SOURCE": 10,
+          "PARENT": 326
+        },
+        "synced_searchable_bindings": 1517,
+        "qdrant_points": 1517
+      },
+      "rag": {
+        "valid_questions": 9,
+        "recall_at_5": 0.8888888888888888,
+        "recall_at_10": 1,
+        "mean_reciprocal_rank": 0.7175925925925927
+      },
+      "integrity": {
+        "postgres_integrity_violations": 0,
+        "synced_searchable_bindings": 1517,
+        "qdrant_points_for_civil_code": 1517,
+        "qdrant_count_mismatch": 0,
+        "qdrant_payload_missing_required_fields": 0
+      }
+    },
+    "access_security": {
+      "verdict": "ACCESS_SECURITY_PASS",
+      "zone_a_qdrant_points": 1580,
+      "zone_b_qdrant_points": 3,
+      "zone_a_search_results": 10,
+      "zone_b_search_for_civil_code_results": 1,
+      "zone_a_search_for_zone_b_secret_results": 6,
+      "zone_b_search_for_zone_b_secret_results": 1,
+      "foreign_parent_resolution_attempts": 1,
+      "foreign_chunk_group_attempts": 1,
+      "cross_zone_leakage_count": 0,
+      "foreign_parent_text_returned": 0,
+      "foreign_metadata_returned": 0,
+      "access_level_violation_count": 0,
+      "permission_denied_count": 0,
+      "not_found_count": 2,
+      "unexpected_ok_count": 0,
+      "transport_error_count": 0
+    }
+  },
+  "consistency": {
+    "verdict": "CONSISTENCY_PARTIAL",
+    "register_parallel_requests": 50,
+    "register_rows_created": 1,
+    "register_idempotent_responses": 50,
+    "register_conflict_rejected": true,
+    "chunking_parallel_requests": 50,
+    "chunking_success": 50,
+    "chunking_conflict_rejected": true,
+    "duplicate_chunks": 0,
+    "duplicate_bindings": 0,
+    "duplicate_outbox_logical_events": 0,
+    "activation_parallel_requests": 10,
+    "activation_success": 10,
+    "active_versions": 1,
+    "concurrent_search_requests": 100,
+    "concurrent_search_success": 100,
+    "concurrent_search_transport_errors": 0,
+    "cross_zone_leakage_count": 0,
+    "empty_parent_context_count": 0,
+    "atomicity_failpoints_total": 8,
+    "atomicity_failpoints_passed": 0,
+    "atomicity_failpoints_status": "NOT_READY",
+    "atomicity_failpoints_reason": "failpoint strings present but no Wave 3 test hook implemented",
+    "outbox_double_claim_status": "NOT_READY",
+    "outbox_stale_completion_status": "NOT_READY",
+    "outbox_fencing_reason": "fencing column exists but smoke helper is not implemented",
+    "qdrant_idempotent_upsert_pass": true,
+    "dead_letter_test_status": "BLOCKED",
+    "dead_letter_reason": "no controllable Qdrant failure mechanism",
+    "data_integrity_violations_after_wave3": 0
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "verdict": "ACCESS_SECURITY_PASS",
+  "zone_a_qdrant_points": 1580,
+  "zone_b_qdrant_points": 3,
+  "zone_a_search_results": 10,
+  "zone_b_search_for_civil_code_results": 1,
+  "zone_a_search_for_zone_b_secret_results": 6,
+  "zone_b_search_for_zone_b_secret_results": 1,
+  "foreign_parent_resolution_attempts": 1,
+  "foreign_chunk_group_attempts": 1,
+  "cross_zone_leakage_count": 0,
+  "foreign_parent_text_returned": 0,
+  "foreign_metadata_returned": 0,
+  "access_level_violation_count": 0,
+  "permission_denied_count": 0,
+  "not_found_count": 2,
+  "unexpected_ok_count": 0,
+  "transport_error_count": 0
+}

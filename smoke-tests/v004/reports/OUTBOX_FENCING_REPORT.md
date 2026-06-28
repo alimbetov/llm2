@@ -1,0 +1,46 @@
+# AstraVector_v004 Outbox Fencing Report
+
+## Verdict
+OUTBOX_FENCING_PASS
+
+## Evidence
+```json
+[
+  {
+    "test_id": "W3C_SCHEMA",
+    "status": "PASS",
+    "document_id": null,
+    "access_zone_id": null,
+    "expected": "lock_generation exists",
+    "actual": "present",
+    "sql_evidence": {},
+    "qdrant_evidence": {},
+    "grpc_evidence": {},
+    "error": null
+  },
+  {
+    "test_id": "W3C_DOUBLE_CLAIM",
+    "status": "PASS",
+    "document_id": null,
+    "access_zone_id": null,
+    "expected": "one claim succeeds",
+    "actual": "claim_a=1 claim_b=none",
+    "sql_evidence": {},
+    "qdrant_evidence": {},
+    "grpc_evidence": {},
+    "error": null
+  },
+  {
+    "test_id": "W3C_STALE_COMPLETION",
+    "status": "PASS",
+    "document_id": null,
+    "access_zone_id": null,
+    "expected": "stale generation rejected/current accepted",
+    "actual": "reclaim=2 stale_rows=0 current_rows=1 final_generation=2",
+    "sql_evidence": {},
+    "qdrant_evidence": {},
+    "grpc_evidence": {},
+    "error": null
+  }
+]
+```

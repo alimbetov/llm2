@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: astravector-lifecycle
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: lifecycle
+              image: astravector-runtime:0.3.0
+              command: ["/usr/local/bin/astravector-lifecycle"]
+              envFrom:
+                - configMapRef: { name: astravector-config }
+                - secretRef: { name: astravector-secret }
+              env:
+                - name: ASTRAVECTOR_QDRANT_ENABLED
+                  value: "true"

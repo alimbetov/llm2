@@ -1,0 +1,59 @@
+[package]
+name = "astravector-runtime"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.82"
+description = "AstraVector canonical dense and BGE learned sparse embedding runtime"
+license = "Proprietary"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt"]
+smoke-failpoints = []
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dashmap = "6"
+futures = "0.3"
+hex = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+moka = { version = "0.12", features = ["future"] }
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "ndarray", "tls-rustls"] }
+pgvector = { version = "=0.4.0", features = ["sqlx"] }
+prost = "0.13"
+prost-types = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
+thiserror = "2"
+tokenizers = "0.21"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+subtle = "2"
+rand = "0.8"
+tonic = { version = "0.12", features = ["transport", "gzip", "tls"] }
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"

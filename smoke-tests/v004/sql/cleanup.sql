@@ -1,0 +1,2 @@
+DROP SCHEMA IF EXISTS astravector CASCADE;
+DROP TABLE IF EXISTS _sqlx_migrations;

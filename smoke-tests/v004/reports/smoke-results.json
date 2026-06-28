@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-06-27T15:27:51Z",
+  "results": [
+    {
+      "test": "bm25-hybrid-retrieval",
+      "status": "BLOCKED",
+      "started_at": "2026-06-27T15:27:50Z",
+      "finished_at": "2026-06-27T15:27:51Z",
+      "duration_ms": 311,
+      "assertions": [],
+      "errors": []
+    }
+  ],
+  "counts": {
+    "PASS": 0,
+    "FAIL": 0,
+    "BLOCKED": 1,
+    "SKIPPED": 0
+  }
+}

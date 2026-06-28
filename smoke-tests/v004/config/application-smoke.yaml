@@ -1,0 +1,70 @@
+service:
+  name: astravector-runtime-smoke
+  instance_id: smoke-${SMOKE_RUN_ID:-local}
+  environment: ${ASTRAVECTOR_ENV:-smoke}
+grpc:
+  host: 127.0.0.1
+  port: ${ASTRAVECTOR_GRPC_PORT:-55051}
+  max_request_message_mb: 8
+  max_response_message_mb: 16
+  max_items_per_batch: 32
+  deadlines: { query_ms: 3000, document_batch_ms: 30000, contract_ms: 1000, health_ms: 1000 }
+  compression: { enabled: false }
+security: { enabled: ${ASTRAVECTOR_AUTH_ENABLED:-false}, api_key: ${ASTRAVECTOR_API_KEY:-}, protect_health: false }
+shutdown: { drain_timeout_seconds: 10 }
+retry: { max_attempts: 3, initial_delay_ms: 50, multiplier: 2.0, max_delay_ms: 500, jitter: true }
+model:
+  id: BAAI/bge-m3
+  format: ONNX
+  precision: INT8
+  path: ${ASTRAVECTOR_MODEL_PATH:-/models/bge-m3/model.int8.onnx}
+  checksum: ${ASTRAVECTOR_MODEL_SHA256:-}
+  version: bge_m3_onnx_int8_v1
+  dense_output_name: sentence_embedding
+  token_output_name: last_hidden_state
+  sparse_output_name: lexical_weights
+tokenizer:
+  path: ${ASTRAVECTOR_TOKENIZER_PATH:-/models/bge-m3/tokenizer.json}
+  checksum: ${ASTRAVECTOR_TOKENIZER_SHA256:-}
+  version: bge_m3_tokenizer_v1
+inference: { provider: { mode: AUTO, preference: [CPU], fallback_to_cpu: true }, warmup_batches: 1 }
+dense: { enabled: true, name: dense_v1, dimension: 1024, pooling: CLS, normalize: true, distance: COSINE, version: bge_m3_dense_cls_l2_v1_onnx_int8 }
+sparse: { enabled: true, name: bge_sparse_v1, min_weight: 0.01, max_non_zero: 256, duplicate_merge: MAX, version: bge_m3_sparse_max_top256_v1_onnx_int8 }
+tokenization:
+  query: { max_length: 256, truncation_allowed: true }
+  child: { max_length: 512, truncation_allowed: false }
+  parent: { enabled: false, max_length: 2048, truncation_allowed: false }
+cache:
+  scope: TENANT
+  l1: { enabled: true, max_entries: 1000, ttl_minutes: 10, idle_timeout_minutes: 5 }
+  l2: { enabled: true, lease_duration_seconds: 15, processing_poll_interval_ms: 50, processing_poll_max_interval_ms: 250 }
+batching:
+  query: { max_wait_ms: 3, max_items: 16, max_padded_tokens: 4096, queue_capacity: 2000 }
+  document: { max_wait_ms: 10, max_items: 16, max_padded_tokens: 8192, queue_capacity: 10000 }
+  buckets: [64, 128, 256, 512]
+scheduler: { max_consecutive_query_batches: 8 }
+postgres:
+  enabled: true
+  url: postgres://${POSTGRES_USER:-astravector}:${POSTGRES_PASSWORD:-astravector_smoke_password}@${POSTGRES_HOST:-127.0.0.1}:${POSTGRES_PORT:-55432}/${POSTGRES_DB:-astravector_smoke}
+  max_connections: 10
+  min_connections: 1
+  acquire_timeout_ms: 2000
+  statement_timeout_ms: 5000
+  lock_timeout_ms: 1000
+  idle_in_transaction_session_timeout_ms: 5000
+  auto_migrate: true
+  required_on_startup: true
+  required_for_readiness: true
+recovery: { enabled: true, interval_seconds: 10, processing_timeout_seconds: 30, batch_size: 50 }
+retention: { query_requests_days: 1, document_requests_days: 1, failed_requests_days: 1, cache_unused_days: 1, delete_batch_size: 100 }
+metrics: { host: 127.0.0.1, port: ${ASTRAVECTOR_METRICS_PORT:-59090} }
+qdrant:
+  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-true}
+  url: ${QDRANT_HTTP_URL:-http://127.0.0.1:56333}
+  api_key: ${ASTRAVECTOR_QDRANT_API_KEY:-}
+  collection: ${QDRANT_COLLECTION:-astravector_smoke_v004}
+  timeout_ms: 5000
+  publisher: { enabled: true, batch_size: 64, poll_interval_ms: 250, max_attempts: 5 }
+lifecycle: { enabled: true, scan_interval_seconds: 30, batch_size: 100, soft_delete_grace_days: 1, min_ttl_days: 1, max_ttl_days: 3650 }
+enrichment: { enabled: false, max_representation_length: 4096, summary_enabled: true, synthetic_questions_enabled: true, synthetic_questions_max_count: 5 }
+relevance: { enabled: true, min_candidate_score: 0.65, min_reuse_score: 0.95 }

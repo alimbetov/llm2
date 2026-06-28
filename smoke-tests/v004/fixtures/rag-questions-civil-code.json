@@ -1,0 +1,167 @@
+[
+  {
+    "id": "civil-001",
+    "question": "Каков общий срок исковой давности?",
+    "language": "ru",
+    "expected_phrase": "Общий срок исковой давности устанавливается в три года",
+    "expected_answer_hint": "три года",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-002",
+    "question": "Когда начинается течение срока исковой давности после перерыва?",
+    "language": "ru",
+    "expected_phrase": "После перерыва течение срока исковой давности начинается заново",
+    "expected_answer_hint": "начинается заново",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-003",
+    "question": "Какими способами осуществляется защита гражданских прав?",
+    "language": "ru",
+    "expected_phrase": "Гражданские права защищаются судом, арбитражем или третейским судом",
+    "expected_answer_hint": "судом",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-004",
+    "question": "Что понимается под сделкой?",
+    "language": "ru",
+    "expected_phrase": "Сделками признаются действия граждан и юридических лиц",
+    "expected_answer_hint": "установление, изменение или прекращение гражданских прав и обязанностей",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-005",
+    "question": "Какие последствия признания сделки недействительной?",
+    "language": "ru",
+    "expected_phrase": "Недействительная сделка не влечет юридических последствий",
+    "expected_answer_hint": "не влечет юридических последствий",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-006",
+    "question": "Какая сделка юридического лица может быть признана недействительной?",
+    "language": "ru",
+    "expected_phrase": "может быть признана недействительной по иску собственника имущества юридического лица",
+    "expected_answer_hint": "противоречии с целями деятельности",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-007",
+    "question": "Является ли простое товарищество юридическим лицом?",
+    "language": "ru",
+    "expected_phrase": "Простое товарищество не является юридическим лицом",
+    "expected_answer_hint": "не является",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-008",
+    "question": "Как влияет истечение срока исковой давности на требования к другим обязанным лицам?",
+    "language": "ru",
+    "expected_phrase": "истечение срока исковой давности по требованию к такому лицу",
+    "expected_answer_hint": "не затрагивают требований кредитора к остальным",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-009",
+    "question": "Как долго продолжается течение срока исковой давности после прекращения обстоятельства приостановления?",
+    "language": "ru",
+    "expected_phrase": "Со дня прекращения обстоятельства, повлекшего приостановление, течение срока исковой давности продолжается",
+    "expected_answer_hint": "продолжается",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "civil-010",
+    "question": "Что происходит со сроком исковой давности, если иск оставлен без рассмотрения?",
+    "language": "ru",
+    "expected_phrase": "Если иск оставлен судом без рассмотрения",
+    "expected_answer_hint": "продолжается в общем порядке",
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "exact_legal_term"
+  },
+  {
+    "id": "hard-001",
+    "question": "Каков срок исковой давности по уголовному делу?",
+    "language": "ru",
+    "expected_phrase": null,
+    "expected_answer_hint": null,
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "hard_negative"
+  },
+  {
+    "id": "hard-002",
+    "question": "Как получить ипотеку в банке?",
+    "language": "ru",
+    "expected_phrase": null,
+    "expected_answer_hint": null,
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "hard_negative"
+  },
+  {
+    "id": "hard-003",
+    "question": "Какие штрафы предусмотрены за нарушение ПДД?",
+    "language": "ru",
+    "expected_phrase": null,
+    "expected_answer_hint": null,
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "hard_negative"
+  },
+  {
+    "id": "hard-004",
+    "question": "Как оформить загранпаспорт?",
+    "language": "ru",
+    "expected_phrase": null,
+    "expected_answer_hint": null,
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "hard_negative"
+  },
+  {
+    "id": "hard-005",
+    "question": "Какой размер НДС?",
+    "language": "ru",
+    "expected_phrase": null,
+    "expected_answer_hint": null,
+    "expected_article": null,
+    "top_k": 10,
+    "min_expected_rank": 10,
+    "category": "hard_negative"
+  }
+]

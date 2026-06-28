@@ -1,0 +1,8 @@
+{"type":"document_indexed","status":"PASS","details":{"label":"zone-b-secret","document_id":"00af7a8d-a963-5583-adbb-f7fc52273fa8","searchable_bindings":3}}
+{"type":"document_indexed","status":"PASS","details":{"label":"zone-a-level-1","document_id":"de0b8166-f2b6-5a9a-a19c-67c887d5fd37","searchable_bindings":3}}
+{"type":"document_indexed","status":"PASS","details":{"label":"zone-a-level-2","document_id":"a178af72-4d52-570d-a867-426672b51a4c","searchable_bindings":3}}
+{"type":"document_indexed","status":"PASS","details":{"label":"zone-a-level-3","document_id":"371d59f4-a4ff-5f7b-82c9-d548552b85ee","searchable_bindings":3}}
+{"type":"document_indexed","status":"PASS","details":{"label":"zone-a-level-4","document_id":"8de2498b-fd48-5b2b-9a43-5169fa451f83","searchable_bindings":3}}
+{"type":"zone_a_civil_search","status":"PASS","details":{"zone_b_leaks":0}}
+{"type":"zone_b_civil_search","status":"PASS","details":{"zone_a_leaks":0}}
+{"type":"zone_a_zone_b_secret_search","status":"PASS","details":{"zone_b_leaks":0}}

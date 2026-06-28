@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: astravector-runtime
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels: { app: astravector-runtime }
+  template:
+    metadata:
+      labels: { app: astravector-runtime }
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: astravector
+          image: astravector-runtime:0.2.0
+          ports:
+            - { name: grpc, containerPort: 50051 }
+            - { name: metrics, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: astravector-config }
+            - secretRef: { name: astravector-secret }
+          volumeMounts:
+            - { name: model, mountPath: /models/bge-m3, readOnly: true }
+          startupProbe:
+            tcpSocket: { port: grpc }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: grpc }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: grpc }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "4", memory: 8Gi }
+      volumes:
+        - name: model
+          persistentVolumeClaim: { claimName: astravector-model-pvc }

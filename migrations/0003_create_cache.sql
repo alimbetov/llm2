@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS astravector.embedding_cache_entries (
+    id uuid PRIMARY KEY,
+    tenant_id varchar(128) NOT NULL,
+    workspace_id varchar(128) NOT NULL,
+    cache_key varchar(64) NOT NULL UNIQUE,
+    text_hash varchar(64) NOT NULL,
+    purpose varchar(32) NOT NULL,
+    chunk_type smallint NOT NULL CHECK (chunk_type IN (1, 2)),
+    tokenizer_version varchar(128) NOT NULL,
+    model_version varchar(128) NOT NULL,
+    dense_version varchar(128),
+    sparse_version varchar(128),
+    status varchar(32) NOT NULL,
+    owner_instance_id varchar(128),
+    processing_started_at timestamptz,
+    error_code varchar(64),
+    error_message text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz,
+    last_accessed_at timestamptz NOT NULL DEFAULT now(),
+    hit_count bigint NOT NULL DEFAULT 0
+);

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: astravector-config
+data:
+  ASTRAVECTOR_CONFIG: /app/config/application.yaml
+  ASTRAVECTOR_ENV: production
+  ASTRAVECTOR_MODEL_PATH: /models/bge-m3/model.int8.onnx
+  ASTRAVECTOR_TOKENIZER_PATH: /models/bge-m3/tokenizer.json
+  ASTRAVECTOR_AUTH_ENABLED: "true"

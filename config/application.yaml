@@ -1,0 +1,159 @@
+service:
+  name: astravector-runtime
+  instance_id: ${HOSTNAME:-local}
+  environment: ${ASTRAVECTOR_ENV:-development}
+
+grpc:
+  host: 0.0.0.0
+  port: 50051
+  max_request_message_mb: 8
+  max_response_message_mb: 16
+  max_items_per_batch: 32
+  deadlines:
+    query_ms: 1000
+    document_batch_ms: 10000
+    contract_ms: 1000
+    health_ms: 500
+  compression:
+    enabled: false
+
+security:
+  enabled: ${ASTRAVECTOR_AUTH_ENABLED:-false}
+  api_key: ${ASTRAVECTOR_API_KEY:-}
+  protect_health: false
+
+shutdown:
+  drain_timeout_seconds: 30
+
+retry:
+  max_attempts: 3
+  initial_delay_ms: 50
+  multiplier: 2.0
+  max_delay_ms: 500
+  jitter: true
+
+model:
+  id: BAAI/bge-m3
+  format: ONNX
+  precision: INT8
+  path: ${ASTRAVECTOR_MODEL_PATH:-/models/bge-m3/model.int8.onnx}
+  checksum: ${ASTRAVECTOR_MODEL_SHA256:-}
+  version: bge_m3_onnx_int8_v1
+  dense_output_name: sentence_embedding
+  token_output_name: last_hidden_state
+  sparse_output_name: lexical_weights
+
+tokenizer:
+  path: ${ASTRAVECTOR_TOKENIZER_PATH:-/models/bge-m3/tokenizer.json}
+  checksum: ${ASTRAVECTOR_TOKENIZER_SHA256:-}
+  version: bge_m3_tokenizer_v1
+
+inference:
+  provider:
+    mode: AUTO
+    preference: [TENSOR_RT, CUDA, CPU]
+    fallback_to_cpu: true
+  warmup_batches: 1
+
+dense:
+  enabled: true
+  name: dense_v1
+  dimension: 1024
+  pooling: CLS
+  normalize: true
+  distance: COSINE
+  version: bge_m3_dense_cls_l2_v1_onnx_int8
+
+sparse:
+  enabled: true
+  name: bge_sparse_v1
+  min_weight: 0.01
+  max_non_zero: 256
+  duplicate_merge: MAX
+  version: bge_m3_sparse_max_top256_v1_onnx_int8
+
+tokenization:
+  query: { max_length: 256, truncation_allowed: true }
+  child: { max_length: 512, truncation_allowed: false }
+  parent: { enabled: false, max_length: 2048, truncation_allowed: false }
+
+cache:
+  scope: TENANT
+  l1: { enabled: true, max_entries: 50000, ttl_minutes: 30, idle_timeout_minutes: 10 }
+  l2:
+    enabled: true
+    lease_duration_seconds: 30
+    processing_poll_interval_ms: 100
+    processing_poll_max_interval_ms: 500
+
+batching:
+  query: { max_wait_ms: 3, max_items: 16, max_padded_tokens: 4096, queue_capacity: 2000 }
+  document: { max_wait_ms: 10, max_items: 16, max_padded_tokens: 8192, queue_capacity: 10000 }
+  buckets: [64, 128, 256, 512]
+
+scheduler:
+  max_consecutive_query_batches: 8
+
+postgres:
+  enabled: true
+  url: ${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@localhost:5432/astravector}
+  max_connections: 20
+  min_connections: 2
+  acquire_timeout_ms: 2000
+  statement_timeout_ms: 3000
+  lock_timeout_ms: 1000
+  idle_in_transaction_session_timeout_ms: 5000
+  auto_migrate: true
+  required_on_startup: true
+  required_for_readiness: true
+
+recovery: { enabled: true, interval_seconds: 60, processing_timeout_seconds: 300, batch_size: 100 }
+retention: { query_requests_days: 7, document_requests_days: 30, failed_requests_days: 30, cache_unused_days: 90, delete_batch_size: 5000 }
+metrics: { host: 0.0.0.0, port: 9090 }
+
+qdrant:
+  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-false}
+  url: ${ASTRAVECTOR_QDRANT_URL:-http://qdrant:6333}
+  api_key: ${ASTRAVECTOR_QDRANT_API_KEY:-}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_v003}
+  timeout_ms: 5000
+  publisher:
+    enabled: true
+    batch_size: 256
+    poll_interval_ms: 500
+    max_attempts: 10
+
+lifecycle:
+  enabled: true
+  scan_interval_seconds: 300
+  batch_size: 500
+  soft_delete_grace_days: 7
+  min_ttl_days: 1
+  max_ttl_days: 3650
+
+enrichment:
+  enabled: false
+  max_representation_length: 4096
+  summary_enabled: true
+  synthetic_questions_enabled: true
+  synthetic_questions_max_count: 5
+
+relevance:
+  enabled: true
+  min_candidate_score: 0.65
+  min_reuse_score: 0.95
+
+partitioning:
+  access_zone_partitions: 32
+chunking:
+  enabled: true
+  profile_version: multi-granularity-v1
+  parent: { target_tokens: 520, min_tokens: 350, max_tokens: 700, overlap_tokens: 80 }
+  sub_180: { target_tokens: 180, min_tokens: 130, max_tokens: 220, overlap_tokens: 35 }
+  sub_260: { target_tokens: 260, min_tokens: 200, max_tokens: 320, overlap_tokens: 50 }
+reconciliation:
+  enabled: true
+  incremental_interval_minutes: 360
+  full_interval_hours: 168
+  orphan_policy: QUARANTINE
+  batch_size: 1000

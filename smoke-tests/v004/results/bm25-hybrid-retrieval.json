@@ -1,0 +1,9 @@
+{
+  "test": "bm25-hybrid-retrieval",
+  "status": "BLOCKED",
+  "started_at": "2026-06-27T15:27:50Z",
+  "finished_at": "2026-06-27T15:27:51Z",
+  "duration_ms": 311,
+  "assertions": [],
+  "errors": []
+}

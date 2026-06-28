@@ -1,0 +1,14 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: astravector-migrations
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: astravector-runtime:0.2.0
+          command: ["/app/astravector-runtime", "migrate"]
+          envFrom:
+            - secretRef: { name: astravector-secret }

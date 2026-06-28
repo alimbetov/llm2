@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: astravector-qdrant-publisher
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: astravector-qdrant-publisher }
+  template:
+    metadata:
+      labels: { app: astravector-qdrant-publisher }
+    spec:
+      containers:
+        - name: publisher
+          image: astravector-runtime:0.3.0
+          command: ["/usr/local/bin/astravector-qdrant-publisher"]
+          envFrom:
+            - configMapRef: { name: astravector-config }
+            - secretRef: { name: astravector-secret }
+          env:
+            - name: ASTRAVECTOR_QDRANT_ENABLED
+              value: "true"
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }

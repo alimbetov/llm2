@@ -1,0 +1,6 @@
+schema_exists|1
+pgvector_extension|1
+document_versions|1
+content_chunks_v004|1
+vector_bindings_v004|1
+vector_outbox|1

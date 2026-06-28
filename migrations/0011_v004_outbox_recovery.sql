@@ -1,0 +1,11 @@
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS binding_access_zone_id uuid;
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS operation_version bigint NOT NULL DEFAULT 1;
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS reclaim_count integer NOT NULL DEFAULT 0;
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS last_started_at timestamptz;
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS last_finished_at timestamptz;
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS last_error_code varchar(64);
+ALTER TABLE astravector.vector_outbox ADD COLUMN IF NOT EXISTS last_error_message text;
+UPDATE astravector.vector_outbox SET binding_access_zone_id=COALESCE(binding_access_zone_id,'00000000-0000-0000-0000-000000000000'::uuid) WHERE binding_access_zone_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_vector_outbox_ready_v004 ON astravector.vector_outbox(next_attempt_at,created_at) WHERE status IN('PENDING','RETRY_PENDING');
+CREATE INDEX IF NOT EXISTS idx_vector_outbox_reclaim_v004 ON astravector.vector_outbox(locked_until) WHERE status='PROCESSING';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_outbox_operation_v004 ON astravector.vector_outbox(binding_access_zone_id,binding_id,operation,operation_version);
