@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "name": "graph-quick",
+  "description": "Runtime profile that requires fixture relation ingestion and GraphRAG expanded context evidence",
+  "corpora": [
+    "graph-rag-mini",
+    "technical-mini",
+    "long-doc-mini"
+  ],
+  "queries": [
+    "graph-rag-golden"
+  ],
+  "runner": {
+    "mode": "remote-runtime",
+    "ingestion": "grpc",
+    "concurrency": 4,
+    "timeout_seconds": 300
+  },
+  "thresholds": {
+    "recall_at_5": 0.85,
+    "mrr": 0.65,
+    "expected_document_hit_rate": 0.85,
+    "expected_block_hit_rate": 0.75,
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0,
+    "forbidden_block_leakage_count": 0,
+    "hard_negative_false_positive_rate": 0.1,
+    "duplicate_rate_after_mmr": 0.35,
+    "graph_expected_related_hit_rate": 0.6,
+    "mmr_expected_aspect_coverage": 0.0,
+    "p95_retrieve_context_ms": 5000,
+    "outbox_dead_letter_count": 0,
+    "qdrant_missing_points": 0
+  }
+}

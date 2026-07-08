@@ -1,0 +1,14 @@
+{
+  "baseline_date": "2026-07-03",
+  "fix_version": "fix474c",
+  "profile": "hybrid-quick",
+  "fixtures_profile": "hybrid-quick",
+  "fixtures_checksum": null,
+  "fixtures_checksum_status": "NOT_IMPLEMENTED",
+  "hard_negative_failed": 15,
+  "forbidden_document_returned": 12,
+  "forbidden_phrase_returned": 3,
+  "quality_gates_failed": 15,
+  "forbidden_total": 15,
+  "notes": "Baseline captured before fix474d no-answer calibration. Used by fix474e confidence gate."
+}

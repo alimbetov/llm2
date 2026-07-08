@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AstraVector Quality Relation",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "relation_id",
+    "corpus",
+    "from_document_id",
+    "from_block_id",
+    "to_document_id",
+    "to_block_id",
+    "relation_type",
+    "weight"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "relation_id": {
+      "type": "string"
+    },
+    "corpus": {
+      "type": "string"
+    },
+    "from_document_id": {
+      "type": "string"
+    },
+    "from_block_id": {
+      "type": "string"
+    },
+    "to_document_id": {
+      "type": "string"
+    },
+    "to_block_id": {
+      "type": "string"
+    },
+    "relation_type": {
+      "type": "string"
+    },
+    "weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  }
+}

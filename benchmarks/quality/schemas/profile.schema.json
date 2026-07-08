@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AstraVector Quality Profile",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "name",
+    "corpora",
+    "queries",
+    "runner",
+    "thresholds"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "name": {
+      "type": "string"
+    },
+    "corpora": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "runner": {
+      "type": "object"
+    },
+    "thresholds": {
+      "type": "object"
+    }
+  }
+}

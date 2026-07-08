@@ -1,0 +1,34 @@
+# Automated test profile. Loaded after config/application.yaml when ASTRAVECTOR_ENV=test or testing.
+service:
+  environment: test
+
+security:
+  enabled: false
+  protect_health: false
+  trust_forwarded_identity_headers: false
+
+postgres:
+  url: ${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@localhost:5432/astravector_test}
+  max_connections: 10
+  min_connections: 1
+  auto_migrate: true
+  required_on_startup: true
+  required_for_readiness: true
+
+qdrant:
+  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-true}
+  url: ${ASTRAVECTOR_QDRANT_URL:-http://localhost:6333}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_v004_test}
+  auto_create_collection: true
+  validate_collection_schema: true
+  ensure_payload_indexes: true
+
+metrics:
+  host: 127.0.0.1
+  port: 19090
+
+index_ttl:
+  cleanup_interval_seconds: 30
+  cleanup_batch_size: 25
+  qdrant_delete_batch_size: 100
+  qdrant_scroll_batch_size: 250

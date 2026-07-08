@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "name": "full-capability-quick",
+  "description": "Runtime profile that requires dense, sparse, hybrid, GraphRAG and MMR capability evidence",
+  "corpora": [
+    "synthetic-mini",
+    "access-zone-mini",
+    "graph-rag-mini",
+    "mmr-diversity-mini",
+    "technical-mini",
+    "sparse-technical-mini",
+    "distractor-mini",
+    "legal-mini",
+    "long-doc-mini"
+  ],
+  "queries": [
+    "dense-only-golden",
+    "technical-golden",
+    "sparse-technical-golden",
+    "distractor-golden",
+    "graph-rag-golden",
+    "mmr-diversity-golden",
+    "access-isolation-golden",
+    "negative-golden"
+  ],
+  "runner": {
+    "mode": "remote-runtime",
+    "ingestion": "grpc",
+    "concurrency": 4,
+    "timeout_seconds": 600
+  },
+  "thresholds": {
+    "recall_at_5": 0.85,
+    "mrr": 0.65,
+    "expected_document_hit_rate": 0.85,
+    "expected_block_hit_rate": 0.75,
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0,
+    "forbidden_block_leakage_count": 0,
+    "hard_negative_false_positive_rate": 0.1,
+    "duplicate_rate_after_mmr": 0.35,
+    "graph_expected_related_hit_rate": 0.6,
+    "mmr_expected_aspect_coverage": 0.6,
+    "p95_retrieve_context_ms": 5000,
+    "outbox_dead_letter_count": 0,
+    "qdrant_missing_points": 0
+  }
+}

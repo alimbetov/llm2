@@ -15,7 +15,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: astravector
-          image: astravector-runtime:0.2.0
+          image: astravector-runtime:0.4.1-fix465-p2-production-hardening
           ports:
             - { name: grpc, containerPort: 50051 }
             - { name: metrics, containerPort: 9090 }
@@ -25,15 +25,24 @@ spec:
           volumeMounts:
             - { name: model, mountPath: /models/bge-m3, readOnly: true }
           startupProbe:
-            tcpSocket: { port: grpc }
+            grpc:
+              port: 50051
+              service: astravector.embedding.v1.AstraVectorRuntime
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
-            tcpSocket: { port: grpc }
+            grpc:
+              port: 50051
+              service: astravector.embedding.v1.AstraVectorRuntime
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           livenessProbe:
-            tcpSocket: { port: grpc }
+            grpc:
+              port: 50051
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
           resources:
             requests: { cpu: "1", memory: 2Gi }
             limits: { cpu: "4", memory: 8Gi }

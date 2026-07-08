@@ -1,0 +1,12 @@
+{
+  "title": "AstraVector Runtime",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {"type":"timeseries","title":"Qdrant search active","targets":[{"expr":"qdrant_search_concurrent_active"}]},
+    {"type":"timeseries","title":"Qdrant search rejected","targets":[{"expr":"rate(qdrant_search_rejected_total[5m])"}]},
+    {"type":"timeseries","title":"RetrieveContext token count","targets":[{"expr":"retrieve_context_final_token_count"}]},
+    {"type":"timeseries","title":"Retention errors","targets":[{"expr":"rate(retention_errors_total[5m])"}]},
+    {"type":"timeseries","title":"Qdrant payload index errors","targets":[{"expr":"rate(qdrant_payload_index_create_errors_total[5m])"}]}
+  ]
+}

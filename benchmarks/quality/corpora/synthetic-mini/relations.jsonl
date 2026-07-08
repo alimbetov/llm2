@@ -1,0 +1,2 @@
+{"schema_version":"1.0","relation_id":"rel-synth-ttl-legalhold-001","corpus":"synthetic-mini","from_document_id":"tech-ttl-001","from_block_id":"ttl-001","to_document_id":"tech-ttl-001","to_block_id":"ttl-002","relation_type":"CONSTRAINED_BY","weight":0.85}
+{"schema_version":"1.0","relation_id":"rel-synth-outbox-qdrant-001","corpus":"synthetic-mini","from_document_id":"tech-outbox-001","from_block_id":"outbox-001","to_document_id":"tech-qdrant-001","to_block_id":"qdrant-001","relation_type":"PUBLISHES_TO","weight":0.9}

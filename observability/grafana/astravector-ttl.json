@@ -1,0 +1,12 @@
+{
+  "title": "AstraVector TTL",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {"type":"timeseries","title":"TTL claimed documents","targets":[{"expr":"rate(index_ttl_claimed_documents_total[5m])"}]},
+    {"type":"timeseries","title":"TTL deleted documents","targets":[{"expr":"rate(index_ttl_deleted_documents_total[5m])"}]},
+    {"type":"timeseries","title":"TTL delete failed","targets":[{"expr":"rate(index_ttl_delete_failed_total[5m])"}]},
+    {"type":"timeseries","title":"TTL oldest expired age","targets":[{"expr":"index_ttl_oldest_expired_age_seconds"}]},
+    {"type":"timeseries","title":"Permanent delete failures","targets":[{"expr":"index_ttl_delete_permanently_failed_documents_total"}]}
+  ]
+}

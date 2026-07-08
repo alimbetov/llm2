@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AstraVector Quality Report",
+  "type": "object",
+  "required": ["schema_version", "profile", "verdict", "summary", "failures"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "profile": { "type": "string" },
+    "verdict": { "enum": ["PASS", "FAIL", "SKIPPED"] },
+    "runtime_execution": { "enum": ["REMOTE_GRPC", "STATIC_VALIDATION", "SKIPPED"] },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "hard_negative_false_positive_rate": { "type": "number" },
+        "forbidden_block_leakage_count": { "type": "integer" },
+        "long_document_target_block_hit_rate": { "type": "number" },
+        "legal_similar_rule_confusion_count": { "type": "integer" },
+        "distractor_false_positive_count": { "type": "integer" },
+        "graph_expected_related_hit_rate": { "type": "number" },
+        "mmr_expected_aspect_coverage": { "type": "number" },
+        "access_zone_conflict_accuracy": { "type": "number" },
+        "access_level_conflict_accuracy": { "type": "number" }
+      }
+    },
+    "failures": { "type": "array" }
+  }
+}

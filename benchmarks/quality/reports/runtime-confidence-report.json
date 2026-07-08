@@ -1,0 +1,121 @@
+{
+  "runtime_execution": "CONFIDENCE_GATE_CONFIRMED",
+  "verdict": "PASS",
+  "production_pass": true,
+  "runtime_ready": true,
+  "blockers": [],
+  "preflight": {
+    "endpoint_available": true,
+    "postgres_available": true,
+    "qdrant_available": true,
+    "qdrant_collection_available": true,
+    "qdrant_vector_schema_available": true,
+    "model_file_found": true,
+    "tokenizer_file_found": true,
+    "model_inference_verified": true,
+    "model_inference_reason": "MODEL_INFERENCE_VERIFIED_BY_DENSE_RUNTIME_PROFILE"
+  },
+  "confidence_gate": {
+    "runtime_execution": "CONFIDENCE_GATE_CONFIRMED",
+    "verdict": "PASS",
+    "production_pass": true,
+    "not_production_pass": false,
+    "quality_run_id": "fix474f-20260708-202920",
+    "started_at": "2026-07-08T20:29:20+05:00",
+    "finished_at": "2026-07-08T20:30:45+05:00",
+    "timeout_triggered": false,
+    "skipped_profiles_count": 0,
+    "data_isolation_mode": "quality_run_id_namespace",
+    "cleanup_executed": false,
+    "reasons": [],
+    "warnings": []
+  },
+  "versions": {
+    "astravector_version": "UNKNOWN",
+    "git_commit": "d1ae47bd12d66f1029cf1d153f4a602282548b5e",
+    "model_version": "UNKNOWN",
+    "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
+    "sparse_encoder_version": "technical-v2",
+    "fusion_strategy": "RRF"
+  },
+  "baseline": {
+    "source_file": "benchmarks/quality/baseline/hard-negative-baseline.json",
+    "fix_version": "fix474c",
+    "forbidden_total": 15,
+    "fixtures_profile": "hybrid-quick",
+    "fixtures_checksum": "b2cc2a4037e226845f1f2fd5eb197db29616459aab352c496cc34dfcf03d3a92",
+    "fixtures_checksum_status": "COMPUTED"
+  },
+  "profiles": {
+    "dense": {
+      "verdict": "PASS",
+      "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+      "blocked": false
+    },
+    "sparse": {
+      "verdict": "PASS",
+      "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+      "blocked": false,
+      "sparse_available": true
+    },
+    "hybrid": {
+      "verdict": "PASS",
+      "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+      "blocked": false,
+      "hybrid_available": true
+    }
+  },
+  "hard_negative": {
+    "baseline_failed": 15,
+    "baseline_forbidden_document_returned": 12,
+    "baseline_forbidden_phrase_returned": 3,
+    "baseline_forbidden_total": 15,
+    "after_failed": 0,
+    "after_forbidden_document_returned": 0,
+    "after_forbidden_phrase_returned": 0,
+    "after_forbidden_total": 0,
+    "false_positive_reduction_rate": 1,
+    "target_reduction_rate": 0.5,
+    "target_met": true,
+    "max_allowed_forbidden_total": 0,
+    "no_answer_triggered_count": 0,
+    "pre_mmr_filtered_candidate_count": 64,
+    "post_mmr_no_answer_triggered_count": 0,
+    "hard_negative_filtered_by": "candidate_filter"
+  },
+  "no_answer": {
+    "debug_enabled": true,
+    "enabled": true,
+    "exact_technical_boost": 0.5,
+    "exact_technical_boost_strategy": "boosted_sparse_score = sparse_score * (1.0 + exact_technical_boost); sparse-only exact technical candidates are allowed when sparse_score >= min_sparse_score * 2.0",
+    "execution_order": [
+      "dense candidates",
+      "sparse candidates",
+      "hybrid/fusion",
+      "pre-MMR weak candidate filtering",
+      "graph expansion",
+      "MMR",
+      "final no-answer policy",
+      "empty contexts on weak evidence",
+      "format/truncate"
+    ],
+    "hard_negative_strict": true,
+    "latency_overhead_ms_p95": null,
+    "min_dense_score": 0.25,
+    "min_hybrid_score": 0.3,
+    "min_sparse_score": 0.1,
+    "non_zero_max_false_positive_contexts_warnings": 0,
+    "post_mmr_no_answer_triggered_count": 0,
+    "pre_mmr_filtered_candidate_count": 64,
+    "sparse_only_min_matched_terms": 2,
+    "sparse_only_require_technical_token": true
+  },
+  "security": {
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0
+  },
+  "optional_profiles": {
+    "graph": {},
+    "full_capability": {}
+  }
+}

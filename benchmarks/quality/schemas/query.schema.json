@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AstraVector Quality Query",
+  "type": "object",
+  "required": ["schema_version", "id", "category", "question", "context", "expected"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "id": { "type": "string" },
+    "category": { "type": "string" },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "question": { "type": "string" },
+    "context": {
+      "type": "object",
+      "required": ["access_zone_code", "caller_access_level", "profile"],
+      "properties": {
+        "access_zone_code": { "type": "string" },
+        "caller_access_level": { "type": "string" },
+        "profile": { "type": "string" },
+        "search_mode": { "type": "string" },
+        "enable_graph_expansion": { "type": "boolean" },
+        "enable_mmr": { "type": "boolean" }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "properties": {
+        "must_contain_phrases": { "type": "array", "items": { "type": "string" } },
+        "must_contain_document_ids": { "type": "array", "items": { "type": "string" } },
+        "must_contain_block_ids": { "type": "array", "items": { "type": "string" } },
+        "forbidden_phrases": { "type": "array", "items": { "type": "string" } },
+        "forbidden_document_ids": { "type": "array", "items": { "type": "string" } },
+        "forbidden_access_zones": { "type": "array", "items": { "type": "string" } },
+        "forbidden_block_ids": { "type": "array", "items": { "type": "string" } },
+        "expected_related_block_ids": { "type": "array", "items": { "type": "string" } },
+        "expected_aspects": { "type": "array", "items": { "type": "string" } },
+        "min_expected_aspect_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "hard_negative": { "type": "boolean" },
+        "max_false_positive_contexts": { "type": "integer", "minimum": 0 },
+        "allowed_document_ids": { "type": "array", "items": { "type": "string" } },
+        "required_ranked_before": { "type": "array" },
+        "runtime_required": { "type": "boolean" },
+        "expected_empty": { "type": "boolean" },
+        "min_recall_at_5": { "type": "number" },
+        "max_rank_for_primary": { "type": "integer" },
+        "min_contexts_count": { "type": "integer" },
+        "max_contexts_count": { "type": "integer" },
+        "must_have_sources": { "type": "array", "items": { "type": "string" } },
+        "must_not_have_sources": { "type": "array", "items": { "type": "string" } },
+        "latency_p95_ms": { "type": "integer" },
+        "consistency_checks": { "type": "object" }
+      }
+    }
+  }
+}

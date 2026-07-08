@@ -33,7 +33,7 @@ cargo metadata --no-deps --format-version=1 | jq '.packages[].targets[] | select
 Фактические binary names:
 
 ```text
-astravector-enrichment
+astravector-enrichment  # experimental/dev-only; not copied to production Docker image in fix465
 astravector-lifecycle
 astravector-qdrant-publisher
 astravector-reconciliation

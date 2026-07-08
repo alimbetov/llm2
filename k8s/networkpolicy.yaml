@@ -7,12 +7,30 @@ spec:
     matchLabels: { app: astravector-runtime }
   policyTypes: [Ingress, Egress]
   ingress:
+    # gRPC traffic must enter only through the trusted gateway/service-mesh tier.
+    # The gateway is responsible for stripping user-supplied x-astravector-* headers
+    # and injecting x-astravector-role/access-level plus x-astravector-gateway-trust.
     - from:
-        - namespaceSelector: {}
+        - podSelector:
+            matchLabels:
+              app: astravector-gateway
       ports:
         - { protocol: TCP, port: 50051 }
+    # Metrics are readable only by Prometheus/monitoring pods.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
         - { protocol: TCP, port: 9090 }
   egress:
     - ports:
         - { protocol: TCP, port: 5432 }
         - { protocol: UDP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: qdrant
+      ports:
+        - { protocol: TCP, port: 6333 }
+        - { protocol: TCP, port: 6334 }

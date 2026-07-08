@@ -1,6 +1,7 @@
 use astravector_runtime::{
     chunking::{
         ChunkingEngine, ChunkingProfile, ConservativeTokenCounter, Granularity, SizeProfile,
+        SourceChunkStorageMode,
     },
     domain::SearchRepresentation,
     relevance,
@@ -47,6 +48,7 @@ fn multi_granularity_is_deterministic() {
             1,
             "One sentence. Two sentence. Three sentence. Four sentence.",
             &p,
+            SourceChunkStorageMode::FullText,
         )
         .unwrap();
     let b = e
@@ -56,6 +58,7 @@ fn multi_granularity_is_deterministic() {
             1,
             "One sentence. Two sentence. Three sentence. Four sentence.",
             &p,
+            SourceChunkStorageMode::FullText,
         )
         .unwrap();
     assert_eq!(

@@ -1,0 +1,32 @@
+# Local developer profile. Loaded after config/application.yaml when ASTRAVECTOR_ENV=dev or development.
+service:
+  environment: development
+
+security:
+  enabled: false
+  protect_health: false
+  trust_forwarded_identity_headers: false
+
+postgres:
+  url: ${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@localhost:5432/astravector}
+  max_connections: 20
+  min_connections: 2
+  auto_migrate: true
+  required_on_startup: true
+  required_for_readiness: true
+
+qdrant:
+  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-true}
+  url: ${ASTRAVECTOR_QDRANT_URL:-http://localhost:6333}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_v004_dev}
+  auto_create_collection: true
+  validate_collection_schema: true
+  ensure_payload_indexes: true
+
+metrics:
+  host: 0.0.0.0
+  port: 9090
+
+index_ttl:
+  cleanup_enabled: true
+  qdrant_reconciliation_enabled: true

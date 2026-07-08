@@ -1,0 +1,12 @@
+{
+  "title": "AstraVector Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {"type":"timeseries","title":"RetrieveContext request rate","targets":[{"expr":"rate(retrieved_contexts_total[5m])"}]},
+    {"type":"timeseries","title":"Empty RetrieveContext rate","targets":[{"expr":"rate(retrieved_contexts_empty_total[5m])"}]},
+    {"type":"timeseries","title":"Qdrant request latency","targets":[{"expr":"histogram_quantile(0.95, rate(qdrant_request_duration_ms_bucket[5m]))"}]},
+    {"type":"timeseries","title":"Outbox backlog","targets":[{"expr":"vector_outbox_backlog_total"}]},
+    {"type":"timeseries","title":"TTL backlog","targets":[{"expr":"index_ttl_backlog_documents_total"}]}
+  ]
+}

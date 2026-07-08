@@ -8,7 +8,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: migrate
-          image: astravector-runtime:0.2.0
-          command: ["/app/astravector-runtime", "migrate"]
+          image: astravector-runtime:0.4.1-fix465-p2-production-hardening
+          command: ["/usr/local/bin/astravector-runtime", "migrate"]
           envFrom:
             - secretRef: { name: astravector-secret }

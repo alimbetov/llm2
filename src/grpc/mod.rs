@@ -1,31 +1,46 @@
 use crate::{
+    access_zone_registry,
     cache::L1Cache,
-    chunking::{ChunkingEngine, ChunkingProfile, ConservativeTokenCounter, SizeProfile},
-    config::AppConfig,
+    chunking::{
+        ChunkingEngine, ChunkingProfile, ConservativeTokenCounter, SizeProfile,
+        SourceChunkStorageMode,
+    },
+    config::{AppConfig, NoAnswerConfig},
     contract,
     error::AstraError,
     health::Readiness,
     inference::{EmbeddingResult, InferenceEngine, InferenceInput},
     pb::{
-        self, astra_vector_runtime_server::AstraVectorRuntime,
+        self, astra_vector_admin_facade_server::AstraVectorAdminFacade,
+        astra_vector_ingestion_facade_server::AstraVectorIngestionFacade,
+        astra_vector_retrieval_facade_server::AstraVectorRetrievalFacade,
+        astra_vector_runtime_server::AstraVectorRuntime,
         astra_vector_v004_control_server::AstraVectorV004Control,
     },
     persistence::{ChunkContentRecord, ClaimResult, ParentContextRecord, Repository},
     provider::SelectedProvider,
-    qdrant::{QdrantClient, QdrantSearchHit},
-    scheduler::{QueueKind, Scheduler},
+    qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
+    scheduler::{QueueKind, Scheduler, SubmitManyOptions},
+    sparse::{SparseTechnicalEncoder, SparseTokenClass},
 };
 use futures::future::join_all;
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
+use moka::future::Cache;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use std::{
-    collections::{BTreeSet, HashSet},
-    sync::Arc,
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
+use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tonic::{metadata::MetadataMap, Request, Response, Status};
+use tonic::{
+    metadata::{MetadataKey, MetadataMap},
+    Request, Response, Status,
+};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -35,7 +50,11 @@ pub struct AstraVectorV004ControlService {
     scheduler: Scheduler,
     repo: Option<Repository>,
     qdrant: Option<Arc<QdrantClient>>,
+    engine: Arc<dyn InferenceEngine>,
     shutdown: CancellationToken,
+    retrieve_context_semaphore: Arc<Semaphore>,
+    graph_expansion_semaphore: Arc<Semaphore>,
+    mmr_fetch_semaphore: Arc<Semaphore>,
 }
 
 impl AstraVectorV004ControlService {
@@ -44,19 +63,43 @@ impl AstraVectorV004ControlService {
         scheduler: Scheduler,
         repo: Option<Repository>,
         qdrant: Option<Arc<QdrantClient>>,
+        engine: Arc<dyn InferenceEngine>,
         shutdown: CancellationToken,
     ) -> Self {
+        let retrieve_context_semaphore = Arc::new(Semaphore::new(
+            cfg.limits.max_concurrent_retrieve_context.max(1),
+        ));
+        let graph_expansion_semaphore = Arc::new(Semaphore::new(
+            cfg.limits.max_concurrent_graph_expansion.max(1),
+        ));
+        let mmr_fetch_semaphore =
+            Arc::new(Semaphore::new(cfg.limits.max_concurrent_mmr_fetch.max(1)));
         Self {
             cfg,
             scheduler,
             repo,
             qdrant,
+            engine,
             shutdown,
+            retrieve_context_semaphore,
+            graph_expansion_semaphore,
+            mmr_fetch_semaphore,
         }
     }
 
-    fn not_implemented() -> Status {
-        Status::unimplemented("AstraVectorV004Control backend is not implemented yet")
+    async fn acquire_backpressure_permit(
+        semaphore: Arc<Semaphore>,
+        timeout_ms: u64,
+        metric_scope: &'static str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), semaphore.acquire_owned())
+            .await
+            .map_err(|_| {
+                counter!("backpressure_acquire_timeout_total", "scope" => metric_scope).increment(1);
+                counter!("retrieval_rejected_total", "scope" => metric_scope, "reason" => "acquire_timeout").increment(1);
+                Status::resource_exhausted(format!("{metric_scope} concurrency limit exceeded"))
+            })?
+            .map_err(|_| Status::unavailable(format!("{metric_scope} semaphore closed")))
     }
 
     #[allow(clippy::result_large_err)]
@@ -71,6 +114,212 @@ impl AstraVectorV004ControlService {
         self.qdrant
             .as_ref()
             .ok_or_else(|| Status::unavailable("Qdrant client is not configured"))
+    }
+
+    fn require_trusted_forwarded_identity_headers(
+        &self,
+        metadata: &MetadataMap,
+    ) -> Result<(), Status> {
+        if !self.cfg.security.enabled {
+            return Ok(());
+        }
+        if !self.cfg.security.trust_forwarded_identity_headers {
+            counter!("security_forwarded_identity_rejected_total", "reason" => "disabled")
+                .increment(1);
+            return Err(Status::permission_denied(
+                "forwarded identity headers are not trusted by this AstraVector instance",
+            ));
+        }
+        let expected = self.cfg.security.gateway_trust_token.as_bytes();
+        if expected.is_empty() {
+            counter!("security_forwarded_identity_rejected_total", "reason" => "missing_expected_token").increment(1);
+            return Err(Status::permission_denied(
+                "trusted gateway token is not configured",
+            ));
+        }
+        let header_name = self.cfg.security.gateway_trust_header.as_str();
+        let Ok(header_key) = MetadataKey::from_bytes(header_name.as_bytes()) else {
+            counter!("security_forwarded_identity_rejected_total", "reason" => "invalid_gateway_header").increment(1);
+            return Err(Status::permission_denied(
+                "trusted gateway header name is invalid",
+            ));
+        };
+        let presented = metadata
+            .get(&header_key)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec();
+        if presented.as_slice().ct_eq(expected).unwrap_u8() != 1 {
+            counter!("security_forwarded_identity_rejected_total", "reason" => "bad_gateway_token")
+                .increment(1);
+            return Err(Status::permission_denied(
+                "trusted gateway identity proof is required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_internal_or_admin(&self, metadata: &MetadataMap) -> Result<(), Status> {
+        if !self.cfg.security.enabled {
+            return Ok(());
+        }
+        self.require_trusted_forwarded_identity_headers(metadata)?;
+        let role = metadata
+            .get("x-astravector-role")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if role.eq_ignore_ascii_case("admin") || role.eq_ignore_ascii_case("internal") {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("internal/admin role is required"))
+        }
+    }
+
+    fn require_admin(&self, metadata: &MetadataMap) -> Result<(), Status> {
+        if !self.cfg.security.enabled {
+            return Ok(());
+        }
+        self.require_trusted_forwarded_identity_headers(metadata)?;
+        let role = metadata
+            .get("x-astravector-role")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if role.eq_ignore_ascii_case("admin") {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("admin role is required"))
+        }
+    }
+
+    fn embedding_mode_requires_sparse(mode: i32, default_required: bool) -> bool {
+        match pb::EmbeddingModeV005::try_from(mode).unwrap_or(pb::EmbeddingModeV005::Unspecified) {
+            pb::EmbeddingModeV005::DenseSparseRequired => true,
+            pb::EmbeddingModeV005::DenseSparseIfAvailable => false,
+            pb::EmbeddingModeV005::DenseOnly => false,
+            pb::EmbeddingModeV005::Unspecified => default_required,
+        }
+    }
+
+    fn embedding_mode_wants_sparse(mode: i32, default_enabled: bool) -> bool {
+        match pb::EmbeddingModeV005::try_from(mode).unwrap_or(pb::EmbeddingModeV005::Unspecified) {
+            pb::EmbeddingModeV005::DenseOnly => false,
+            pb::EmbeddingModeV005::DenseSparseIfAvailable
+            | pb::EmbeddingModeV005::DenseSparseRequired => true,
+            pb::EmbeddingModeV005::Unspecified => default_enabled,
+        }
+    }
+
+    fn resolve_search_mode(mode: i32, configured_default: &str) -> pb::SearchModeV005 {
+        let explicit =
+            pb::SearchModeV005::try_from(mode).unwrap_or(pb::SearchModeV005::Unspecified);
+        if explicit != pb::SearchModeV005::Unspecified {
+            return explicit;
+        }
+        match configured_default.to_ascii_uppercase().as_str() {
+            "DENSE" => pb::SearchModeV005::Dense,
+            "SPARSE" => pb::SearchModeV005::Sparse,
+            _ => pb::SearchModeV005::Hybrid,
+        }
+    }
+
+    fn validate_access_zone_id_format(value: &str, max_len: usize) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.is_empty() || bytes.len() > max_len {
+            return false;
+        }
+        let first = bytes[0] as char;
+        if !first.is_ascii_alphanumeric() {
+            return false;
+        }
+        value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/'))
+    }
+
+    async fn resolve_search_access_zones(
+        &self,
+        legacy_access_zone_id: &str,
+        access_zone_ids: &[String],
+        access_zone_code: &str,
+        access_zone_codes: &[String],
+    ) -> Result<Vec<access_zone_registry::ResolvedAccessZone>, Status> {
+        if !self.cfg.access_zones.allow_multi_zone_search
+            && (access_zone_ids.len() > 1 || access_zone_codes.len() > 1)
+        {
+            counter!("access_zone_search_rejected_total", "reason" => "multi_zone_disabled")
+                .increment(1);
+            return Err(Status::invalid_argument("multi-zone search is disabled"));
+        }
+        access_zone_registry::resolve_request_zones(
+            &self.repo()?.pool,
+            &self.cfg,
+            legacy_access_zone_id,
+            access_zone_ids,
+            access_zone_code,
+            access_zone_codes,
+        )
+        .await
+    }
+
+    async fn resolve_ingestion_access_zone(
+        &self,
+        legacy_access_zone_id: &str,
+        access_zone_code: &str,
+    ) -> Result<access_zone_registry::ResolvedAccessZone, Status> {
+        access_zone_registry::resolve_or_create_ingestion_zone(
+            &self.repo()?.pool,
+            &self.cfg,
+            legacy_access_zone_id,
+            access_zone_code,
+        )
+        .await
+    }
+
+    fn version_filters_from_search_request(r: &pb::SearchRequestV004) -> QdrantVersionFilters {
+        QdrantVersionFilters {
+            model_version: r.model_version.clone().filter(|v| !v.trim().is_empty()),
+            tokenizer_version: r.tokenizer_version.clone().filter(|v| !v.trim().is_empty()),
+            dense_version: r.dense_version.clone().filter(|v| !v.trim().is_empty()),
+            sparse_version: r.sparse_version.clone().filter(|v| !v.trim().is_empty()),
+            chunking_version: r.chunking_version.clone().filter(|v| !v.trim().is_empty()),
+            payload_filters: Self::payload_filters_from_request(&r.filters),
+        }
+    }
+
+    fn version_filters_from_explain_request(r: &pb::ExplainSearchRequest) -> QdrantVersionFilters {
+        QdrantVersionFilters {
+            model_version: r.model_version.clone().filter(|v| !v.trim().is_empty()),
+            tokenizer_version: r.tokenizer_version.clone().filter(|v| !v.trim().is_empty()),
+            dense_version: r.dense_version.clone().filter(|v| !v.trim().is_empty()),
+            sparse_version: r.sparse_version.clone().filter(|v| !v.trim().is_empty()),
+            chunking_version: r.chunking_version.clone().filter(|v| !v.trim().is_empty()),
+            payload_filters: Vec::new(),
+        }
+    }
+
+    fn payload_filters_from_request(filters: &[pb::SearchFilterV004]) -> Vec<(String, String)> {
+        filters
+            .iter()
+            .filter_map(|f| {
+                let key = f.key.trim();
+                let value = f.value.trim();
+                if Self::is_safe_payload_filter_key(key) && !value.is_empty() && value.len() <= 256
+                {
+                    Some((key.to_string(), value.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn is_safe_payload_filter_key(key: &str) -> bool {
+        !key.is_empty()
+            && key.len() <= 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
     }
 
     fn default_chunking_profile(input: Option<pb::ChunkingProfileV004>) -> ChunkingProfile {
@@ -138,6 +387,145 @@ impl AstraVectorV004ControlService {
             sub260,
         }
     }
+
+    async fn compute_document_sync_status(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+        include_qdrant: bool,
+    ) -> Result<pb::GetVectorSyncStatusResponse, Status> {
+        let repo = self.repo()?;
+        let row = sqlx::query(r#"SELECT
+          COALESCE((SELECT status FROM astravector.document_versions WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3),'NOT_FOUND') AS document_status,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS expected_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status='SYNCED' AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS synced_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status IN('PENDING','UPDATE_PENDING','DELETE_PENDING') AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS pending_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status IN('FAILED','DEAD_LETTER') AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS failed_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS dense_vectors_expected,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_dense d ON d.cache_entry_id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND b.chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS dense_vectors_found,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS sparse_vectors_expected,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_sparse s ON s.cache_entry_id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND b.chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS sparse_vectors_found,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='PENDING') AS outbox_pending,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='RETRY_PENDING') AS outbox_retry_pending,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='COMPLETED') AS outbox_completed,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status IN('FAILED','DEAD_LETTER')) AS outbox_failed,
+          (SELECT COALESCE(max(o.updated_at)::text,'') FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3) AS last_sync_attempt_at,
+          (SELECT COALESCE(o.error_code,'') FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.error_code IS NOT NULL ORDER BY o.updated_at DESC LIMIT 1) AS last_sync_error_code,
+          (SELECT COALESCE(o.error_message,'') FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.error_message IS NOT NULL ORDER BY o.updated_at DESC LIMIT 1) AS last_sync_error_message
+        "#)
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_one(&repo.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres sync status: {e}")))?;
+        let expected_bindings: i64 = row.get("expected_bindings");
+        let synced_bindings: i64 = row.get("synced_bindings");
+        let dense_vectors_expected: i64 = row.get("dense_vectors_expected");
+        let dense_vectors_found: i64 = row.get("dense_vectors_found");
+        let sparse_vectors_expected: i64 = row.get("sparse_vectors_expected");
+        let sparse_vectors_found: i64 = row.get("sparse_vectors_found");
+        let outbox_pending: i64 = row.get("outbox_pending");
+        let outbox_retry_pending: i64 = row.get("outbox_retry_pending");
+        let outbox_completed: i64 = row.get("outbox_completed");
+        let outbox_failed: i64 = row.get("outbox_failed");
+        let expected_point_ids: std::collections::HashSet<Uuid> = sqlx::query(
+            "SELECT qdrant_point_id FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')",
+        )
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_all(&repo.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres expected qdrant ids: {e}")))?
+            .into_iter()
+            .map(|row| row.get::<Uuid, _>("qdrant_point_id"))
+            .collect();
+        let mut qdrant_collection_exists = false;
+        let mut qdrant_points_found = 0_u32;
+        let mut qdrant_points_missing = expected_point_ids.len() as u32;
+        let mut qdrant_points_extra = 0_u32;
+        let mut warnings = Vec::new();
+        if include_qdrant {
+            if let Some(q) = self.qdrant.as_ref() {
+                qdrant_collection_exists = q.collection_exists().await.map_err(Status::from)?;
+                if qdrant_collection_exists {
+                    let actual_point_ids = q
+                        .point_ids_by_document(access_zone_id, document_id, document_version)
+                        .await
+                        .map_err(Status::from)?;
+                    qdrant_points_found = actual_point_ids.len() as u32;
+                    qdrant_points_missing =
+                        expected_point_ids.difference(&actual_point_ids).count() as u32;
+                    qdrant_points_extra =
+                        actual_point_ids.difference(&expected_point_ids).count() as u32;
+                    if qdrant_points_missing > 0 || qdrant_points_extra > 0 {
+                        counter!("astravector_sync_status_consistency_mismatch_total").increment(1);
+                    }
+                    if qdrant_points_extra > 0 {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "QDRANT_EXTRA_POINTS_FOUND".into(),
+                            message: format!("Qdrant contains {qdrant_points_extra} extra point(s) for this document/version"),
+                        });
+                    }
+                }
+            }
+        } else {
+            qdrant_collection_exists = self.qdrant.is_some();
+            qdrant_points_found = expected_bindings as u32;
+            qdrant_points_missing = 0;
+        }
+        let ready = expected_bindings > 0
+            && synced_bindings == expected_bindings
+            && dense_vectors_found == dense_vectors_expected
+            && (!self.cfg.sparse.required || sparse_vectors_found == sparse_vectors_expected)
+            && outbox_completed >= expected_bindings
+            && outbox_pending == 0
+            && outbox_retry_pending == 0
+            && outbox_failed == 0
+            && qdrant_collection_exists
+            && qdrant_points_missing == 0
+            && qdrant_points_found >= expected_bindings as u32;
+        Ok(pb::GetVectorSyncStatusResponse {
+            document_status: row.get::<String, _>("document_status"),
+            expected_bindings: expected_bindings as u32,
+            synced_bindings: synced_bindings as u32,
+            pending_bindings: row.get::<i64, _>("pending_bindings") as u32,
+            failed_bindings: row.get::<i64, _>("failed_bindings") as u32,
+            dense_vectors_expected: dense_vectors_expected as u32,
+            dense_vectors_found: dense_vectors_found as u32,
+            sparse_vectors_expected: sparse_vectors_expected as u32,
+            sparse_vectors_found: sparse_vectors_found as u32,
+            outbox_pending: outbox_pending as u32,
+            outbox_retry_pending: outbox_retry_pending as u32,
+            outbox_completed: outbox_completed as u32,
+            outbox_failed: outbox_failed as u32,
+            qdrant_collection: self.cfg.qdrant.collection.clone(),
+            qdrant_collection_exists,
+            qdrant_points_expected: expected_bindings as u32,
+            qdrant_points_found,
+            qdrant_points_missing,
+            qdrant_points_extra,
+            ready_to_activate: ready,
+            last_sync_attempt_at: row
+                .try_get::<Option<String>, _>("last_sync_attempt_at")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            last_sync_error_code: row
+                .try_get::<Option<String>, _>("last_sync_error_code")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            last_sync_error_message: row
+                .try_get::<Option<String>, _>("last_sync_error_message")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            warnings,
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -152,15 +540,26 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         if query.is_empty() {
             return Err(Status::invalid_argument("query must not be empty"));
         }
-        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
-            .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
+        let resolved_zones = self
+            .resolve_search_access_zones(
+                &r.access_zone_id,
+                &r.access_zone_ids,
+                &r.access_zone_code,
+                &r.access_zone_codes,
+            )
+            .await?;
+        let access_zone_ids: Vec<Uuid> = resolved_zones.iter().map(|z| z.access_zone_id).collect();
         let caller_access_level = pb::AccessLevel::try_from(r.caller_access_level)
             .ok()
             .filter(|v| *v != pb::AccessLevel::Unspecified)
             .ok_or_else(|| Status::invalid_argument("caller_access_level is required"))?;
-        let top_k = if r.top_k == 0 { 10 } else { r.top_k }.min(50);
-        if r.top_k > 50 {
-            return Err(Status::invalid_argument("top_k must be <= 50"));
+        let top_k_max = self.cfg.limits.search_top_k_max.max(1);
+        let top_k = if r.top_k == 0 { 10 } else { r.top_k }.min(top_k_max);
+        if r.top_k > top_k_max {
+            return Err(Status::invalid_argument(format!(
+                "top_k must be <= {}",
+                top_k_max
+            )));
         }
         let candidate_limit = if r.candidate_limit == 0 {
             (top_k * 4).max(top_k)
@@ -170,16 +569,18 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         if candidate_limit < top_k {
             return Err(Status::invalid_argument("candidate_limit must be >= top_k"));
         }
-        let candidate_limit = candidate_limit.min(200);
+        let candidate_limit =
+            candidate_limit.min(self.cfg.limits.search_candidate_limit_max.max(top_k));
         let parent_limit = if r.parent_limit == 0 {
             top_k
         } else {
             r.parent_limit
         };
-        if parent_limit == 0 || parent_limit > 50 {
-            return Err(Status::invalid_argument(
-                "parent_limit must be between 1 and 50",
-            ));
+        if parent_limit == 0 || parent_limit > self.cfg.limits.search_top_k_max {
+            return Err(Status::invalid_argument(format!(
+                "parent_limit must be between 1 and {}",
+                self.cfg.limits.search_top_k_max
+            )));
         }
         let timeout_ms = if r.timeout_ms == 0 {
             self.cfg.grpc.deadlines.query_ms
@@ -188,6 +589,61 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         .min(self.cfg.grpc.deadlines.query_ms);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let search_mode = Self::resolve_search_mode(r.search_mode, &self.cfg.search.default_mode);
+        let version_filters = Self::version_filters_from_search_request(&r);
+        tracing::debug!(
+            correlation_id = %r.correlation_id,
+            access_zone_ids = ?access_zone_ids,
+            access_zone_code = %r.access_zone_code,
+            caller_access_level = ?caller_access_level,
+            search_mode = ?search_mode,
+            top_k,
+            candidate_limit,
+            parent_limit,
+            query_len = query.chars().count(),
+            "SEARCH_REQUEST_RECEIVED"
+        );
+        let wants_sparse = matches!(
+            search_mode,
+            pb::SearchModeV005::Sparse | pb::SearchModeV005::Hybrid
+        );
+        let wants_dense = matches!(
+            search_mode,
+            pb::SearchModeV005::Dense | pb::SearchModeV005::Hybrid
+        );
+        let sparse_available = self.engine.sparse_available();
+        let sparse_required = wants_sparse
+            && Self::embedding_mode_requires_sparse(r.embedding_mode, self.cfg.sparse.required);
+        let mut warnings = Vec::new();
+        if r.include_vectors {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "INCLUDE_VECTORS_IGNORED".into(),
+                message: "include_vectors is ignored for search responses; dense embeddings are internal-only and are stripped before returning results.".into(),
+            });
+        }
+        if search_mode == pb::SearchModeV005::Sparse && !sparse_available {
+            counter!("astravector_sparse_unavailable_total").increment(1);
+            return Err(Status::failed_precondition(
+                "SPARSE_UNAVAILABLE: SPARSE search requested but loaded ONNX artifact has no sparse output",
+            ));
+        }
+        if wants_sparse && sparse_required && !sparse_available {
+            counter!("astravector_sparse_unavailable_total").increment(1);
+            return Err(Status::failed_precondition(
+                "SPARSE_UNAVAILABLE: sparse search requested but loaded ONNX artifact has no sparse output",
+            ));
+        }
+        if search_mode == pb::SearchModeV005::Hybrid
+            && wants_sparse
+            && !sparse_required
+            && !sparse_available
+        {
+            counter!("astravector_search_dense_fallback_warning_total").increment(1);
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "SPARSE_UNAVAILABLE_DENSE_FALLBACK".into(),
+                message: "Sparse embedding is unavailable; HYBRID search degraded to DENSE search because embeddingMode is DENSE_SPARSE_IF_AVAILABLE.".into(),
+            });
+        }
 
         let emb_started = std::time::Instant::now();
         let embedding = self
@@ -198,8 +654,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     text: query.to_string(),
                     max_length: self.cfg.tokenization.query.max_length,
                     allow_truncation: self.cfg.tokenization.query.truncation_allowed,
-                    want_dense: true,
-                    want_sparse: false,
+                    want_dense: wants_dense,
+                    want_sparse: wants_sparse && sparse_available,
                     token_count_hint: 0,
                 },
                 deadline,
@@ -208,27 +664,196 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .await
             .map_err(Status::from)?;
         let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
-        let dense = embedding
-            .dense
-            .as_deref()
-            .ok_or_else(|| Status::failed_precondition("query dense embedding unavailable"))?;
-
         let qdrant_started = std::time::Instant::now();
-        let hits = self
-            .qdrant()?
-            .search_dense(
-                dense,
-                access_zone_id,
-                caller_access_level as i16,
-                candidate_limit as usize,
-            )
-            .await
-            .map_err(Status::from)?;
+        let qdrant = self.qdrant()?.clone();
+        let dense_vector = embedding.dense.clone();
+        let sparse_indices = embedding.sparse_indices.clone();
+        let sparse_values = embedding.sparse_values.clone();
+        let dense_dim = dense_vector.as_ref().map(|v| v.len()).unwrap_or(0);
+        let dense_norm = dense_vector
+            .as_ref()
+            .map(|v| {
+                v.iter()
+                    .map(|x| (*x as f64) * (*x as f64))
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .unwrap_or(0.0);
+        tracing::debug!(
+            correlation_id = %r.correlation_id,
+            query_embedding_ms,
+            dense_dim,
+            dense_norm,
+            sparse_terms = sparse_indices.as_ref().map(|v| v.len()).unwrap_or(0),
+            "SEARCH_QUERY_EMBEDDING_READY"
+        );
+        let dense_access_zone_ids = access_zone_ids.clone();
+        let sparse_access_zone_ids = access_zone_ids.clone();
+        let dense_future = {
+            let qdrant = qdrant.clone();
+            let version_filters = version_filters.clone();
+            async move {
+                if !wants_dense {
+                    return Ok::<Option<Vec<QdrantSearchHit>>, Status>(None);
+                }
+                let Some(dense) = dense_vector.as_deref() else {
+                    return Err(Status::failed_precondition(
+                        "query dense embedding unavailable",
+                    ));
+                };
+                qdrant
+                    .search_dense(
+                        dense,
+                        &dense_access_zone_ids,
+                        caller_access_level as i16,
+                        candidate_limit as usize,
+                        Some(&version_filters),
+                    )
+                    .await
+                    .map(Some)
+                    .map_err(Status::from)
+            }
+        };
+        let sparse_future = {
+            let qdrant = qdrant.clone();
+            let version_filters = version_filters.clone();
+            async move {
+                if !wants_sparse {
+                    return Ok::<Option<Vec<QdrantSearchHit>>, Status>(None);
+                }
+                match (sparse_indices.as_deref(), sparse_values.as_deref()) {
+                    (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
+                        qdrant
+                            .search_sparse(
+                                indices,
+                                values,
+                                &sparse_access_zone_ids,
+                                caller_access_level as i16,
+                                candidate_limit as usize,
+                                Some(&version_filters),
+                            )
+                            .await
+                            .map(Some)
+                            .map_err(Status::from)
+                    }
+                    _ if sparse_required => Err(Status::failed_precondition(
+                        "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
+                    )),
+                    _ => Ok(Some(Vec::new())),
+                }
+            }
+        };
+        let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
+        let mut dense_failed = false;
+        let mut sparse_failed = false;
+        let dense_hits = match dense_result {
+            Ok(Some(hits)) => hits,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                dense_failed = true;
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "DENSE_SEARCH_FAILED".into(),
+                    message: format!("Dense Qdrant search failed: {}", e.message()),
+                });
+                Vec::new()
+            }
+        };
+        let sparse_hits = match sparse_result {
+            Ok(Some(hits)) => hits,
+            Ok(None) => Vec::new(),
+            Err(e) if sparse_required => return Err(e),
+            Err(e) => {
+                sparse_failed = true;
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "SPARSE_SEARCH_FAILED".into(),
+                    message: format!("Sparse Qdrant search failed: {}", e.message()),
+                });
+                Vec::new()
+            }
+        };
+        let hits = match search_mode {
+            pb::SearchModeV005::Dense => {
+                if dense_hits.is_empty() && dense_failed {
+                    return Err(Status::unavailable(
+                        "QDRANT_SEARCH_UNAVAILABLE: dense search failed",
+                    ));
+                }
+                dense_hits
+            }
+            pb::SearchModeV005::Sparse => {
+                if sparse_hits.is_empty() && sparse_failed {
+                    return Err(Status::unavailable(
+                        "QDRANT_SEARCH_UNAVAILABLE: sparse search failed",
+                    ));
+                }
+                sparse_hits
+            }
+            _ => {
+                if dense_hits.is_empty()
+                    && sparse_hits.is_empty()
+                    && (dense_failed || sparse_failed)
+                {
+                    return Err(Status::unavailable(
+                        "QDRANT_SEARCH_UNAVAILABLE: dense and sparse search unavailable",
+                    ));
+                }
+                if !dense_hits.is_empty() && !sparse_hits.is_empty() {
+                    fuse_qdrant_hits(
+                        dense_hits,
+                        sparse_hits,
+                        candidate_limit as usize,
+                        &self.cfg.search.hybrid_fusion_method,
+                        self.cfg.search.hybrid_dense_weight,
+                        self.cfg.search.hybrid_sparse_weight,
+                        self.cfg.search.rrf_k,
+                    )
+                } else if !dense_hits.is_empty() {
+                    if sparse_failed {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "SPARSE_SEARCH_FAILED_FALLBACK_TO_DENSE".into(),
+                            message: "Sparse search failed; returning dense-only retrieval results"
+                                .into(),
+                        });
+                    }
+                    dense_hits
+                } else {
+                    if dense_failed {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "DENSE_SEARCH_FAILED_FALLBACK_TO_SPARSE".into(),
+                            message: "Dense search failed; returning sparse-only retrieval results"
+                                .into(),
+                        });
+                    }
+                    sparse_hits
+                }
+            }
+        };
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        tracing::debug!(
+            correlation_id = %r.correlation_id,
+            search_mode = ?search_mode,
+            qdrant_search_ms,
+            raw_hits_count = hits.len(),
+            dense_failed,
+            sparse_failed,
+            "SEARCH_QDRANT_RESULTS_READY"
+        );
 
-        let mut groups: Vec<(Uuid, QdrantSearchHit)> = Vec::new();
+        // fix462: direct parent grouping is keyed by (access_zone_id, parent_id), not parent_id alone.
+        // content_chunks_v004 is keyed by (access_zone_id, id); using only UUID would mix tenants/zones when
+        // malformed or imported data contains the same chunk UUID in more than one zone.
+        let mut groups: Vec<((Uuid, Uuid), QdrantSearchHit)> = Vec::new();
         let mut seen = HashSet::new();
         for hit in hits.iter() {
+            let Some(hit_access_zone_id) = hit
+                .payload
+                .get("access_zone_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok())
+            else {
+                counter!("retrieval_hit_missing_access_zone_total").increment(1);
+                continue;
+            };
             let granularity = hit
                 .payload
                 .get("chunk_granularity")
@@ -244,38 +869,654 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .payload
                     .get("parent_chunk_id")
                     .and_then(serde_json::Value::as_str)
-                    .and_then(|v| Uuid::parse_str(v).ok()),
+                    .and_then(|v| Uuid::parse_str(v).ok())
+                    .or_else(|| {
+                        hit.payload
+                            .get("chunk_id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|v| Uuid::parse_str(v).ok())
+                    }),
                 _ => None,
             };
             if let Some(parent_id) = parent_id {
-                if seen.insert(parent_id) {
-                    groups.push((parent_id, hit.clone()));
+                let parent_key = (hit_access_zone_id, parent_id);
+                if seen.insert(parent_key) {
+                    groups.push((parent_key, hit.clone()));
                 }
             }
-            if groups.len() >= parent_limit as usize {
+            if groups.len() >= candidate_limit as usize {
                 break;
             }
         }
-        let parent_ids: Vec<Uuid> = groups.iter().map(|(id, _)| *id).collect();
+        let parent_ids: Vec<Uuid> = groups.iter().map(|((_, id), _)| *id).collect();
+        tracing::debug!(
+            correlation_id = %r.correlation_id,
+            raw_hits_count = hits.len(),
+            parent_group_count = groups.len(),
+            parent_ids_count = parent_ids.len(),
+            "SEARCH_PARENT_GROUPS_READY"
+        );
         let parent_fetch_started = std::time::Instant::now();
         let parents = self
             .repo()?
-            .fetch_parent_contexts(access_zone_id, &parent_ids, caller_access_level as i16)
+            .fetch_parent_contexts_multi(&access_zone_ids, &parent_ids, caller_access_level as i16)
             .await
             .map_err(Status::from)?;
         let parent_fetch_ms = parent_fetch_started.elapsed().as_millis() as u64;
-        let by_parent: std::collections::HashMap<Uuid, ParentContextRecord> =
-            parents.into_iter().map(|p| (p.id, p)).collect();
-        let mut results = Vec::new();
-        for (parent_id, hit) in groups {
-            if results.len() >= top_k as usize {
+        let fetched_parent_count = parents.len();
+        let by_parent: std::collections::HashMap<(Uuid, Uuid), ParentContextRecord> = parents
+            .into_iter()
+            .map(|p| ((p.access_zone_id, p.id), p))
+            .collect();
+        let matched_chunk_keys: Vec<(Uuid, Uuid)> = groups
+            .iter()
+            .filter_map(|((zone, _), hit)| {
+                hit.payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|v| Uuid::parse_str(v).ok())
+                    .map(|chunk_id| (*zone, chunk_id))
+            })
+            .collect();
+        let matched_chunk_ids: Vec<Uuid> = matched_chunk_keys.iter().map(|(_, id)| *id).collect();
+        let matched_texts = self
+            .repo()?
+            .fetch_chunk_texts_by_ids_multi(
+                &access_zone_ids,
+                &matched_chunk_ids,
+                caller_access_level as i16,
+            )
+            .await
+            .map_err(Status::from)?;
+        let matched_traces = self
+            .repo()?
+            .fetch_chunk_traces_by_ids_multi(
+                &access_zone_ids,
+                &matched_chunk_ids,
+                caller_access_level as i16,
+            )
+            .await
+            .map_err(Status::from)?;
+        let mut direct_results = Vec::new();
+        let mut graph_results = Vec::new();
+        let mut seed_scores: HashMap<(Uuid, Uuid), f32> = HashMap::new();
+        for ((zone, _), hit) in &groups {
+            if let Some(seed_id) = hit
+                .payload
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok())
+            {
+                seed_scores.entry((*zone, seed_id)).or_insert(hit.score);
+            }
+        }
+        for ((parent_zone_id, parent_id), hit) in &groups {
+            if direct_results.len() >= candidate_limit as usize {
                 break;
             }
-            let Some(parent) = by_parent.get(&parent_id) else {
+            let Some(parent) = by_parent.get(&(*parent_zone_id, *parent_id)) else {
                 continue;
             };
-            results.push(search_result_from_hit(parent, &hit));
+            let hit_access_zone_id = *parent_zone_id;
+            let matched_text = hit
+                .payload
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .and_then(|id| matched_texts.get(&(hit_access_zone_id, id)).cloned())
+                .unwrap_or_else(|| parent.content.clone());
+            let matched_id = hit
+                .payload
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok());
+            let trace = matched_id
+                .as_ref()
+                .and_then(|id| matched_traces.get(&(hit_access_zone_id, *id)));
+            let mut direct = search_result_from_hit(parent, hit, matched_text, trace);
+            if let Some(citation) = direct.citation.as_mut() {
+                citation
+                    .metadata
+                    .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+                citation
+                    .metadata
+                    .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+            }
+            calibrate_result_score(
+                &mut direct,
+                "VECTOR_DIRECT",
+                self.cfg.graph_rag.scoring.direct_score_weight,
+                self.cfg.graph_rag.scoring.graph_score_weight,
+                self.cfg.graph_rag.scoring.graph_score_bias,
+            );
+            direct_results.push(direct);
         }
+        if matches!(
+            search_mode,
+            pb::SearchModeV005::Sparse | pb::SearchModeV005::Hybrid
+        ) {
+            let quality_run_id_filter = search_quality_run_id_filter(&r.filters);
+            let lexical_candidates = self
+                .repo()?
+                .fetch_active_parent_context_candidates_multi(
+                    &access_zone_ids,
+                    caller_access_level as i16,
+                    quality_run_id_filter.as_deref(),
+                    self.cfg
+                        .limits
+                        .search_candidate_limit_max
+                        .max(candidate_limit) as i64,
+                )
+                .await
+                .map_err(Status::from)?;
+            let mut seen_result_keys = direct_results
+                .iter()
+                .map(result_identity_key)
+                .collect::<HashSet<_>>();
+            let query_terms = query_term_count(query);
+            let mut lexical_added = 0usize;
+            for parent in lexical_candidates {
+                if lexical_added >= candidate_limit as usize {
+                    break;
+                }
+                let lexical = search_result_from_lexical_parent(&parent, query);
+                let matched_terms = matched_term_count(&lexical, query);
+                let matched_discriminating_terms =
+                    matched_discriminating_term_count(&lexical, query);
+                let leading_discriminating_match =
+                    leading_discriminating_query_term_matches(&lexical, query);
+                let strong_coverage =
+                    query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
+                if matched_terms < 2
+                    || matched_discriminating_terms < 1
+                    || !leading_discriminating_match
+                    || !strong_coverage
+                {
+                    continue;
+                }
+                if seen_result_keys.insert(result_identity_key(&lexical)) {
+                    direct_results.push(lexical);
+                    lexical_added += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            correlation_id = %r.correlation_id,
+            parent_fetch_ms,
+            fetched_parent_count,
+            direct_contexts_count = direct_results.len(),
+            "SEARCH_PARENT_FETCH_DONE"
+        );
+        let mut no_answer_stats = NoAnswerFilterStats::default();
+        let no_answer_debug = no_answer_debug_enabled(r.include_debug, &self.cfg.search.no_answer);
+        let query_technical_tokens = if self.cfg.search.no_answer.enabled {
+            strong_technical_query_tokens(query)
+        } else {
+            Vec::new()
+        };
+        no_answer_stats.pre_mmr_filtered_count = apply_pre_mmr_no_answer_filter(
+            &mut direct_results,
+            query,
+            &query_technical_tokens,
+            search_mode,
+            &self.cfg.search.no_answer,
+            no_answer_debug,
+        );
+        if no_answer_stats.pre_mmr_filtered_count > 0 {
+            counter!("retrieval_no_answer_pre_mmr_filtered_total")
+                .increment(no_answer_stats.pre_mmr_filtered_count as u64);
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "PRE_MMR_WEAK_CANDIDATE_FILTERED".into(),
+                message: format!(
+                    "no-answer policy filtered {} weak direct candidates before graph expansion/MMR",
+                    no_answer_stats.pre_mmr_filtered_count
+                ),
+            });
+        }
+        let mut graph_expansion_duration_ms = 0_u64;
+        let mut graph_candidates_by_relation: HashMap<String, usize> = HashMap::new();
+        if r.enable_graph_expansion && self.cfg.graph_rag.enabled && !matched_chunk_ids.is_empty() {
+            let maybe_graph_permit = Self::acquire_backpressure_permit(
+                self.graph_expansion_semaphore.clone(),
+                self.cfg.limits.backpressure_acquire_timeout_ms,
+                "graph_expansion",
+            )
+            .await;
+            if maybe_graph_permit.is_err() {
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "GRAPH_EXPANSION_BACKPRESSURE".into(),
+                    message: "Graph expansion skipped because concurrency limit is exceeded".into(),
+                });
+                counter!("graph_expansion_rejected_total", "reason" => "backpressure").increment(1);
+            }
+            if let Ok(_graph_permit) = maybe_graph_permit {
+                gauge!("graph_expansion_concurrent_active").set(
+                    (self
+                        .cfg
+                        .limits
+                        .max_concurrent_graph_expansion
+                        .saturating_sub(self.graph_expansion_semaphore.available_permits()))
+                        as f64,
+                );
+                let graph_expansion_started = std::time::Instant::now();
+                let graph_timeout = Duration::from_millis(self.cfg.graph_rag.retrieval.timeout_ms);
+                let max_related = if r.graph_max_related_contexts == 0 {
+                    self.cfg
+                        .graph_rag
+                        .retrieval
+                        .max_related_chunks
+                        .min(self.cfg.limits.graph_related_contexts_max) as u32
+                } else {
+                    r.graph_max_related_contexts
+                        .min(self.cfg.limits.graph_related_contexts_max as u32)
+                };
+                let graph_call = self.repo()?.expand_chunks_1hop_by_seed_keys(
+                    &matched_chunk_keys,
+                    caller_access_level as i16,
+                    max_related,
+                    self.cfg.graph_rag.retrieval.max_seed_chunks,
+                    self.cfg.graph_rag.retrieval.max_edges_visited,
+                    &self.cfg.graph_rag.retrieval.allowed_relations,
+                );
+                match tokio::time::timeout(graph_timeout, graph_call).await {
+                    Ok(Ok(related)) => {
+                        let related_ids = related.iter().map(|r| r.chunk_id).collect::<Vec<_>>();
+                        let contexts = self
+                            .repo()?
+                            .fetch_contexts_for_graph_related_chunks_multi(
+                                &access_zone_ids,
+                                &related_ids,
+                                caller_access_level as i16,
+                            )
+                            .await
+                            .map_err(Status::from)?;
+                        let by_chunk: HashMap<
+                            (Uuid, Uuid),
+                            crate::persistence::GraphChunkContextRecord,
+                        > = contexts
+                            .into_iter()
+                            .map(|c| ((c.parent_record.access_zone_id, c.chunk_id), c))
+                            .collect();
+                        let scoring = graph_scoring_options_from_config(&self.cfg);
+                        let mut filtered_candidates = 0usize;
+                        for rel in related {
+                            if graph_results.len()
+                                >= (max_related as usize).min(
+                                    self.cfg
+                                        .graph_rag
+                                        .retrieval
+                                        .graph_expansion_result_limit
+                                        .max(1),
+                                )
+                            {
+                                break;
+                            }
+                            let graph_lookup_key = (rel.access_zone_id, rel.chunk_id);
+                            let Some(ctx) = by_chunk.get(&graph_lookup_key) else {
+                                continue;
+                            };
+                            *graph_candidates_by_relation
+                                .entry(rel.relation_type.as_str().to_string())
+                                .or_insert(0) += 1;
+                            metrics::counter!("graph_expansion_candidates_by_relation_total", "relation_type" => rel.relation_type.as_str().to_string()).increment(1);
+                            let parent_id = ctx.parent_record.id.to_string();
+                            let seed_score = seed_scores
+                                .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                .copied()
+                                .unwrap_or(0.5);
+                            let raw_graph_score = crate::graph::score_graph_candidate_with_options(
+                                seed_score,
+                                rel.relation_type,
+                                rel.relation_score,
+                                rel.hop_distance,
+                                &scoring,
+                            );
+                            if raw_graph_score < scoring.graph_min_score {
+                                filtered_candidates += 1;
+                                metrics::counter!("graph_candidates_filtered_by_relation_total", "relation_type" => rel.relation_type.as_str().to_string()).increment(1);
+                                continue;
+                            }
+                            let relation_weight =
+                                crate::graph::relation_weight(&scoring, rel.relation_type);
+                            let hop_penalty = crate::graph::hop_penalty(&scoring, rel.hop_distance);
+                            let adjusted_edge_weight = if rel.relation_type
+                                == crate::graph::GraphRelationType::ChunkSemanticSimilar
+                            {
+                                rel.relation_score.powf(scoring.semantic_power)
+                            } else {
+                                rel.relation_score
+                            };
+                            let hit = QdrantSearchHit {
+                                id: rel.chunk_id,
+                                score: raw_graph_score,
+                                dense_score: 0.0,
+                                sparse_score: 0.0,
+                                fusion_score: raw_graph_score,
+                                dense_rank: None,
+                                sparse_rank: None,
+                                payload: serde_json::json!({
+                                    "access_zone_id": rel.access_zone_id.to_string(),
+                                    "chunk_id": rel.chunk_id.to_string(),
+                                    "parent_chunk_id": parent_id,
+                                    "source_block_id": ctx.trace.as_ref().and_then(|t| t.source_block_id.clone()).unwrap_or_default(),
+                                    "chunk_granularity": "GRAPH_EXPANDED",
+                                    "source_chunk_granularity": ctx.source_chunk_granularity.clone().unwrap_or_default(),
+                                    "qdrant_point_id": ctx.qdrant_point_id.map(|v| v.to_string()).unwrap_or_default(),
+                                    "representation_type": ctx.representation_type.clone().unwrap_or_else(|| "ORIGINAL".into()),
+                                    "dense_version": ctx.dense_version.clone().unwrap_or_default(),
+                                    "model_version": ctx.model_version.clone().unwrap_or_default(),
+                                    "payload_version": ctx.payload_version.unwrap_or_default()
+                                }),
+                            };
+                            let mut graph_result = search_result_from_hit(
+                                &ctx.parent_record,
+                                &hit,
+                                ctx.matched_text.clone(),
+                                ctx.trace.as_ref(),
+                            );
+                            if let Some(citation) = graph_result.citation.as_mut() {
+                                citation
+                                    .metadata
+                                    .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+                                citation.metadata.insert(
+                                    "graph_seed_access_zone_id".into(),
+                                    rel.seed_access_zone_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_seed_chunk_id".into(),
+                                    rel.seed_chunk_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_relation_type".into(),
+                                    rel.relation_type.as_str().into(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_relation_score".into(),
+                                    rel.relation_score.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_relation_weight".into(),
+                                    relation_weight.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_hop_distance".into(),
+                                    rel.hop_distance.to_string(),
+                                );
+                                citation
+                                    .metadata
+                                    .insert("graph_hop_penalty".into(), hop_penalty.to_string());
+                                citation.metadata.insert(
+                                    "graph_adjusted_edge_weight".into(),
+                                    adjusted_edge_weight.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_semantic_power".into(),
+                                    if rel.relation_type
+                                        == crate::graph::GraphRelationType::ChunkSemanticSimilar
+                                    {
+                                        scoring.semantic_power.to_string()
+                                    } else {
+                                        String::new()
+                                    },
+                                );
+                                citation
+                                    .metadata
+                                    .insert("graph_score".into(), raw_graph_score.to_string());
+                                citation.metadata.insert(
+                                    "retrieval_sources".into(),
+                                    "[\"GRAPH_EXPANDED\"]".into(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_merge_strategy".into(),
+                                    self.cfg.graph_rag.retrieval.graph_merge_strategy.clone(),
+                                );
+                                if citation
+                                    .metadata
+                                    .get("qdrant_point_id")
+                                    .map(|v| !v.is_empty())
+                                    .unwrap_or(false)
+                                {
+                                    metrics::counter!("graph_candidate_identity_found_total")
+                                        .increment(1);
+                                    if citation
+                                        .metadata
+                                        .get("representation_type")
+                                        .map(|v| v == "ORIGINAL")
+                                        .unwrap_or(false)
+                                    {
+                                        metrics::counter!(
+                                            "graph_candidate_identity_original_selected_total"
+                                        )
+                                        .increment(1);
+                                    } else {
+                                        metrics::counter!("graph_candidate_identity_fallback_representation_total").increment(1);
+                                    }
+                                } else {
+                                    metrics::counter!("graph_candidate_identity_missing_total")
+                                        .increment(1);
+                                }
+                            }
+                            calibrate_result_score(
+                                &mut graph_result,
+                                "GRAPH_EXPANDED",
+                                self.cfg.graph_rag.scoring.direct_score_weight,
+                                self.cfg.graph_rag.scoring.graph_score_weight,
+                                self.cfg.graph_rag.scoring.graph_score_bias,
+                            );
+                            graph_results.push(graph_result);
+                        }
+                        metrics::counter!("graph_expansion_candidates_filtered_total")
+                            .increment(filtered_candidates as u64);
+                    }
+                    Ok(Err(e)) => warnings.push(pb::DiagnosticWarningV005 {
+                        code: "GRAPH_EXPANSION_FAILED".into(),
+                        message: format!(
+                            "Graph expansion failed; vector-only results returned: {e}"
+                        ),
+                    }),
+                    Err(_) => warnings.push(pb::DiagnosticWarningV005 {
+                        code: "GRAPH_EXPANSION_TIMEOUT".into(),
+                        message: "Graph expansion timed out; vector-only results returned".into(),
+                    }),
+                }
+                graph_expansion_duration_ms = graph_expansion_started.elapsed().as_millis() as u64;
+            }
+            tracing::info!(
+                direct_candidates = direct_results.len(),
+                graph_candidates = graph_results.len(),
+                duration_ms = graph_expansion_duration_ms,
+                "GRAPH_EXPANSION_COMPLETED"
+            );
+        }
+        let merge_started = std::time::Instant::now();
+        let direct_count = direct_results.len();
+        let graph_count = graph_results.len();
+        let final_limit = resolve_final_context_limit(
+            self.cfg.graph_rag.retrieval.final_context_limit,
+            top_k as usize,
+            &self.cfg.graph_rag.retrieval.final_context_limit_mode,
+        );
+        let embedding_fetch_limit = self
+            .cfg
+            .graph_rag
+            .rerank
+            .mmr_candidate_limit
+            .max(final_limit);
+        let maybe_mmr_permit = Self::acquire_backpressure_permit(
+            self.mmr_fetch_semaphore.clone(),
+            self.cfg.limits.backpressure_acquire_timeout_ms,
+            "mmr_fetch",
+        )
+        .await;
+        let embedding_fetch_stats = if let Ok(_mmr_permit) = maybe_mmr_permit {
+            gauge!("mmr_fetch_concurrent_active").set(
+                (self
+                    .cfg
+                    .limits
+                    .max_concurrent_mmr_fetch
+                    .saturating_sub(self.mmr_fetch_semaphore.available_permits()))
+                    as f64,
+            );
+            enrich_dense_embeddings_for_mmr(
+                self.repo.as_ref(),
+                &access_zone_ids,
+                &mut direct_results,
+                &mut graph_results,
+                &self.cfg,
+                embedding_fetch_limit,
+            )
+            .await
+        } else {
+            counter!("mmr_fetch_rejected_total", "reason" => "backpressure").increment(1);
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "MMR_FETCH_BACKPRESSURE".into(),
+                message: "MMR embedding fetch skipped because concurrency limit is exceeded".into(),
+            });
+            MmrEmbeddingFetchStats::skipped()
+        };
+        let selection_result = select_results_with_strategy_aware_mmr(
+            direct_results,
+            graph_results,
+            final_limit,
+            &self.cfg.graph_rag.retrieval.graph_merge_strategy,
+            self.cfg.graph_rag.retrieval.direct_context_limit,
+            self.cfg.graph_rag.retrieval.graph_context_append_limit,
+            self.cfg.graph_rag.rerank.mmr_enabled,
+            self.cfg.graph_rag.rerank.mmr_lambda,
+            self.cfg.graph_rag.rerank.mmr_lambda_direct,
+            self.cfg.graph_rag.rerank.mmr_lambda_graph,
+            self.cfg.graph_rag.rerank.mmr_candidate_limit,
+            &self.cfg.graph_rag.rerank.mmr_similarity_source,
+            &self.cfg.graph_rag.rerank.mmr_fallback_similarity_source,
+            self.cfg.graph_rag.rerank.mmr_allow_direct_candidates,
+            self.cfg.graph_rag.rerank.mmr_allow_graph_candidates,
+            self.cfg
+                .graph_rag
+                .retrieval
+                .max_graph_relations_debug_per_candidate,
+        );
+        let merge_duration_ms = merge_started.elapsed().as_millis() as u64;
+        let mmr_result = selection_result.mmr.clone();
+        let mut results = selection_result.results;
+        if final_no_answer_should_trigger(
+            &results,
+            query,
+            &query_technical_tokens,
+            search_mode,
+            &self.cfg.search.no_answer,
+        ) {
+            no_answer_stats.post_mmr_triggered_count = 1;
+            counter!("retrieval_no_answer_post_mmr_triggered_total").increment(1);
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "POST_MMR_NO_ANSWER_TRIGGERED".into(),
+                message: "final no-answer policy returned an empty context set because final evidence was below configured thresholds".into(),
+            });
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "FINAL_CONTEXT_SET_TOO_WEAK".into(),
+                message: "all final contexts were below the no-answer branch threshold after MMR"
+                    .into(),
+            });
+            results.clear();
+        }
+        let token_budget_before =
+            estimate_results_tokens(&results, self.cfg.rag_context.chars_per_token);
+        let (dropped_chunk_ids, token_budget_warning_codes, dropped_chunk_count) =
+            apply_token_budget_truncation(&mut results, &self.cfg);
+        for code in &token_budget_warning_codes {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: code.clone(),
+                message: format!("token budget warning: {code}"),
+            });
+        }
+        let token_budget_after =
+            estimate_results_tokens(&results, self.cfg.rag_context.chars_per_token);
+        if dropped_chunk_count > 0 {
+            counter!("rag_context_token_budget_applied_total").increment(1);
+            counter!("rag_context_chunks_dropped_total").increment(dropped_chunk_count as u64);
+        }
+        let final_visibility_ids = results
+            .iter()
+            .filter_map(|r| Uuid::parse_str(&r.matched_chunk_id).ok())
+            .collect::<Vec<_>>();
+        if !final_visibility_ids.is_empty() {
+            let visible = self
+                .repo()?
+                .filter_visible_chunk_ids_multi(
+                    &access_zone_ids,
+                    &final_visibility_ids,
+                    caller_access_level as i16,
+                )
+                .await
+                .map_err(Status::from)?;
+            let before = results.len();
+            results.retain(|r| {
+                let Ok(zone_id) = Uuid::parse_str(&r.access_zone_id) else {
+                    return false;
+                };
+                let Ok(chunk_id) = Uuid::parse_str(&r.matched_chunk_id) else {
+                    return false;
+                };
+                visible.contains(&(zone_id, chunk_id))
+            });
+            let dropped = before.saturating_sub(results.len());
+            counter!("retrieve_context_final_visibility_recheck_total").increment(1);
+            if dropped > 0 {
+                counter!("retrieve_context_final_visibility_dropped_total")
+                    .increment(dropped as u64);
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "FINAL_VISIBILITY_RECHECK_DROPPED_CONTEXTS".into(),
+                    message: format!(
+                        "final PostgreSQL visibility recheck dropped {dropped} stale contexts"
+                    ),
+                });
+            }
+        }
+        strip_internal_embedding_metadata(&mut results);
+        let final_results_count = results.len();
+        counter!("retrieved_contexts_total").increment(final_results_count as u64);
+        if final_results_count == 0 {
+            counter!("retrieved_contexts_empty_total").increment(1);
+        }
+        for result in &results {
+            for source in extraction_retrieval_sources(result) {
+                counter!("retrieved_contexts_by_source_total", "source" => source).increment(1);
+            }
+        }
+        gauge!("retrieve_context_final_token_count").set(token_budget_after as f64);
+        if mmr_result.enabled {
+            metrics::counter!("graph_mmr_enabled_total").increment(1);
+        } else {
+            metrics::counter!("graph_mmr_disabled_total").increment(1);
+        }
+        metrics::counter!("graph_mmr_candidates_total").increment(mmr_result.input_count as u64);
+        metrics::counter!("graph_mmr_selected_total").increment(mmr_result.selected_count as u64);
+        metrics::histogram!("graph_mmr_duration_ms").record(mmr_result.duration_ms as f64);
+        metrics::counter!("graph_mmr_embedding_missing_total")
+            .increment(mmr_result.embedding_missing_count as u64);
+        metrics::counter!("graph_mmr_token_fallback_total")
+            .increment(mmr_result.token_fallback_count as u64);
+        metrics::counter!("graph_merge_direct_candidates_total").increment(direct_count as u64);
+        metrics::counter!("graph_merge_graph_candidates_total").increment(graph_count as u64);
+        metrics::counter!("graph_merge_final_candidates_total")
+            .increment(final_results_count as u64);
+        metrics::counter!("graph_merge_deduplicated_total")
+            .increment(selection_result.deduplicated_count as u64);
+        for (relation_type, count) in &graph_candidates_by_relation {
+            metrics::counter!("graph_merge_candidates_by_relation_total", "relation_type" => relation_type.clone()).increment(*count as u64);
+        }
+        metrics::histogram!("graph_merge_duration_ms").record(merge_duration_ms as f64);
+        tracing::info!(
+            direct_candidates = direct_count,
+            graph_candidates = graph_count,
+            final_candidates = final_results_count,
+            deduplicated_candidates = selection_result.deduplicated_count,
+            no_answer_pre_mmr_filtered = no_answer_stats.pre_mmr_filtered_count,
+            no_answer_post_mmr_triggered = no_answer_stats.post_mmr_triggered_count,
+            strategy = self.cfg.graph_rag.retrieval.graph_merge_strategy.as_str(),
+            final_context_limit = final_limit,
+            duration_ms = merge_duration_ms,
+            "GRAPH_MERGE_COMPLETED"
+        );
         Ok(Response::new(pb::SearchResponseV004 {
             results,
             diagnostics: Some(pb::SearchDiagnosticsV004 {
@@ -285,7 +1526,73 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 total_ms: started.elapsed().as_millis() as u64,
                 candidate_count: hits.len() as u32,
                 parent_group_count: by_parent.len() as u32,
+                direct_candidates_count: direct_count as u32,
+                graph_candidates_count: graph_count as u32,
+                merged_candidates_count: selection_result.merged_count as u32,
+                final_candidates_count: final_results_count as u32,
+                deduplicated_candidates_count: selection_result.deduplicated_count as u32,
+                graph_candidates_by_relation_json: serde_json::to_string(
+                    &graph_candidates_by_relation,
+                )
+                .unwrap_or_else(|_| "{}".into()),
+                graph_expansion_duration_ms,
+                graph_merge_duration_ms: merge_duration_ms,
+                graph_merge_strategy: self.cfg.graph_rag.retrieval.graph_merge_strategy.clone(),
+                final_context_limit: final_limit as u32,
+                final_context_limit_mode: self
+                    .cfg
+                    .graph_rag
+                    .retrieval
+                    .final_context_limit_mode
+                    .clone(),
+                graph_min_score: self.cfg.graph_rag.scoring.graph_min_score,
+                semantic_power: self.cfg.graph_rag.scoring.semantic_power,
+                mmr_enabled: mmr_result.enabled,
+                mmr_lambda: self.cfg.graph_rag.rerank.mmr_lambda,
+                mmr_candidate_count: mmr_result.input_count as u32,
+                mmr_selected_count: mmr_result.selected_count as u32,
+                mmr_duration_ms: mmr_result.duration_ms,
+                mmr_similarity_source: mmr_result.similarity_source.clone(),
+                learned_reranker_enabled: self.cfg.graph_rag.rerank.learned_reranker_enabled,
+                learned_reranker_provider: self
+                    .cfg
+                    .graph_rag
+                    .rerank
+                    .learned_reranker_provider
+                    .clone(),
+                direct_context_limit: self.cfg.graph_rag.retrieval.direct_context_limit as u32,
+                graph_context_append_limit: self.cfg.graph_rag.retrieval.graph_context_append_limit
+                    as u32,
+                direct_score_weight: self.cfg.graph_rag.scoring.direct_score_weight,
+                graph_score_weight: self.cfg.graph_rag.scoring.graph_score_weight,
+                graph_score_bias: self.cfg.graph_rag.scoring.graph_score_bias,
+                score_normalization: self.cfg.graph_rag.scoring.score_normalization.clone(),
+                mmr_lambda_direct: self.cfg.graph_rag.rerank.mmr_lambda_direct,
+                mmr_lambda_graph: self.cfg.graph_rag.rerank.mmr_lambda_graph,
+                mmr_embedding_fetch_requested: embedding_fetch_stats.requested as u32,
+                mmr_embedding_fetch_found: embedding_fetch_stats.found as u32,
+                mmr_embedding_fetch_missing: embedding_fetch_stats.missing as u32,
+                mmr_embedding_fetch_duration_ms: embedding_fetch_stats.duration_ms,
+                mmr_embedding_cache_hits: embedding_fetch_stats.cache_hits as u32,
+                mmr_embedding_cache_misses: embedding_fetch_stats.cache_misses as u32,
+                mmr_embedding_fetch_errors: embedding_fetch_stats.errors as u32,
+                mmr_embedding_fetch_timeouts: embedding_fetch_stats.timeouts as u32,
+                mmr_embedding_fetch_skipped_all_present: embedding_fetch_stats.skipped_all_present,
+                mmr_embedding_fetch_skipped_small_pool: embedding_fetch_stats.skipped_small_pool,
+                mmr_dense_pair_comparisons: mmr_result.dense_pair_comparisons as u32,
+                mmr_token_pair_comparisons: mmr_result.token_pair_comparisons as u32,
+                mmr_effective_similarity_source: mmr_result.similarity_source.clone(),
+                warning_codes: warnings.iter().map(|w| w.code.clone()).collect(),
+                token_budget_enabled: self.cfg.rag_context.token_budget_enabled,
+                max_context_tokens: self.cfg.rag_context.max_context_tokens as u32,
+                estimated_context_tokens_before: token_budget_before as u32,
+                estimated_context_tokens_after: token_budget_after as u32,
+                context_chunks_dropped_by_token_budget: dropped_chunk_count,
+                token_truncation_strategy: self.cfg.rag_context.truncation_strategy.clone(),
+                dropped_chunk_ids: dropped_chunk_ids.iter().take(50).cloned().collect(),
+                huge_chunk_strategy: self.cfg.rag_context.huge_chunk_strategy.clone(),
             }),
+            warnings,
         }))
     }
 
@@ -293,11 +1600,46 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         &self,
         request: Request<pb::CreateMultiGranularityChunksRequest>,
     ) -> Result<Response<pb::CreateMultiGranularityChunksResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
         let r = request.into_inner();
-        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
-            .map_err(|_| Status::invalid_argument("access_zone_id must be UUID"))?;
+        let resolved_access_zone = self
+            .resolve_ingestion_access_zone(&r.access_zone_id, &r.access_zone_code)
+            .await?;
+        let access_zone_id = resolved_access_zone.access_zone_id;
+        let access_zone_code = resolved_access_zone.access_zone_code.clone();
         let document_id = Uuid::parse_str(r.document_id.trim())
             .map_err(|_| Status::invalid_argument("document_id must be UUID"))?;
+        let effective_chunk_ttl_days: Option<i32> = match r.ttl_days {
+            Some(0) => {
+                if !(self.cfg.index_ttl.allow_never_expire
+                    && resolved_access_zone.allow_never_expire)
+                {
+                    return Err(Status::invalid_argument("ttl_days=0 requires index_ttl.allow_never_expire=true and access zone allow_never_expire=true"));
+                }
+                None
+            }
+            Some(v) => {
+                if v < self.cfg.index_ttl.min_ttl_days || v > self.cfg.index_ttl.max_ttl_days {
+                    return Err(Status::invalid_argument(
+                        "ttl_days is outside configured min/max bounds",
+                    ));
+                }
+                Some(v as i32)
+            }
+            None => {
+                let default_ttl = resolved_access_zone.default_ttl_days;
+                if default_ttl == 0 {
+                    if !(self.cfg.index_ttl.allow_never_expire
+                        && resolved_access_zone.allow_never_expire)
+                    {
+                        return Err(Status::invalid_argument("default ttl_days=0 requires index_ttl.allow_never_expire=true and access zone allow_never_expire=true"));
+                    }
+                    None
+                } else {
+                    Some(default_ttl as i32)
+                }
+            }
+        };
         if r.document_version == 0 {
             return Err(Status::invalid_argument(
                 "document_version must be greater than zero",
@@ -306,10 +1648,46 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         if r.source_text.trim().is_empty() {
             return Err(Status::invalid_argument("source_text is required"));
         }
-        if r.source_text.len() > 2 * 1024 * 1024 {
-            return Err(Status::out_of_range(
-                "source_text exceeds 2 MiB smoke limit",
-            ));
+        let from_chunked_finalize = r
+            .metadata
+            .get("chunked_ingestion_finalize")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if !from_chunked_finalize
+            && r.source_text.len() > self.cfg.ingestion.single_request_max_bytes
+        {
+            let message = match self.cfg.ingestion.large_document_mode.as_str() {
+                "REQUIRE_CHUNKED" => format!(
+                    "source_text exceeds configured single_request_max_bytes={} bytes; use chunked logical ingestion API",
+                    self.cfg.ingestion.single_request_max_bytes
+                ),
+                "ACCEPT_WITH_WARNING" => {
+                    tracing::warn!(
+                        bytes = r.source_text.len(),
+                        limit = self.cfg.ingestion.single_request_max_bytes,
+                        "LARGE_DOCUMENT_ACCEPTED_WITH_WARNING is configured, but current single-request path still rejects over-limit payloads"
+                    );
+                    format!(
+                        "source_text exceeds configured single_request_max_bytes={} bytes; ACCEPT_WITH_WARNING is reserved until streaming storage is enabled",
+                        self.cfg.ingestion.single_request_max_bytes
+                    )
+                }
+                _ => format!(
+                    "source_text exceeds configured single_request_max_bytes={} bytes",
+                    self.cfg.ingestion.single_request_max_bytes
+                ),
+            };
+            counter!("ingestion_large_document_rejected_total").increment(1);
+            return Err(Status::out_of_range(message));
+        }
+        if from_chunked_finalize
+            && r.source_text.len() > self.cfg.limits.source_text_absolute_max_bytes
+        {
+            counter!("ingestion_large_document_rejected_total").increment(1);
+            return Err(Status::resource_exhausted(format!(
+                "chunked source_text exceeds configured source_text_absolute_max_bytes={} bytes",
+                self.cfg.limits.source_text_absolute_max_bytes
+            )));
         }
         let access_level = pb::AccessLevel::try_from(r.access_level)
             .ok()
@@ -351,17 +1729,61 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             }
         }
         let engine = ChunkingEngine::new(ConservativeTokenCounter);
-        let generated = engine
-            .chunk(
-                access_zone_id,
-                document_id,
-                r.document_version,
-                &r.source_text,
-                &profile,
-            )
-            .map_err(Status::from)?;
+        let annotated_segments = annotated_segments_from_metadata(&r.metadata)?;
+        let generated = if annotated_segments.is_empty() {
+            engine
+                .chunk(
+                    access_zone_id,
+                    document_id,
+                    r.document_version,
+                    &r.source_text,
+                    &profile,
+                    SourceChunkStorageMode::from_config(
+                        &self.cfg.chunking.source_chunk_storage_mode,
+                    )
+                    .map_err(Status::from)?,
+                )
+                .map_err(Status::from)?
+        } else {
+            engine
+                .chunk_segments(
+                    access_zone_id,
+                    document_id,
+                    r.document_version,
+                    &annotated_segments,
+                    &profile,
+                    SourceChunkStorageMode::from_config(
+                        &self.cfg.chunking.source_chunk_storage_mode,
+                    )
+                    .map_err(Status::from)?,
+                )
+                .map_err(Status::from)?
+        };
+        match self.cfg.chunking.source_chunk_storage_mode.as_str() {
+            "METADATA_ONLY" => counter!("source_chunk_metadata_only_total").increment(1),
+            "DISABLED" => counter!("source_chunk_disabled_total").increment(1),
+            _ => counter!("source_chunk_full_text_total").increment(1),
+        }
+        if generated.len() > self.cfg.ingestion.max_chunks_per_document
+            || generated.len() > self.cfg.limits.max_chunks_per_document
+        {
+            return Err(Status::resource_exhausted(format!(
+                "document generated {} chunks, configured max_chunks_per_document is {}",
+                generated.len(),
+                self.cfg
+                    .ingestion
+                    .max_chunks_per_document
+                    .min(self.cfg.limits.max_chunks_per_document)
+            )));
+        }
         let mut request_metadata = serde_json::to_value(&r.metadata)
             .map_err(|e| Status::internal(format!("metadata serialization: {e}")))?;
+        if let Some(object) = request_metadata.as_object_mut() {
+            object.insert(
+                "access_zone_code".to_string(),
+                serde_json::Value::String(access_zone_code.clone()),
+            );
+        }
         if let Some(object) = request_metadata.as_object_mut() {
             if !idempotency_key.is_empty() {
                 object.insert(
@@ -374,94 +1796,155 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 );
             }
         }
-        let stored = self
-            .repo()?
-            .store_v004_chunks(
-                access_zone_id,
-                document_id,
-                r.document_version as i64,
-                &generated,
-                &self.cfg.tokenizer.version,
-                &profile_version,
-                access_level as i16,
-                r.ttl_days.map(|v| v as i32),
-                request_metadata.clone(),
-            )
-            .await
-            .map_err(Status::from)?;
+        let embedding_mode = pb::EmbeddingModeV005::try_from(r.embedding_mode)
+            .unwrap_or(pb::EmbeddingModeV005::DenseSparseRequired);
+        let sparse_required = embedding_mode == pb::EmbeddingModeV005::DenseSparseRequired;
+        let wants_sparse = matches!(
+            embedding_mode,
+            pb::EmbeddingModeV005::DenseSparseRequired
+                | pb::EmbeddingModeV005::DenseSparseIfAvailable
+        );
+        let sparse_available = self.engine.sparse_available();
+        if sparse_required && !sparse_available {
+            counter!("astravector_sparse_unavailable_total").increment(1);
+            return Err(Status::failed_precondition(
+                "SPARSE_UNAVAILABLE: sparse embedding requested but loaded ONNX artifact has no sparse output",
+            ));
+        }
+
         let deadline =
             Instant::now() + Duration::from_millis(self.cfg.grpc.deadlines.document_batch_ms);
-        for stored_chunk in stored.iter().filter(|chunk| chunk.granularity != "SOURCE") {
-            let Some(generated_chunk) = generated.iter().find(|chunk| {
-                chunk.granularity.as_db_str() == stored_chunk.granularity
-                    && chunk.sequence_no as i32 == stored_chunk.sequence_no
-                    && chunk.content_hash == stored_chunk.content_hash
-            }) else {
-                return Err(Status::internal(
-                    "stored chunk cannot be matched to generated content",
-                ));
-            };
-            if generated_chunk.granularity.as_db_str() == "SOURCE" {
-                continue;
-            }
-            let input = InferenceInput {
+        let document_chunks = generated
+            .iter()
+            .filter(|chunk| chunk.granularity.as_db_str() != "SOURCE")
+            .collect::<Vec<_>>();
+        if document_chunks.len() > self.cfg.limits.max_embeddings_per_request {
+            return Err(Status::resource_exhausted(format!(
+                "document requires {} embeddings, configured max_embeddings_per_request is {}",
+                document_chunks.len(),
+                self.cfg.limits.max_embeddings_per_request
+            )));
+        }
+        let inputs = document_chunks
+            .iter()
+            .map(|generated_chunk| InferenceInput {
                 text: generated_chunk.content.clone(),
                 max_length: self.cfg.tokenization.child.max_length,
                 allow_truncation: self.cfg.tokenization.child.truncation_allowed,
                 want_dense: true,
-                want_sparse: false,
+                want_sparse: wants_sparse && sparse_available,
                 token_count_hint: generated_chunk.token_count,
-            };
-            let embedding = self
-                .scheduler
-                .submit(
+            })
+            .collect::<Vec<_>>();
+        let embeddings = if self.cfg.embedding.document_submit_mode == "BOUNDED_CONCURRENT" {
+            self.scheduler
+                .submit_many(
                     QueueKind::Document,
-                    input,
+                    inputs,
                     deadline,
                     self.shutdown.child_token(),
+                    SubmitManyOptions {
+                        max_in_flight: self.cfg.embedding.document_max_in_flight_chunks,
+                        preserve_order: self.cfg.embedding.document_preserve_order,
+                        cancel_on_error: self.cfg.embedding.cancel_on_error,
+                    },
                 )
                 .await
-                .map_err(Status::from)?;
-            let core_chunk = crate::persistence::V004ChunkForEmbedding {
+                .map_err(Status::from)?
+        } else {
+            let mut out = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                out.push(
+                    self.scheduler
+                        .submit(
+                            QueueKind::Document,
+                            input,
+                            deadline,
+                            self.shutdown.child_token(),
+                        )
+                        .await
+                        .map_err(Status::from)?,
+                );
+            }
+            out
+        };
+        let mut prepared_embeddings = Vec::with_capacity(embeddings.len());
+        for (generated_chunk, embedding) in document_chunks.into_iter().zip(embeddings) {
+            if sparse_required
+                && embedding
+                    .sparse_indices
+                    .as_ref()
+                    .map(|v| v.is_empty())
+                    .unwrap_or(true)
+            {
+                counter!("astravector_sparse_unavailable_total").increment(1);
+                return Err(Status::failed_precondition(
+                    "SPARSE_UNAVAILABLE: document sparse embedding required but produced no sparse indices",
+                ));
+            }
+            prepared_embeddings.push(crate::persistence::PreparedV004IndexEmbedding {
+                chunk: generated_chunk.clone(),
+                embedding,
+            });
+        }
+        let publish_outbox = r.publish_mode != pb::PublishModeV005::None as i32;
+        let summary = self
+            .repo()?
+            .persist_v004_index_transactionally(
                 access_zone_id,
                 document_id,
-                document_version: r.document_version as i64,
-                root_chunk_id: stored_chunk.root_id,
-                source_chunk_id: stored_chunk.source_id,
-                parent_chunk_id: stored_chunk.parent_id,
-                chunk_id: stored_chunk.id,
-                granularity: stored_chunk.granularity.clone(),
-                sequence_no: stored_chunk.sequence_no,
-                token_count: stored_chunk.token_count,
-                content_hash: stored_chunk.content_hash.clone(),
-                content: generated_chunk.content.clone(),
-                access_level: access_level as i16,
-                ttl_days: r.ttl_days.map(|v| v as i32),
-                metadata: request_metadata.clone(),
-            };
-            self.repo()?
-                .persist_v004_embedding_binding_outbox(
-                    "v004-control",
-                    &access_zone_id.to_string(),
-                    &core_chunk,
-                    &stored_chunk.content_hash,
-                    &embedding,
-                    &self.cfg.tokenizer.version,
-                    &self.cfg.model.version,
-                    &self.cfg.dense.name,
-                    &self.cfg.dense.version,
-                    &self.cfg.sparse.name,
-                    &self.cfg.sparse.version,
-                    self.cfg.sparse.min_weight,
-                    self.cfg.sparse.max_non_zero as i32,
-                    &self.cfg.qdrant.collection,
-                    &profile_version,
-                )
-                .await
-                .map_err(Status::from)?;
-        }
-        Ok(Response::new(chunks_response_from_records(
-            stored, "INDEXING",
+                r.document_version as i64,
+                &generated,
+                &prepared_embeddings,
+                &self.cfg.tokenizer.version,
+                &profile_version,
+                access_level as i16,
+                effective_chunk_ttl_days,
+                request_metadata.clone(),
+                "v004-control",
+                &access_zone_id.to_string(),
+                &self.cfg.model.version,
+                &self.cfg.dense.name,
+                &self.cfg.dense.version,
+                &self.cfg.sparse.name,
+                &self.cfg.sparse.version,
+                self.cfg.sparse.min_weight,
+                self.cfg.sparse.max_non_zero as i32,
+                &self.cfg.qdrant.collection,
+                publish_outbox,
+                self.cfg.graph_rag.enabled,
+                Some(graph_build_limits_from_config(&self.cfg)),
+                self.cfg.graph_rag.build.bulk_insert_batch_size,
+                self.cfg
+                    .graph_rag
+                    .build
+                    .failure_mode
+                    .eq_ignore_ascii_case("WARN_AND_CONTINUE"),
+            )
+            .await
+            .map_err(Status::from)?;
+        let _ = sqlx::query("UPDATE astravector.document_versions SET access_zone_code=$4, updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND delete_operation_id IS NULL")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(r.document_version as i64)
+            .bind(&access_zone_code)
+            .execute(&self.repo()?.pool)
+            .await;
+        let _ = sqlx::query("UPDATE astravector.content_chunks_v004 SET access_zone_code=$4, updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(r.document_version as i64)
+            .bind(&access_zone_code)
+            .execute(&self.repo()?.pool)
+            .await;
+        let stored = summary.chunks;
+        Ok(Response::new(chunks_response_from_records_with_summary(
+            stored,
+            "INDEXING",
+            summary.dense_vectors,
+            summary.sparse_vectors,
+            summary.bindings,
+            summary.outbox_created,
         )))
     }
 
@@ -531,9 +2014,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         &self,
         request: Request<pb::RegisterDocumentVersionRequest>,
     ) -> Result<Response<pb::DocumentVersionResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
         let r = request.into_inner();
-        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
-            .map_err(|_| Status::invalid_argument("access_zone_id must be UUID"))?;
+        let resolved_access_zone = self
+            .resolve_ingestion_access_zone(&r.access_zone_id, &r.access_zone_code)
+            .await?;
+        let access_zone_id = resolved_access_zone.access_zone_id;
+        let access_zone_code = resolved_access_zone.access_zone_code.clone();
         let document_id = Uuid::parse_str(r.document_id.trim())
             .map_err(|_| Status::invalid_argument("document_id must be UUID"))?;
         if r.document_version == 0 {
@@ -563,6 +2050,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             )
             .await
             .map_err(Status::from)?;
+        let _ = sqlx::query("UPDATE astravector.document_versions SET access_zone_code=$4, updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(r.document_version as i64)
+            .bind(&access_zone_code)
+            .execute(&self.repo()?.pool)
+            .await;
         Ok(Response::new(pb::DocumentVersionResponse {
             document_id: record.document_id.to_string(),
             document_version: record.document_version as u64,
@@ -574,6 +2068,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         &self,
         request: Request<pb::ActivateDocumentVersionRequest>,
     ) -> Result<Response<pb::DocumentVersionResponse>, Status> {
+        let metadata = request.metadata().clone();
         let r = request.into_inner();
         let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
             .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
@@ -582,11 +2077,50 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         if r.document_version == 0 {
             return Err(Status::invalid_argument("document_version must be > 0"));
         }
-        let record = self
-            .repo()?
-            .activate_document_version(access_zone_id, document_id, r.document_version as i64)
-            .await
-            .map_err(Status::from)?;
+        let record = if r.force_activate {
+            self.require_admin(&metadata)?;
+            if r.force_reason.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "force_reason is required when force_activate=true",
+                ));
+            }
+            eprintln!("event=FORCE_ACTIVATE_DOCUMENT access_zone_id={} document_id={} document_version={} force_reason={}", access_zone_id, document_id, r.document_version, r.force_reason.replace('\n', " "));
+            self.repo()?
+                .force_activate_document_version(
+                    access_zone_id,
+                    document_id,
+                    r.document_version as i64,
+                    &r.force_reason,
+                )
+                .await
+                .map_err(Status::from)?
+        } else {
+            self.require_internal_or_admin(&metadata)?;
+            let status = self
+                .compute_document_sync_status(
+                    access_zone_id,
+                    document_id,
+                    r.document_version as i64,
+                    true,
+                )
+                .await?;
+            if !status.ready_to_activate {
+                return Err(Status::failed_precondition(format!(
+                    "DOCUMENT_NOT_READY_TO_ACTIVATE: expected_bindings={}, synced_bindings={}, outbox_pending={}, outbox_retry_pending={}, outbox_failed={}, qdrant_points_expected={}, qdrant_points_found={}",
+                    status.expected_bindings,
+                    status.synced_bindings,
+                    status.outbox_pending,
+                    status.outbox_retry_pending,
+                    status.outbox_failed,
+                    status.qdrant_points_expected,
+                    status.qdrant_points_found
+                )));
+            }
+            self.repo()?
+                .activate_document_version(access_zone_id, document_id, r.document_version as i64)
+                .await
+                .map_err(Status::from)?
+        };
         Ok(Response::new(pb::DocumentVersionResponse {
             document_id: record.document_id.to_string(),
             document_version: record.document_version as u64,
@@ -594,55 +2128,1976 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }))
     }
 
-    async fn delete_chunk_group(
+    async fn explain_search(
         &self,
-        _request: Request<pb::DeleteChunkGroupRequest>,
-    ) -> Result<Response<pb::DeleteChunkGroupResponse>, Status> {
-        Err(Self::not_implemented())
+        request: Request<pb::ExplainSearchRequest>,
+    ) -> Result<Response<pb::ExplainSearchResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let started = std::time::Instant::now();
+        let r = request.into_inner();
+        let query = r.query.trim();
+        if query.is_empty() {
+            return Err(Status::invalid_argument("query must not be empty"));
+        }
+        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
+            .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
+        let caller_access_level = pb::AccessLevel::try_from(r.caller_access_level)
+            .ok()
+            .filter(|v| *v != pb::AccessLevel::Unspecified)
+            .ok_or_else(|| Status::invalid_argument("caller_access_level is required"))?;
+        let top_k = if r.top_k == 0 { 5 } else { r.top_k }.min(self.cfg.limits.search_top_k_max);
+        let candidate_limit = if r.candidate_limit == 0 {
+            20
+        } else {
+            r.candidate_limit
+        }
+        .min(self.cfg.limits.search_candidate_limit_max);
+        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, self.cfg.grpc.deadlines.query_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let search_mode = Self::resolve_search_mode(r.search_mode, &self.cfg.search.default_mode);
+        let version_filters = Self::version_filters_from_explain_request(&r);
+        let wants_sparse = matches!(
+            search_mode,
+            pb::SearchModeV005::Sparse | pb::SearchModeV005::Hybrid
+        );
+        let wants_dense = matches!(
+            search_mode,
+            pb::SearchModeV005::Dense | pb::SearchModeV005::Hybrid
+        );
+        let sparse_required = wants_sparse
+            && Self::embedding_mode_requires_sparse(r.embedding_mode, self.cfg.sparse.required);
+        if wants_sparse && sparse_required && !self.engine.sparse_available() {
+            return Err(Status::failed_precondition("SPARSE_UNAVAILABLE: sparse explain requested but loaded ONNX artifact has no sparse output"));
+        }
+        let emb_started = std::time::Instant::now();
+        let embedding = self
+            .scheduler
+            .submit(
+                QueueKind::Query,
+                InferenceInput {
+                    text: query.to_string(),
+                    max_length: self.cfg.tokenization.query.max_length,
+                    allow_truncation: self.cfg.tokenization.query.truncation_allowed,
+                    want_dense: wants_dense,
+                    want_sparse: wants_sparse && self.engine.sparse_available(),
+                    token_count_hint: 0,
+                },
+                deadline,
+                self.shutdown.child_token(),
+            )
+            .await
+            .map_err(Status::from)?;
+        let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
+        let q_started = std::time::Instant::now();
+        let qdrant = self.qdrant()?;
+        let dense_hits = if wants_dense {
+            let dense = embedding
+                .dense
+                .as_deref()
+                .ok_or_else(|| Status::failed_precondition("query dense embedding unavailable"))?;
+            qdrant
+                .search_dense(
+                    dense,
+                    &[access_zone_id],
+                    caller_access_level as i16,
+                    candidate_limit as usize,
+                    Some(&version_filters),
+                )
+                .await
+                .map_err(Status::from)?
+        } else {
+            Vec::new()
+        };
+        let sparse_hits = if wants_sparse {
+            match (
+                embedding.sparse_indices.as_deref(),
+                embedding.sparse_values.as_deref(),
+            ) {
+                (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
+                    qdrant
+                        .search_sparse(
+                            indices,
+                            values,
+                            &[access_zone_id],
+                            caller_access_level as i16,
+                            candidate_limit as usize,
+                            Some(&version_filters),
+                        )
+                        .await
+                        .map_err(Status::from)?
+                }
+                _ if sparse_required => {
+                    return Err(Status::failed_precondition(
+                        "SPARSE_UNAVAILABLE: query sparse embedding unavailable",
+                    ))
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let qdrant_search_ms = q_started.elapsed().as_millis() as u64;
+        let fused = fuse_qdrant_hits(
+            dense_hits.clone(),
+            sparse_hits.clone(),
+            candidate_limit as usize,
+            &self.cfg.search.hybrid_fusion_method,
+            self.cfg.search.hybrid_dense_weight,
+            self.cfg.search.hybrid_sparse_weight,
+            self.cfg.search.rrf_k,
+        );
+        let dense_candidates = dense_hits
+            .iter()
+            .take(top_k as usize)
+            .enumerate()
+            .map(|(rank, hit)| explain_candidate(rank, hit))
+            .collect();
+        let sparse_candidates = sparse_hits
+            .iter()
+            .take(top_k as usize)
+            .enumerate()
+            .map(|(rank, hit)| explain_candidate(rank, hit))
+            .collect();
+        let fusion = fused
+            .iter()
+            .take(top_k as usize)
+            .enumerate()
+            .map(|(rank, hit)| pb::ExplainFusionCandidateV005 {
+                rank: (rank + 1) as u32,
+                chunk_id: hit
+                    .payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                dense_rank: hit.dense_rank,
+                sparse_rank: hit.sparse_rank,
+                dense_score: hit.dense_score,
+                sparse_score: hit.sparse_score,
+                fusion_score: hit.fusion_score,
+                reason: if hit.dense_rank.is_some() && hit.sparse_rank.is_some() {
+                    "MATCHED_BY_DENSE_AND_SPARSE"
+                } else if hit.dense_rank.is_some() {
+                    "MATCHED_BY_DENSE_ONLY"
+                } else {
+                    "MATCHED_BY_SPARSE_ONLY"
+                }
+                .into(),
+            })
+            .collect();
+        let selected_parents = fused
+            .iter()
+            .take(top_k as usize)
+            .filter_map(|hit| {
+                let parent = hit
+                    .payload
+                    .get("parent_chunk_id")
+                    .or_else(|| hit.payload.get("chunk_id"))?
+                    .as_str()?;
+                Some(pb::ExplainSelectedParentV005 {
+                    parent_chunk_id: parent.to_string(),
+                    selected_because: "best fused candidate".into(),
+                })
+            })
+            .collect();
+        let top_sparse_tokens = match (&embedding.sparse_indices, &embedding.sparse_values) {
+            (Some(indices), Some(values)) => {
+                let mut pairs: Vec<(u32, f32)> = indices
+                    .iter()
+                    .copied()
+                    .zip(values.iter().copied())
+                    .collect();
+                pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                pairs.truncate(self.cfg.explain.top_sparse_tokens as usize);
+                pairs
+                    .into_iter()
+                    .map(|(token_id, weight)| pb::SparseTokenPreviewV005 { token_id, weight })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Ok(Response::new(pb::ExplainSearchResponse {
+            query: query.to_string(),
+            query_embedding: Some(pb::QueryEmbeddingSummaryV005 {
+                dense_dimension: embedding.dense.as_ref().map(|v| v.len()).unwrap_or(0) as u32,
+                sparse_non_zero_count: embedding
+                    .sparse_indices
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or(0) as u32,
+                top_sparse_tokens,
+            }),
+            dense_candidates,
+            sparse_candidates,
+            fusion,
+            selected_parents,
+            applied_filters: vec![
+                pb::AppliedFilterV005 {
+                    key: "access_zone_id".into(),
+                    op: "eq".into(),
+                    value: access_zone_id.to_string(),
+                },
+                pb::AppliedFilterV005 {
+                    key: "access_level".into(),
+                    op: "lte".into(),
+                    value: (caller_access_level as i32).to_string(),
+                },
+                pb::AppliedFilterV005 {
+                    key: "lifecycle_status".into(),
+                    op: "eq".into(),
+                    value: "ACTIVE".into(),
+                },
+            ],
+            diagnostics: Some(pb::SearchDiagnosticsV004 {
+                query_embedding_ms,
+                qdrant_search_ms,
+                parent_fetch_ms: 0,
+                total_ms: started.elapsed().as_millis() as u64,
+                candidate_count: fused.len() as u32,
+                parent_group_count: fused.len() as u32,
+                direct_candidates_count: fused.len() as u32,
+                graph_candidates_count: 0,
+                merged_candidates_count: fused.len() as u32,
+                final_candidates_count: fused.len() as u32,
+                deduplicated_candidates_count: 0,
+                graph_candidates_by_relation_json: "{}".into(),
+                graph_expansion_duration_ms: 0,
+                graph_merge_duration_ms: 0,
+                graph_merge_strategy: "N/A".into(),
+                final_context_limit: fused.len() as u32,
+                final_context_limit_mode: "N/A".into(),
+                graph_min_score: 0.0,
+                semantic_power: 1.0,
+                mmr_enabled: false,
+                mmr_lambda: 0.75,
+                mmr_candidate_count: 0,
+                mmr_selected_count: 0,
+                mmr_duration_ms: 0,
+                mmr_similarity_source: "N/A".into(),
+                learned_reranker_enabled: false,
+                learned_reranker_provider: "NONE".into(),
+                direct_context_limit: 0,
+                graph_context_append_limit: 0,
+                direct_score_weight: 1.0,
+                graph_score_weight: 1.0,
+                graph_score_bias: 0.0,
+                score_normalization: "NONE".into(),
+                mmr_lambda_direct: 0.80,
+                mmr_lambda_graph: 0.60,
+                mmr_embedding_fetch_requested: 0,
+                mmr_embedding_fetch_found: 0,
+                mmr_embedding_fetch_missing: 0,
+                mmr_embedding_fetch_duration_ms: 0,
+                mmr_embedding_cache_hits: 0,
+                mmr_embedding_cache_misses: 0,
+                mmr_embedding_fetch_errors: 0,
+                mmr_embedding_fetch_timeouts: 0,
+                mmr_embedding_fetch_skipped_all_present: false,
+                mmr_embedding_fetch_skipped_small_pool: false,
+                mmr_dense_pair_comparisons: 0,
+                mmr_token_pair_comparisons: 0,
+                mmr_effective_similarity_source: "N/A".into(),
+                warning_codes: Vec::new(),
+                token_budget_enabled: self.cfg.rag_context.token_budget_enabled,
+                max_context_tokens: self.cfg.rag_context.max_context_tokens as u32,
+                estimated_context_tokens_before: 0,
+                estimated_context_tokens_after: 0,
+                context_chunks_dropped_by_token_budget: 0,
+                token_truncation_strategy: self.cfg.rag_context.truncation_strategy.clone(),
+                dropped_chunk_ids: Vec::new(),
+                huge_chunk_strategy: self.cfg.rag_context.huge_chunk_strategy.clone(),
+            }),
+        }))
     }
 
-    async fn update_chunk_group_ttl(
+    async fn debug_document_state(
         &self,
-        _request: Request<pb::UpdateChunkGroupTtlRequest>,
-    ) -> Result<Response<pb::UpdateChunkGroupTtlResponse>, Status> {
-        Err(Self::not_implemented())
+        request: Request<pb::DebugDocumentStateRequest>,
+    ) -> Result<Response<pb::DebugDocumentStateResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
+            .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
+        let document_id = Uuid::parse_str(r.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document_id must be a UUID"))?;
+        if r.document_version == 0 {
+            return Err(Status::invalid_argument("document_version must be > 0"));
+        }
+        let repo = self.repo()?;
+        let doc = sqlx::query("SELECT status, content_hash FROM astravector.document_versions WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id).bind(document_id).bind(r.document_version as i64)
+            .fetch_optional(&repo.pool).await.map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+        let (status, content_hash) = doc
+            .map(|row| {
+                (
+                    row.get::<String, _>("status"),
+                    row.get::<String, _>("content_hash"),
+                )
+            })
+            .unwrap_or_else(|| ("NOT_FOUND".into(), String::new()));
+        let chunks_rows = if r.include_chunks {
+            sqlx::query("SELECT c.id,c.parent_chunk_id,c.root_chunk_id,c.granularity,c.actual_token_count,c.lifecycle_status,c.source_block_id,c.source_location,c.source_links,COALESCE((SELECT m.relation_type FROM astravector.logical_block_chunk_mapping m WHERE m.access_zone_id=c.access_zone_id AND m.document_id=c.document_id AND m.document_version=c.document_version AND m.chunk_id=c.id LIMIT 1),'') AS trace_relation_type,CASE WHEN c.source_block_id IS NULL THEN 'MISSING' WHEN (SELECT count(*) FROM astravector.logical_block_chunk_mapping m WHERE m.access_zone_id=c.access_zone_id AND m.document_id=c.document_id AND m.document_version=c.document_version AND m.chunk_id=c.id) > 1 THEN 'MERGED' ELSE 'EXACT' END AS trace_quality,COALESCE(array_agg(b.qdrant_point_id::text) FILTER (WHERE b.qdrant_point_id IS NOT NULL),'{}') AS qdrant_point_ids FROM astravector.content_chunks_v004 c LEFT JOIN astravector.vector_bindings_v004 b ON b.access_zone_id=c.access_zone_id AND b.chunk_id=c.id WHERE c.access_zone_id=$1 AND c.document_id=$2 AND c.document_version=$3 GROUP BY c.id,c.parent_chunk_id,c.root_chunk_id,c.granularity,c.actual_token_count,c.lifecycle_status,c.source_block_id,c.source_location,c.source_links,c.metadata ORDER BY c.created_at")
+                .bind(access_zone_id).bind(document_id).bind(r.document_version as i64)
+                .fetch_all(&repo.pool).await.map_err(|e| Status::unavailable(format!("postgres: {e}")))?
+        } else {
+            Vec::new()
+        };
+        let chunks: Vec<pb::DebugChunkInfoV005> = chunks_rows
+            .into_iter()
+            .map(|row| pb::DebugChunkInfoV005 {
+                chunk_id: row.get::<Uuid, _>("id").to_string(),
+                parent_chunk_id: row
+                    .try_get::<Option<Uuid>, _>("parent_chunk_id")
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                root_chunk_id: row.get::<Uuid, _>("root_chunk_id").to_string(),
+                granularity: granularity_from_str(&row.get::<String, _>("granularity")),
+                actual_token_count: row.get::<i32, _>("actual_token_count") as u32,
+                lifecycle_status: row.get::<String, _>("lifecycle_status"),
+                source_block_id: row
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                trace_relation_type: row
+                    .try_get::<String, _>("trace_relation_type")
+                    .unwrap_or_default(),
+                trace_quality: row
+                    .try_get::<String, _>("trace_quality")
+                    .unwrap_or_default(),
+                source_location_json: row
+                    .try_get::<serde_json::Value, _>("source_location")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                source_links_json: row
+                    .try_get::<serde_json::Value, _>("source_links")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                qdrant_point_ids: row
+                    .try_get::<Vec<String>, _>("qdrant_point_ids")
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let counts = sqlx::query(r#"SELECT
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3) AS bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_dense d ON d.cache_entry_id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3) AS dense_count,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_sparse s ON s.cache_entry_id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3) AS sparse_count,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='PENDING') AS outbox_pending,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='RETRY_PENDING') AS outbox_retry_pending,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='COMPLETED') AS outbox_completed,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status IN('FAILED','DEAD_LETTER')) AS outbox_failed
+        "#)
+            .bind(access_zone_id).bind(document_id).bind(r.document_version as i64)
+            .fetch_one(&repo.pool).await.map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+        let bindings_count: i64 = counts.get("bindings");
+        let mut qdrant_collection_exists = self.qdrant.is_some();
+        let mut qdrant_point_ids = std::collections::HashSet::new();
+        let mut scroll_status = String::from("NOT_REQUESTED");
+        let mut scroll_pages_read = 0_u32;
+        let mut scroll_points_read = 0_u32;
+        if r.include_qdrant {
+            if let Some(q) = self.qdrant.as_ref() {
+                qdrant_collection_exists = q.collection_exists().await.map_err(Status::from)?;
+                if qdrant_collection_exists {
+                    let scroll = q
+                        .point_ids_by_document_paginated(
+                            access_zone_id,
+                            document_id,
+                            r.document_version as i64,
+                        )
+                        .await
+                        .map_err(Status::from)?;
+                    scroll_status = format!("{:?}", scroll.status);
+                    scroll_pages_read = scroll.pages_read as u32;
+                    scroll_points_read = scroll.points_read as u32;
+                    qdrant_point_ids = scroll.point_ids;
+                } else {
+                    scroll_status = String::from("COLLECTION_MISSING");
+                }
+            } else {
+                qdrant_collection_exists = false;
+                scroll_status = String::from("QDRANT_DISABLED");
+            }
+        }
+        let binding_rows = sqlx::query("SELECT b.id,b.chunk_id,b.qdrant_point_id,b.qdrant_sync_status, COALESCE((SELECT o.status FROM astravector.vector_outbox o WHERE o.binding_access_zone_id=b.access_zone_id AND o.binding_id=b.id AND o.operation='UPSERT_POINT' ORDER BY o.updated_at DESC LIMIT 1),'') AS outbox_status FROM astravector.vector_bindings_v004 b WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3")
+            .bind(access_zone_id).bind(document_id).bind(r.document_version as i64)
+            .fetch_all(&repo.pool).await.map_err(|e| Status::unavailable(format!("postgres qdrant debug: {e}")))?;
+        let mut points_missing = Vec::new();
+        for row in &binding_rows {
+            let point_id: Uuid = row.get("qdrant_point_id");
+            if r.include_qdrant
+                && (!qdrant_collection_exists || !qdrant_point_ids.contains(&point_id))
+            {
+                let sync_status: String = row.get("qdrant_sync_status");
+                let outbox_status: String = row.get("outbox_status");
+                let reason = if !qdrant_collection_exists {
+                    "QDRANT_COLLECTION_MISSING"
+                } else if sync_status != "SYNCED" {
+                    "BINDING_NOT_SYNCED"
+                } else if outbox_status != "COMPLETED" {
+                    "OUTBOX_NOT_COMPLETED"
+                } else {
+                    "QDRANT_POINT_NOT_FOUND"
+                };
+                points_missing.push(pb::MissingQdrantPointV005 {
+                    chunk_id: row.get::<Uuid, _>("chunk_id").to_string(),
+                    binding_id: row.get::<Uuid, _>("id").to_string(),
+                    qdrant_point_id: point_id.to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+        }
+        let qdrant_info = pb::DebugQdrantInfoV005 {
+            collection: self.cfg.qdrant.collection.clone(),
+            collection_exists: qdrant_collection_exists,
+            points_expected: bindings_count as u32,
+            points_found: if r.include_qdrant {
+                qdrant_point_ids.len() as u32
+            } else {
+                bindings_count as u32
+            },
+            points_missing,
+            scroll_status,
+            scroll_pages_read,
+            scroll_points_read,
+        };
+        let trace_counts = sqlx::query(r#"SELECT
+          (SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND source_block_id IS NOT NULL) AS traced_chunks,
+          (SELECT count(*) FROM astravector.logical_block_chunk_mapping WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3) AS mapping_rows
+        "#)
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(r.document_version as i64)
+            .fetch_one(&repo.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres trace debug: {e}")))?;
+        let traced_chunks: i64 = trace_counts.get("traced_chunks");
+        let mapping_rows: i64 = trace_counts.get("mapping_rows");
+        let mut debug_warnings = Vec::new();
+        if r.include_vectors {
+            debug_warnings.push(pb::DiagnosticWarningV005 {
+                code: "INCLUDE_VECTORS_IGNORED".into(),
+                message: "include_vectors is ignored for debug/explain responses; dense embeddings are internal-only and are not returned.".into(),
+            });
+        }
+        debug_warnings.push(pb::DiagnosticWarningV005 {
+            code: "LOGICAL_BLOCK_TRACE_SUMMARY".into(),
+            message: format!("Debug trace: traced_chunks={traced_chunks}, logical_block_chunk_mapping_rows={mapping_rows}, bindings={bindings_count}"),
+        });
+        if bindings_count > 0 && traced_chunks == 0 {
+            debug_warnings.push(pb::DiagnosticWarningV005 {
+                code: "SOURCE_TRACE_MISSING".into(),
+                message: "No chunk source trace found for this document; legacy or pre-fix2 indexing path may have been used".into(),
+            });
+        }
+        let graph_summary = match repo
+            .fetch_graph_summary(access_zone_id, document_id, r.document_version as i64)
+            .await
+        {
+            Ok(g) => Some(pb::DebugGraphSummaryV005 {
+                total_graph_nodes: g.total_nodes,
+                total_graph_edges: g.total_edges,
+                nodes_by_type_json: g.nodes_by_type.to_string(),
+                edges_by_relation_type_json: g.edges_by_relation_type.to_string(),
+                graph_partitions_status: "PARTITIONED_BY_NODE_TYPE_AND_RELATION_TYPE".into(),
+                semantic_edges_count: g.semantic_edges_count,
+                semantic_avg_weight: g.semantic_avg_weight.unwrap_or_default(),
+                semantic_min_weight: g.semantic_min_weight.unwrap_or_default(),
+                semantic_max_weight: g.semantic_max_weight.unwrap_or_default(),
+                allowed_relations_json: serde_json::to_string(
+                    &self.cfg.graph_rag.retrieval.allowed_relations,
+                )
+                .unwrap_or_default(),
+                relation_weights_json: serde_json::to_string(
+                    &self.cfg.graph_rag.scoring.relation_weights,
+                )
+                .unwrap_or_default(),
+            }),
+            Err(e) => {
+                debug_warnings.push(pb::DiagnosticWarningV005 {
+                    code: "GRAPH_DEBUG_UNAVAILABLE".into(),
+                    message: format!("Graph summary unavailable: {e}"),
+                });
+                None
+            }
+        };
+        let sync = self
+            .compute_document_sync_status(
+                access_zone_id,
+                document_id,
+                r.document_version as i64,
+                r.include_qdrant,
+            )
+            .await?;
+        let ready = sync.ready_to_activate;
+        Ok(Response::new(pb::DebugDocumentStateResponse {
+            document: Some(pb::DebugDocumentInfoV005 {
+                status,
+                content_hash,
+                model_version: self.cfg.model.version.clone(),
+                tokenizer_version: self.cfg.tokenizer.version.clone(),
+                chunking_version: "unknown".into(),
+            }),
+            chunks,
+            vectors: Some(pb::DebugVectorInfoV005 {
+                dense_count: counts.get::<i64, _>("dense_count") as u32,
+                sparse_count: counts.get::<i64, _>("sparse_count") as u32,
+                bindings_count: bindings_count as u32,
+            }),
+            outbox: Some(pb::DebugOutboxInfoV005 {
+                pending: counts.get::<i64, _>("outbox_pending") as u32,
+                retry_pending: counts.get::<i64, _>("outbox_retry_pending") as u32,
+                completed: counts.get::<i64, _>("outbox_completed") as u32,
+                failed: counts.get::<i64, _>("outbox_failed") as u32,
+            }),
+            qdrant: Some(qdrant_info),
+            ready_to_activate: ready,
+            warnings: debug_warnings,
+            graph: graph_summary,
+        }))
     }
 
-    async fn set_chunk_group_legal_hold(
+    async fn retry_vector_outbox(
         &self,
-        _request: Request<pb::SetChunkGroupLegalHoldRequest>,
-    ) -> Result<Response<pb::SetChunkGroupLegalHoldResponse>, Status> {
-        Err(Self::not_implemented())
-    }
-
-    async fn get_relevance_evaluation_v004(
-        &self,
-        _request: Request<pb::GetRelevanceEvaluationRequest>,
-    ) -> Result<Response<pb::GetRelevanceEvaluationResponse>, Status> {
-        Err(Self::not_implemented())
-    }
-
-    async fn submit_relevance_feedback_v004(
-        &self,
-        _request: Request<pb::SubmitRelevanceFeedbackRequest>,
-    ) -> Result<Response<pb::SubmitRelevanceFeedbackResponse>, Status> {
-        Err(Self::not_implemented())
-    }
-
-    async fn list_quarantined_points(
-        &self,
-        _request: Request<pb::ListQuarantinedPointsRequest>,
-    ) -> Result<Response<pb::ListQuarantinedPointsResponse>, Status> {
-        Err(Self::not_implemented())
-    }
-
-    async fn resolve_quarantined_point(
-        &self,
-        _request: Request<pb::ResolveQuarantinedPointRequest>,
-    ) -> Result<Response<pb::ResolveQuarantinedPointResponse>, Status> {
-        Err(Self::not_implemented())
+        request: Request<pb::RetryVectorOutboxRequest>,
+    ) -> Result<Response<pb::RetryVectorOutboxResponse>, Status> {
+        self.require_admin(request.metadata())?;
+        let r = request.into_inner();
+        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
+            .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
+        let document_id = Uuid::parse_str(r.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document_id must be a UUID"))?;
+        if r.document_version == 0 {
+            return Err(Status::invalid_argument("document_version must be > 0"));
+        }
+        let operation = r.operation.as_deref().unwrap_or("UPSERT_POINT");
+        let status_filter = r.status.as_deref();
+        let sql = if status_filter.is_some() {
+            "UPDATE astravector.vector_outbox o SET status='PENDING', next_attempt_at=now(), locked_by=NULL, locked_until=NULL, error_code=NULL, error_message=NULL, updated_at=now() FROM astravector.vector_bindings_v004 b WHERE b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id AND b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.operation=$4 AND o.status=$5 RETURNING o.id"
+        } else {
+            "UPDATE astravector.vector_outbox o SET status='PENDING', next_attempt_at=now(), locked_by=NULL, locked_until=NULL, error_code=NULL, error_message=NULL, updated_at=now() FROM astravector.vector_bindings_v004 b WHERE b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id AND b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.operation=$4 AND o.status IN('FAILED','RETRY_PENDING','DEAD_LETTER') RETURNING o.id"
+        };
+        let mut q = sqlx::query(sql)
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(r.document_version as i64)
+            .bind(operation);
+        if let Some(status) = status_filter {
+            q = q.bind(status);
+        }
+        let rows = q
+            .fetch_all(&self.repo()?.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<Uuid, _>("id").to_string())
+            .collect();
+        Ok(Response::new(pb::RetryVectorOutboxResponse {
+            matched: ids.len() as u32,
+            reset_to_pending: ids.len() as u32,
+            affected_outbox_ids: ids,
+        }))
     }
 }
+
+#[tonic::async_trait]
+impl AstraVectorIngestionFacade for AstraVectorV004ControlService {
+    async fn index_logical_document(
+        &self,
+        request: Request<pb::IndexLogicalDocumentRequest>,
+    ) -> Result<Response<pb::IndexLogicalDocumentResponse>, Status> {
+        let metadata = request.metadata().clone();
+        self.require_internal_or_admin(&metadata)?;
+        let r = request.into_inner();
+        let ctx = r.context.unwrap_or_default();
+        let resolved_access_zone = self
+            .resolve_ingestion_access_zone(&r.access_zone_id, &r.access_zone_code)
+            .await?;
+        let access_zone_id = resolved_access_zone.access_zone_id;
+        let access_zone_code = resolved_access_zone.access_zone_code.clone();
+        let document = r
+            .document
+            .ok_or_else(|| Status::invalid_argument("document is required"))?;
+        let document_id = resolve_facade_document_id(&document)?;
+        validate_source_links("document", &document.source_links)?;
+        let document_version = if document.document_version == 0 {
+            1
+        } else {
+            document.document_version
+        };
+        let logical_blocks = validate_and_sort_logical_blocks(r.blocks)?;
+        let source_text = render_logical_blocks_for_chunking(&logical_blocks);
+        if source_text.trim().is_empty() {
+            return Err(Status::invalid_argument("logical blocks contain no text"));
+        }
+        let from_chunked_finalize = ctx.caller_service == "chunked-ingestion";
+        if !from_chunked_finalize && source_text.len() > self.cfg.ingestion.single_request_max_bytes
+        {
+            counter!("ingestion_large_document_rejected_total").increment(1);
+            return Err(Status::out_of_range(format!(
+                "logical document text exceeds configured single_request_max_bytes={} bytes; use chunked logical ingestion API",
+                self.cfg.ingestion.single_request_max_bytes
+            )));
+        }
+        if from_chunked_finalize
+            && source_text.len() > self.cfg.limits.source_text_absolute_max_bytes
+        {
+            counter!("ingestion_large_document_rejected_total").increment(1);
+            return Err(Status::resource_exhausted(format!(
+                "chunked logical document text exceeds configured source_text_absolute_max_bytes={} bytes",
+                self.cfg.limits.source_text_absolute_max_bytes
+            )));
+        }
+        let content_hash = normalized_content_hash(&document.content_hash, &source_text)?;
+        let indexing_options = r.indexing_options.clone().unwrap_or_default();
+        reject_unsupported_activation_policy(indexing_options.activation_policy)?;
+        let activation_policy = activation_policy_as_str(indexing_options.activation_policy);
+        let _ = self
+            .repo()?
+            .register_document_version(
+                access_zone_id,
+                document_id,
+                document_version as i64,
+                &content_hash,
+                activation_policy,
+            )
+            .await
+            .map_err(Status::from)?;
+
+        let mut merged_metadata = r.metadata.clone();
+        attach_document_metadata(&mut merged_metadata, &document);
+        attach_logical_block_metadata(&mut merged_metadata, &logical_blocks)?;
+        merged_metadata.insert("ingestion_facade".into(), "IndexLogicalDocument".into());
+        if from_chunked_finalize {
+            merged_metadata.insert("chunked_ingestion_finalize".into(), "true".into());
+        }
+        merged_metadata.insert(
+            "logical_blocks_count".into(),
+            logical_blocks.len().to_string(),
+        );
+        merged_metadata.insert("content_hash".into(), content_hash.clone());
+        merged_metadata.insert("access_zone_code".into(), access_zone_code.clone());
+
+        let requested_ttl_days = ttl_days_from_policy(indexing_options.ttl_policy.as_ref())?;
+        let effective_ttl_days =
+            requested_ttl_days.unwrap_or(resolved_access_zone.default_ttl_days);
+        if effective_ttl_days == 0
+            && !(self.cfg.index_ttl.allow_never_expire && resolved_access_zone.allow_never_expire)
+        {
+            return Err(Status::invalid_argument("ttl_days=0 requires index_ttl.allow_never_expire=true and access zone allow_never_expire=true"));
+        }
+        if effective_ttl_days != 0
+            && (effective_ttl_days < self.cfg.index_ttl.min_ttl_days
+                || effective_ttl_days > self.cfg.index_ttl.max_ttl_days)
+        {
+            return Err(Status::invalid_argument(
+                "ttl_days is outside configured min/max bounds",
+            ));
+        }
+        let chunk_ttl_days = if effective_ttl_days == 0 {
+            None
+        } else {
+            Some(effective_ttl_days)
+        };
+        let idempotency_key = if !ctx.idempotency_key.trim().is_empty() {
+            ctx.idempotency_key.clone()
+        } else {
+            format!(
+                "v007-index-logical:{}:{}:{}",
+                access_zone_id, document_id, document_version
+            )
+        };
+        let mut inner = Request::new(pb::CreateMultiGranularityChunksRequest {
+            access_zone_id: access_zone_id.to_string(),
+            document_id: document_id.to_string(),
+            document_version,
+            source_text,
+            access_level: normalized_access_level(ctx.caller_access_level) as i32,
+            ttl_days: chunk_ttl_days,
+            profile: Some(chunking_profile_v004_from_v007(r.chunking_options.as_ref())),
+            metadata: merged_metadata,
+            idempotency_key,
+            correlation_id: ctx.correlation_id.clone(),
+            embedding_mode: normalized_embedding_mode(indexing_options.embedding_mode) as i32,
+            publish_mode: normalized_publish_mode(indexing_options.publish_mode) as i32,
+            access_zone_code: access_zone_code.clone(),
+        });
+        *inner.metadata_mut() = metadata;
+        let created =
+            <Self as AstraVectorV004Control>::create_multi_granularity_chunks(self, inner)
+                .await?
+                .into_inner();
+        let summary = created.summary.unwrap_or_default();
+        // fix4.5.3: document-version TTL/lifecycle metadata is the PostgreSQL source of truth.
+        let _ = sqlx::query("UPDATE astravector.document_versions SET indexed_at=COALESCE(indexed_at, now()), ttl_days=$4, expires_at=CASE WHEN $4=0 THEN NULL ELSE COALESCE(indexed_at, now()) + ($4 * interval '1 day') END, lifecycle_status=CASE WHEN status='ACTIVE' THEN 'ACTIVE' ELSE lifecycle_status END, access_zone_code=$5, updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND delete_operation_id IS NULL")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version as i64)
+            .bind(effective_ttl_days as i32)
+            .bind(&access_zone_code)
+            .execute(&self.repo()?.pool)
+            .await;
+        let state = match pb::ActivationPolicy::try_from(indexing_options.activation_policy)
+            .unwrap_or(pb::ActivationPolicy::Manual)
+        {
+            pb::ActivationPolicy::Skip => pb::OperationState::Indexing,
+            pb::ActivationPolicy::AutoWhenReady => pb::OperationState::Publishing,
+            _ => pb::OperationState::Indexing,
+        };
+        Ok(Response::new(pb::IndexLogicalDocumentResponse {
+            document: Some(pb::DocumentRef {
+                access_zone_id: access_zone_id.to_string(),
+                document_id: document_id.to_string(),
+                document_version,
+            }),
+            operation: Some(pb::OperationStatus {
+                operation_id: ctx.correlation_id,
+                state: state as i32,
+                message:
+                    "Logical blocks accepted; tokenizer-aware chunks and vector outbox were created"
+                        .into(),
+                warnings: Vec::new(),
+                errors: Vec::new(),
+            }),
+            summary: Some(pb::IndexingSummary {
+                blocks_received: logical_blocks.len() as u32,
+                blocks_accepted: logical_blocks.len() as u32,
+                blocks_rejected: 0,
+                chunks_created: summary.chunks_total,
+                parent_chunks_created: summary.parent_chunks,
+                child_chunks_created: summary.sub180_chunks + summary.sub260_chunks,
+                atomic_chunks_created: 0,
+                dense_vectors_created: summary.dense_vectors,
+                sparse_vectors_created: summary.sparse_vectors,
+                qdrant_points_scheduled: summary.outbox_created,
+                already_indexed: false,
+            }),
+        }))
+    }
+
+    async fn start_logical_document_ingestion(
+        &self,
+        request: Request<pb::StartLogicalDocumentIngestionRequest>,
+    ) -> Result<Response<pb::StartLogicalDocumentIngestionResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        if !self.cfg.ingestion.chunked_ingestion_enabled {
+            return Err(Status::failed_precondition("chunked ingestion is disabled"));
+        }
+        let r = request.into_inner();
+        let resolved_access_zone = self
+            .resolve_ingestion_access_zone(&r.access_zone_id, &r.access_zone_code)
+            .await?;
+        let access_zone_id = resolved_access_zone.access_zone_id;
+        let access_zone_code = resolved_access_zone.access_zone_code.clone();
+        let document_id = Uuid::parse_str(r.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document_id must be UUID"))?;
+        if r.document_version == 0 {
+            return Err(Status::invalid_argument("document_version must be > 0"));
+        }
+        let normalized_ttl_days = if r.ttl_days == 0 {
+            resolved_access_zone.default_ttl_days
+        } else {
+            r.ttl_days
+        };
+        if normalized_ttl_days == 0
+            && !(self.cfg.index_ttl.allow_never_expire && resolved_access_zone.allow_never_expire)
+        {
+            return Err(Status::invalid_argument("ttl_days=0 requires index_ttl.allow_never_expire=true and access zone allow_never_expire=true"));
+        }
+        if normalized_ttl_days != 0
+            && (normalized_ttl_days < self.cfg.index_ttl.min_ttl_days
+                || normalized_ttl_days > self.cfg.index_ttl.max_ttl_days)
+        {
+            return Err(Status::invalid_argument(
+                "ttl_days is outside configured min/max bounds",
+            ));
+        }
+        if r.total_bytes_estimate as usize > self.cfg.limits.source_text_absolute_max_bytes {
+            return Err(Status::resource_exhausted(
+                "estimated document size exceeds configured absolute maximum",
+            ));
+        }
+        if r.total_blocks_estimate as usize > self.cfg.ingestion.max_blocks_per_document {
+            return Err(Status::resource_exhausted(
+                "estimated block count exceeds max_blocks_per_document",
+            ));
+        }
+        let repo = self.repo()?;
+        let idempotency_key = if r.idempotency_key.trim().is_empty() {
+            format!(
+                "v007-chunked:{}:{}:{}",
+                access_zone_id, document_id, r.document_version
+            )
+        } else {
+            r.idempotency_key.trim().to_owned()
+        };
+        let request_fingerprint =
+            start_ingestion_fingerprint(&r, access_zone_id, document_id, &idempotency_key)?;
+        let mut tx =
+            repo.pool.begin().await.map_err(|e| {
+                Status::unavailable(format!("postgres ingestion start tx begin: {e}"))
+            })?;
+        // Serialize start-session limit checks in the same transaction as INSERT.
+        // The global lock protects max_concurrent_ingestion_sessions and per-zone limits;
+        // the document lock protects max_sessions_per_document and idempotency for one document.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind("ingestion-start:global")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!("postgres ingestion global advisory lock: {e}"))
+            })?;
+        let advisory_key = format!(
+            "ingestion-start:{access_zone_id}:{document_id}:{}",
+            r.document_version
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&advisory_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!("postgres ingestion document advisory lock: {e}"))
+            })?;
+        counter!("ingestion_start_advisory_lock_acquired_total").increment(1);
+
+        if let Some(existing) = sqlx::query("SELECT ingestion_session_id, status, expires_at, request_fingerprint FROM astravector.ingestion_sessions_v004 WHERE access_zone_id=$1 AND idempotency_key=$2")
+            .bind(access_zone_id).bind(&idempotency_key)
+            .fetch_optional(&mut *tx).await.map_err(|e| Status::unavailable(format!("postgres ingestion start lookup: {e}")))? {
+            let existing_fp: Option<String> = existing.try_get("request_fingerprint").ok();
+            if existing_fp.as_deref() != Some(request_fingerprint.as_str()) {
+                counter!("ingestion_start_idempotency_conflict_total").increment(1);
+                return Err(Status::failed_precondition("IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST"));
+            }
+            let response = pb::StartLogicalDocumentIngestionResponse {
+                ingestion_session_id: existing.get::<Uuid,_>("ingestion_session_id").to_string(),
+                status: existing.get::<String,_>("status"),
+                expires_at: existing.get::<chrono::DateTime<chrono::Utc>,_>("expires_at").to_rfc3339(),
+                warnings: Vec::new(),
+            };
+            tx.commit().await.map_err(|e| Status::unavailable(format!("postgres ingestion start replay commit: {e}")))?;
+            counter!("ingestion_start_idempotent_replay_total").increment(1);
+            return Ok(Response::new(response));
+        }
+        let active_global: i64 = sqlx::query_scalar("SELECT count(*) FROM astravector.ingestion_sessions_v004 WHERE status IN ('ACTIVE','FINALIZING')")
+            .fetch_one(&mut *tx).await.map_err(|e| Status::unavailable(format!("postgres ingestion active count: {e}")))?;
+        if active_global as usize >= self.cfg.ingestion.max_concurrent_ingestion_sessions {
+            counter!("ingestion_limit_rejected_total", "limit" => "max_concurrent_ingestion_sessions").increment(1);
+            counter!("ingestion_start_limit_rejected_total", "limit" => "max_concurrent_ingestion_sessions").increment(1);
+            return Err(Status::resource_exhausted(
+                "max_concurrent_ingestion_sessions exceeded",
+            ));
+        }
+        let active_zone: i64 = sqlx::query_scalar("SELECT count(*) FROM astravector.ingestion_sessions_v004 WHERE access_zone_id=$1 AND status IN ('ACTIVE','FINALIZING')")
+            .bind(access_zone_id).fetch_one(&mut *tx).await.map_err(|e| Status::unavailable(format!("postgres ingestion zone count: {e}")))?;
+        if active_zone as usize >= self.cfg.ingestion.max_sessions_per_access_zone {
+            counter!("ingestion_limit_rejected_total", "limit" => "max_sessions_per_access_zone")
+                .increment(1);
+            counter!("ingestion_start_limit_rejected_total", "limit" => "max_sessions_per_access_zone").increment(1);
+            return Err(Status::resource_exhausted(
+                "max_sessions_per_access_zone exceeded",
+            ));
+        }
+        let active_doc: i64 = sqlx::query_scalar("SELECT count(*) FROM astravector.ingestion_sessions_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND status IN ('ACTIVE','FINALIZING')")
+            .bind(access_zone_id).bind(document_id).bind(r.document_version as i64)
+            .fetch_one(&mut *tx).await.map_err(|e| Status::unavailable(format!("postgres ingestion document count: {e}")))?;
+        if active_doc as usize >= self.cfg.ingestion.max_sessions_per_document {
+            counter!("ingestion_limit_rejected_total", "limit" => "max_sessions_per_document")
+                .increment(1);
+            counter!("ingestion_start_limit_rejected_total", "limit" => "max_sessions_per_document").increment(1);
+            return Err(Status::resource_exhausted(
+                "max_sessions_per_document exceeded",
+            ));
+        }
+        let session_id = Uuid::new_v4();
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::seconds(
+                self.cfg.ingestion.chunked_ingestion_session_ttl_seconds as i64,
+            );
+        let row = sqlx::query(
+            "INSERT INTO astravector.ingestion_sessions_v004 (ingestion_session_id, access_zone_id, access_zone_code, document_id, document_version, source_uri, file_name, content_hash, idempotency_key, request_fingerprint, status, total_bytes_estimate, total_blocks_estimate, ttl_days, expires_at, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'ACTIVE',$11,$12,$13,$14,now(),now()) RETURNING ingestion_session_id, status, expires_at"
+        )
+        .bind(session_id)
+        .bind(access_zone_id)
+        .bind(&access_zone_code)
+        .bind(document_id)
+        .bind(r.document_version as i64)
+        .bind(&r.source_uri)
+        .bind(&r.file_name)
+        .bind(&r.content_hash)
+        .bind(&idempotency_key)
+        .bind(&request_fingerprint)
+        .bind(r.total_bytes_estimate as i64)
+        .bind(r.total_blocks_estimate as i64)
+        .bind(normalized_ttl_days as i32)
+        .bind(expires_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres ingestion start: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion start commit: {e}")))?;
+        counter!("ingestion_chunked_sessions_started_total").increment(1);
+        Ok(Response::new(pb::StartLogicalDocumentIngestionResponse {
+            ingestion_session_id: row.get::<Uuid, _>("ingestion_session_id").to_string(),
+            status: row.get::<String, _>("status"),
+            expires_at: row
+                .get::<chrono::DateTime<chrono::Utc>, _>("expires_at")
+                .to_rfc3339(),
+            warnings: Vec::new(),
+        }))
+    }
+
+    async fn append_logical_document_blocks(
+        &self,
+        request: Request<pb::AppendLogicalDocumentBlocksRequest>,
+    ) -> Result<Response<pb::AppendLogicalDocumentBlocksResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let session_id = Uuid::parse_str(r.ingestion_session_id.trim())
+            .map_err(|_| Status::invalid_argument("ingestion_session_id must be UUID"))?;
+        if r.blocks.is_empty() {
+            return Err(Status::invalid_argument("blocks are required"));
+        }
+        if r.batch_content_hash.trim().is_empty() {
+            return Err(Status::invalid_argument("batch_content_hash is required"));
+        }
+        let client_batch_hash = normalize_sha256_hex(&r.batch_content_hash)
+            .map_err(|_| Status::invalid_argument("batch_content_hash must be sha256 hex"))?;
+        let server_batch_hash = compute_batch_content_hash(&r.blocks)
+            .map_err(|e| Status::internal(format!("batch hash serialization: {e}")))?;
+        if client_batch_hash != server_batch_hash {
+            counter!("ingestion_append_batch_hash_mismatch_total").increment(1);
+            return Err(Status::failed_precondition("BATCH_HASH_MISMATCH"));
+        }
+        if r.blocks.len() > self.cfg.ingestion.chunked_ingestion_max_blocks_per_batch {
+            counter!("ingestion_limit_rejected_total", "limit" => "chunked_ingestion_max_blocks_per_batch").increment(1);
+            return Err(Status::resource_exhausted(
+                "batch exceeds chunked_ingestion_max_blocks_per_batch",
+            ));
+        }
+        let batch_bytes: usize = r.blocks.iter().map(logical_block_size_bytes).sum();
+        if batch_bytes > self.cfg.ingestion.chunked_ingestion_max_batch_bytes {
+            counter!("ingestion_append_batch_size_rejected_total").increment(1);
+            counter!("ingestion_limit_rejected_total", "limit" => "chunked_ingestion_max_batch_bytes").increment(1);
+            return Err(Status::resource_exhausted(
+                "batch exceeds chunked_ingestion_max_batch_bytes",
+            ));
+        }
+        let repo = self.repo()?;
+        let mut tx = repo
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion append tx: {e}")))?;
+        let session = sqlx::query("SELECT status, expires_at, received_blocks FROM astravector.ingestion_sessions_v004 WHERE ingestion_session_id=$1 FOR UPDATE")
+            .bind(session_id).fetch_optional(&mut *tx).await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion append lookup: {e}")))?
+            .ok_or_else(|| Status::not_found("INGESTION_SESSION_NOT_FOUND"))?;
+        let status: String = session.get("status");
+        if status != "ACTIVE" {
+            return Err(Status::failed_precondition(format!(
+                "INGESTION_SESSION_{status}"
+            )));
+        }
+        let expires_at: chrono::DateTime<chrono::Utc> = session.get("expires_at");
+        if expires_at < chrono::Utc::now() {
+            return Err(Status::failed_precondition("INGESTION_SESSION_EXPIRED"));
+        }
+        if let Some(batch) = sqlx::query("SELECT batch_content_hash, block_count, batch_size_bytes FROM astravector.ingestion_session_batches_v004 WHERE ingestion_session_id=$1 AND batch_index=$2")
+            .bind(session_id).bind(r.batch_index as i32).fetch_optional(&mut *tx).await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion append batch lookup: {e}")))? {
+            let stored_hash: String = batch.get("batch_content_hash");
+            if stored_hash != server_batch_hash {
+                counter!("ingestion_append_batch_hash_mismatch_total").increment(1);
+                return Err(Status::failed_precondition("BATCH_HASH_MISMATCH"));
+            }
+            tx.commit().await.map_err(|e| Status::unavailable(format!("postgres ingestion append replay commit: {e}")))?;
+            counter!("ingestion_append_batches_replayed_total").increment(1);
+            return Ok(Response::new(pb::AppendLogicalDocumentBlocksResponse { ingestion_session_id: session_id.to_string(), status: "ACTIVE".into(), accepted_blocks: batch.get::<i32,_>("block_count") as u32, accepted_batch_index: r.batch_index, warnings: Vec::new() }));
+        }
+        let received_blocks: i64 = session.get("received_blocks");
+        if received_blocks.saturating_add(r.blocks.len() as i64) as usize
+            > self.cfg.ingestion.max_blocks_per_document
+        {
+            counter!("ingestion_limit_rejected_total", "limit" => "max_blocks_per_document")
+                .increment(1);
+            return Err(Status::resource_exhausted(
+                "max_blocks_per_document exceeded",
+            ));
+        }
+        sqlx::query("INSERT INTO astravector.ingestion_session_batches_v004 (ingestion_session_id, batch_index, batch_content_hash, block_count, batch_size_bytes, created_at) VALUES ($1,$2,$3,$4,$5,now())")
+            .bind(session_id).bind(r.batch_index as i32).bind(&server_batch_hash).bind(r.blocks.len() as i32).bind(batch_bytes as i64)
+            .execute(&mut *tx).await.map_err(|e| Status::unavailable(format!("postgres ingestion append batch insert: {e}")))?;
+        for (idx, block) in r.blocks.iter().enumerate() {
+            let block_json = logical_block_to_json(block);
+            sqlx::query("INSERT INTO astravector.ingestion_session_blocks_v004 (ingestion_session_id, batch_index, block_index, block_json, batch_content_hash, block_size_bytes, created_at) VALUES ($1,$2,$3,$4,$5,$6,now())")
+                .bind(session_id).bind(r.batch_index as i32).bind(idx as i32).bind(block_json).bind(&server_batch_hash).bind(logical_block_size_bytes(block) as i32)
+                .execute(&mut *tx).await.map_err(|e| Status::unavailable(format!("postgres ingestion append block: {e}")))?;
+        }
+        sqlx::query("UPDATE astravector.ingestion_sessions_v004 SET received_batches = received_batches + 1, received_blocks = received_blocks + $2, received_bytes = received_bytes + $3, updated_at=now() WHERE ingestion_session_id=$1")
+            .bind(session_id).bind(r.blocks.len() as i64).bind(batch_bytes as i64).execute(&mut *tx).await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion append update: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion append commit: {e}")))?;
+        counter!("ingestion_append_batches_inserted_total").increment(1);
+        Ok(Response::new(pb::AppendLogicalDocumentBlocksResponse {
+            ingestion_session_id: session_id.to_string(),
+            status: "ACTIVE".into(),
+            accepted_blocks: r.blocks.len() as u32,
+            accepted_batch_index: r.batch_index,
+            warnings: Vec::new(),
+        }))
+    }
+
+    async fn finalize_logical_document_ingestion(
+        &self,
+        request: Request<pb::FinalizeLogicalDocumentIngestionRequest>,
+    ) -> Result<Response<pb::IndexLogicalDocumentResponse>, Status> {
+        let metadata = request.metadata().clone();
+        self.require_internal_or_admin(&metadata)?;
+        let r = request.into_inner();
+        let session_id = Uuid::parse_str(r.ingestion_session_id.trim())
+            .map_err(|_| Status::invalid_argument("ingestion_session_id must be UUID"))?;
+        if r.final_content_hash.trim().is_empty() {
+            return Err(Status::invalid_argument("final_content_hash is required"));
+        }
+        let repo = self.repo()?;
+        let started = Instant::now();
+
+        // fix4.5.1: acquire finalize ownership atomically. Only ACTIVE -> FINALIZING is allowed.
+        // No indexing call is allowed unless this UPDATE returns the session row.
+        let owned = sqlx::query(
+            "UPDATE astravector.ingestion_sessions_v004
+             SET status='FINALIZING',
+                 finalizing_started_at=COALESCE(finalizing_started_at, now()),
+                 finalizing_heartbeat_at=now(),
+                 updated_at=now()
+             WHERE ingestion_session_id=$1
+               AND status='ACTIVE'
+               AND expires_at >= now()
+             RETURNING access_zone_id, document_id, document_version, status, expires_at, source_uri, file_name, content_hash, ttl_days"
+        )
+        .bind(session_id)
+        .fetch_optional(&repo.pool)
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres ingestion finalize ownership: {e}")))?;
+
+        let Some(session) = owned else {
+            let existing = sqlx::query(
+                "SELECT status, expires_at, result_response_json, error_code, error_message
+                 FROM astravector.ingestion_sessions_v004
+                 WHERE ingestion_session_id=$1",
+            )
+            .bind(session_id)
+            .fetch_optional(&repo.pool)
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!("postgres ingestion finalize state lookup: {e}"))
+            })?
+            .ok_or_else(|| Status::not_found("INGESTION_SESSION_NOT_FOUND"))?;
+
+            let status: String = existing.get("status");
+            if status == "COMPLETED" {
+                if let Some(value) = existing
+                    .try_get::<Option<serde_json::Value>, _>("result_response_json")
+                    .ok()
+                    .flatten()
+                {
+                    let response = index_logical_document_response_from_json(value)?;
+                    counter!("ingestion_finalize_replayed_completed_total").increment(1);
+                    counter!("ingestion_finalize_completed_replay_total").increment(1);
+                    return Ok(Response::new(response));
+                }
+                return Err(Status::data_loss("INGESTION_COMPLETED_RESULT_MISSING"));
+            }
+            if status == "FINALIZING" {
+                counter!("ingestion_finalize_already_finalizing_total").increment(1);
+                counter!("ingestion_finalize_concurrent_rejected_total").increment(1);
+                return Err(Status::aborted("INGESTION_SESSION_FINALIZING"));
+            }
+            if status == "FAILED" {
+                let code: Option<String> = existing.try_get("error_code").ok();
+                let msg: Option<String> = existing.try_get("error_message").ok();
+                return Err(Status::failed_precondition(format!(
+                    "INGESTION_SESSION_FAILED:{}:{}",
+                    code.unwrap_or_default(),
+                    msg.unwrap_or_default()
+                )));
+            }
+            if status == "ABORTED" || status == "EXPIRED" {
+                return Err(Status::failed_precondition(format!(
+                    "INGESTION_SESSION_{status}"
+                )));
+            }
+            let expires_at: chrono::DateTime<chrono::Utc> = existing.get("expires_at");
+            if expires_at < chrono::Utc::now() {
+                return Err(Status::failed_precondition("INGESTION_SESSION_EXPIRED"));
+            }
+            return Err(Status::failed_precondition(format!(
+                "INGESTION_SESSION_{status}"
+            )));
+        };
+        counter!("ingestion_finalize_ownership_acquired_total").increment(1);
+
+        let block_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM astravector.ingestion_session_blocks_v004 WHERE ingestion_session_id=$1"
+        )
+        .bind(session_id)
+        .fetch_one(&repo.pool)
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres ingestion finalize block count: {e}")))?;
+        if block_count == 0 {
+            mark_ingestion_session_failed(
+                &repo.pool,
+                session_id,
+                "INGESTION_STAGING_EMPTY",
+                "no staged blocks",
+            )
+            .await
+            .ok();
+            return Err(Status::failed_precondition("INGESTION_STAGING_EMPTY"));
+        }
+        if block_count as usize > self.cfg.ingestion.max_blocks_per_document {
+            mark_ingestion_session_failed(
+                &repo.pool,
+                session_id,
+                "MAX_BLOCKS_PER_DOCUMENT_EXCEEDED",
+                "staged blocks exceed max_blocks_per_document",
+            )
+            .await
+            .ok();
+            counter!("ingestion_limit_rejected_total", "limit" => "max_blocks_per_document")
+                .increment(1);
+            return Err(Status::resource_exhausted(
+                "max_blocks_per_document exceeded",
+            ));
+        }
+        if self.cfg.ingestion.finalize_mode == "BOUNDED_IN_MEMORY"
+            && block_count as usize > self.cfg.ingestion.finalize_streaming_required_above_blocks
+            && block_count as usize > self.cfg.ingestion.finalize_max_in_memory_blocks
+        {
+            record_nonterminal_ingestion_error(
+                &repo.pool,
+                session_id,
+                "FINALIZE_MEMORY_GUARD_EXCEEDED",
+                "staged document exceeds bounded in-memory finalize guard",
+                self.cfg
+                    .ingestion
+                    .finalize_memory_guard_exceeded_status
+                    .as_str(),
+            )
+            .await
+            .ok();
+            counter!("ingestion_finalize_max_in_memory_guard_rejected_total").increment(1);
+            counter!("ingestion_finalize_memory_guard_exceeded_total").increment(1);
+            return Err(Status::resource_exhausted("FINALIZE_MEMORY_GUARD_EXCEEDED: staged document exceeds bounded in-memory finalize guard"));
+        }
+
+        let mut blocks = Vec::with_capacity(
+            (block_count as usize).min(self.cfg.ingestion.finalize_max_in_memory_blocks),
+        );
+        let mut cursor: Option<(i32, i32)> = None;
+        let page_size = self.cfg.ingestion.finalize_read_batch_size.max(1) as i64;
+        let mut read_pages = 0u64;
+        loop {
+            let rows = if let Some((batch_idx, block_idx)) = cursor {
+                sqlx::query(
+                    "SELECT batch_index, block_index, block_json
+                     FROM astravector.ingestion_session_blocks_v004
+                     WHERE ingestion_session_id=$1
+                       AND (batch_index, block_index) > ($2, $3)
+                     ORDER BY batch_index, block_index
+                     LIMIT $4",
+                )
+                .bind(session_id)
+                .bind(batch_idx)
+                .bind(block_idx)
+                .bind(page_size)
+                .fetch_all(&repo.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "SELECT batch_index, block_index, block_json
+                     FROM astravector.ingestion_session_blocks_v004
+                     WHERE ingestion_session_id=$1
+                     ORDER BY batch_index, block_index
+                     LIMIT $2",
+                )
+                .bind(session_id)
+                .bind(page_size)
+                .fetch_all(&repo.pool)
+                .await
+            }
+            .map_err(|e| {
+                Status::unavailable(format!("postgres ingestion finalize blocks page: {e}"))
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            read_pages += 1;
+            if self.cfg.ingestion.finalizing_heartbeat_enabled {
+                let _ = sqlx::query("UPDATE astravector.ingestion_sessions_v004 SET finalizing_heartbeat_at=now(), updated_at=now() WHERE ingestion_session_id=$1 AND status='FINALIZING'")
+                    .bind(session_id)
+                    .execute(&repo.pool)
+                    .await;
+                counter!("ingestion_finalizing_heartbeat_total").increment(1);
+            }
+            for row in rows {
+                let batch_idx: i32 = row.get("batch_index");
+                let block_idx: i32 = row.get("block_index");
+                cursor = Some((batch_idx, block_idx));
+                let value: serde_json::Value = row.get("block_json");
+                blocks.push(logical_block_from_json(&value)?);
+                if blocks.len() > self.cfg.ingestion.finalize_max_in_memory_blocks {
+                    record_nonterminal_ingestion_error(
+                        &repo.pool,
+                        session_id,
+                        "FINALIZE_MEMORY_GUARD_EXCEEDED",
+                        "staged blocks exceed finalize_max_in_memory_blocks",
+                        self.cfg
+                            .ingestion
+                            .finalize_memory_guard_exceeded_status
+                            .as_str(),
+                    )
+                    .await
+                    .ok();
+                    counter!("ingestion_finalize_max_in_memory_guard_rejected_total").increment(1);
+                    counter!("ingestion_finalize_memory_guard_exceeded_total").increment(1);
+                    return Err(Status::resource_exhausted(
+                        "finalize_max_in_memory_blocks exceeded",
+                    ));
+                }
+            }
+        }
+        counter!("ingestion_finalize_blocks_streamed_total").increment(blocks.len() as u64);
+        counter!("ingestion_finalize_read_pages_total").increment(read_pages);
+
+        validate_staged_batch_consistency(&repo.pool, session_id).await?;
+
+        let staged_text = render_logical_blocks_for_chunking(&blocks);
+        let computed_hash = normalized_content_hash("", &staged_text)?;
+        if computed_hash
+            != r.final_content_hash
+                .trim()
+                .trim_start_matches("sha256:")
+                .to_ascii_lowercase()
+        {
+            // Hash mismatch is a client-correctable precondition error; keep session FINALIZING unsafe would block retry,
+            // so return it to ACTIVE and record the last error fields.
+            record_nonterminal_ingestion_error(
+                &repo.pool,
+                session_id,
+                "FINAL_CONTENT_HASH_MISMATCH",
+                &format!(
+                    "expected {}, computed {}",
+                    r.final_content_hash, computed_hash
+                ),
+                "RETURN_TO_ACTIVE",
+            )
+            .await
+            .ok();
+            counter!("ingestion_finalize_hash_mismatch_total").increment(1);
+            return Err(Status::failed_precondition("FINAL_CONTENT_HASH_MISMATCH"));
+        }
+        let access_zone_id: Uuid = session.get("access_zone_id");
+        let document_id: Uuid = session.get("document_id");
+        let document_version: i64 = session.get("document_version");
+        let source_uri: Option<String> = session
+            .try_get::<Option<String>, _>("source_uri")
+            .ok()
+            .flatten();
+        let file_name: Option<String> = session
+            .try_get::<Option<String>, _>("file_name")
+            .ok()
+            .flatten();
+        let content_hash: Option<String> = session
+            .try_get::<Option<String>, _>("content_hash")
+            .ok()
+            .flatten();
+        let ttl_days: Option<i32> = session.try_get::<Option<i32>, _>("ttl_days").ok().flatten();
+        let access_zone_code: Option<String> = session
+            .try_get::<Option<String>, _>("access_zone_code")
+            .ok()
+            .flatten();
+        let ttl_policy = ttl_days.and_then(|d| {
+            if d <= 0 {
+                None
+            } else {
+                Some(pb::TtlPolicy {
+                    mode: pb::TtlMode::Relative as i32,
+                    ttl_seconds: (d as u64).saturating_mul(86_400),
+                    expires_at: String::new(),
+                    delete_from_qdrant_on_expire: true,
+                    keep_metadata_after_expire: true,
+                })
+            }
+        });
+        let mut inner = Request::new(pb::IndexLogicalDocumentRequest {
+            context: Some(pb::RequestContext {
+                correlation_id: format!("chunked-finalize-{session_id}"),
+                idempotency_key: format!("v007-chunked-finalize:{session_id}"),
+                caller_service: "chunked-ingestion".into(),
+                caller_user_id: String::new(),
+                caller_access_level: pb::AccessLevel::Internal as i32,
+            }),
+            access_zone_id: access_zone_id.to_string(),
+            access_zone_code: access_zone_code.unwrap_or_default(),
+            document: Some(pb::DocumentIdentity {
+                external_document_id: String::new(),
+                document_id: document_id.to_string(),
+                document_version: document_version as u64,
+                title: file_name.clone().unwrap_or_default(),
+                source_uri: source_uri.unwrap_or_default(),
+                source_type: "CHUNKED_LOGICAL_DOCUMENT".into(),
+                mime_type: String::new(),
+                content_hash: content_hash.unwrap_or_default(),
+                source_links: Vec::new(),
+            }),
+            blocks,
+            chunking_options: None,
+            indexing_options: Some(pb::VectorIndexingOptions {
+                activation_policy: pb::ActivationPolicy::AutoWhenReady as i32,
+                embedding_mode: pb::EmbeddingModeV005::DenseSparseIfAvailable as i32,
+                publish_mode: pb::PublishModeV005::Outbox as i32,
+                ttl_policy,
+                replace_existing_version: true,
+            }),
+            metadata: std::collections::HashMap::new(),
+        });
+        *inner.metadata_mut() = metadata;
+        if self.cfg.ingestion.finalizing_heartbeat_enabled {
+            let _ = sqlx::query("UPDATE astravector.ingestion_sessions_v004 SET finalizing_heartbeat_at=now(), updated_at=now() WHERE ingestion_session_id=$1 AND status='FINALIZING'")
+                .bind(session_id)
+                .execute(&repo.pool)
+                .await;
+            counter!("ingestion_finalizing_heartbeat_total").increment(1);
+        }
+        // fix463: keep FINALIZING session heartbeat fresh while the potentially
+        // long index_logical_document call is running, otherwise ingestion_cleanup
+        // can mark the session FAILED while indexing commits document/chunks/outbox.
+        let finalize_hb_stop = CancellationToken::new();
+        let finalize_hb_task = if self.cfg.ingestion.finalizing_heartbeat_enabled {
+            let pool = repo.pool.clone();
+            let stop = finalize_hb_stop.clone();
+            let interval_seconds = self
+                .cfg
+                .ingestion
+                .finalizing_heartbeat_interval_seconds
+                .max(1);
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = interval.tick() => {
+                            let _ = sqlx::query("UPDATE astravector.ingestion_sessions_v004 SET finalizing_heartbeat_at=now(), updated_at=now() WHERE ingestion_session_id=$1 AND status='FINALIZING'")
+                                .bind(session_id)
+                                .execute(&pool)
+                                .await;
+                            counter!("ingestion_finalizing_heartbeat_total").increment(1);
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        let indexing_result = self.index_logical_document(inner).await;
+        finalize_hb_stop.cancel();
+        if let Some(task) = finalize_hb_task {
+            let _ = task.await;
+        }
+        let response = match indexing_result {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                mark_ingestion_session_failed(
+                    &repo.pool,
+                    session_id,
+                    "INDEXING_FAILED",
+                    status.message(),
+                )
+                .await
+                .ok();
+                counter!("ingestion_finalize_failed_total", "error_code" => "INDEXING_FAILED")
+                    .increment(1);
+                counter!("ingestion_finalize_indexing_failed_total").increment(1);
+                return Err(status);
+            }
+        };
+        let response_json = index_logical_document_response_to_json(&response);
+        let complete_result = sqlx::query("UPDATE astravector.ingestion_sessions_v004 SET status='COMPLETED', final_content_hash=$2, result_response_json=$3, finalized_at=now(), result_expires_at=now() + ($4 * interval '1 second'), finalizing_heartbeat_at=now(), updated_at=now() WHERE ingestion_session_id=$1 AND status='FINALIZING'")
+            .bind(session_id)
+            .bind(&r.final_content_hash)
+            .bind(response_json)
+            .bind(self.cfg.ingestion.completed_session_result_retention_seconds as i64)
+            .execute(&repo.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion finalize complete: {e}")))?;
+        if complete_result.rows_affected() != 1 {
+            counter!("ingestion_finalize_lost_ownership_total").increment(1);
+            counter!("ingestion_finalize_complete_update_zero_rows_total").increment(1);
+            return Err(Status::aborted("INGESTION_FINALIZE_LOST_OWNERSHIP"));
+        }
+        counter!("ingestion_chunked_sessions_finalized_total").increment(1);
+        histogram!("ingestion_finalize_duration_ms").record(started.elapsed().as_millis() as f64);
+        Ok(Response::new(response))
+    }
+
+    async fn abort_logical_document_ingestion(
+        &self,
+        request: Request<pb::AbortLogicalDocumentIngestionRequest>,
+    ) -> Result<Response<pb::AbortLogicalDocumentIngestionResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let session_id = Uuid::parse_str(r.ingestion_session_id.trim())
+            .map_err(|_| Status::invalid_argument("ingestion_session_id must be UUID"))?;
+        let repo = self.repo()?;
+        let row = sqlx::query(
+            "SELECT status FROM astravector.ingestion_sessions_v004 WHERE ingestion_session_id=$1",
+        )
+        .bind(session_id)
+        .fetch_optional(&repo.pool)
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres ingestion abort lookup: {e}")))?
+        .ok_or_else(|| Status::not_found("INGESTION_SESSION_NOT_FOUND"))?;
+        let status: String = row.get("status");
+        match status.as_str() {
+            "ACTIVE" => {
+                let result = sqlx::query("UPDATE astravector.ingestion_sessions_v004 SET status='ABORTED', error_message=$2, updated_at=now() WHERE ingestion_session_id=$1 AND status='ACTIVE'")
+                    .bind(session_id)
+                    .bind(r.reason)
+                    .execute(&repo.pool)
+                    .await
+                    .map_err(|e| Status::unavailable(format!("postgres ingestion abort: {e}")))?;
+                if result.rows_affected() == 0 {
+                    return Err(Status::aborted("INGESTION_SESSION_STATE_CHANGED"));
+                }
+                counter!("ingestion_chunked_sessions_aborted_total").increment(1);
+                Ok(Response::new(pb::AbortLogicalDocumentIngestionResponse {
+                    ingestion_session_id: session_id.to_string(),
+                    status: "ABORTED".into(),
+                }))
+            }
+            "ABORTED" => Ok(Response::new(pb::AbortLogicalDocumentIngestionResponse {
+                ingestion_session_id: session_id.to_string(),
+                status: "ABORTED".into(),
+            })),
+            "FINALIZING" => Err(Status::failed_precondition("INGESTION_SESSION_FINALIZING")),
+            "COMPLETED" => Err(Status::failed_precondition("INGESTION_SESSION_COMPLETED")),
+            "FAILED" => Err(Status::failed_precondition("INGESTION_SESSION_FAILED")),
+            "EXPIRED" => Err(Status::failed_precondition("INGESTION_SESSION_EXPIRED")),
+            other => Err(Status::failed_precondition(format!(
+                "INGESTION_SESSION_{other}"
+            ))),
+        }
+    }
+
+    async fn get_logical_document_ingestion_status(
+        &self,
+        request: Request<pb::GetLogicalDocumentIngestionStatusRequest>,
+    ) -> Result<Response<pb::GetLogicalDocumentIngestionStatusResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let session_id = Uuid::parse_str(r.ingestion_session_id.trim())
+            .map_err(|_| Status::invalid_argument("ingestion_session_id must be UUID"))?;
+        let row = sqlx::query("SELECT status, received_batches, received_blocks, received_bytes, expires_at, error_code, error_message FROM astravector.ingestion_sessions_v004 WHERE ingestion_session_id=$1")
+            .bind(session_id)
+            .fetch_optional(&self.repo()?.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres ingestion status: {e}")))?
+            .ok_or_else(|| Status::not_found("INGESTION_SESSION_NOT_FOUND"))?;
+        Ok(Response::new(
+            pb::GetLogicalDocumentIngestionStatusResponse {
+                ingestion_session_id: session_id.to_string(),
+                status: row.get::<String, _>("status"),
+                received_batches: row.get::<i32, _>("received_batches") as u32,
+                received_blocks: row.get::<i64, _>("received_blocks") as u64,
+                received_bytes: row.get::<i64, _>("received_bytes") as u64,
+                expires_at: row
+                    .get::<chrono::DateTime<chrono::Utc>, _>("expires_at")
+                    .to_rfc3339(),
+                error_code: row.try_get::<String, _>("error_code").unwrap_or_default(),
+                error_message: row
+                    .try_get::<String, _>("error_message")
+                    .unwrap_or_default(),
+            },
+        ))
+    }
+
+    async fn get_document_vector_status(
+        &self,
+        request: Request<pb::GetDocumentVectorStatusRequest>,
+    ) -> Result<Response<pb::GetDocumentVectorStatusResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let doc = r
+            .document
+            .ok_or_else(|| Status::invalid_argument("document is required"))?;
+        let access_zone_id = Uuid::parse_str(doc.access_zone_id.trim())
+            .map_err(|_| Status::invalid_argument("document.access_zone_id must be UUID"))?;
+        let document_id = Uuid::parse_str(doc.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document.document_id must be UUID"))?;
+        if doc.document_version == 0 {
+            return Err(Status::invalid_argument(
+                "document.document_version must be > 0",
+            ));
+        }
+        let sync = self
+            .compute_document_sync_status(
+                access_zone_id,
+                document_id,
+                doc.document_version as i64,
+                r.include_qdrant,
+            )
+            .await?;
+        let state = if sync.ready_to_activate {
+            pb::OperationState::ReadyToActivate
+        } else if sync.failed_bindings > 0 || sync.outbox_failed > 0 {
+            pb::OperationState::Failed
+        } else if sync.outbox_pending > 0 || sync.outbox_retry_pending > 0 {
+            pb::OperationState::Publishing
+        } else {
+            pb::OperationState::Syncing
+        };
+        let progress = if sync.expected_bindings == 0 {
+            0.0
+        } else {
+            ((sync.synced_bindings as f32 / sync.expected_bindings as f32) * 100.0).min(100.0)
+        };
+        Ok(Response::new(pb::GetDocumentVectorStatusResponse {
+            document: Some(doc),
+            status: Some(pb::DocumentVectorStatus {
+                state: state as i32,
+                progress_percent: progress,
+                searchable: sync.ready_to_activate,
+                message: document_status_message(&sync),
+                ready_to_activate: sync.ready_to_activate,
+                sync: Some(sync),
+            }),
+        }))
+    }
+
+    async fn delete_document_vectors_facade(
+        &self,
+        request: Request<pb::DeleteDocumentVectorsFacadeRequest>,
+    ) -> Result<Response<pb::DeleteDocumentVectorsFacadeResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let doc = r
+            .document
+            .ok_or_else(|| Status::invalid_argument("document is required"))?;
+        let access_zone_id = Uuid::parse_str(doc.access_zone_id.trim())
+            .map_err(|_| Status::invalid_argument("document.access_zone_id must be UUID"))?;
+        let document_id = Uuid::parse_str(doc.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document.document_id must be UUID"))?;
+        if doc.document_version == 0 {
+            return Err(Status::invalid_argument(
+                "document.document_version must be > 0",
+            ));
+        }
+        let affected = schedule_v004_delete_document_vectors(
+            self.repo()?,
+            access_zone_id,
+            document_id,
+            doc.document_version as i64,
+        )
+        .await?;
+        Ok(Response::new(pb::DeleteDocumentVectorsFacadeResponse {
+            document: Some(doc),
+            operation: Some(pb::OperationStatus {
+                operation_id: r.context.map(|c| c.correlation_id).unwrap_or_default(),
+                state: pb::OperationState::DeleteScheduled as i32,
+                message: format!("DELETE_POINT events scheduled for {affected} vector bindings; final DELETED state is reported only after publisher/reconciliation confirmation"),
+                warnings: Vec::new(),
+                errors: Vec::new(),
+            }),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
+    async fn retrieve_context(
+        &self,
+        request: Request<pb::RetrieveContextRequest>,
+    ) -> Result<Response<pb::RetrieveContextResponse>, Status> {
+        let metadata = request.metadata().clone();
+        let _retrieve_permit = Self::acquire_backpressure_permit(
+            self.retrieve_context_semaphore.clone(),
+            self.cfg.limits.backpressure_acquire_timeout_ms,
+            "retrieve_context",
+        )
+        .await?;
+        gauge!("retrieval_concurrent_active").set(
+            (self
+                .cfg
+                .limits
+                .max_concurrent_retrieve_context
+                .saturating_sub(self.retrieve_context_semaphore.available_permits()))
+                as f64,
+        );
+        if self.cfg.security.enabled {
+            self.require_trusted_forwarded_identity_headers(&metadata)?;
+        }
+        let r = request.into_inner();
+        let ctx = r.context.unwrap_or_default();
+        let effective_access_level =
+            effective_retrieve_access_level(&metadata, ctx.caller_access_level)?;
+        if r.question.trim().is_empty() {
+            return Err(Status::invalid_argument("question is required"));
+        }
+        let profile =
+            pb::RetrievalProfile::try_from(r.profile).unwrap_or(pb::RetrievalProfile::Balanced);
+        let max_contexts = if r.max_contexts == 0 {
+            5
+        } else {
+            r.max_contexts.min(self.cfg.limits.search_top_k_max)
+        };
+        let correlation_id = ctx.correlation_id.clone();
+        tracing::debug!(
+            correlation_id = %correlation_id,
+            access_zone_id = %r.access_zone_id,
+            access_zone_code = %r.access_zone_code,
+            access_zone_ids_count = r.access_zone_ids.len(),
+            access_zone_codes_count = r.access_zone_codes.len(),
+            caller_access_level = ?effective_access_level,
+            profile = ?profile,
+            search_mode = ?retrieval_search_mode(profile),
+            max_contexts,
+            question_len = r.question.chars().count(),
+            "RETRIEVE_CONTEXT_REQUEST_RECEIVED"
+        );
+        let mut inner = Request::new(pb::SearchRequestV004 {
+            correlation_id,
+            access_zone_id: r.access_zone_id,
+            caller_access_level: effective_access_level as i32,
+            query: r.question,
+            top_k: max_contexts,
+            candidate_limit: retrieval_candidate_limit(profile),
+            parent_limit: max_contexts,
+            filters: r.filters,
+            timeout_ms: self.cfg.grpc.deadlines.query_ms as u32,
+            search_mode: retrieval_search_mode(profile) as i32,
+            include_debug: r.response_detail == pb::ResponseDetail::Debug as i32,
+            include_vectors: false,
+            embedding_mode: retrieval_embedding_mode(profile) as i32,
+            model_version: None,
+            tokenizer_version: None,
+            dense_version: None,
+            sparse_version: None,
+            chunking_version: None,
+            enable_graph_expansion: r.enable_graph_expansion
+                || self.cfg.graph_rag.retrieval.enabled_by_default,
+            graph_max_hops: if r.graph_max_hops == 0 {
+                1
+            } else {
+                r.graph_max_hops.min(1)
+            },
+            graph_max_related_contexts: if r.graph_max_related_contexts == 0 {
+                self.cfg
+                    .graph_rag
+                    .retrieval
+                    .max_related_chunks
+                    .min(self.cfg.limits.graph_related_contexts_max) as u32
+            } else {
+                r.graph_max_related_contexts
+                    .min(self.cfg.limits.graph_related_contexts_max as u32)
+            },
+            access_zone_ids: r.access_zone_ids,
+            access_zone_code: r.access_zone_code,
+            access_zone_codes: r.access_zone_codes,
+        });
+        *inner.metadata_mut() = metadata;
+        let search = <Self as AstraVectorV004Control>::search(self, inner)
+            .await?
+            .into_inner();
+        let total_candidates = search
+            .diagnostics
+            .as_ref()
+            .map(|d| d.candidate_count)
+            .unwrap_or(search.results.len() as u32);
+        let contexts = search
+            .results
+            .into_iter()
+            .map(retrieved_context_from_search_result)
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            total_candidates,
+            returned_contexts = contexts.len(),
+            profile = ?profile,
+            "RETRIEVE_CONTEXT_RESPONSE_ASSEMBLED"
+        );
+        Ok(Response::new(pb::RetrieveContextResponse {
+            summary: Some(pb::RetrievalSummary {
+                total_candidates,
+                returned_contexts: contexts.len() as u32,
+                profile: profile as i32,
+            }),
+            contexts,
+            warnings: search.warnings,
+        }))
+    }
+
+    async fn explain_retrieve(
+        &self,
+        request: Request<pb::ExplainRetrieveRequest>,
+    ) -> Result<Response<pb::ExplainRetrieveResponse>, Status> {
+        let metadata = request.metadata().clone();
+        if self.cfg.security.enabled {
+            self.require_trusted_forwarded_identity_headers(&metadata)?;
+        }
+        let r = request.into_inner();
+        let ctx = r.context.unwrap_or_default();
+        let effective_access_level =
+            effective_retrieve_access_level(&metadata, ctx.caller_access_level)?;
+        let profile =
+            pb::RetrievalProfile::try_from(r.profile).unwrap_or(pb::RetrievalProfile::Balanced);
+        let mut inner = Request::new(pb::ExplainSearchRequest {
+            correlation_id: ctx.correlation_id,
+            access_zone_id: r.access_zone_id,
+            caller_access_level: effective_access_level as i32,
+            query: r.question,
+            search_mode: retrieval_search_mode(profile) as i32,
+            embedding_mode: retrieval_embedding_mode(profile) as i32,
+            top_k: if r.max_contexts == 0 {
+                5
+            } else {
+                r.max_contexts.min(self.cfg.limits.search_top_k_max)
+            },
+            candidate_limit: retrieval_candidate_limit(profile),
+            timeout_ms: self.cfg.grpc.deadlines.query_ms,
+            model_version: None,
+            tokenizer_version: None,
+            dense_version: None,
+            sparse_version: None,
+            chunking_version: None,
+        });
+        *inner.metadata_mut() = metadata;
+        let explain = <Self as AstraVectorV004Control>::explain_search(self, inner)
+            .await?
+            .into_inner();
+        Ok(Response::new(pb::ExplainRetrieveResponse {
+            explain: Some(explain),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl AstraVectorAdminFacade for AstraVectorV004ControlService {
+    async fn debug_document(
+        &self,
+        request: Request<pb::DebugDocumentRequest>,
+    ) -> Result<Response<pb::DebugDocumentResponse>, Status> {
+        let metadata = request.metadata().clone();
+        let r = request.into_inner();
+        let doc = r
+            .document
+            .ok_or_else(|| Status::invalid_argument("document is required"))?;
+        let mut inner = Request::new(pb::DebugDocumentStateRequest {
+            access_zone_id: doc.access_zone_id,
+            document_id: doc.document_id,
+            document_version: doc.document_version,
+            include_chunks: r.include_chunks,
+            include_vectors: r.include_vectors,
+            include_outbox: r.include_outbox,
+            include_qdrant: r.include_qdrant,
+        });
+        *inner.metadata_mut() = metadata;
+        let debug = <Self as AstraVectorV004Control>::debug_document_state(self, inner)
+            .await?
+            .into_inner();
+        Ok(Response::new(pb::DebugDocumentResponse {
+            debug: Some(debug),
+        }))
+    }
+
+    async fn retry_outbox(
+        &self,
+        request: Request<pb::RetryOutboxFacadeRequest>,
+    ) -> Result<Response<pb::RetryOutboxFacadeResponse>, Status> {
+        let metadata = request.metadata().clone();
+        let r = request.into_inner();
+        let doc = r
+            .document
+            .ok_or_else(|| Status::invalid_argument("document is required"))?;
+        let mut inner = Request::new(pb::RetryVectorOutboxRequest {
+            access_zone_id: doc.access_zone_id,
+            document_id: doc.document_id,
+            document_version: doc.document_version,
+            operation: if r.operation.trim().is_empty() {
+                None
+            } else {
+                Some(r.operation)
+            },
+            status: if r.status.trim().is_empty() {
+                None
+            } else {
+                Some(r.status)
+            },
+        });
+        *inner.metadata_mut() = metadata;
+        let result = <Self as AstraVectorV004Control>::retry_vector_outbox(self, inner)
+            .await?
+            .into_inner();
+        Ok(Response::new(pb::RetryOutboxFacadeResponse {
+            result: Some(result),
+        }))
+    }
+
+    async fn retry_document_deletion(
+        &self,
+        request: Request<pb::RetryDocumentDeletionRequest>,
+    ) -> Result<Response<pb::RetryDocumentDeletionResponse>, Status> {
+        self.require_admin(request.metadata())?;
+        let r = request.into_inner();
+        if r.document_version == 0 {
+            return Err(Status::invalid_argument("document_version must be > 0"));
+        }
+        let document_id = Uuid::parse_str(r.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document_id must be a UUID"))?;
+
+        let access_zone_id = if !r.access_zone_id.trim().is_empty() {
+            let zone_id = Uuid::parse_str(r.access_zone_id.trim())
+                .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
+            if !r.access_zone_code.trim().is_empty() {
+                let zone = access_zone_registry::resolve_single_code(
+                    &self.repo()?.pool,
+                    &self.cfg,
+                    r.access_zone_code.trim(),
+                )
+                .await?;
+                if zone.access_zone_id != zone_id {
+                    counter!("access_zone_code_uuid_mismatch_total").increment(1);
+                    return Err(Status::invalid_argument(
+                        "access_zone_code/access_zone_id mismatch",
+                    ));
+                }
+            }
+            zone_id
+        } else if !r.access_zone_code.trim().is_empty() {
+            access_zone_registry::resolve_single_code(
+                &self.repo()?.pool,
+                &self.cfg,
+                r.access_zone_code.trim(),
+            )
+            .await?
+            .access_zone_id
+        } else {
+            return Err(Status::invalid_argument(
+                "access_zone_id or access_zone_code is required",
+            ));
+        };
+
+        let row = sqlx::query(
+            "WITH target AS (
+                 SELECT access_zone_id, document_id, document_version, lifecycle_status AS previous_lifecycle_status
+                 FROM astravector.document_versions
+                 WHERE access_zone_id=$1
+                   AND document_id=$2
+                   AND document_version=$3
+                   AND lifecycle_status IN ('DELETE_PERMANENTLY_FAILED','DELETE_FAILED')
+                   AND delete_operation_id IS NULL
+                 FOR UPDATE
+             )
+             UPDATE astravector.document_versions dv
+             SET lifecycle_status='DELETE_FAILED',
+                 next_delete_attempt_at=now(),
+                 last_delete_error_code=NULL,
+                 last_delete_error_message=NULL,
+                 last_delete_error_stage=NULL,
+                 delete_operation_id=NULL,
+                 delete_fencing_started_at=NULL,
+                 delete_attempts=CASE WHEN $4 THEN 0 ELSE dv.delete_attempts END,
+                 updated_at=now()
+             FROM target
+             WHERE dv.access_zone_id=target.access_zone_id
+               AND dv.document_id=target.document_id
+               AND dv.document_version=target.document_version
+             RETURNING target.previous_lifecycle_status,
+                       dv.lifecycle_status AS new_lifecycle_status,
+                       dv.delete_attempts,
+                       dv.next_delete_attempt_at"
+        )
+        .bind(access_zone_id)
+        .bind(document_id)
+        .bind(r.document_version as i64)
+        .bind(r.reset_attempts)
+        .fetch_optional(&self.repo()?.pool)
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres retry document deletion: {e}")))?;
+
+        let Some(row) = row else {
+            counter!("document_lifecycle_update_blocked_by_delete_operation_total", "operation" => "retry_document_deletion").increment(1);
+            return Err(Status::failed_precondition("document is not in DELETE_FAILED or DELETE_PERMANENTLY_FAILED, or an active delete_operation_id is present"));
+        };
+        counter!("index_ttl_retry_document_deletion_manual_total").increment(1);
+        let next_attempt: chrono::DateTime<chrono::Utc> = row.get("next_delete_attempt_at");
+        Ok(Response::new(pb::RetryDocumentDeletionResponse {
+            accepted: true,
+            previous_lifecycle_status: row.get::<String, _>("previous_lifecycle_status"),
+            new_lifecycle_status: row.get::<String, _>("new_lifecycle_status"),
+            delete_attempts: row.get::<i32, _>("delete_attempts").max(0) as u32,
+            next_delete_attempt_at: next_attempt.to_rfc3339(),
+        }))
+    }
+
+    async fn get_runtime_health(
+        &self,
+        request: Request<pb::GetRuntimeHealthRequest>,
+    ) -> Result<Response<pb::GetRuntimeHealthResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let mut status = "SERVING";
+        let mut details = Vec::new();
+
+        match &self.repo {
+            Some(repo) => match repo.ping().await {
+                Ok(()) => details.push("postgres=SERVING".to_string()),
+                Err(e) => {
+                    status = "NOT_SERVING";
+                    details.push(format!("postgres=NOT_SERVING:{e}"));
+                }
+            },
+            None => {
+                status = "NOT_SERVING";
+                details.push("postgres=NOT_CONFIGURED".to_string());
+            }
+        }
+
+        if self.cfg.qdrant.enabled {
+            match &self.qdrant {
+                Some(qdrant) => match qdrant.collection_exists().await {
+                    Ok(true) => details.push("qdrant=SERVING".to_string()),
+                    Ok(false) => {
+                        status = "NOT_SERVING";
+                        details.push("qdrant=NOT_SERVING:collection_missing".to_string());
+                    }
+                    Err(e) => {
+                        status = "NOT_SERVING";
+                        details.push(format!("qdrant=NOT_SERVING:{e}"));
+                    }
+                },
+                None => {
+                    status = "NOT_SERVING";
+                    details.push("qdrant=NOT_CONFIGURED".to_string());
+                }
+            }
+        } else {
+            details.push("qdrant=DISABLED".to_string());
+        }
+
+        details.push(format!("adaptive_mode={:?}", self.cfg.adaptive.mode));
+
+        Ok(Response::new(pb::GetRuntimeHealthResponse {
+            status: status.into(),
+            message: details.join("; "),
+        }))
+    }
+}
+
 #[derive(Clone)]
 pub struct AstraVectorService {
     cfg: Arc<AppConfig>,
@@ -650,6 +4105,7 @@ pub struct AstraVectorService {
     engine: Arc<dyn InferenceEngine>,
     l1: L1Cache,
     repo: Option<Repository>,
+    qdrant: Option<Arc<QdrantClient>>,
     provider: SelectedProvider,
     readiness: Readiness,
     shutdown: CancellationToken,
@@ -662,6 +4118,7 @@ impl AstraVectorService {
         engine: Arc<dyn InferenceEngine>,
         l1: L1Cache,
         repo: Option<Repository>,
+        qdrant: Option<Arc<QdrantClient>>,
         provider: SelectedProvider,
         readiness: Readiness,
         shutdown: CancellationToken,
@@ -672,11 +4129,170 @@ impl AstraVectorService {
             engine,
             l1,
             repo,
+            qdrant,
             provider,
             readiness,
             shutdown,
         }
     }
+
+    fn require_internal_or_admin(&self, metadata: &MetadataMap) -> Result<(), Status> {
+        if !self.cfg.security.enabled {
+            return Ok(());
+        }
+        let role = metadata
+            .get("x-astravector-role")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if role.eq_ignore_ascii_case("admin") || role.eq_ignore_ascii_case("internal") {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("internal/admin role is required"))
+        }
+    }
+
+    async fn compute_document_sync_status(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+        include_qdrant: bool,
+    ) -> Result<pb::GetVectorSyncStatusResponse, Status> {
+        let repo = self
+            .repo
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("PostgreSQL unavailable"))?;
+        let row = sqlx::query(r#"SELECT
+          COALESCE((SELECT status FROM astravector.document_versions WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3),'NOT_FOUND') AS document_status,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS expected_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status='SYNCED' AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS synced_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status IN('PENDING','UPDATE_PENDING','DELETE_PENDING') AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS pending_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status IN('FAILED','DEAD_LETTER') AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS failed_bindings,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS dense_vectors_expected,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_dense d ON d.cache_entry_id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND b.chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS dense_vectors_found,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS sparse_vectors_expected,
+          (SELECT count(*) FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_sparse s ON s.cache_entry_id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND b.chunk_granularity IN('PARENT','SUB_180','SUB_260')) AS sparse_vectors_found,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='PENDING') AS outbox_pending,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='RETRY_PENDING') AS outbox_retry_pending,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status='COMPLETED') AS outbox_completed,
+          (SELECT count(*) FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.status IN('FAILED','DEAD_LETTER')) AS outbox_failed,
+          (SELECT COALESCE(max(o.updated_at)::text,'') FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3) AS last_sync_attempt_at,
+          (SELECT COALESCE(o.error_code,'') FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.error_code IS NOT NULL ORDER BY o.updated_at DESC LIMIT 1) AS last_sync_error_code,
+          (SELECT COALESCE(o.error_message,'') FROM astravector.vector_outbox o JOIN astravector.vector_bindings_v004 b ON b.id=o.binding_id AND b.access_zone_id=o.binding_access_zone_id WHERE b.access_zone_id=$1 AND b.document_id=$2 AND b.document_version=$3 AND o.error_message IS NOT NULL ORDER BY o.updated_at DESC LIMIT 1) AS last_sync_error_message
+        "#)
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_one(&repo.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres sync status: {e}")))?;
+        let expected_bindings: i64 = row.get("expected_bindings");
+        let synced_bindings: i64 = row.get("synced_bindings");
+        let dense_vectors_expected: i64 = row.get("dense_vectors_expected");
+        let dense_vectors_found: i64 = row.get("dense_vectors_found");
+        let sparse_vectors_expected: i64 = row.get("sparse_vectors_expected");
+        let sparse_vectors_found: i64 = row.get("sparse_vectors_found");
+        let outbox_pending: i64 = row.get("outbox_pending");
+        let outbox_retry_pending: i64 = row.get("outbox_retry_pending");
+        let outbox_completed: i64 = row.get("outbox_completed");
+        let outbox_failed: i64 = row.get("outbox_failed");
+        let expected_point_ids: std::collections::HashSet<Uuid> = sqlx::query(
+            "SELECT qdrant_point_id FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND chunk_granularity IN('PARENT','SUB_180','SUB_260')",
+        )
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_all(&repo.pool)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres expected qdrant ids: {e}")))?
+            .into_iter()
+            .map(|row| row.get::<Uuid, _>("qdrant_point_id"))
+            .collect();
+        let mut qdrant_collection_exists = false;
+        let mut qdrant_points_found = 0_u32;
+        let mut qdrant_points_missing = expected_point_ids.len() as u32;
+        let mut qdrant_points_extra = 0_u32;
+        let mut warnings = Vec::new();
+        if include_qdrant {
+            if let Some(q) = self.qdrant.as_ref() {
+                qdrant_collection_exists = q.collection_exists().await.map_err(Status::from)?;
+                if qdrant_collection_exists {
+                    let actual_point_ids = q
+                        .point_ids_by_document(access_zone_id, document_id, document_version)
+                        .await
+                        .map_err(Status::from)?;
+                    qdrant_points_found = actual_point_ids.len() as u32;
+                    qdrant_points_missing =
+                        expected_point_ids.difference(&actual_point_ids).count() as u32;
+                    qdrant_points_extra =
+                        actual_point_ids.difference(&expected_point_ids).count() as u32;
+                    if qdrant_points_missing > 0 || qdrant_points_extra > 0 {
+                        counter!("astravector_sync_status_consistency_mismatch_total").increment(1);
+                    }
+                    if qdrant_points_extra > 0 {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "QDRANT_EXTRA_POINTS_FOUND".into(),
+                            message: format!("Qdrant contains {qdrant_points_extra} extra point(s) for this document/version"),
+                        });
+                    }
+                }
+            }
+        } else {
+            qdrant_collection_exists = self.qdrant.is_some();
+            qdrant_points_found = expected_bindings as u32;
+            qdrant_points_missing = 0;
+        }
+        let ready = expected_bindings > 0
+            && synced_bindings == expected_bindings
+            && dense_vectors_found == dense_vectors_expected
+            && (!self.cfg.sparse.required || sparse_vectors_found == sparse_vectors_expected)
+            && outbox_completed >= expected_bindings
+            && outbox_pending == 0
+            && outbox_retry_pending == 0
+            && outbox_failed == 0
+            && qdrant_collection_exists
+            && qdrant_points_missing == 0
+            && qdrant_points_found >= expected_bindings as u32;
+        Ok(pb::GetVectorSyncStatusResponse {
+            document_status: row.get::<String, _>("document_status"),
+            expected_bindings: expected_bindings as u32,
+            synced_bindings: synced_bindings as u32,
+            pending_bindings: row.get::<i64, _>("pending_bindings") as u32,
+            failed_bindings: row.get::<i64, _>("failed_bindings") as u32,
+            dense_vectors_expected: dense_vectors_expected as u32,
+            dense_vectors_found: dense_vectors_found as u32,
+            sparse_vectors_expected: sparse_vectors_expected as u32,
+            sparse_vectors_found: sparse_vectors_found as u32,
+            outbox_pending: outbox_pending as u32,
+            outbox_retry_pending: outbox_retry_pending as u32,
+            outbox_completed: outbox_completed as u32,
+            outbox_failed: outbox_failed as u32,
+            qdrant_collection: self.cfg.qdrant.collection.clone(),
+            qdrant_collection_exists,
+            qdrant_points_expected: expected_bindings as u32,
+            qdrant_points_found,
+            qdrant_points_missing,
+            qdrant_points_extra,
+            ready_to_activate: ready,
+            last_sync_attempt_at: row
+                .try_get::<Option<String>, _>("last_sync_attempt_at")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            last_sync_error_code: row
+                .try_get::<Option<String>, _>("last_sync_error_code")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            last_sync_error_message: row
+                .try_get::<Option<String>, _>("last_sync_error_message")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            warnings,
+        })
+    }
+
     fn validate(&self, r: &mut pb::EncodeBatchRequest) -> Result<(), AstraError> {
         for (n, v) in [
             ("emb_task_id", &r.emb_task_id),
@@ -1406,24 +5022,138 @@ impl AstraVectorRuntime for AstraVectorService {
         &self,
         request: Request<pb::GetVectorSyncStatusRequest>,
     ) -> Result<Response<pb::GetVectorSyncStatusResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
         let r = request.into_inner();
-        let repo = self
-            .repo
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("PostgreSQL unavailable"))?;
-        let id = Uuid::parse_str(&r.binding_id)
-            .map_err(|_| Status::invalid_argument("invalid binding_id"))?;
-        let s = repo
-            .binding_status(&r.tenant_id, &r.workspace_id, id)
+        let access_zone_id = Uuid::parse_str(r.access_zone_id.trim())
+            .map_err(|_| Status::invalid_argument("access_zone_id must be a UUID"))?;
+        let document_id = Uuid::parse_str(r.document_id.trim())
+            .map_err(|_| Status::invalid_argument("document_id must be a UUID"))?;
+        if r.document_version == 0 {
+            return Err(Status::invalid_argument("document_version must be > 0"));
+        }
+        let status = self
+            .compute_document_sync_status(
+                access_zone_id,
+                document_id,
+                r.document_version as i64,
+                r.include_qdrant,
+            )
+            .await?;
+        Ok(Response::new(status))
+    }
+
+    async fn preview_embedding(
+        &self,
+        request: Request<pb::PreviewEmbeddingRequest>,
+    ) -> Result<Response<pb::PreviewEmbeddingResponse>, Status> {
+        self.require_internal_or_admin(request.metadata())?;
+        let r = request.into_inner();
+        let text = r.text.trim();
+        if text.is_empty() {
+            return Err(Status::invalid_argument("text must not be empty"));
+        }
+        let purpose =
+            pb::EncodingPurpose::try_from(r.purpose).unwrap_or(pb::EncodingPurpose::Unspecified);
+        if purpose == pb::EncodingPurpose::Unspecified {
+            return Err(Status::invalid_argument("purpose is required"));
+        }
+        let profile = if purpose == pb::EncodingPurpose::Query {
+            &self.cfg.tokenization.query
+        } else {
+            &self.cfg.tokenization.child
+        };
+        let sparse_required = match pb::EmbeddingModeV005::try_from(r.embedding_mode)
+            .unwrap_or(pb::EmbeddingModeV005::Unspecified)
+        {
+            pb::EmbeddingModeV005::DenseSparseRequired => true,
+            pb::EmbeddingModeV005::Unspecified => self.cfg.sparse.required,
+            _ => false,
+        };
+        let wants_sparse = match pb::EmbeddingModeV005::try_from(r.embedding_mode)
+            .unwrap_or(pb::EmbeddingModeV005::Unspecified)
+        {
+            pb::EmbeddingModeV005::DenseOnly => false,
+            pb::EmbeddingModeV005::DenseSparseIfAvailable
+            | pb::EmbeddingModeV005::DenseSparseRequired => true,
+            pb::EmbeddingModeV005::Unspecified => self.cfg.sparse.enabled,
+        };
+        if wants_sparse && sparse_required && !self.engine.sparse_available() {
+            return Err(Status::failed_precondition(
+                "SPARSE_UNAVAILABLE: sparse embedding requested but loaded ONNX artifact has no sparse output",
+            ));
+        }
+        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, self.cfg.grpc.deadlines.query_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let result = self
+            .scheduler
+            .submit(
+                if purpose == pb::EncodingPurpose::Query {
+                    QueueKind::Query
+                } else {
+                    QueueKind::Document
+                },
+                InferenceInput {
+                    text: text.to_string(),
+                    max_length: profile.max_length,
+                    allow_truncation: profile.truncation_allowed,
+                    want_dense: r.include_dense || !r.include_sparse,
+                    want_sparse: r.include_sparse && wants_sparse && self.engine.sparse_available(),
+                    token_count_hint: 0,
+                },
+                deadline,
+                self.shutdown.child_token(),
+            )
             .await
             .map_err(Status::from)?;
-        Ok(Response::new(pb::GetVectorSyncStatusResponse {
-            binding_id: s.id.to_string(),
-            lifecycle_status: s.lifecycle_status,
-            qdrant_sync_status: s.qdrant_sync_status,
-            last_error: s.last_error,
+        let mut warnings = Vec::new();
+        if r.include_sparse && wants_sparse && !self.engine.sparse_available() {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "SPARSE_UNAVAILABLE".into(),
+                message: "Sparse output is not available in loaded ONNX artifact".into(),
+            });
+        }
+        let dense = result.dense.as_ref().map(|values| pb::DensePreviewV005 {
+            dimension: values.len() as u32,
+            norm: values.iter().map(|v| v * v).sum::<f32>().sqrt(),
+            preview_values: values.iter().take(8).copied().collect(),
+            full_values: if r.include_full_dense {
+                values.clone()
+            } else {
+                Vec::new()
+            },
+        });
+        let sparse = match (&result.sparse_indices, &result.sparse_values) {
+            (Some(indices), Some(values)) => {
+                let top = if r.top_sparse == 0 {
+                    indices.len()
+                } else {
+                    r.top_sparse as usize
+                }
+                .min(indices.len());
+                Some(pb::SparsePreviewV005 {
+                    non_zero_count: indices.len() as u32,
+                    indices: indices.iter().take(top).copied().collect(),
+                    values: values.iter().take(top).copied().collect(),
+                })
+            }
+            _ => None,
+        };
+        Ok(Response::new(pb::PreviewEmbeddingResponse {
+            model_version: self.cfg.model.version.clone(),
+            tokenizer_version: self.cfg.tokenizer.version.clone(),
+            dense_version: self.cfg.dense.version.clone(),
+            sparse_version: self.cfg.sparse.version.clone(),
+            dense,
+            sparse,
+            tokenization: Some(pb::TokenizationPreviewV005 {
+                token_count: result.token_count as u32,
+                max_tokens: profile.max_length as u32,
+                truncated: result.truncated,
+            }),
+            warnings,
         }))
     }
+
     async fn evaluate_relevance(
         &self,
         request: Request<pb::EvaluateRelevanceRequest>,
@@ -1471,6 +5201,17 @@ fn chunks_response_from_records(
     stored: Vec<crate::persistence::StoredChunkRecord>,
     status: &str,
 ) -> pb::CreateMultiGranularityChunksResponse {
+    chunks_response_from_records_with_summary(stored, status, 0, 0, 0, 0)
+}
+
+fn chunks_response_from_records_with_summary(
+    stored: Vec<crate::persistence::StoredChunkRecord>,
+    status: &str,
+    dense_vectors: u32,
+    sparse_vectors: u32,
+    bindings: u32,
+    outbox_created: u32,
+) -> pb::CreateMultiGranularityChunksResponse {
     let root_chunk_id = stored
         .first()
         .map(|c| c.root_id.to_string())
@@ -1497,6 +5238,18 @@ fn chunks_response_from_records(
         sub_chunks_260,
         total_chunks: stored.len() as u32,
         status: status.into(),
+        summary: Some(pb::IndexSummaryV005 {
+            chunks_total: stored.len() as u32,
+            source_chunks: stored.iter().filter(|c| c.granularity == "SOURCE").count() as u32,
+            parent_chunks: stored.iter().filter(|c| c.granularity == "PARENT").count() as u32,
+            sub180_chunks: stored.iter().filter(|c| c.granularity == "SUB_180").count() as u32,
+            sub260_chunks: stored.iter().filter(|c| c.granularity == "SUB_260").count() as u32,
+            dense_vectors,
+            sparse_vectors,
+            bindings,
+            outbox_created,
+            status: status.into(),
+        }),
     }
 }
 fn parent_context_to_pb(parent: ParentContextRecord) -> pb::ChunkContentV004 {
@@ -1531,9 +5284,3500 @@ fn chunk_content_to_pb(chunk: ChunkContentRecord) -> pb::ChunkContentV004 {
         representation_type: pb::SearchRepresentationType::Original as i32,
     }
 }
+
+fn explain_candidate(rank: usize, hit: &QdrantSearchHit) -> pb::ExplainCandidateV005 {
+    pb::ExplainCandidateV005 {
+        rank: (rank + 1) as u32,
+        score: hit.score,
+        qdrant_point_id: hit.id.to_string(),
+        chunk_id: hit
+            .payload
+            .get("chunk_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        parent_chunk_id: hit
+            .payload
+            .get("parent_chunk_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        granularity: granularity_from_str(
+            hit.payload
+                .get("chunk_granularity")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        ),
+    }
+}
+
+fn normalize_scores_for_fusion(scores: &[f32]) -> Vec<f32> {
+    if scores.is_empty() {
+        return Vec::new();
+    }
+    let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !min.is_finite() || !max.is_finite() || (max - min).abs() < f32::EPSILON {
+        return vec![1.0; scores.len()];
+    }
+    scores
+        .iter()
+        .map(|s| ((*s - min) / (max - min)).clamp(0.0, 1.0))
+        .collect()
+}
+
+fn fuse_qdrant_hits(
+    dense_hits: Vec<QdrantSearchHit>,
+    sparse_hits: Vec<QdrantSearchHit>,
+    limit: usize,
+    fusion_method: &str,
+    dense_weight: f32,
+    sparse_weight: f32,
+    rrf_k: f32,
+) -> Vec<QdrantSearchHit> {
+    let mut by_id: std::collections::HashMap<Uuid, QdrantSearchHit> =
+        std::collections::HashMap::new();
+    let method = fusion_method.to_ascii_uppercase();
+    let use_weighted = method == "WEIGHTED_SCORE" || method == "NORMALIZED_WEIGHTED_SCORE";
+    let use_normalized = method == "NORMALIZED_WEIGHTED_SCORE";
+    let dense_weight = dense_weight.max(0.0);
+    let sparse_weight = sparse_weight.max(0.0);
+    let rrf_k = rrf_k.max(1.0);
+    let dense_norm = if use_normalized {
+        normalize_scores_for_fusion(&dense_hits.iter().map(|h| h.score).collect::<Vec<_>>())
+    } else {
+        Vec::new()
+    };
+    let sparse_norm = if use_normalized {
+        normalize_scores_for_fusion(&sparse_hits.iter().map(|h| h.score).collect::<Vec<_>>())
+    } else {
+        Vec::new()
+    };
+
+    for (rank, hit) in dense_hits.into_iter().enumerate() {
+        let contribution = if use_normalized {
+            dense_weight * dense_norm.get(rank).copied().unwrap_or(0.0)
+        } else if use_weighted {
+            dense_weight * hit.score
+        } else {
+            1.0_f32 / (rrf_k + rank as f32 + 1.0)
+        };
+        by_id
+            .entry(hit.id)
+            .and_modify(|existing| {
+                existing.dense_score = hit.score;
+                existing.dense_rank = Some((rank + 1) as u32);
+                existing.fusion_score += contribution;
+                existing.score = existing.fusion_score;
+            })
+            .or_insert_with(|| QdrantSearchHit {
+                id: hit.id,
+                score: contribution,
+                dense_score: hit.score,
+                sparse_score: 0.0,
+                fusion_score: contribution,
+                dense_rank: Some((rank + 1) as u32),
+                sparse_rank: None,
+                payload: hit.payload,
+            });
+    }
+
+    for (rank, hit) in sparse_hits.into_iter().enumerate() {
+        let contribution = if use_normalized {
+            sparse_weight * sparse_norm.get(rank).copied().unwrap_or(0.0)
+        } else if use_weighted {
+            sparse_weight * hit.score
+        } else {
+            1.0_f32 / (rrf_k + rank as f32 + 1.0)
+        };
+        by_id
+            .entry(hit.id)
+            .and_modify(|existing| {
+                existing.sparse_score = hit.score;
+                existing.sparse_rank = Some((rank + 1) as u32);
+                existing.fusion_score += contribution;
+                existing.score = existing.fusion_score;
+            })
+            .or_insert_with(|| QdrantSearchHit {
+                id: hit.id,
+                score: contribution,
+                dense_score: 0.0,
+                sparse_score: hit.score,
+                fusion_score: contribution,
+                dense_rank: None,
+                sparse_rank: Some((rank + 1) as u32),
+                payload: hit.payload,
+            });
+    }
+
+    metrics::counter!("hybrid_fusion_applied_total", "method" => method.clone()).increment(1);
+    let mut hits: Vec<QdrantSearchHit> = by_id.into_values().collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    hits
+}
+
+fn effective_retrieve_access_level(
+    metadata: &MetadataMap,
+    body_value: i32,
+) -> Result<pb::AccessLevel, Status> {
+    if let Some(level) = access_level_from_metadata(metadata)? {
+        return Ok(level);
+    }
+    let body_level = pb::AccessLevel::try_from(body_value).unwrap_or(pb::AccessLevel::Unspecified);
+    if body_level == pb::AccessLevel::Unspecified {
+        return Err(Status::permission_denied(
+            "ACCESS_LEVEL_REQUIRED: RetrieveContext requires caller access level from trusted metadata or explicit non-UNSPECIFIED request context",
+        ));
+    }
+    Ok(body_level)
+}
+
+fn access_level_from_metadata(metadata: &MetadataMap) -> Result<Option<pb::AccessLevel>, Status> {
+    let raw = metadata
+        .get("x-astravector-access-level")
+        .or_else(|| metadata.get("x-astravector-caller-access-level"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let normalized = raw.trim_start_matches("ACCESS_LEVEL_").to_ascii_uppercase();
+    let level = match normalized.as_str() {
+        "1" | "PUBLIC" => pb::AccessLevel::Public,
+        "2" | "INTERNAL" => pb::AccessLevel::Internal,
+        "3" | "CONFIDENTIAL" => pb::AccessLevel::Confidential,
+        "4" | "RESTRICTED" => pb::AccessLevel::Restricted,
+        "0" | "UNSPECIFIED" => {
+            return Err(Status::permission_denied(
+                "ACCESS_LEVEL_REQUIRED: metadata access level is UNSPECIFIED",
+            ));
+        }
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "INVALID_ACCESS_LEVEL: unsupported x-astravector-access-level value: {}",
+                raw
+            )));
+        }
+    };
+    Ok(Some(level))
+}
+
+fn reject_unsupported_activation_policy(value: i32) -> Result<(), Status> {
+    match pb::ActivationPolicy::try_from(value).unwrap_or(pb::ActivationPolicy::Manual) {
+        pb::ActivationPolicy::AutoWhenReady => Err(Status::invalid_argument(
+            "UNSUPPORTED_ACTIVATION_POLICY_AUTO_WHEN_READY: AUTO_WHEN_READY requires lifecycle auto-activation worker and is disabled in v007 fix1",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn normalized_access_level(value: i32) -> pb::AccessLevel {
+    pb::AccessLevel::try_from(value)
+        .ok()
+        .filter(|v| *v != pb::AccessLevel::Unspecified)
+        .unwrap_or(pb::AccessLevel::Internal)
+}
+
+fn normalized_embedding_mode(value: i32) -> pb::EmbeddingModeV005 {
+    pb::EmbeddingModeV005::try_from(value)
+        .ok()
+        .filter(|v| *v != pb::EmbeddingModeV005::Unspecified)
+        .unwrap_or(pb::EmbeddingModeV005::DenseSparseRequired)
+}
+
+fn normalized_publish_mode(value: i32) -> pb::PublishModeV005 {
+    pb::PublishModeV005::try_from(value)
+        .ok()
+        .filter(|v| *v != pb::PublishModeV005::Unspecified)
+        .unwrap_or(pb::PublishModeV005::Outbox)
+}
+
+fn resolve_facade_document_id(document: &pb::DocumentIdentity) -> Result<Uuid, Status> {
+    if !document.document_id.trim().is_empty() {
+        return Uuid::parse_str(document.document_id.trim()).map_err(|_| {
+            Status::invalid_argument("document.document_id must be UUID when provided")
+        });
+    }
+    let source = if !document.external_document_id.trim().is_empty() {
+        document.external_document_id.trim()
+    } else if !document.source_uri.trim().is_empty() {
+        document.source_uri.trim()
+    } else {
+        return Err(Status::invalid_argument(
+            "document.document_id or document.external_document_id is required",
+        ));
+    };
+    Ok(Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_bytes()))
+}
+
+fn validate_and_sort_logical_blocks(
+    mut blocks: Vec<pb::LogicalBlock>,
+) -> Result<Vec<pb::LogicalBlock>, Status> {
+    if blocks.is_empty() {
+        return Err(Status::invalid_argument(
+            "LOGICAL_BLOCKS_EMPTY: blocks must not be empty",
+        ));
+    }
+
+    let mut by_id: HashMap<String, &pb::LogicalBlock> = HashMap::new();
+    let mut root_count = 0_u32;
+    for block in &blocks {
+        let block_id = block.block_id.trim();
+        if block_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "LOGICAL_BLOCK_ID_REQUIRED: block_id is required for every logical block",
+            ));
+        }
+        if by_id.insert(block_id.to_string(), block).is_some() {
+            return Err(Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_DUPLICATE_ID: duplicate logical block_id: {}",
+                block_id
+            )));
+        }
+        let block_type =
+            pb::BlockType::try_from(block.block_type).unwrap_or(pb::BlockType::Unspecified);
+        if block_type == pb::BlockType::Unspecified {
+            return Err(Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_TYPE_INVALID: block {} has BLOCK_TYPE_UNSPECIFIED",
+                block_id
+            )));
+        }
+        if block_type == pb::BlockType::Document {
+            root_count += 1;
+        }
+        if block.text.trim().is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_TEXT_EMPTY: logical block {} has empty text",
+                block_id
+            )));
+        }
+        if block.parent_block_id.trim() == block_id {
+            return Err(Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_SELF_PARENT: logical block {} cannot reference itself as parent",
+                block_id
+            )));
+        }
+        validate_source_location(block_id, block.source_location.as_ref())?;
+        validate_source_links(block_id, &block.source_links)?;
+    }
+
+    if root_count != 1 {
+        return Err(Status::invalid_argument(format!(
+            "LOGICAL_BLOCK_ROOT_INVALID: expected exactly one BLOCK_TYPE_DOCUMENT root, found {}",
+            root_count
+        )));
+    }
+
+    for block in &blocks {
+        let block_id = block.block_id.trim();
+        let parent_id = block.parent_block_id.trim();
+        if parent_id.is_empty() {
+            if pb::BlockType::try_from(block.block_type).unwrap_or(pb::BlockType::Unspecified)
+                != pb::BlockType::Document
+            {
+                return Err(Status::invalid_argument(format!(
+                    "LOGICAL_BLOCK_PARENT_REQUIRED: non-root block {} must have parent_block_id",
+                    block_id
+                )));
+            }
+            continue;
+        }
+        let parent = by_id.get(parent_id).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_PARENT_NOT_FOUND: block {} references missing parent_block_id {}",
+                block_id, parent_id
+            ))
+        })?;
+        validate_parent_child(block, parent)?;
+    }
+
+    for block in &blocks {
+        assert_no_logical_block_cycle(block, &by_id)?;
+    }
+
+    blocks.sort_by(|a, b| {
+        a.order_index
+            .cmp(&b.order_index)
+            .then_with(|| a.block_id.cmp(&b.block_id))
+    });
+    Ok(blocks)
+}
+
+fn validate_parent_child(
+    child: &pb::LogicalBlock,
+    parent: &pb::LogicalBlock,
+) -> Result<(), Status> {
+    let child_type =
+        pb::BlockType::try_from(child.block_type).unwrap_or(pb::BlockType::Unspecified);
+    let parent_type =
+        pb::BlockType::try_from(parent.block_type).unwrap_or(pb::BlockType::Unspecified);
+    let allowed = match child_type {
+        pb::BlockType::Section => matches!(
+            parent_type,
+            pb::BlockType::Document | pb::BlockType::Section
+        ),
+        pb::BlockType::Subsection => matches!(
+            parent_type,
+            pb::BlockType::Section | pb::BlockType::Subsection
+        ),
+        pb::BlockType::Paragraph => matches!(
+            parent_type,
+            pb::BlockType::Document | pb::BlockType::Section | pb::BlockType::Subsection
+        ),
+        pb::BlockType::Table => matches!(
+            parent_type,
+            pb::BlockType::Document | pb::BlockType::Section | pb::BlockType::Subsection
+        ),
+        pb::BlockType::TableRow => parent_type == pb::BlockType::Table,
+        pb::BlockType::List => matches!(
+            parent_type,
+            pb::BlockType::Document
+                | pb::BlockType::Section
+                | pb::BlockType::Subsection
+                | pb::BlockType::Paragraph
+        ),
+        pb::BlockType::ListItem => parent_type == pb::BlockType::List,
+        pb::BlockType::FaqItem => matches!(
+            parent_type,
+            pb::BlockType::Document | pb::BlockType::Section | pb::BlockType::Subsection
+        ),
+        pb::BlockType::CodeBlock => matches!(
+            parent_type,
+            pb::BlockType::Document
+                | pb::BlockType::Section
+                | pb::BlockType::Subsection
+                | pb::BlockType::Paragraph
+        ),
+        pb::BlockType::Caption => matches!(
+            parent_type,
+            pb::BlockType::Table | pb::BlockType::Section | pb::BlockType::Subsection
+        ),
+        pb::BlockType::Document => child.parent_block_id.trim().is_empty(),
+        pb::BlockType::Unspecified => false,
+    };
+    if !allowed {
+        return Err(Status::invalid_argument(format!(
+            "LOGICAL_BLOCK_PARENT_CHILD_INVALID: block {} type {:?} cannot have parent {} type {:?}",
+            child.block_id, child_type, parent.block_id, parent_type
+        )));
+    }
+    Ok(())
+}
+
+fn assert_no_logical_block_cycle(
+    block: &pb::LogicalBlock,
+    by_id: &HashMap<String, &pb::LogicalBlock>,
+) -> Result<(), Status> {
+    let mut visited = HashSet::new();
+    let mut current = block;
+    while !current.parent_block_id.trim().is_empty() {
+        let current_id = current.block_id.trim().to_string();
+        if !visited.insert(current_id.clone()) {
+            return Err(Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_TREE_CYCLE: cycle detected at block {}",
+                current_id
+            )));
+        }
+        current = by_id.get(current.parent_block_id.trim()).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "LOGICAL_BLOCK_PARENT_NOT_FOUND: block {} references missing parent_block_id {}",
+                current.block_id, current.parent_block_id
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_source_location(
+    block_id: &str,
+    location: Option<&pb::SourceLocation>,
+) -> Result<(), Status> {
+    let Some(location) = location else {
+        return Ok(());
+    };
+    if location.page_end > 0 && location.page_start > 0 && location.page_end < location.page_start {
+        return Err(Status::invalid_argument(format!(
+            "SOURCE_LOCATION_INVALID: block {} has page_end < page_start",
+            block_id
+        )));
+    }
+    if location.char_end > 0 && location.char_start > 0 && location.char_end < location.char_start {
+        return Err(Status::invalid_argument(format!(
+            "SOURCE_LOCATION_INVALID: block {} has char_end < char_start",
+            block_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_source_links(owner: &str, links: &[pb::SourceLink]) -> Result<(), Status> {
+    for link in links {
+        let link_type =
+            pb::SourceLinkType::try_from(link.r#type).unwrap_or(pb::SourceLinkType::Unspecified);
+        if link_type == pb::SourceLinkType::Unspecified {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_TYPE_INVALID: {} contains SOURCE_LINK_TYPE_UNSPECIFIED",
+                owner
+            )));
+        }
+        let url = link.url.trim();
+        if url.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_URL_REQUIRED: {} contains source link without url",
+                owner
+            )));
+        }
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("javascript:")
+            || lower.starts_with("file:")
+            || lower.starts_with("data:")
+        {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_INVALID_SCHEME: {} contains unsafe source link scheme",
+                owner
+            )));
+        }
+        let allowed = lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("s3://")
+            || lower.starts_with("minio://")
+            || lower.starts_with("internal://");
+        if !allowed {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_INVALID_SCHEME: {} contains unsupported source link scheme",
+                owner
+            )));
+        }
+        if url.len() > 4096 {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_TOO_LONG: {} contains source link longer than 4096 characters",
+                owner
+            )));
+        }
+        if link.label.len() > 512 {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_LABEL_TOO_LONG: {} contains source link label longer than 512 characters",
+                owner
+            )));
+        }
+        if link_type == pb::SourceLinkType::Download
+            && (lower.contains("token=")
+                || lower.contains("signature=")
+                || lower.contains("x-amz-signature"))
+            && link.expires_at.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(format!(
+                "SOURCE_LINK_EXPIRES_AT_REQUIRED: {} contains signed download link without expires_at",
+                owner
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_logical_blocks_for_chunking(blocks: &[pb::LogicalBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let Some(location) = block.source_location.as_ref() {
+            if !location.heading.trim().is_empty() {
+                out.push_str(location.heading.trim());
+                out.push('\n');
+            }
+        }
+        out.push_str(block.text.trim());
+        out.push_str("\n\n");
+    }
+    out
+}
+
+fn annotated_segments_from_metadata(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Result<Vec<crate::chunking::AnnotatedTextSegment>, Status> {
+    let Some(raw) = metadata.get("logical_blocks") else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        Status::invalid_argument(format!("logical_blocks metadata is not valid JSON: {e}"))
+    })?;
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let block_id = item
+            .get("block_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if block_id.is_empty() {
+            continue;
+        }
+        let block_type = item
+            .get("block_type_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| block_type_name_from_json(item.get("block_type")).to_string());
+        let parent_block_id = item
+            .get("parent_block_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        let text = item
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::chunking::AnnotatedTextSegment {
+            block_id,
+            parent_block_id,
+            block_type,
+            text,
+            source_location: item
+                .get("source_location")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            source_links: item
+                .get("source_links")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            metadata: item
+                .get("metadata")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            order_index: item
+                .get("order_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+        });
+    }
+    out.sort_by_key(|s| s.order_index);
+    Ok(out)
+}
+
+fn block_type_name_from_json(value: Option<&serde_json::Value>) -> &'static str {
+    let Some(value) = value else {
+        return "UNSPECIFIED";
+    };
+    let code = value.as_i64().unwrap_or(0);
+    match pb::BlockType::try_from(code as i32).unwrap_or(pb::BlockType::Unspecified) {
+        pb::BlockType::Document => "DOCUMENT",
+        pb::BlockType::Section => "SECTION",
+        pb::BlockType::Subsection => "SUBSECTION",
+        pb::BlockType::Paragraph => "PARAGRAPH",
+        pb::BlockType::Table => "TABLE",
+        pb::BlockType::TableRow => "TABLE_ROW",
+        pb::BlockType::List => "LIST",
+        pb::BlockType::ListItem => "LIST_ITEM",
+        pb::BlockType::FaqItem => "FAQ_ITEM",
+        pb::BlockType::CodeBlock => "CODE_BLOCK",
+        pb::BlockType::Caption => "CAPTION",
+        pb::BlockType::Unspecified => "UNSPECIFIED",
+    }
+}
+
+fn normalized_content_hash(user_hash: &str, source_text: &str) -> Result<String, Status> {
+    let candidate = user_hash
+        .trim()
+        .trim_start_matches("sha256:")
+        .to_ascii_lowercase();
+    if candidate.is_empty() {
+        return Ok(hash_text(source_text));
+    }
+    if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(candidate)
+    } else {
+        Err(Status::invalid_argument(
+            "document.content_hash must be a 64-character sha256 hex string or empty",
+        ))
+    }
+}
+
+fn activation_policy_as_str(value: i32) -> &'static str {
+    match pb::ActivationPolicy::try_from(value).unwrap_or(pb::ActivationPolicy::Manual) {
+        pb::ActivationPolicy::AutoWhenReady => "AUTO_WHEN_READY",
+        pb::ActivationPolicy::Skip => "SKIP",
+        _ => "MANUAL",
+    }
+}
+
+fn attach_document_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    document: &pb::DocumentIdentity,
+) {
+    for (k, v) in [
+        (
+            "external_document_id",
+            document.external_document_id.as_str(),
+        ),
+        ("document_title", document.title.as_str()),
+        ("source_uri", document.source_uri.as_str()),
+        ("source_type", document.source_type.as_str()),
+        ("mime_type", document.mime_type.as_str()),
+    ] {
+        if !v.trim().is_empty() {
+            metadata.insert(k.into(), v.into());
+        }
+    }
+    if !document.source_links.is_empty() {
+        if let Ok(json) = serde_json::to_string(&source_links_as_json(&document.source_links)) {
+            metadata.insert("document_source_links".into(), json);
+        }
+    }
+}
+
+fn attach_logical_block_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    blocks: &[pb::LogicalBlock],
+) -> Result<(), Status> {
+    let block_refs = blocks
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "block_id": b.block_id,
+                "parent_block_id": b.parent_block_id,
+                "block_type": b.block_type,
+                "block_type_name": block_type_name_for_proto(b.block_type),
+                "text": b.text,
+                "order_index": b.order_index,
+                "source_location": b.source_location.as_ref().map(source_location_as_json),
+                "source_links": source_links_as_json(&b.source_links),
+                "metadata": b.metadata,
+            })
+        })
+        .collect::<Vec<_>>();
+    let json = serde_json::to_string(&block_refs)
+        .map_err(|e| Status::internal(format!("logical block metadata serialization: {e}")))?;
+    metadata.insert("logical_blocks".into(), json);
+    Ok(())
+}
+
+fn block_type_name_for_proto(value: i32) -> &'static str {
+    match pb::BlockType::try_from(value).unwrap_or(pb::BlockType::Unspecified) {
+        pb::BlockType::Document => "DOCUMENT",
+        pb::BlockType::Section => "SECTION",
+        pb::BlockType::Subsection => "SUBSECTION",
+        pb::BlockType::Paragraph => "PARAGRAPH",
+        pb::BlockType::Table => "TABLE",
+        pb::BlockType::TableRow => "TABLE_ROW",
+        pb::BlockType::List => "LIST",
+        pb::BlockType::ListItem => "LIST_ITEM",
+        pb::BlockType::FaqItem => "FAQ_ITEM",
+        pb::BlockType::CodeBlock => "CODE_BLOCK",
+        pb::BlockType::Caption => "CAPTION",
+        pb::BlockType::Unspecified => "UNSPECIFIED",
+    }
+}
+
+fn source_location_as_json(location: &pb::SourceLocation) -> serde_json::Value {
+    serde_json::json!({
+        "page_start": location.page_start,
+        "page_end": location.page_end,
+        "char_start": location.char_start,
+        "char_end": location.char_end,
+        "section_path": location.section_path,
+        "heading": location.heading,
+        "table_id": location.table_id,
+        "row_index": location.row_index,
+        "column_index": location.column_index,
+    })
+}
+
+fn source_links_as_json(links: &[pb::SourceLink]) -> Vec<serde_json::Value> {
+    links
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "type": l.r#type,
+                "url": &l.url,
+                "label": &l.label,
+                "mime_type": &l.mime_type,
+                "requires_auth": l.requires_auth,
+                "expires_at": &l.expires_at,
+                "attributes": &l.attributes,
+            })
+        })
+        .collect()
+}
+
+fn ttl_days_from_policy(policy: Option<&pb::TtlPolicy>) -> Result<Option<u32>, Status> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    match pb::TtlMode::try_from(policy.mode).unwrap_or(pb::TtlMode::None) {
+        pb::TtlMode::None | pb::TtlMode::Unspecified => Ok(None),
+        pb::TtlMode::Relative => {
+            if policy.ttl_seconds == 0 {
+                return Err(Status::invalid_argument(
+                    "ttl_seconds must be > 0 for TTL_MODE_RELATIVE",
+                ));
+            }
+            let days = policy.ttl_seconds.div_ceil(86_400).min(u32::MAX as u64) as u32;
+            Ok(Some(days.max(1)))
+        }
+        pb::TtlMode::Absolute => {
+            if policy.expires_at.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "expires_at is required for TTL_MODE_ABSOLUTE",
+                ));
+            }
+            Err(Status::invalid_argument(
+                "UNSUPPORTED_TTL_MODE_ABSOLUTE: TTL_MODE_ABSOLUTE is not enabled in v007 fix1; use TTL_MODE_RELATIVE or TTL_MODE_NONE",
+            ))
+        }
+    }
+}
+
+fn chunking_profile_v004_from_v007(
+    input: Option<&pb::TokenAwareChunkingOptions>,
+) -> pb::ChunkingProfileV004 {
+    let profile = input
+        .map(|i| pb::ChunkingProfile::try_from(i.profile).unwrap_or(pb::ChunkingProfile::Default))
+        .unwrap_or(pb::ChunkingProfile::Default);
+    let (parent_target, parent_max, child_target, child_max, overlap, version) = match profile {
+        pb::ChunkingProfile::Legal => (1200, 1400, 220, 280, 60, "v007-legal-token-aware"),
+        pb::ChunkingProfile::Technical => (1000, 1200, 260, 340, 50, "v007-technical-token-aware"),
+        pb::ChunkingProfile::Faq => (500, 700, 180, 240, 20, "v007-faq-token-aware"),
+        pb::ChunkingProfile::TableHeavy => {
+            (800, 1000, 200, 260, 30, "v007-table-heavy-token-aware")
+        }
+        _ => (900, 1100, 260, 320, 40, "v007-default-token-aware"),
+    };
+    let parent = input
+        .and_then(|i| optional_size(i.parent_target_tokens, i.parent_max_tokens, 0))
+        .unwrap_or((parent_target, 1, parent_max, 0));
+    let child = input
+        .and_then(|i| {
+            optional_size(
+                i.child_target_tokens,
+                i.child_max_tokens,
+                i.child_overlap_tokens,
+            )
+        })
+        .unwrap_or((child_target, 1, child_max, overlap));
+    pb::ChunkingProfileV004 {
+        parent: Some(pb::ChunkSizeProfileV004 {
+            granularity: pb::ChunkGranularityV004::ParentV004 as i32,
+            target_tokens: parent.0,
+            min_tokens: parent.1,
+            max_tokens: parent.2,
+            overlap_tokens: parent.3,
+        }),
+        granularities: vec![
+            pb::ChunkSizeProfileV004 {
+                granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+                target_tokens: child.0.min(220),
+                min_tokens: child.1,
+                max_tokens: child.2.min(280),
+                overlap_tokens: child.3,
+            },
+            pb::ChunkSizeProfileV004 {
+                granularity: pb::ChunkGranularityV004::Sub260V004 as i32,
+                target_tokens: child.0,
+                min_tokens: child.1,
+                max_tokens: child.2,
+                overlap_tokens: child.3,
+            },
+        ],
+        preserve_headings: input.map(|i| i.preserve_block_boundaries).unwrap_or(true),
+        preserve_paragraphs: !input
+            .map(|i| i.allow_split_inside_paragraph)
+            .unwrap_or(true),
+        preserve_sentences: true,
+        profile_version: version.into(),
+    }
+}
+
+fn optional_size(target: u32, max: u32, overlap: u32) -> Option<(u32, u32, u32, u32)> {
+    if target == 0 && max == 0 {
+        return None;
+    }
+    let target = if target == 0 { max } else { target };
+    let max = if max == 0 { target } else { max };
+    Some((
+        target,
+        1,
+        max.max(target),
+        overlap.min(target.saturating_sub(1)),
+    ))
+}
+
+fn start_ingestion_fingerprint(
+    req: &pb::StartLogicalDocumentIngestionRequest,
+    access_zone_id: Uuid,
+    document_id: Uuid,
+    idempotency_key: &str,
+) -> Result<String, Status> {
+    let mut metadata_pairs = req.metadata.iter().collect::<Vec<_>>();
+    metadata_pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = Sha256::new();
+    hasher.update(access_zone_id.as_bytes());
+    hasher.update(document_id.as_bytes());
+    hasher.update(req.document_version.to_le_bytes());
+    hasher.update(req.content_hash.as_bytes());
+    hasher.update(req.source_uri.as_bytes());
+    hasher.update(req.file_name.as_bytes());
+    hasher.update(req.ttl_days.to_le_bytes());
+    hasher.update(idempotency_key.as_bytes());
+    for (k, v) in metadata_pairs {
+        hasher.update(k.as_bytes());
+        hasher.update([0]);
+        hasher.update(v.as_bytes());
+        hasher.update([0xff]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn logical_block_size_bytes(block: &pb::LogicalBlock) -> usize {
+    block.block_id.len()
+        + block.parent_block_id.len()
+        + block.text.len()
+        + block
+            .metadata
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+}
+
+fn logical_block_to_json(block: &pb::LogicalBlock) -> serde_json::Value {
+    let source_location = block
+        .source_location
+        .as_ref()
+        .map(|s| {
+            serde_json::json!({
+                "page_start": s.page_start,
+                "page_end": s.page_end,
+                "char_start": s.char_start,
+                "char_end": s.char_end,
+                "section_path": &s.section_path,
+                "heading": &s.heading,
+                "table_id": &s.table_id,
+                "row_index": s.row_index,
+                "column_index": s.column_index,
+            })
+        })
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let source_links = serde_json::Value::Array(
+        block
+            .source_links
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "type": l.r#type,
+                    "url": &l.url,
+                    "label": &l.label,
+                    "mime_type": &l.mime_type,
+                    "requires_auth": l.requires_auth,
+                    "expires_at": &l.expires_at,
+                    "attributes": &l.attributes,
+                })
+            })
+            .collect(),
+    );
+    serde_json::json!({
+        "block_id": &block.block_id,
+        "parent_block_id": &block.parent_block_id,
+        "block_type": block.block_type,
+        "text": &block.text,
+        "order_index": block.order_index,
+        "metadata": &block.metadata,
+        "source_location": source_location,
+        "source_links": source_links,
+    })
+}
+
+fn normalize_sha256_hex(raw: &str) -> Result<String, ()> {
+    let candidate = raw
+        .trim()
+        .trim_start_matches("sha256:")
+        .to_ascii_lowercase();
+    if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(candidate)
+    } else {
+        Err(())
+    }
+}
+
+fn compute_batch_content_hash(blocks: &[pb::LogicalBlock]) -> Result<String, serde_json::Error> {
+    // fix4.5.2: server-side canonical batch hash. serde_json::json! uses a stable object shape
+    // because logical_block_to_json constructs fields in a fixed order.
+    let values: Vec<serde_json::Value> = blocks.iter().map(logical_block_to_json).collect();
+    let bytes = serde_json::to_vec(&values)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn logical_block_from_json(value: &serde_json::Value) -> Result<pb::LogicalBlock, Status> {
+    let obj = value.as_object().ok_or_else(|| {
+        Status::data_loss("INGESTION_STAGING_CORRUPTED: block_json is not object")
+    })?;
+    let metadata = obj
+        .get("metadata")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let source_location = obj
+        .get("source_location")
+        .and_then(|v| v.as_object())
+        .map(|m| pb::SourceLocation {
+            page_start: m
+                .get("page_start")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            page_end: m
+                .get("page_end")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            char_start: m
+                .get("char_start")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            char_end: m
+                .get("char_end")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            section_path: m
+                .get("section_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            heading: m
+                .get("heading")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            table_id: m
+                .get("table_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            row_index: m
+                .get("row_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            column_index: m
+                .get("column_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+        });
+    let source_links = obj
+        .get("source_links")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_object())
+                .map(|m| pb::SourceLink {
+                    r#type: m.get("type").and_then(|v| v.as_i64()).unwrap_or_default() as i32,
+                    url: m
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    label: m
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    mime_type: m
+                        .get("mime_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    requires_auth: m
+                        .get("requires_auth")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    expires_at: m
+                        .get("expires_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    attributes: m
+                        .get("attributes")
+                        .and_then(|v| v.as_object())
+                        .map(|mm| {
+                            mm.iter()
+                                .map(|(k, v)| {
+                                    (k.clone(), v.as_str().unwrap_or_default().to_string())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(pb::LogicalBlock {
+        block_id: obj
+            .get("block_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        parent_block_id: obj
+            .get("parent_block_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        block_type: obj
+            .get("block_type")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default() as i32,
+        text: obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        order_index: obj
+            .get("order_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default() as u32,
+        source_location,
+        source_links,
+        metadata,
+    })
+}
+
+fn index_logical_document_response_to_json(
+    response: &pb::IndexLogicalDocumentResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "document": response.document.as_ref().map(|d| serde_json::json!({"access_zone_id": &d.access_zone_id, "document_id": &d.document_id, "document_version": d.document_version})),
+        "operation": response.operation.as_ref().map(|o| serde_json::json!({"operation_id": &o.operation_id, "state": o.state, "message": &o.message})),
+        "summary": response.summary.as_ref().map(|s| serde_json::json!({
+            "blocks_received": s.blocks_received,
+            "blocks_accepted": s.blocks_accepted,
+            "blocks_rejected": s.blocks_rejected,
+            "chunks_created": s.chunks_created,
+            "parent_chunks_created": s.parent_chunks_created,
+            "child_chunks_created": s.child_chunks_created,
+            "atomic_chunks_created": s.atomic_chunks_created,
+            "dense_vectors_created": s.dense_vectors_created,
+            "sparse_vectors_created": s.sparse_vectors_created,
+            "qdrant_points_scheduled": s.qdrant_points_scheduled,
+            "already_indexed": s.already_indexed,
+        })),
+    })
+}
+
+fn index_logical_document_response_from_json(
+    value: serde_json::Value,
+) -> Result<pb::IndexLogicalDocumentResponse, Status> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| Status::data_loss("stored finalize response is not object"))?;
+    let document = obj
+        .get("document")
+        .and_then(|v| v.as_object())
+        .map(|d| pb::DocumentRef {
+            access_zone_id: d
+                .get("access_zone_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            document_id: d
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            document_version: d
+                .get("document_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default(),
+        });
+    let operation = obj
+        .get("operation")
+        .and_then(|v| v.as_object())
+        .map(|o| pb::OperationStatus {
+            operation_id: o
+                .get("operation_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            state: o.get("state").and_then(|v| v.as_i64()).unwrap_or_default() as i32,
+            message: o
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        });
+    let summary = obj
+        .get("summary")
+        .and_then(|v| v.as_object())
+        .map(|s| pb::IndexingSummary {
+            blocks_received: s
+                .get("blocks_received")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            blocks_accepted: s
+                .get("blocks_accepted")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            blocks_rejected: s
+                .get("blocks_rejected")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            chunks_created: s
+                .get("chunks_created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            parent_chunks_created: s
+                .get("parent_chunks_created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            child_chunks_created: s
+                .get("child_chunks_created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            atomic_chunks_created: s
+                .get("atomic_chunks_created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            dense_vectors_created: s
+                .get("dense_vectors_created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            sparse_vectors_created: s
+                .get("sparse_vectors_created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            qdrant_points_scheduled: s
+                .get("qdrant_points_scheduled")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32,
+            already_indexed: s
+                .get("already_indexed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    Ok(pb::IndexLogicalDocumentResponse {
+        document,
+        operation,
+        summary,
+    })
+}
+
+fn graph_build_limits_from_config(cfg: &AppConfig) -> crate::graph::GraphBuildLimits {
+    crate::graph::GraphBuildLimits {
+        max_document_graph_nodes: cfg.graph_rag.build.max_document_graph_nodes,
+        max_document_graph_edges: cfg.graph_rag.build.max_document_graph_edges,
+        max_block_nodes: cfg.graph_rag.build.max_block_nodes,
+        max_chunk_nodes: cfg.graph_rag.build.max_chunk_nodes,
+        max_children_per_block: cfg.graph_rag.build.max_children_per_block,
+        max_same_parent_edges: cfg.graph_rag.build.max_same_parent_edges,
+        max_same_table_edges: cfg.graph_rag.build.max_same_table_edges,
+        semantic_edges_enabled: cfg.graph_rag.build.semantic_edges_enabled,
+        semantic_top_k_per_chunk: cfg.graph_rag.build.semantic_top_k_per_chunk,
+        semantic_min_score: cfg.graph_rag.build.semantic_min_score,
+        semantic_max_edges_per_document: cfg.graph_rag.build.semantic_max_edges_per_document,
+        semantic_max_chunks_for_in_memory: cfg.graph_rag.build.semantic_max_chunks_for_in_memory,
+        semantic_large_document_policy: cfg.graph_rag.build.semantic_large_document_policy.clone(),
+        semantic_normalize_embeddings: cfg.graph_rag.build.semantic_normalize_embeddings,
+        semantic_parallel_enabled: cfg.graph_rag.build.semantic_parallel_enabled,
+        semantic_parallelism: cfg.graph_rag.build.semantic_parallelism,
+        semantic_warn_build_time_ms: cfg.graph_rag.build.semantic_warn_build_time_ms,
+        semantic_rebuild_timeout_ms: cfg.graph_rag.build.semantic_rebuild_timeout_ms,
+    }
+}
+
+fn graph_scoring_options_from_config(cfg: &AppConfig) -> crate::graph::GraphScoringOptions {
+    crate::graph::GraphScoringOptions {
+        relation_weights: cfg.graph_rag.scoring.relation_weights.clone(),
+        default_structural_relation_weight: cfg
+            .graph_rag
+            .scoring
+            .default_structural_relation_weight,
+        default_semantic_relation_weight: cfg.graph_rag.scoring.default_semantic_relation_weight,
+        graph_hop_penalty: cfg.graph_rag.scoring.graph_hop_penalty.clone(),
+        graph_min_score: cfg.graph_rag.scoring.graph_min_score,
+        semantic_power: cfg.graph_rag.scoring.semantic_power,
+    }
+}
+
+fn retrieval_search_mode(profile: pb::RetrievalProfile) -> pb::SearchModeV005 {
+    match profile {
+        pb::RetrievalProfile::Semantic => pb::SearchModeV005::Dense,
+        pb::RetrievalProfile::LexicalStrict => pb::SearchModeV005::Sparse,
+        _ => pb::SearchModeV005::Hybrid,
+    }
+}
+
+fn retrieval_embedding_mode(profile: pb::RetrievalProfile) -> pb::EmbeddingModeV005 {
+    match profile {
+        pb::RetrievalProfile::Legal | pb::RetrievalProfile::LexicalStrict => {
+            pb::EmbeddingModeV005::DenseSparseRequired
+        }
+        pb::RetrievalProfile::Semantic => pb::EmbeddingModeV005::DenseOnly,
+        _ => pb::EmbeddingModeV005::DenseSparseIfAvailable,
+    }
+}
+
+fn retrieval_candidate_limit(profile: pb::RetrievalProfile) -> u32 {
+    match profile {
+        pb::RetrievalProfile::Legal => 120,
+        pb::RetrievalProfile::Technical => 100,
+        pb::RetrievalProfile::LexicalStrict => 80,
+        pb::RetrievalProfile::Semantic => 60,
+        _ => 80,
+    }
+}
+
+fn retrieved_context_from_search_result(result: pb::SearchResultV004) -> pb::RetrievedContext {
+    let mut metadata = result
+        .citation
+        .as_ref()
+        .map(|c| c.metadata.clone())
+        .unwrap_or_default();
+    // fix463: RetrieveContext response must preserve tenant/zone lineage even if
+    // the generated proto consumer only inspects metadata/citation.
+    metadata
+        .entry("access_zone_id".into())
+        .or_insert_with(|| result.access_zone_id.clone());
+    metadata
+        .entry("document_id".into())
+        .or_insert_with(|| result.document_id.clone());
+    metadata
+        .entry("document_version".into())
+        .or_insert_with(|| result.document_version.to_string());
+    metadata
+        .entry("matched_chunk_id".into())
+        .or_insert_with(|| result.matched_chunk_id.clone());
+    metadata
+        .entry("parent_chunk_id".into())
+        .or_insert_with(|| result.parent_chunk_id.clone());
+    let source_links = source_links_from_metadata(&metadata);
+    let citation = pb::Citation {
+        document_id: result.document_id.clone(),
+        document_version: result.document_version,
+        source_uri: metadata.get("source_uri").cloned().unwrap_or_default(),
+        title: metadata.get("document_title").cloned().unwrap_or_default(),
+        page_start: metadata
+            .get("page_start")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default(),
+        page_end: metadata
+            .get("page_end")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default(),
+        section_path: metadata.get("section_path").cloned().unwrap_or_default(),
+        heading: metadata.get("heading").cloned().unwrap_or_default(),
+        matched_chunk_id: result.matched_chunk_id.clone(),
+        parent_chunk_id: result.parent_chunk_id.clone(),
+        source_block_id: metadata.get("source_block_id").cloned().unwrap_or_default(),
+    };
+    let scores = result.scores.unwrap_or_default();
+    pb::RetrievedContext {
+        matched_text: result.matched_text,
+        parent_text: result.parent_text,
+        citation: Some(citation),
+        scores: Some(pb::Scores {
+            dense_score: scores.dense_score,
+            sparse_score: scores.sparse_score,
+            fusion_score: scores.fusion_score,
+            final_score: scores.final_score,
+        }),
+        document_id: result.document_id,
+        document_version: result.document_version,
+        access_zone_id: metadata.get("access_zone_id").cloned().unwrap_or_default(),
+        source_block_id: metadata.get("source_block_id").cloned().unwrap_or_default(),
+        matched_chunk_id: result.matched_chunk_id,
+        parent_chunk_id: result.parent_chunk_id,
+        source_links,
+        metadata,
+    }
+}
+
+fn source_links_from_metadata(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Vec<pb::SourceLink> {
+    let mut links = Vec::new();
+    for (key, link_type, label) in [
+        (
+            "preview_url",
+            pb::SourceLinkType::Preview,
+            "Предпросмотр документа",
+        ),
+        (
+            "download_url",
+            pb::SourceLinkType::Download,
+            "Скачать документ",
+        ),
+        (
+            "source_url",
+            pb::SourceLinkType::OriginalDocument,
+            "Открыть оригинальный документ",
+        ),
+        (
+            "source_uri",
+            pb::SourceLinkType::OriginalDocument,
+            "Источник документа",
+        ),
+        ("page_url", pb::SourceLinkType::Page, "Открыть страницу"),
+        ("section_url", pb::SourceLinkType::Section, "Открыть раздел"),
+    ] {
+        if let Some(url) = metadata.get(key).filter(|v| !v.trim().is_empty()) {
+            links.push(pb::SourceLink {
+                r#type: link_type as i32,
+                url: url.clone(),
+                label: label.into(),
+                mime_type: metadata.get("mime_type").cloned().unwrap_or_default(),
+                requires_auth: true,
+                expires_at: metadata.get("expires_at").cloned().unwrap_or_default(),
+                attributes: metadata.clone(),
+            });
+        }
+    }
+    for raw_key in ["matched_source_links", "document_source_links"] {
+        if let Some(raw) = metadata.get(raw_key) {
+            if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+                for v in values {
+                    if let Some(url) = v.get("url").and_then(serde_json::Value::as_str) {
+                        links.push(pb::SourceLink {
+                            r#type: v
+                                .get("type")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0) as i32,
+                            url: url.into(),
+                            label: v
+                                .get("label")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("Источник")
+                                .into(),
+                            mime_type: v
+                                .get("mime_type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .into(),
+                            requires_auth: v
+                                .get("requires_auth")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true),
+                            expires_at: v
+                                .get("expires_at")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .into(),
+                            attributes: std::collections::HashMap::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    links.retain(|l| seen.insert(format!("{}|{}", l.r#type, l.url)));
+    links
+}
+
+fn document_status_message(sync: &pb::GetVectorSyncStatusResponse) -> String {
+    if sync.ready_to_activate {
+        "Document vectors are synchronized and ready to activate".into()
+    } else if sync.failed_bindings > 0 || sync.outbox_failed > 0 {
+        "Document vector synchronization has failed bindings or outbox failures".into()
+    } else if sync.outbox_pending > 0 || sync.outbox_retry_pending > 0 {
+        "Document vectors are waiting for Qdrant publisher".into()
+    } else {
+        "Document vectors are being synchronized".into()
+    }
+}
+
+async fn schedule_v004_delete_document_vectors(
+    repo: &Repository,
+    access_zone_id: Uuid,
+    document_id: Uuid,
+    document_version: i64,
+) -> Result<u64, Status> {
+    let mut tx = repo
+        .pool
+        .begin()
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+    let rows = sqlx::query(
+        "SELECT id FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status NOT IN('DELETE_PENDING') FOR UPDATE",
+    )
+    .bind(access_zone_id)
+    .bind(document_id)
+    .bind(document_version)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+    for row in &rows {
+        let id: Uuid = row.get("id");
+        sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='DELETE_PENDING', updated_at=now() WHERE access_zone_id=$1 AND id=$2")
+            .bind(access_zone_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+        sqlx::query("INSERT INTO astravector.vector_outbox(id,binding_access_zone_id,binding_id,operation,operation_version,status) SELECT $1,$2,$3,'DELETE_POINT',payload_version,'PENDING' FROM astravector.vector_bindings_v004 WHERE access_zone_id=$2 AND id=$3 ON CONFLICT(binding_access_zone_id,binding_id,operation,operation_version) DO NOTHING")
+            .bind(Uuid::new_v4())
+            .bind(access_zone_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
+    Ok(rows.len() as u64)
+}
+
+#[derive(Debug)]
+pub struct SearchMergeResult {
+    pub results: Vec<pb::SearchResultV004>,
+    pub merged_count: usize,
+    pub deduplicated_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchMmrResult {
+    pub results: Vec<pb::SearchResultV004>,
+    pub input_count: usize,
+    pub selected_count: usize,
+    pub duration_ms: u64,
+    pub enabled: bool,
+    pub similarity_source: String,
+    pub embedding_missing_count: usize,
+    pub token_fallback_count: usize,
+    pub dense_pair_comparisons: usize,
+    pub token_pair_comparisons: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchSelectionResult {
+    pub results: Vec<pb::SearchResultV004>,
+    pub merged_count: usize,
+    pub deduplicated_count: usize,
+    pub mmr: SearchMmrResult,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MmrEmbeddingFetchStats {
+    pub requested: usize,
+    pub found: usize,
+    pub missing: usize,
+    pub errors: usize,
+    pub timeouts: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub skipped_all_present: bool,
+    pub skipped_small_pool: bool,
+    pub duration_ms: u64,
+}
+
+impl MmrEmbeddingFetchStats {
+    fn skipped() -> Self {
+        Self {
+            skipped_small_pool: true,
+            ..Self::default()
+        }
+    }
+}
+
+static MMR_EMBEDDING_CACHE: OnceLock<Cache<String, Vec<f32>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct EmbeddingIdentity {
+    key: String,
+    access_zone_id: Uuid,
+    qdrant_point_id: Option<Uuid>,
+    chunk_id: Option<Uuid>,
+}
+
+fn embedding_identity_from_result(
+    result: &pb::SearchResultV004,
+    _default_access_zone_id: Uuid,
+    cfg: &AppConfig,
+) -> Option<EmbeddingIdentity> {
+    let metadata = result.citation.as_ref().map(|c| &c.metadata)?;
+    let access_zone_id = match Uuid::parse_str(&result.access_zone_id) {
+        Ok(id) => id,
+        Err(_) => {
+            metrics::counter!("graph_mmr_embedding_identity_missing_access_zone_total")
+                .increment(1);
+            return None;
+        }
+    };
+    let dense_version = metadata
+        .get("dense_version")
+        .cloned()
+        .unwrap_or_else(|| cfg.dense.version.clone());
+    let model_version = metadata
+        .get("model_version")
+        .cloned()
+        .unwrap_or_else(|| "UNKNOWN".into());
+    let payload_version = metadata
+        .get("payload_version")
+        .cloned()
+        .unwrap_or_else(|| "UNKNOWN".into());
+    if let Some(raw) = metadata.get("qdrant_point_id") {
+        if let Ok(point_id) = Uuid::parse_str(raw) {
+            return Some(EmbeddingIdentity {
+                key: format!(
+                    "{}:point:{}:docv:{}:payload:{}:model:{}:dense:{}",
+                    access_zone_id,
+                    point_id,
+                    result.document_version,
+                    payload_version,
+                    model_version,
+                    dense_version
+                ),
+                access_zone_id,
+                qdrant_point_id: Some(point_id),
+                chunk_id: Uuid::parse_str(&result.matched_chunk_id).ok(),
+            });
+        }
+    }
+    metrics::counter!("graph_mmr_embedding_identity_missing_total").increment(1);
+    if cfg.graph_rag.rerank.embedding_fetch_allow_chunk_fallback {
+        if let Ok(chunk_id) = Uuid::parse_str(&result.matched_chunk_id) {
+            let representation_type = metadata
+                .get("representation_type")
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".into());
+            let tokenizer_version = metadata
+                .get("tokenizer_version")
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".into());
+            let content_hash = metadata
+                .get("content_hash")
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".into());
+            let required = [
+                payload_version.as_str(),
+                model_version.as_str(),
+                dense_version.as_str(),
+                tokenizer_version.as_str(),
+                content_hash.as_str(),
+            ];
+            if required
+                .iter()
+                .any(|v| *v == "UNKNOWN" || v.trim().is_empty())
+            {
+                metrics::counter!("graph_mmr_embedding_identity_fallback_uncacheable_total")
+                    .increment(1);
+                return Some(EmbeddingIdentity {
+                    key: format!(
+                        "{}:chunk:{}:uncacheable:{}",
+                        access_zone_id,
+                        chunk_id,
+                        uuid::Uuid::new_v4()
+                    ),
+                    access_zone_id,
+                    qdrant_point_id: None,
+                    chunk_id: Some(chunk_id),
+                });
+            }
+            metrics::counter!("graph_mmr_embedding_identity_fallback_total").increment(1);
+            return Some(EmbeddingIdentity {
+                key: format!(
+                    "{}:chunk:{}:docv:{}:payload:{}:model:{}:dense:{}:tokenizer:{}:repr:{}:hash:{}",
+                    access_zone_id,
+                    chunk_id,
+                    result.document_version,
+                    payload_version,
+                    model_version,
+                    dense_version,
+                    tokenizer_version,
+                    representation_type,
+                    content_hash
+                ),
+                access_zone_id,
+                qdrant_point_id: None,
+                chunk_id: Some(chunk_id),
+            });
+        }
+    }
+    None
+}
+
+fn mmr_embedding_cache(cfg: &AppConfig) -> &'static Cache<String, Vec<f32>> {
+    MMR_EMBEDDING_CACHE.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(cfg.graph_rag.rerank.embedding_cache_max_entries as u64)
+            .time_to_live(Duration::from_secs(
+                cfg.graph_rag.rerank.embedding_cache_ttl_seconds,
+            ))
+            .build()
+    })
+}
+
+fn prelimit_candidates_for_embedding_fetch(results: &mut Vec<pb::SearchResultV004>, limit: usize) {
+    if results.len() <= limit {
+        return;
+    }
+    results.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    metrics::counter!("graph_mmr_candidates_truncated_total", "stage" => "embedding_fetch_prelimit").increment(1);
+    metrics::counter!("graph_mmr_candidates_truncated_by_total", "stage" => "embedding_fetch_prelimit").increment((results.len() - limit) as u64);
+    results.truncate(limit);
+}
+
+async fn enrich_dense_embeddings_for_mmr(
+    repo: Option<&Repository>,
+    access_zone_ids: &[Uuid],
+    direct_results: &mut [pb::SearchResultV004],
+    graph_results: &mut [pb::SearchResultV004],
+    cfg: &AppConfig,
+    enrichment_limit: usize,
+) -> MmrEmbeddingFetchStats {
+    let started = std::time::Instant::now();
+    let mut stats = MmrEmbeddingFetchStats::default();
+    if !cfg.graph_rag.rerank.embedding_fetch_enabled {
+        return stats;
+    }
+    let Some(default_access_zone_id) = access_zone_ids.first().copied() else {
+        return stats;
+    };
+    let total_candidates = direct_results.len() + graph_results.len();
+    if total_candidates < cfg.graph_rag.rerank.embedding_fetch_min_candidates {
+        stats.skipped_small_pool = true;
+        metrics::counter!("graph_mmr_embedding_fetch_skipped_small_pool_total").increment(1);
+        return stats;
+    }
+
+    let mut identities: Vec<EmbeddingIdentity> = Vec::new();
+    let mut seen_keys = HashSet::new();
+    let mut enrichment_candidates: Vec<&pb::SearchResultV004> =
+        direct_results.iter().chain(graph_results.iter()).collect();
+    metrics::counter!("graph_mmr_full_candidates_total")
+        .increment(enrichment_candidates.len() as u64);
+    enrichment_candidates.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let original_enrichment_count = enrichment_candidates.len();
+    enrichment_candidates.truncate(enrichment_limit.max(1));
+    metrics::counter!("graph_mmr_enrichment_candidates_total")
+        .increment(enrichment_candidates.len() as u64);
+    if original_enrichment_count > enrichment_candidates.len() {
+        metrics::counter!("graph_mmr_enrichment_candidates_skipped_total")
+            .increment((original_enrichment_count - enrichment_candidates.len()) as u64);
+    }
+    for result in enrichment_candidates {
+        if extract_normalized_embedding(result).is_some() {
+            continue;
+        }
+        if let Some(identity) = embedding_identity_from_result(result, default_access_zone_id, cfg)
+        {
+            if seen_keys.insert(identity.key.clone()) {
+                identities.push(identity);
+            }
+        } else {
+            metrics::counter!("graph_mmr_embedding_identity_missing_total").increment(1);
+        }
+    }
+    if identities.is_empty() {
+        stats.skipped_all_present = true;
+        metrics::counter!("graph_mmr_embedding_fetch_skipped_all_present_total").increment(1);
+        return stats;
+    }
+
+    let mut embeddings_by_key: HashMap<String, Vec<f32>> = HashMap::new();
+    if cfg.graph_rag.rerank.embedding_cache_enabled {
+        let cache = mmr_embedding_cache(cfg);
+        for identity in &identities {
+            if let Some(vector) = cache.get(&identity.key).await {
+                embeddings_by_key.insert(identity.key.clone(), vector);
+                stats.cache_hits += 1;
+                metrics::counter!("graph_mmr_embedding_cache_hit_total").increment(1);
+            } else {
+                stats.cache_misses += 1;
+                metrics::counter!("graph_mmr_embedding_cache_miss_total").increment(1);
+            }
+        }
+    }
+
+    let point_ids_to_fetch = identities
+        .iter()
+        .filter(|i| !embeddings_by_key.contains_key(&i.key))
+        .filter_map(|i| i.qdrant_point_id)
+        .collect::<Vec<_>>();
+    let chunk_ids_to_fetch = identities
+        .iter()
+        .filter(|i| !embeddings_by_key.contains_key(&i.key))
+        .filter(|i| i.qdrant_point_id.is_none())
+        .filter_map(|i| i.chunk_id)
+        .collect::<Vec<_>>();
+
+    stats.requested = point_ids_to_fetch.len() + chunk_ids_to_fetch.len();
+    if stats.requested > 0 {
+        metrics::counter!("graph_mmr_embedding_fetch_requested_total")
+            .increment(stats.requested as u64);
+    }
+
+    if let Some(repo) = repo {
+        if !point_ids_to_fetch.is_empty() {
+            metrics::counter!("graph_mmr_embedding_fetch_by_point_total")
+                .increment(point_ids_to_fetch.len() as u64);
+            let fetch = repo.fetch_dense_embeddings_for_points_multi(
+                access_zone_ids,
+                &point_ids_to_fetch,
+                &cfg.graph_rag.rerank.embedding_dense_representation_name,
+            );
+            match tokio::time::timeout(
+                Duration::from_millis(cfg.graph_rag.rerank.embedding_fetch_timeout_ms),
+                fetch,
+            )
+            .await
+            {
+                Ok(Ok(fetched)) => {
+                    stats.found += fetched.len();
+                    metrics::counter!("graph_mmr_embedding_fetch_found_total")
+                        .increment(fetched.len() as u64);
+                    for ((zone_id, point_id), vector) in fetched {
+                        let normalized = normalize_embedding_once(vector);
+                        if normalized.is_empty() {
+                            metrics::counter!("graph_mmr_embedding_invalid_total").increment(1);
+                            continue;
+                        }
+                        for identity in identities.iter().filter(|i| {
+                            i.access_zone_id == zone_id && i.qdrant_point_id == Some(point_id)
+                        }) {
+                            if cfg.graph_rag.rerank.embedding_cache_enabled {
+                                mmr_embedding_cache(cfg)
+                                    .insert(identity.key.clone(), normalized.clone())
+                                    .await;
+                                metrics::counter!("graph_mmr_embedding_cache_insert_total")
+                                    .increment(1);
+                            }
+                            embeddings_by_key.insert(identity.key.clone(), normalized.clone());
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    stats.errors += 1;
+                    metrics::counter!("graph_mmr_embedding_fetch_error_total").increment(1);
+                    tracing::warn!(candidate_count = point_ids_to_fetch.len(), error = %e, "MMR_EMBEDDING_FETCH_BY_POINT_FAILED_TOKEN_FALLBACK");
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                    stats.timeouts += 1;
+                    metrics::counter!("graph_mmr_embedding_fetch_timeout_total").increment(1);
+                    tracing::warn!(
+                        candidate_count = point_ids_to_fetch.len(),
+                        timeout_ms = cfg.graph_rag.rerank.embedding_fetch_timeout_ms,
+                        "MMR_EMBEDDING_FETCH_BY_POINT_TIMEOUT_TOKEN_FALLBACK"
+                    );
+                }
+            }
+        }
+        if !chunk_ids_to_fetch.is_empty()
+            && cfg.graph_rag.rerank.embedding_fetch_allow_chunk_fallback
+        {
+            metrics::counter!("graph_mmr_embedding_fetch_by_chunk_fallback_total")
+                .increment(chunk_ids_to_fetch.len() as u64);
+            let fetch = repo.fetch_dense_embeddings_for_chunks_multi(
+                access_zone_ids,
+                &chunk_ids_to_fetch,
+                &cfg.graph_rag.rerank.embedding_dense_representation_name,
+                Some(cfg.dense.version.as_str()),
+            );
+            match tokio::time::timeout(
+                Duration::from_millis(cfg.graph_rag.rerank.embedding_fetch_timeout_ms),
+                fetch,
+            )
+            .await
+            {
+                Ok(Ok(fetched)) => {
+                    stats.found += fetched.len();
+                    metrics::counter!("graph_mmr_embedding_fetch_found_total")
+                        .increment(fetched.len() as u64);
+                    for ((zone_id, chunk_id), vector) in fetched {
+                        let normalized = normalize_embedding_once(vector);
+                        if normalized.is_empty() {
+                            metrics::counter!("graph_mmr_embedding_invalid_total").increment(1);
+                            continue;
+                        }
+                        for identity in identities.iter().filter(|i| {
+                            i.access_zone_id == zone_id
+                                && i.chunk_id == Some(chunk_id)
+                                && i.qdrant_point_id.is_none()
+                        }) {
+                            if cfg.graph_rag.rerank.embedding_cache_enabled {
+                                mmr_embedding_cache(cfg)
+                                    .insert(identity.key.clone(), normalized.clone())
+                                    .await;
+                                metrics::counter!("graph_mmr_embedding_cache_insert_total")
+                                    .increment(1);
+                            }
+                            embeddings_by_key.insert(identity.key.clone(), normalized.clone());
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    stats.errors += 1;
+                    metrics::counter!("graph_mmr_embedding_fetch_error_total").increment(1);
+                    tracing::warn!(candidate_count = chunk_ids_to_fetch.len(), error = %e, "MMR_EMBEDDING_FETCH_BY_CHUNK_FALLBACK_FAILED_TOKEN_FALLBACK");
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                    stats.timeouts += 1;
+                    metrics::counter!("graph_mmr_embedding_fetch_timeout_total").increment(1);
+                    tracing::warn!(
+                        candidate_count = chunk_ids_to_fetch.len(),
+                        timeout_ms = cfg.graph_rag.rerank.embedding_fetch_timeout_ms,
+                        "MMR_EMBEDDING_FETCH_BY_CHUNK_FALLBACK_TIMEOUT_TOKEN_FALLBACK"
+                    );
+                }
+            }
+        }
+    } else if stats.requested > 0 {
+        stats.errors += 1;
+        metrics::counter!("graph_mmr_embedding_fetch_error_total", "reason" => "repo_unavailable")
+            .increment(1);
+    }
+
+    for result in direct_results.iter_mut().chain(graph_results.iter_mut()) {
+        if extract_normalized_embedding(result).is_some() {
+            continue;
+        }
+        let Some(identity) = embedding_identity_from_result(result, default_access_zone_id, cfg)
+        else {
+            continue;
+        };
+        if let Some(vector) = embeddings_by_key.get(&identity.key) {
+            if let Some(citation) = result.citation.as_mut() {
+                if let Ok(json) = serde_json::to_string(vector) {
+                    citation
+                        .metadata
+                        .insert("embedding_normalized_json".into(), json);
+                    citation
+                        .metadata
+                        .insert("embedding_identity_key".into(), identity.key);
+                    citation
+                        .metadata
+                        .insert("embedding_internal_only".into(), "true".into());
+                }
+            }
+        }
+    }
+
+    stats.duration_ms = started.elapsed().as_millis() as u64;
+    stats.missing = identities.len().saturating_sub(embeddings_by_key.len());
+    metrics::counter!("graph_mmr_embedding_fetch_missing_total").increment(stats.missing as u64);
+    metrics::counter!("graph_mmr_candidate_embedding_missing_total")
+        .increment(stats.missing as u64);
+    metrics::histogram!("graph_mmr_embedding_fetch_duration_ms").record(stats.duration_ms as f64);
+    if stats.duration_ms > cfg.graph_rag.rerank.embedding_fetch_warn_threshold_ms {
+        metrics::counter!("graph_mmr_embedding_fetch_slow_total").increment(1);
+        tracing::warn!(
+            duration_ms = stats.duration_ms,
+            threshold_ms = cfg.graph_rag.rerank.embedding_fetch_warn_threshold_ms,
+            requested = stats.requested,
+            found = stats.found,
+            cache_hits = stats.cache_hits,
+            "MMR_EMBEDDING_FETCH_SLOW"
+        );
+    }
+    stats
+}
+
+fn normalize_embedding_once(mut vector: Vec<f32>) -> Vec<f32> {
+    if vector.is_empty() || vector.iter().any(|v| !v.is_finite()) {
+        return Vec::new();
+    }
+    let norm_sq: f32 = vector.iter().map(|v| v * v).sum();
+    if (0.99..=1.01).contains(&norm_sq) {
+        metrics::counter!("graph_mmr_embedding_already_normalized_total").increment(1);
+        return vector;
+    }
+    let norm = norm_sq.sqrt();
+    if norm <= f32::EPSILON {
+        metrics::counter!("graph_mmr_embedding_zero_norm_total").increment(1);
+        return Vec::new();
+    }
+    for value in &mut vector {
+        *value /= norm;
+    }
+    metrics::counter!("graph_mmr_embedding_normalized_on_attach_total").increment(1);
+    vector
+}
+
+fn estimate_results_tokens(results: &[pb::SearchResultV004], chars_per_token: usize) -> usize {
+    let divisor = chars_per_token.max(1);
+    results
+        .iter()
+        .map(|r| {
+            let chars = r.matched_text.len() + r.parent_text.len();
+            chars.div_ceil(divisor)
+        })
+        .sum()
+}
+
+fn estimate_text_tokens(text: &str, chars_per_token: usize) -> usize {
+    let divisor = chars_per_token.max(1);
+    text.len().div_ceil(divisor)
+}
+
+fn apply_token_budget_truncation(
+    results: &mut Vec<pb::SearchResultV004>,
+    cfg: &AppConfig,
+) -> (Vec<String>, Vec<String>, u32) {
+    if !cfg.rag_context.token_budget_enabled {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let available = cfg
+        .rag_context
+        .max_context_tokens
+        .saturating_sub(cfg.rag_context.reserved_answer_tokens);
+    let effective_available = available.saturating_mul(
+        100usize.saturating_sub(cfg.rag_context.tokenizer_safety_margin_percent.min(80)),
+    ) / 100;
+    if effective_available == 0 {
+        let dropped = results
+            .iter()
+            .map(|r| r.matched_chunk_id.clone())
+            .collect::<Vec<_>>();
+        results.clear();
+        let count = dropped.len() as u32;
+        return (dropped, Vec::new(), count);
+    }
+    let mut dropped = Vec::new();
+    let chars_per_token = cfg.rag_context.chars_per_token.max(1);
+    let mut huge_to_drop = Vec::new();
+    for (idx, result) in results.iter_mut().enumerate() {
+        let tokens = estimate_text_tokens(&result.matched_text, chars_per_token)
+            + estimate_text_tokens(&result.parent_text, chars_per_token);
+        if tokens > effective_available {
+            match cfg.rag_context.huge_chunk_strategy.as_str() {
+                "TRUNCATE_ONE_HUGE_CHUNK" if cfg.rag_context.allow_chunk_text_truncation => {
+                    let max_chars = effective_available.saturating_mul(chars_per_token).max(1);
+                    result.matched_text = result.matched_text.chars().take(max_chars).collect();
+                    counter!("rag_context_huge_chunk_truncated_total").increment(1);
+                }
+                _ => {
+                    huge_to_drop.push(idx);
+                    counter!("rag_context_huge_chunk_dropped_total").increment(1);
+                }
+            }
+        }
+    }
+    for idx in huge_to_drop.into_iter().rev() {
+        let removed = results.remove(idx);
+        dropped.push(removed.matched_chunk_id);
+    }
+    while estimate_results_tokens(results, chars_per_token) > effective_available
+        && !results.is_empty()
+    {
+        let idx = results
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let sa = token_truncation_score(a, &cfg.rag_context.truncation_strategy);
+                let sb = token_truncation_score(b, &cfg.rag_context.truncation_strategy);
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(results.len() - 1);
+        if cfg.rag_context.truncation_strategy == "TRUNCATE_LAST_CHUNK"
+            && cfg.rag_context.allow_chunk_text_truncation
+            && !results.is_empty()
+        {
+            let prefix_tokens = estimate_results_tokens(
+                &results[..results.len().saturating_sub(1)],
+                chars_per_token,
+            );
+            if prefix_tokens < effective_available {
+                let allowed_for_last = effective_available.saturating_sub(prefix_tokens).max(1);
+                if let Some(last) = results.last_mut() {
+                    let max_chars = allowed_for_last.saturating_mul(chars_per_token).max(1);
+                    last.matched_text = last.matched_text.chars().take(max_chars).collect();
+                }
+                if estimate_results_tokens(results, chars_per_token) <= effective_available {
+                    break;
+                }
+            }
+        }
+        let removed = results.remove(idx);
+        dropped.push(removed.matched_chunk_id);
+    }
+    let dropped_count = dropped.len() as u32;
+    let mut warnings = Vec::new();
+    if dropped.len() > 50 {
+        dropped.truncate(50);
+        warnings.push("DROPPED_CHUNK_IDS_TRUNCATED".to_string());
+        counter!("rag_context_dropped_chunk_ids_truncated_total").increment(1);
+    }
+    (dropped, warnings, dropped_count)
+}
+
+fn token_truncation_score(result: &pb::SearchResultV004, strategy: &str) -> f32 {
+    let Some(scores) = result.scores.as_ref() else {
+        return 0.0;
+    };
+    match strategy {
+        "DROP_LOWEST_SCORE_CHUNKS" => scores.fusion_score,
+        "DROP_LOWEST_MMR_SCORE_CHUNKS" => scores.final_score,
+        _ => scores.final_score,
+    }
+}
+
+fn strip_internal_embedding_metadata(results: &mut [pb::SearchResultV004]) {
+    for result in results {
+        if let Some(citation) = result.citation.as_mut() {
+            citation.metadata.remove("embedding_normalized_json");
+            citation.metadata.remove("dense_embedding_normalized_json");
+            citation.metadata.remove("embedding_internal_only");
+        }
+    }
+}
+
+pub fn resolve_final_context_limit(configured_limit: usize, top_k: usize, mode: &str) -> usize {
+    match mode {
+        "AT_LEAST_TOP_K" => configured_limit.max(top_k).max(1),
+        _ => configured_limit.max(1),
+    }
+}
+
+pub fn merge_search_results_before_truncate(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+    strategy: &str,
+    direct_context_limit: usize,
+    graph_context_append_limit: usize,
+) -> SearchMergeResult {
+    match strategy {
+        "DIRECT_FIRST" => merge_direct_first(direct_results, graph_results, final_limit),
+        "GRAPH_AS_CONTEXT_APPEND" => merge_graph_as_context_append(
+            direct_results,
+            graph_results,
+            final_limit,
+            direct_context_limit,
+            graph_context_append_limit,
+        ),
+        _ => merge_score_then_truncate(direct_results, graph_results, final_limit),
+    }
+}
+
+fn merge_score_then_truncate(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+) -> SearchMergeResult {
+    let mut by_chunk: HashMap<String, pb::SearchResultV004> = HashMap::new();
+    let mut dedup_count = 0usize;
+    for result in direct_results.into_iter().chain(graph_results) {
+        let key = result_identity_key(&result);
+        if let Some(existing) = by_chunk.get_mut(&key) {
+            dedup_count += 1;
+            merge_secondary_metadata(existing, &result);
+            if score_of(&result) > score_of(existing) {
+                let mut replacement = result;
+                merge_secondary_metadata(&mut replacement, existing);
+                *existing = replacement;
+            }
+            continue;
+        }
+        by_chunk.insert(key, result);
+    }
+    let merged_count = by_chunk.len();
+    let mut merged = by_chunk.into_values().collect::<Vec<_>>();
+    merged.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(final_limit);
+    SearchMergeResult {
+        results: merged,
+        merged_count,
+        deduplicated_count: dedup_count,
+    }
+}
+
+fn merge_direct_first(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+) -> SearchMergeResult {
+    let mut seen = HashSet::new();
+    let mut dedup_count = 0usize;
+    let mut merged = Vec::with_capacity(direct_results.len() + graph_results.len());
+    for result in direct_results {
+        if seen.insert(result_identity_key(&result)) {
+            merged.push(result);
+        } else {
+            dedup_count += 1;
+        }
+    }
+    let mut graph_sorted = graph_results;
+    graph_sorted.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for result in graph_sorted {
+        if seen.insert(result_identity_key(&result)) {
+            merged.push(result);
+        } else {
+            dedup_count += 1;
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|r| result_identity_key(r) == result_identity_key(&result))
+            {
+                merge_secondary_metadata(existing, &result);
+            }
+        }
+    }
+    let merged_count = merged.len();
+    merged.truncate(final_limit);
+    SearchMergeResult {
+        results: merged,
+        merged_count,
+        deduplicated_count: dedup_count,
+    }
+}
+
+fn merge_graph_as_context_append(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+    direct_context_limit: usize,
+    graph_context_append_limit: usize,
+) -> SearchMergeResult {
+    let mut seen = HashSet::new();
+    let mut dedup_count = 0usize;
+    let mut merged = Vec::with_capacity(final_limit);
+    let direct_budget = direct_context_limit.min(final_limit);
+    for result in direct_results.into_iter().take(direct_budget) {
+        if seen.insert(result_identity_key(&result)) {
+            merged.push(result);
+        } else {
+            dedup_count += 1;
+        }
+    }
+    let graph_budget = graph_context_append_limit.min(final_limit.saturating_sub(merged.len()));
+    let mut graph_sorted = graph_results;
+    graph_sorted.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for result in graph_sorted.into_iter().take(graph_budget) {
+        if seen.insert(result_identity_key(&result)) {
+            merged.push(result);
+        } else {
+            dedup_count += 1;
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|r| result_identity_key(r) == result_identity_key(&result))
+            {
+                merge_secondary_metadata(existing, &result);
+            }
+        }
+    }
+    let merged_count = merged.len();
+    SearchMergeResult {
+        results: merged,
+        merged_count,
+        deduplicated_count: dedup_count,
+    }
+}
+
+pub fn select_results_with_strategy_aware_mmr(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+    strategy: &str,
+    direct_context_limit: usize,
+    graph_context_append_limit: usize,
+    mmr_enabled: bool,
+    mmr_lambda: f32,
+    mmr_lambda_direct: f32,
+    mmr_lambda_graph: f32,
+    mmr_candidate_limit: usize,
+    similarity_source: &str,
+    fallback_similarity_source: &str,
+    mmr_allow_direct_candidates: bool,
+    mmr_allow_graph_candidates: bool,
+    max_graph_relations_debug_per_candidate: usize,
+) -> SearchSelectionResult {
+    match strategy {
+        "DIRECT_FIRST" => select_direct_first_with_group_mmr(
+            direct_results,
+            graph_results,
+            final_limit,
+            mmr_enabled,
+            mmr_lambda_direct,
+            mmr_lambda_graph,
+            mmr_candidate_limit,
+            similarity_source,
+            fallback_similarity_source,
+            mmr_allow_direct_candidates,
+            mmr_allow_graph_candidates,
+            max_graph_relations_debug_per_candidate,
+        ),
+        "GRAPH_AS_CONTEXT_APPEND" => select_graph_append_with_group_mmr(
+            direct_results,
+            graph_results,
+            final_limit,
+            direct_context_limit,
+            graph_context_append_limit,
+            mmr_enabled,
+            mmr_lambda_direct,
+            mmr_lambda_graph,
+            mmr_candidate_limit,
+            similarity_source,
+            fallback_similarity_source,
+            mmr_allow_direct_candidates,
+            mmr_allow_graph_candidates,
+            max_graph_relations_debug_per_candidate,
+        ),
+        _ => {
+            let merge = merge_score_then_truncate(
+                direct_results,
+                graph_results,
+                mmr_candidate_limit.max(final_limit),
+            );
+            let mmr = apply_mmr_rerank(
+                merge.results,
+                final_limit,
+                mmr_enabled && (mmr_allow_direct_candidates || mmr_allow_graph_candidates),
+                mmr_lambda,
+                mmr_candidate_limit,
+                similarity_source,
+                fallback_similarity_source,
+            );
+            SearchSelectionResult {
+                results: mmr.results.clone(),
+                merged_count: merge.merged_count,
+                deduplicated_count: merge.deduplicated_count,
+                mmr,
+            }
+        }
+    }
+}
+
+fn dedup_results_by_chunk(
+    mut results: Vec<pb::SearchResultV004>,
+    max_relations: usize,
+) -> (Vec<pb::SearchResultV004>, usize) {
+    results.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut by_chunk: HashMap<String, pb::SearchResultV004> = HashMap::new();
+    let mut dedup = 0usize;
+    for result in results {
+        let key = result_identity_key(&result);
+        if let Some(existing) = by_chunk.get_mut(&key) {
+            dedup += 1;
+            merge_secondary_metadata_with_limit(existing, &result, max_relations);
+            if score_of(&result) > score_of(existing) {
+                let mut replacement = result;
+                merge_secondary_metadata_with_limit(&mut replacement, existing, max_relations);
+                *existing = replacement;
+            }
+        } else {
+            by_chunk.insert(key, result);
+        }
+    }
+    let mut out = by_chunk.into_values().collect::<Vec<_>>();
+    out.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (out, dedup)
+}
+
+fn combine_group_mmr(
+    left: SearchMmrResult,
+    right: SearchMmrResult,
+    results: Vec<pb::SearchResultV004>,
+) -> SearchMmrResult {
+    let source = if left.similarity_source == "DENSE_EMBEDDING"
+        && right.similarity_source == "DENSE_EMBEDDING"
+    {
+        "DENSE_EMBEDDING".to_string()
+    } else if !left.enabled && !right.enabled {
+        "SCORE_ONLY".to_string()
+    } else {
+        "MIXED_OR_FALLBACK".to_string()
+    };
+    SearchMmrResult {
+        results,
+        input_count: left.input_count + right.input_count,
+        selected_count: left.selected_count + right.selected_count,
+        duration_ms: left.duration_ms + right.duration_ms,
+        enabled: left.enabled || right.enabled,
+        similarity_source: source,
+        embedding_missing_count: left.embedding_missing_count + right.embedding_missing_count,
+        token_fallback_count: left.token_fallback_count + right.token_fallback_count,
+        dense_pair_comparisons: left.dense_pair_comparisons + right.dense_pair_comparisons,
+        token_pair_comparisons: left.token_pair_comparisons + right.token_pair_comparisons,
+    }
+}
+
+fn select_direct_first_with_group_mmr(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+    mmr_enabled: bool,
+    mmr_lambda_direct: f32,
+    mmr_lambda_graph: f32,
+    mmr_candidate_limit: usize,
+    similarity_source: &str,
+    fallback_similarity_source: &str,
+    mmr_allow_direct_candidates: bool,
+    mmr_allow_graph_candidates: bool,
+    max_graph_relations_debug_per_candidate: usize,
+) -> SearchSelectionResult {
+    let (direct_pool, direct_dedup) =
+        dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
+    metrics::counter!("graph_mmr_group_direct_candidates_total")
+        .increment(direct_pool.len() as u64);
+    metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
+    metrics::gauge!("graph_mmr_group_graph_lambda_current").set(mmr_lambda_graph as f64);
+    let direct_mmr = apply_mmr_rerank(
+        direct_pool,
+        final_limit,
+        mmr_enabled && mmr_allow_direct_candidates,
+        mmr_lambda_direct,
+        mmr_candidate_limit,
+        similarity_source,
+        fallback_similarity_source,
+    );
+    let mut selected = direct_mmr.results.clone();
+    let mut dedup_count = direct_dedup;
+    let mut graph_candidates = Vec::new();
+    let selected_by_chunk: HashMap<String, usize> = selected
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| (result_identity_key(r), idx))
+        .collect();
+    for graph in graph_results {
+        if let Some(idx) = selected_by_chunk.get(&result_identity_key(&graph)).copied() {
+            dedup_count += 1;
+            merge_secondary_metadata_with_limit(
+                &mut selected[idx],
+                &graph,
+                max_graph_relations_debug_per_candidate,
+            );
+        } else {
+            graph_candidates.push(graph);
+        }
+    }
+    let remaining = final_limit.saturating_sub(selected.len());
+    metrics::counter!("graph_mmr_group_graph_candidates_total")
+        .increment(graph_candidates.len() as u64);
+    let graph_mmr = apply_mmr_rerank(
+        graph_candidates,
+        remaining,
+        mmr_enabled && mmr_allow_graph_candidates && remaining > 0,
+        mmr_lambda_graph,
+        mmr_candidate_limit,
+        similarity_source,
+        fallback_similarity_source,
+    );
+    selected.extend(graph_mmr.results.clone());
+    metrics::counter!("graph_mmr_group_direct_selected_total")
+        .increment(direct_mmr.selected_count as u64);
+    metrics::counter!("graph_mmr_group_graph_selected_total")
+        .increment(graph_mmr.selected_count as u64);
+    let mmr = combine_group_mmr(direct_mmr, graph_mmr, selected.clone());
+    SearchSelectionResult {
+        results: selected,
+        merged_count: mmr.input_count,
+        deduplicated_count: dedup_count,
+        mmr,
+    }
+}
+
+fn select_graph_append_with_group_mmr(
+    direct_results: Vec<pb::SearchResultV004>,
+    graph_results: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+    direct_context_limit: usize,
+    graph_context_append_limit: usize,
+    mmr_enabled: bool,
+    mmr_lambda_direct: f32,
+    mmr_lambda_graph: f32,
+    mmr_candidate_limit: usize,
+    similarity_source: &str,
+    fallback_similarity_source: &str,
+    mmr_allow_direct_candidates: bool,
+    mmr_allow_graph_candidates: bool,
+    max_graph_relations_debug_per_candidate: usize,
+) -> SearchSelectionResult {
+    let (direct_pool, direct_dedup) =
+        dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
+    metrics::counter!("graph_mmr_group_direct_candidates_total")
+        .increment(direct_pool.len() as u64);
+    metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
+    metrics::gauge!("graph_mmr_group_graph_lambda_current").set(mmr_lambda_graph as f64);
+    let direct_budget = direct_context_limit.min(final_limit);
+    let direct_mmr = apply_mmr_rerank(
+        direct_pool,
+        direct_budget,
+        mmr_enabled && mmr_allow_direct_candidates && direct_budget > 0,
+        mmr_lambda_direct,
+        mmr_candidate_limit,
+        similarity_source,
+        fallback_similarity_source,
+    );
+    let mut selected = direct_mmr.results.clone();
+    let mut dedup_count = direct_dedup;
+    let selected_by_chunk: HashMap<String, usize> = selected
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| (result_identity_key(r), idx))
+        .collect();
+    let mut graph_filtered = Vec::new();
+    for graph in graph_results {
+        if let Some(idx) = selected_by_chunk.get(&result_identity_key(&graph)).copied() {
+            dedup_count += 1;
+            merge_secondary_metadata_with_limit(
+                &mut selected[idx],
+                &graph,
+                max_graph_relations_debug_per_candidate,
+            );
+        } else {
+            graph_filtered.push(graph);
+        }
+    }
+    let graph_budget = graph_context_append_limit.min(final_limit.saturating_sub(selected.len()));
+    metrics::counter!("graph_mmr_group_graph_candidates_total")
+        .increment(graph_filtered.len() as u64);
+    let graph_mmr = apply_mmr_rerank(
+        graph_filtered,
+        graph_budget,
+        mmr_enabled && mmr_allow_graph_candidates && graph_budget > 0,
+        mmr_lambda_graph,
+        mmr_candidate_limit,
+        similarity_source,
+        fallback_similarity_source,
+    );
+    selected.extend(graph_mmr.results.clone());
+    metrics::counter!("graph_mmr_group_direct_selected_total")
+        .increment(direct_mmr.selected_count as u64);
+    metrics::counter!("graph_mmr_group_graph_selected_total")
+        .increment(graph_mmr.selected_count as u64);
+    let mmr = combine_group_mmr(direct_mmr, graph_mmr, selected.clone());
+    SearchSelectionResult {
+        results: selected,
+        merged_count: mmr.input_count,
+        deduplicated_count: dedup_count,
+        mmr,
+    }
+}
+
+pub fn apply_mmr_rerank(
+    mut candidates: Vec<pb::SearchResultV004>,
+    final_limit: usize,
+    enabled: bool,
+    lambda: f32,
+    candidate_limit: usize,
+    similarity_source: &str,
+    fallback_similarity_source: &str,
+) -> SearchMmrResult {
+    let started = std::time::Instant::now();
+    let requested_similarity_source = similarity_source.to_string();
+    if !enabled {
+        candidates.sort_by(|a, b| {
+            score_of(b)
+                .partial_cmp(&score_of(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(final_limit);
+        let selected_count = candidates.len();
+        return SearchMmrResult {
+            results: candidates,
+            input_count: 0,
+            selected_count,
+            duration_ms: started.elapsed().as_millis() as u64,
+            enabled: false,
+            similarity_source: "SCORE_ONLY".into(),
+            embedding_missing_count: 0,
+            token_fallback_count: 0,
+            dense_pair_comparisons: 0,
+            token_pair_comparisons: 0,
+        };
+    }
+
+    let input_count = candidates.len();
+    candidates.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let truncate_limit = candidate_limit.max(final_limit);
+    if candidates.len() > truncate_limit {
+        metrics::counter!("graph_mmr_candidates_truncated_total").increment(1);
+        metrics::counter!("graph_mmr_candidates_truncated_by_total")
+            .increment((candidates.len() - truncate_limit) as u64);
+    }
+    candidates.truncate(truncate_limit);
+
+    let mut prepared: Vec<MmrPreparedCandidate> = candidates
+        .into_iter()
+        .map(MmrPreparedCandidate::from_result)
+        .collect();
+    let embedding_missing_count = prepared
+        .iter()
+        .filter(|c| c.embedding_normalized.is_none())
+        .count();
+    let mut dense_pair_comparisons = 0usize;
+    let mut token_pair_comparisons = 0usize;
+
+    let mut selected: Vec<MmrPreparedCandidate> = Vec::with_capacity(final_limit);
+    while !prepared.is_empty() && selected.len() < final_limit {
+        let mut best_idx = 0usize;
+        let mut best_mmr = f32::MIN;
+        let mut best_similarity = 0.0_f32;
+
+        for (idx, candidate) in prepared.iter().enumerate() {
+            let relevance = score_of(&candidate.result);
+            let max_similarity = selected
+                .iter()
+                .map(|selected_candidate| {
+                    let (similarity, source) = candidate_similarity(
+                        candidate,
+                        selected_candidate,
+                        &requested_similarity_source,
+                    );
+                    match source {
+                        SimilaritySource::DenseEmbedding => dense_pair_comparisons += 1,
+                        SimilaritySource::TokenJaccardFallback => token_pair_comparisons += 1,
+                    }
+                    similarity
+                })
+                .fold(0.0_f32, f32::max);
+            let mmr_score = lambda * relevance - (1.0 - lambda) * max_similarity;
+            if mmr_score > best_mmr {
+                best_mmr = mmr_score;
+                best_idx = idx;
+                best_similarity = max_similarity;
+            }
+        }
+
+        let mut chosen = prepared.remove(best_idx);
+        if let Some(citation) = chosen.result.citation.as_mut() {
+            citation
+                .metadata
+                .insert("rerank_stage".into(), "MMR".into());
+            citation
+                .metadata
+                .insert("mmr_score".into(), best_mmr.to_string());
+            citation
+                .metadata
+                .insert("mmr_lambda".into(), lambda.to_string());
+            citation.metadata.insert(
+                "mmr_max_similarity_to_selected".into(),
+                best_similarity.to_string(),
+            );
+            let effective_source = if dense_pair_comparisons > 0 && token_pair_comparisons > 0 {
+                "MIXED"
+            } else if dense_pair_comparisons > 0 {
+                "DENSE_EMBEDDING"
+            } else {
+                fallback_similarity_source
+            };
+            citation
+                .metadata
+                .insert("mmr_similarity_source".into(), effective_source.to_string());
+            citation.metadata.insert(
+                "mmr_dense_pair_comparisons".into(),
+                dense_pair_comparisons.to_string(),
+            );
+            citation.metadata.insert(
+                "mmr_token_pair_comparisons".into(),
+                token_pair_comparisons.to_string(),
+            );
+        }
+        selected.push(chosen);
+    }
+
+    let effective_source = if dense_pair_comparisons > 0 && token_pair_comparisons > 0 {
+        "MIXED".to_string()
+    } else if dense_pair_comparisons > 0 {
+        "DENSE_EMBEDDING".to_string()
+    } else if enabled {
+        fallback_similarity_source.to_string()
+    } else {
+        "SCORE_ONLY".to_string()
+    };
+    let token_fallback_count = token_pair_comparisons;
+    metrics::counter!("graph_mmr_dense_pair_comparisons_total")
+        .increment(dense_pair_comparisons as u64);
+    metrics::counter!("graph_mmr_token_pair_comparisons_total")
+        .increment(token_pair_comparisons as u64);
+    if effective_source == "MIXED" {
+        metrics::counter!("graph_mmr_mixed_similarity_sessions_total").increment(1);
+    }
+    let results = selected.into_iter().map(|c| c.result).collect::<Vec<_>>();
+    let selected_count = results.len();
+    SearchMmrResult {
+        results,
+        input_count,
+        selected_count,
+        duration_ms: started.elapsed().as_millis() as u64,
+        enabled: true,
+        similarity_source: effective_source,
+        embedding_missing_count,
+        token_fallback_count,
+        dense_pair_comparisons,
+        token_pair_comparisons,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MmrPreparedCandidate {
+    result: pb::SearchResultV004,
+    embedding_normalized: Option<Vec<f32>>,
+    token_set: HashSet<String>,
+}
+
+impl MmrPreparedCandidate {
+    fn from_result(result: pb::SearchResultV004) -> Self {
+        let embedding_normalized = extract_normalized_embedding(&result);
+        let token_set = tokenize_result_text(&result);
+        Self {
+            result,
+            embedding_normalized,
+            token_set,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SimilaritySource {
+    DenseEmbedding,
+    TokenJaccardFallback,
+}
+
+fn candidate_similarity(
+    a: &MmrPreparedCandidate,
+    b: &MmrPreparedCandidate,
+    requested_similarity_source: &str,
+) -> (f32, SimilaritySource) {
+    if requested_similarity_source == "DENSE_EMBEDDING" {
+        if let (Some(ae), Some(be)) = (
+            a.embedding_normalized.as_deref(),
+            b.embedding_normalized.as_deref(),
+        ) {
+            if let Some(dot) = dot_slices(ae, be) {
+                metrics::counter!("graph_mmr_embedding_similarity_total").increment(1);
+                return (dot.clamp(-1.0, 1.0), SimilaritySource::DenseEmbedding);
+            }
+            metrics::counter!("graph_mmr_embedding_dimension_mismatch_total").increment(1);
+        }
+    }
+    (
+        token_jaccard_sets(&a.token_set, &b.token_set),
+        SimilaritySource::TokenJaccardFallback,
+    )
+}
+
+fn extract_normalized_embedding(result: &pb::SearchResultV004) -> Option<Vec<f32>> {
+    let metadata = &result.citation.as_ref()?.metadata;
+    let raw = metadata
+        .get("embedding_normalized_json")
+        .or_else(|| metadata.get("dense_embedding_normalized_json"))?;
+    let vector: Vec<f32> = serde_json::from_str(raw).ok()?;
+    if vector.is_empty() || vector.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let norm_sq: f32 = vector.iter().map(|v| v * v).sum();
+    if !(0.95..=1.05).contains(&norm_sq) {
+        return None;
+    }
+    Some(vector)
+}
+
+fn dot_slices(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    Some(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
+}
+
+fn tokenize_result_text(result: &pb::SearchResultV004) -> HashSet<String> {
+    let text = format!("{} {}", result.matched_text, result.parent_text);
+    tokenize_text(&text)
+}
+
+fn tokenize_text(text: &str) -> HashSet<String> {
+    text.nfkc()
+        .collect::<String>()
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn result_text_similarity(a: &pb::SearchResultV004, b: &pb::SearchResultV004) -> f32 {
+    let a_text = format!("{} {}", a.matched_text, a.parent_text);
+    let b_text = format!("{} {}", b.matched_text, b.parent_text);
+    token_jaccard_similarity(&a_text, &b_text)
+}
+
+fn token_jaccard_similarity(a: &str, b: &str) -> f32 {
+    let a_tokens = tokenize_text(a);
+    let b_tokens = tokenize_text(b);
+    token_jaccard_sets(&a_tokens, &b_tokens)
+}
+
+fn token_jaccard_sets(a_tokens: &HashSet<String>, b_tokens: &HashSet<String>) -> f32 {
+    if a_tokens.is_empty() || b_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = a_tokens.intersection(b_tokens).count() as f32;
+    let union = a_tokens.union(b_tokens).count() as f32;
+    if union <= f32::EPSILON {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn calibrate_result_score(
+    result: &mut pb::SearchResultV004,
+    source: &str,
+    direct_score_weight: f32,
+    graph_score_weight: f32,
+    graph_score_bias: f32,
+) {
+    let raw_score = score_of(result);
+    let calibrated_score = if source == "GRAPH_EXPANDED" {
+        raw_score * graph_score_weight + graph_score_bias
+    } else {
+        raw_score * direct_score_weight
+    };
+    if let Some(scores) = result.scores.as_mut() {
+        scores.final_score = calibrated_score;
+    }
+    if let Some(citation) = result.citation.as_mut() {
+        citation
+            .metadata
+            .insert("raw_score".into(), raw_score.to_string());
+        citation
+            .metadata
+            .insert("calibrated_score".into(), calibrated_score.to_string());
+        citation
+            .metadata
+            .insert("score_calibration_source".into(), source.into());
+    }
+    metrics::counter!("graph_score_calibration_applied_total", "source" => source.to_string())
+        .increment(1);
+}
+
+fn merge_secondary_metadata(primary: &mut pb::SearchResultV004, secondary: &pb::SearchResultV004) {
+    merge_secondary_metadata_with_limit(primary, secondary, 5);
+}
+
+fn merge_secondary_metadata_with_limit(
+    primary: &mut pb::SearchResultV004,
+    secondary: &pb::SearchResultV004,
+    max_relations: usize,
+) {
+    let Some(primary_citation) = primary.citation.as_mut() else {
+        return;
+    };
+    let Some(secondary_citation) = secondary.citation.as_ref() else {
+        return;
+    };
+    let primary_source = primary_citation
+        .metadata
+        .get("retrieval_source")
+        .cloned()
+        .unwrap_or_else(|| "UNKNOWN".into());
+    let secondary_source = secondary_citation
+        .metadata
+        .get("retrieval_source")
+        .cloned()
+        .unwrap_or_else(|| "UNKNOWN".into());
+
+    let mut sources =
+        parse_string_array_metadata(primary_citation.metadata.get("retrieval_sources"));
+    if sources.is_empty() {
+        sources.push(primary_source.clone());
+    }
+    if !sources.iter().any(|s| s == &secondary_source) {
+        sources.push(secondary_source.clone());
+    }
+    if let Ok(json) = serde_json::to_string(&sources) {
+        primary_citation
+            .metadata
+            .insert("retrieval_sources".into(), json);
+    }
+    primary_citation.metadata.insert(
+        "secondary_sources_count".into(),
+        sources.len().saturating_sub(1).to_string(),
+    );
+
+    let mut relations = parse_json_array_metadata(primary_citation.metadata.get("graph_relations"));
+    if let Some(relation) = secondary_citation.metadata.get("graph_relation_type") {
+        relations.push(serde_json::json!({
+            "relation_type": relation,
+            "relation_score": secondary_citation.metadata.get("graph_relation_score").and_then(|v| v.parse::<f32>().ok()).unwrap_or_default(),
+            "graph_score": secondary_citation.metadata.get("graph_score").and_then(|v| v.parse::<f32>().ok()).unwrap_or_default(),
+            "seed_chunk_id": secondary_citation.metadata.get("graph_seed_chunk_id").cloned().unwrap_or_default(),
+            "hop_distance": secondary_citation.metadata.get("graph_hop_distance").and_then(|v| v.parse::<u32>().ok()).unwrap_or_default(),
+        }));
+    }
+    if !relations.is_empty() {
+        let mut seen = HashSet::new();
+        relations.retain(|value| seen.insert(value.to_string()));
+        let limit = max_relations.max(1);
+        let truncated = relations.len() > limit;
+        relations.truncate(limit);
+        if let Ok(json) = serde_json::to_string(&relations) {
+            primary_citation
+                .metadata
+                .insert("graph_relations".into(), json);
+        }
+        if truncated {
+            primary_citation
+                .metadata
+                .insert("graph_relations_truncated".into(), "true".into());
+        }
+    }
+    metrics::counter!("graph_secondary_sources_merged_total").increment(1);
+}
+
+fn parse_string_array_metadata(value: Option<&String>) -> Vec<String> {
+    let Some(raw) = value else {
+        return Vec::new();
+    };
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(raw) {
+        return values;
+    }
+    raw.split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn extraction_retrieval_sources(result: &pb::SearchResultV004) -> Vec<String> {
+    let Some(citation) = result.citation.as_ref() else {
+        return vec!["unknown".to_string()];
+    };
+    let mut sources = parse_string_array_metadata(citation.metadata.get("retrieval_sources"));
+    if sources.is_empty() {
+        if let Some(source) = citation.metadata.get("retrieval_source") {
+            if !source.trim().is_empty() {
+                sources.push(source.trim().to_string());
+            }
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    if sources.is_empty() {
+        sources.push("unknown".to_string());
+    }
+    sources
+}
+
+fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
+    value
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+        .unwrap_or_default()
+}
+
+fn score_of(result: &pb::SearchResultV004) -> f32 {
+    result.scores.as_ref().map(|s| s.final_score).unwrap_or(0.0)
+}
+
+#[derive(Debug, Clone, Default)]
+struct NoAnswerFilterStats {
+    pre_mmr_filtered_count: usize,
+    post_mmr_triggered_count: usize,
+}
+
+fn strong_technical_query_tokens(query: &str) -> Vec<String> {
+    let encoder = SparseTechnicalEncoder::new(0.0, 512);
+    let mut tokens = encoder
+        .analyze(query)
+        .tokens
+        .into_iter()
+        .filter(|token| {
+            matches!(
+                token.class,
+                SparseTokenClass::NumericExact
+                    | SparseTokenClass::Alphanumeric
+                    | SparseTokenClass::ErrorCode
+                    | SparseTokenClass::UnderscoreIdentifier
+                    | SparseTokenClass::Path
+                    | SparseTokenClass::Filename
+                    | SparseTokenClass::IpOrPort
+                    | SparseTokenClass::Uuid
+                    | SparseTokenClass::GrpcMethod
+                    | SparseTokenClass::VersionToken
+            )
+        })
+        .map(|token| token.token)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn no_answer_debug_enabled(include_debug: bool, cfg: &NoAnswerConfig) -> bool {
+    include_debug
+        || cfg.debug_candidates
+        || std::env::var("ASTRAVECTOR_RETRIEVAL_DEBUG_CANDIDATES")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+        || std::env::var("ASTRAVECTOR_QUALITY_DEBUG_CANDIDATES")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+}
+
+fn candidate_text_for_no_answer(result: &pb::SearchResultV004) -> String {
+    let matched = result.matched_text.trim();
+    if !matched.is_empty() {
+        matched.to_lowercase()
+    } else {
+        result.parent_text.to_lowercase()
+    }
+}
+
+fn matched_technical_tokens(
+    result: &pb::SearchResultV004,
+    query_technical_tokens: &[String],
+) -> Vec<String> {
+    if query_technical_tokens.is_empty() {
+        return Vec::new();
+    }
+    let candidate_text = candidate_text_for_no_answer(result);
+    query_technical_tokens
+        .iter()
+        .filter(|token| candidate_text.contains(&token.to_lowercase()))
+        .cloned()
+        .collect()
+}
+
+fn matched_term_count(result: &pb::SearchResultV004, query: &str) -> usize {
+    let candidate_text = candidate_text_for_no_answer(result);
+    let candidate_terms = lexical_terms(&candidate_text);
+    lexical_terms(query)
+        .into_iter()
+        .filter(|term| candidate_terms.contains(term))
+        .count()
+}
+
+fn matched_discriminating_term_count(result: &pb::SearchResultV004, query: &str) -> usize {
+    let candidate_text = candidate_text_for_no_answer(result);
+    let candidate_terms = lexical_terms(&candidate_text);
+    lexical_terms(query)
+        .into_iter()
+        .filter(|term| !is_common_retrieval_overlap_term(term))
+        .filter(|term| candidate_terms.contains(term))
+        .count()
+}
+
+fn leading_discriminating_query_term_matches(result: &pb::SearchResultV004, query: &str) -> bool {
+    let Some(leading) = ordered_lexical_terms(query)
+        .into_iter()
+        .find(|term| !is_common_retrieval_overlap_term(term))
+    else {
+        return true;
+    };
+    lexical_terms(&candidate_text_for_no_answer(result)).contains(&leading)
+}
+
+fn query_term_count(query: &str) -> usize {
+    lexical_terms(query).len()
+}
+
+fn lexical_terms(text: &str) -> HashSet<String> {
+    ordered_lexical_terms(text).into_iter().collect()
+}
+
+fn ordered_lexical_terms(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms = Vec::new();
+    for term in text.split_whitespace().filter_map(normalized_lexical_term) {
+        for variant in lexical_term_variants(&term) {
+            if seen.insert(variant.clone()) {
+                terms.push(variant);
+            }
+        }
+    }
+    terms
+}
+
+fn lexical_term_variants(term: &str) -> Vec<String> {
+    let mut variants = vec![term.to_string()];
+    match term {
+        "absent" => variants.push("missing".into()),
+        "missing" => variants.push("absent".into()),
+        "tenant" => variants.push("access_zone_id".into()),
+        "gateway" => variants.push("x-astravector".into()),
+        _ => {}
+    }
+    variants
+}
+
+fn normalized_lexical_term(term: &str) -> Option<String> {
+    let term = term
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+        .to_lowercase();
+    if term.len() < 2 || is_lexical_stopword(&term) {
+        return None;
+    }
+    Some(lexical_stem(&term))
+}
+
+fn lexical_stem(term: &str) -> String {
+    if matches!(term, "binding" | "chess" | "missing" | "ranking") {
+        return term.to_string();
+    }
+    if term.len() > 5 && term.ends_with("ies") {
+        return format!("{}y", &term[..term.len() - 3]);
+    }
+    if term.len() > 6 && (term.ends_with("ates") || term.ends_with("les")) {
+        return term[..term.len() - 1].to_string();
+    }
+    for suffix in ["ing", "ed", "es", "s"] {
+        if term.len() > suffix.len() + 3 && term.ends_with(suffix) {
+            return term[..term.len() - suffix.len()].to_string();
+        }
+    }
+    term.to_string()
+}
+
+fn is_lexical_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "did"
+            | "do"
+            | "does"
+            | "during"
+            | "for"
+            | "from"
+            | "happen"
+            | "happens"
+            | "how"
+            | "if"
+            | "in"
+            | "is"
+            | "it"
+            | "must"
+            | "of"
+            | "on"
+            | "or"
+            | "should"
+            | "the"
+            | "to"
+            | "what"
+            | "when"
+            | "which"
+            | "where"
+            | "while"
+            | "with"
+            | "why"
+    )
+}
+
+fn is_common_retrieval_overlap_term(term: &str) -> bool {
+    matches!(
+        term,
+        "astravector"
+            | "claim"
+            | "claims"
+            | "dead-letter"
+            | "event"
+            | "events"
+            | "filter"
+            | "filters"
+            | "point"
+            | "points"
+            | "publish"
+            | "publishing"
+            | "qdrant"
+            | "search"
+            | "vector"
+            | "vectors"
+    )
+}
+
+fn strong_lexical_match(matched_terms: usize, query_terms: usize, cfg: &NoAnswerConfig) -> bool {
+    if query_terms == 0 {
+        return false;
+    }
+    let required_terms = cfg.sparse_only_min_matched_terms.max(2).min(query_terms);
+    matched_terms >= required_terms && matched_terms.saturating_mul(2) >= query_terms
+}
+
+fn apply_no_answer_exact_technical_boost(
+    result: &mut pb::SearchResultV004,
+    matched_tokens: &[String],
+    cfg: &NoAnswerConfig,
+    debug_enabled: bool,
+) -> (bool, f32, f32) {
+    let sparse_before = result
+        .scores
+        .as_ref()
+        .map(|scores| scores.sparse_score)
+        .unwrap_or(0.0);
+    let exact_match = !matched_tokens.is_empty();
+    let mut sparse_after = sparse_before;
+    let mut boost_applied = false;
+    if exact_match && sparse_before > 0.0 {
+        sparse_after = sparse_before * (1.0 + cfg.exact_technical_boost);
+        boost_applied = true;
+        if let Some(scores) = result.scores.as_mut() {
+            scores.sparse_score = sparse_after;
+            scores.final_score = scores.final_score.max(sparse_after);
+            scores.fusion_score = scores.fusion_score.max(sparse_after);
+        }
+    }
+    if debug_enabled {
+        if let Some(citation) = result.citation.as_mut() {
+            citation.metadata.insert(
+                "candidate_debug.exact_technical_token_match".into(),
+                exact_match.to_string(),
+            );
+            citation.metadata.insert(
+                "candidate_debug.matched_technical_tokens".into(),
+                serde_json::to_string(matched_tokens).unwrap_or_else(|_| "[]".into()),
+            );
+            citation.metadata.insert(
+                "candidate_debug.exact_technical_boost_applied".into(),
+                boost_applied.to_string(),
+            );
+            citation.metadata.insert(
+                "candidate_debug.sparse_score_before_boost".into(),
+                sparse_before.to_string(),
+            );
+            citation.metadata.insert(
+                "candidate_debug.sparse_score_after_boost".into(),
+                sparse_after.to_string(),
+            );
+        }
+    }
+    (exact_match, sparse_before, sparse_after)
+}
+
+fn no_answer_candidate_passes(
+    result: &pb::SearchResultV004,
+    search_mode: pb::SearchModeV005,
+    exact_technical_match: bool,
+    sparse_after_boost: f32,
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    leading_discriminating_match: bool,
+    query_terms: usize,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    let Some(scores) = result.scores.as_ref() else {
+        return false;
+    };
+    let strong_query_coverage = matched_terms.saturating_mul(5) >= query_terms.saturating_mul(3);
+    let exact_sparse_allow =
+        exact_technical_match && sparse_after_boost >= cfg.min_sparse_score * 2.0;
+    let exact_hybrid_allow = exact_sparse_allow && strong_query_coverage;
+    let strong_lexical_match = strong_lexical_match(matched_terms, query_terms, cfg);
+    let strong_hybrid_lexical_allow = strong_lexical_match
+        && matched_terms >= cfg.sparse_only_min_matched_terms.max(3)
+        && matched_discriminating_terms >= 2
+        && leading_discriminating_match
+        && strong_query_coverage;
+    match search_mode {
+        pb::SearchModeV005::Dense => {
+            scores.dense_score >= cfg.min_dense_score || scores.final_score >= cfg.min_dense_score
+        }
+        pb::SearchModeV005::Sparse => {
+            let technical_gate = !cfg.sparse_only_require_technical_token
+                || exact_technical_match
+                || strong_lexical_match;
+            (technical_gate
+                && matched_terms >= cfg.sparse_only_min_matched_terms
+                && (sparse_after_boost >= cfg.min_sparse_score || strong_lexical_match))
+                || exact_sparse_allow
+        }
+        pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
+            ((scores.final_score >= cfg.min_hybrid_score
+                || scores.fusion_score >= cfg.min_hybrid_score)
+                && matched_terms >= 2
+                && matched_discriminating_terms >= 1
+                && leading_discriminating_match)
+                || strong_hybrid_lexical_allow
+                || (exact_hybrid_allow && matched_discriminating_terms >= 2)
+        }
+    }
+}
+
+fn is_negative_mention_evidence(result: &pb::SearchResultV004) -> bool {
+    let text = format!("{}\n{}", result.matched_text, result.parent_text).to_lowercase();
+    [
+        "does not mention",
+        "do not mention",
+        "doesn't mention",
+        "does not rebuild",
+        "does not prevent",
+        "do not prevent",
+        "differs from",
+        "no mention of",
+        "not a ",
+        "not mentioned",
+        "not prevent",
+        "not reference",
+        "does not reference",
+        "should not be confused",
+        "unrelated to",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn apply_pre_mmr_no_answer_filter(
+    results: &mut Vec<pb::SearchResultV004>,
+    query: &str,
+    query_technical_tokens: &[String],
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+    debug_enabled: bool,
+) -> usize {
+    if !cfg.enabled || results.is_empty() {
+        return 0;
+    }
+    let before = results.len();
+    let query_terms = query_term_count(query);
+    for result in results.iter_mut() {
+        let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+        apply_no_answer_exact_technical_boost(result, &matched_tokens, cfg, debug_enabled);
+    }
+    results.retain(|result| {
+        let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+        let exact_technical_match = !matched_tokens.is_empty();
+        let sparse_after_boost = result
+            .scores
+            .as_ref()
+            .map(|scores| scores.sparse_score)
+            .unwrap_or(0.0);
+        let matched_terms = matched_term_count(result, query);
+        let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+        let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
+        if is_negative_mention_evidence(result) {
+            return false;
+        }
+        no_answer_candidate_passes(
+            result,
+            search_mode,
+            exact_technical_match,
+            sparse_after_boost,
+            matched_terms,
+            matched_discriminating_terms,
+            leading_discriminating_match,
+            query_terms,
+            cfg,
+        )
+    });
+    before.saturating_sub(results.len())
+}
+
+fn final_no_answer_should_trigger(
+    results: &[pb::SearchResultV004],
+    query: &str,
+    query_technical_tokens: &[String],
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    if !cfg.enabled || results.is_empty() {
+        return false;
+    }
+    !results.iter().any(|result| {
+        let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+        let exact_technical_match = !matched_tokens.is_empty();
+        let sparse_after_boost = result
+            .scores
+            .as_ref()
+            .map(|scores| scores.sparse_score)
+            .unwrap_or(0.0);
+        let matched_terms = matched_term_count(result, query);
+        let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+        let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
+        let query_terms = query_term_count(query);
+        if is_negative_mention_evidence(result) {
+            return false;
+        }
+        no_answer_candidate_passes(
+            result,
+            search_mode,
+            exact_technical_match,
+            sparse_after_boost,
+            matched_terms,
+            matched_discriminating_terms,
+            leading_discriminating_match,
+            query_terms,
+            cfg,
+        )
+    })
+}
+
+fn result_identity_key(result: &pb::SearchResultV004) -> String {
+    format!("{}:{}", result.access_zone_id, result.matched_chunk_id)
+}
+
+fn search_quality_run_id_filter(filters: &[pb::SearchFilterV004]) -> Option<String> {
+    filters
+        .iter()
+        .find(|filter| filter.key == "quality_run_id")
+        .map(|filter| filter.value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn lexical_parent_score(parent: &ParentContextRecord, query: &str) -> f32 {
+    let candidate_terms = lexical_terms(&parent.content);
+    let query_terms = lexical_terms(query);
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let matched = query_terms
+        .iter()
+        .filter(|term| candidate_terms.contains(*term))
+        .count();
+    (matched as f32 / query_terms.len() as f32).clamp(0.0, 1.0)
+}
+
+fn best_logical_block_for_query(
+    metadata: &serde_json::Value,
+    query: &str,
+) -> Option<(String, String)> {
+    let blocks = metadata
+        .get("logical_blocks")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
+    let query_terms = lexical_terms(query);
+    let ordered_discriminating = ordered_lexical_terms(query)
+        .into_iter()
+        .filter(|term| !is_common_retrieval_overlap_term(term))
+        .collect::<Vec<_>>();
+    let leading = ordered_discriminating.first().cloned();
+    let second = ordered_discriminating.get(1).cloned();
+    blocks
+        .as_array()?
+        .iter()
+        .filter_map(|block| {
+            let block_id = block.get("block_id")?.as_str()?.to_string();
+            if block_id == "doc-root" {
+                return None;
+            }
+            let text = block.get("text")?.as_str()?.to_string();
+            let heading = block
+                .get("source_location")
+                .and_then(|location| location.get("heading"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let section_path = block
+                .get("source_location")
+                .and_then(|location| location.get("section_path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let block_terms = lexical_terms(&format!("{heading} {section_path} {text}"));
+            let matched = query_terms
+                .iter()
+                .filter(|term| block_terms.contains(*term))
+                .count();
+            let leading_bonus = leading
+                .as_ref()
+                .map(|term| block_terms.contains(term) as usize)
+                .unwrap_or(1);
+            let second_bonus = second
+                .as_ref()
+                .map(|term| block_terms.contains(term) as usize)
+                .unwrap_or(0);
+            Some((
+                (matched * 10) + (leading_bonus * 3) + (second_bonus * 2),
+                block_id,
+                text,
+            ))
+        })
+        .max_by_key(|(score, _, _)| *score)
+        .filter(|(score, _, _)| *score > 0)
+        .map(|(_, block_id, text)| (block_id, text))
+}
+
+fn search_result_from_lexical_parent(
+    parent: &ParentContextRecord,
+    query: &str,
+) -> pb::SearchResultV004 {
+    let mut metadata: std::collections::HashMap<String, String> = parent
+        .metadata
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    metadata.insert("retrieval_source".into(), "LEXICAL_PARENT_BACKFILL".into());
+    metadata.insert(
+        "retrieval_sources".into(),
+        "[\"LEXICAL_PARENT_BACKFILL\"]".into(),
+    );
+    metadata.insert("chunk_granularity".into(), "PARENT".into());
+    metadata.insert("representation_type".into(), "ORIGINAL".into());
+    let score = lexical_parent_score(parent, query);
+    let (source_block_id, matched_text) = best_logical_block_for_query(&parent.metadata, query)
+        .unwrap_or_else(|| {
+            (
+                metadata.get("source_block_id").cloned().unwrap_or_default(),
+                parent.content.clone(),
+            )
+        });
+    if !source_block_id.is_empty() {
+        metadata.insert("source_block_id".into(), source_block_id);
+    }
+    pb::SearchResultV004 {
+        document_id: parent.document_id.to_string(),
+        document_version: parent.document_version as u64,
+        root_chunk_id: parent.root_chunk_id.to_string(),
+        source_chunk_id: parent.source_chunk_id.to_string(),
+        parent_chunk_id: parent.id.to_string(),
+        matched_chunk_id: parent.id.to_string(),
+        matched_granularity: granularity_from_str("PARENT"),
+        parent_text: parent.content.clone(),
+        scores: Some(pb::SearchScoresV004 {
+            dense_score: 0.0,
+            sparse_score: score,
+            fusion_score: score,
+            final_score: score,
+        }),
+        citation: Some(pb::SearchCitationV004 { metadata }),
+        access_zone_id: parent.access_zone_id.to_string(),
+        access_level: parent.access_level as i32,
+        matched_text,
+    }
+}
+
 fn search_result_from_hit(
     parent: &ParentContextRecord,
     hit: &QdrantSearchHit,
+    matched_text: String,
+    trace: Option<&crate::persistence::ChunkTraceRecord>,
 ) -> pb::SearchResultV004 {
     let matched_chunk_id = hit
         .payload
@@ -1546,7 +8790,7 @@ fn search_result_from_hit(
         .get("chunk_granularity")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let metadata = parent
+    let mut metadata: std::collections::HashMap<String, String> = parent
         .metadata
         .as_object()
         .map(|m| {
@@ -1555,6 +8799,101 @@ fn search_result_from_hit(
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(trace) = trace {
+        if let Some(source_block_id) = &trace.source_block_id {
+            metadata.insert("source_block_id".into(), source_block_id.clone());
+        }
+        if let Some(obj) = trace.source_location.as_object() {
+            for key in [
+                "page_start",
+                "page_end",
+                "char_start",
+                "char_end",
+                "section_path",
+                "heading",
+                "table_id",
+                "row_index",
+                "column_index",
+            ] {
+                if let Some(value) = obj.get(key) {
+                    if let Some(s) = value.as_str() {
+                        if !s.is_empty() {
+                            metadata.insert(key.into(), s.into());
+                        }
+                    } else if value.is_number() {
+                        metadata.insert(key.into(), value.to_string());
+                    }
+                }
+            }
+            if let Some(page) = obj.get("page_start").and_then(serde_json::Value::as_u64) {
+                if let Some(source_uri) = metadata
+                    .get("source_uri")
+                    .cloned()
+                    .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
+                {
+                    metadata
+                        .entry("page_url".into())
+                        .or_insert_with(|| format!("{}?page={}", source_uri, page));
+                }
+            }
+        }
+        if let Some(source_links) = trace.source_links.as_array().filter(|a| !a.is_empty()) {
+            if let Ok(json) = serde_json::to_string(source_links) {
+                metadata.insert("matched_source_links".into(), json);
+            }
+        }
+        if let Some(obj) = trace.metadata.as_object() {
+            for (k, v) in obj {
+                if k.starts_with("source_") || k == "document_title" || k == "mime_type" {
+                    if let Some(s) = v.as_str() {
+                        metadata.entry(k.clone()).or_insert_with(|| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(point_id) = hit
+        .payload
+        .get("qdrant_point_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        metadata.insert("qdrant_point_id".into(), point_id.to_string());
+    } else if matched_granularity != "GRAPH_EXPANDED" {
+        metadata.insert("qdrant_point_id".into(), hit.id.to_string());
+    }
+    for key in [
+        "representation_type",
+        "dense_version",
+        "model_version",
+        "payload_version",
+        "chunk_granularity",
+        "source_chunk_granularity",
+    ] {
+        if let Some(value) = hit.payload.get(key) {
+            if let Some(s) = value.as_str() {
+                if !s.is_empty() {
+                    metadata.insert(key.into(), s.into());
+                }
+            } else if value.is_number() {
+                metadata.insert(key.into(), value.to_string());
+            }
+        }
+    }
+    if metadata
+        .get("source_block_id")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        if let Some(source_block_id) = hit
+            .payload
+            .get("source_block_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            metadata.insert("source_block_id".into(), source_block_id.into());
+        }
+    }
     pb::SearchResultV004 {
         document_id: parent.document_id.to_string(),
         document_version: parent.document_version as u64,
@@ -1565,12 +8904,15 @@ fn search_result_from_hit(
         matched_granularity: granularity_from_str(matched_granularity),
         parent_text: parent.content.clone(),
         scores: Some(pb::SearchScoresV004 {
-            dense_score: hit.score,
+            dense_score: hit.dense_score,
+            sparse_score: hit.sparse_score,
+            fusion_score: hit.fusion_score,
             final_score: hit.score.max(0.0),
         }),
         citation: Some(pb::SearchCitationV004 { metadata }),
         access_zone_id: parent.access_zone_id.to_string(),
         access_level: parent.access_level as i32,
+        matched_text,
     }
 }
 fn deadline_from(m: &MetadataMap, fallback: u64) -> Instant {
@@ -1582,7 +8924,10 @@ fn deadline_from(m: &MetadataMap, fallback: u64) -> Instant {
     Instant::now() + d
 }
 fn parse_timeout(s: &str) -> Option<Duration> {
-    let (unit, num) = s.split_at(s.len().checked_sub(1)?);
+    // gRPC timeout format is <digits><unit>, e.g. "100m", "2S", "1H".
+    // fix463: split into (number, unit). The previous code inverted these and
+    // silently ignored valid grpc-timeout headers by falling back to config timeouts.
+    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
     let n: std::num::NonZeroU64 = num
         .parse::<u64>()
         .ok()
@@ -1596,6 +8941,14 @@ fn parse_timeout(s: &str) -> Option<Duration> {
         'n' => Duration::from_nanos(n.get()),
         _ => return None,
     })
+}
+
+fn effective_query_timeout_ms(requested: u64, configured_max: u64) -> u64 {
+    if requested == 0 {
+        configured_max
+    } else {
+        requested.min(configured_max)
+    }
 }
 fn hash_text(t: &str) -> String {
     let c = t.nfc().collect::<String>().replace("\r\n", "\n");
@@ -1704,5 +9057,562 @@ fn failed_pb(i: &pb::EncodeItem, e: &AstraError) -> pb::EncodeItemResponse {
         l2_cache_hit: false,
         error_code: Some("ITEM_ERROR".into()),
         error_message: Some(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod v007_fix1_tests {
+    use super::*;
+
+    fn test_result(chunk_id: &str, text: &str, score: f32) -> pb::SearchResultV004 {
+        pb::SearchResultV004 {
+            document_id: "doc".into(),
+            document_version: 1,
+            root_chunk_id: chunk_id.into(),
+            source_chunk_id: chunk_id.into(),
+            parent_chunk_id: chunk_id.into(),
+            matched_chunk_id: chunk_id.into(),
+            matched_granularity: pb::ChunkGranularityV004::ParentV004 as i32,
+            parent_text: text.into(),
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: score,
+                sparse_score: 0.0,
+                fusion_score: score,
+                final_score: score,
+            }),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: std::collections::HashMap::new(),
+            }),
+            access_zone_id: "zone".into(),
+            access_level: pb::AccessLevel::Public as i32,
+            matched_text: text.into(),
+        }
+    }
+
+    #[test]
+    fn mmr_disabled_keeps_score_order() {
+        let candidates = vec![
+            test_result("a", "alpha credit repayment", 0.7),
+            test_result("b", "beta branch address", 0.9),
+        ];
+        let result = apply_mmr_rerank(
+            candidates,
+            2,
+            false,
+            0.75,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+        );
+        assert!(!result.enabled);
+        assert_eq!(result.results[0].matched_chunk_id, "b");
+    }
+
+    #[test]
+    fn mmr_enabled_adds_metadata_and_selects_limit() {
+        let candidates = vec![
+            test_result("a", "early loan repayment without fee", 0.95),
+            test_result("b", "early loan repayment no commission", 0.90),
+            test_result("c", "branch address and service schedule", 0.80),
+        ];
+        let result = apply_mmr_rerank(
+            candidates,
+            2,
+            true,
+            0.75,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+        );
+        assert!(result.enabled);
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.selected_count, 2);
+        assert!(result.results[0]
+            .citation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .contains_key("mmr_score"));
+    }
+
+    #[test]
+    fn token_jaccard_similarity_detects_overlap() {
+        let same = token_jaccard_similarity("early loan repayment", "loan repayment early");
+        let different = token_jaccard_similarity("early loan repayment", "branch address schedule");
+        assert!(same > different);
+    }
+
+    fn block(
+        id: &str,
+        parent: &str,
+        kind: pb::BlockType,
+        text: &str,
+        order: u32,
+    ) -> pb::LogicalBlock {
+        pb::LogicalBlock {
+            block_id: id.to_string(),
+            parent_block_id: parent.to_string(),
+            block_type: kind as i32,
+            text: text.to_string(),
+            order_index: order,
+            source_location: None,
+            source_links: Vec::new(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn validates_valid_logical_block_tree() {
+        let blocks = vec![
+            block("root", "", pb::BlockType::Document, "Document", 0),
+            block("sec", "root", pb::BlockType::Section, "Section", 1),
+            block("p", "sec", pb::BlockType::Paragraph, "Paragraph", 2),
+        ];
+        assert!(validate_and_sort_logical_blocks(blocks).is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_parent() {
+        let blocks = vec![
+            block("root", "", pb::BlockType::Document, "Document", 0),
+            block("p", "missing", pb::BlockType::Paragraph, "Paragraph", 1),
+        ];
+        let err = validate_and_sort_logical_blocks(blocks).unwrap_err();
+        assert!(err.message().contains("LOGICAL_BLOCK_PARENT_NOT_FOUND"));
+    }
+
+    #[test]
+    fn rejects_cycle() {
+        let blocks = vec![
+            block("root", "", pb::BlockType::Document, "Document", 0),
+            block("a", "b", pb::BlockType::Section, "A", 1),
+            block("b", "a", pb::BlockType::Subsection, "B", 2),
+        ];
+        let err = validate_and_sort_logical_blocks(blocks).unwrap_err();
+        assert!(
+            err.message().contains("LOGICAL_BLOCK_TREE_CYCLE")
+                || err.message().contains("LOGICAL_BLOCK_PARENT_CHILD_INVALID")
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_source_link() {
+        let mut root = block("root", "", pb::BlockType::Document, "Document", 0);
+        root.source_links.push(pb::SourceLink {
+            r#type: pb::SourceLinkType::Preview as i32,
+            url: "javascript:alert(1)".into(),
+            label: "bad".into(),
+            mime_type: String::new(),
+            requires_auth: true,
+            expires_at: String::new(),
+            attributes: std::collections::HashMap::new(),
+        });
+        let err = validate_and_sort_logical_blocks(vec![root]).unwrap_err();
+        assert!(err.message().contains("SOURCE_LINK_INVALID_SCHEME"));
+    }
+
+    #[test]
+    fn rejects_absolute_ttl_until_supported() {
+        let policy = pb::TtlPolicy {
+            mode: pb::TtlMode::Absolute as i32,
+            ttl_seconds: 0,
+            expires_at: "2026-07-01T00:00:00Z".into(),
+            delete_from_qdrant_on_expire: true,
+            keep_metadata_after_expire: true,
+        };
+        let err = ttl_days_from_policy(Some(&policy)).unwrap_err();
+        assert!(err.message().contains("UNSUPPORTED_TTL_MODE_ABSOLUTE"));
+    }
+
+    #[test]
+    fn rejects_missing_retrieve_access_level() {
+        let metadata = MetadataMap::new();
+        let err = effective_retrieve_access_level(&metadata, pb::AccessLevel::Unspecified as i32)
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn embedding_mmr_uses_dense_vectors_when_present() {
+        let mut a = test_result("a", "loan repayment", 0.95);
+        let mut b = test_result("b", "credit closure", 0.90);
+        for (r, emb) in [(&mut a, vec![1.0_f32, 0.0]), (&mut b, vec![0.0_f32, 1.0])] {
+            r.citation.as_mut().unwrap().metadata.insert(
+                "embedding_normalized_json".into(),
+                serde_json::to_string(&emb).unwrap(),
+            );
+        }
+        let result = apply_mmr_rerank(
+            vec![a, b],
+            2,
+            true,
+            0.75,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+        );
+        assert_eq!(result.similarity_source, "DENSE_EMBEDDING");
+        assert_eq!(result.embedding_missing_count, 0);
+    }
+
+    #[test]
+    fn direct_first_preserves_direct_priority_after_group_mmr() {
+        let direct = vec![
+            test_result("d1", "direct one", 0.9),
+            test_result("d2", "direct two", 0.8),
+        ];
+        let graph = vec![
+            test_result("g1", "graph high", 0.99),
+            test_result("g2", "graph second", 0.98),
+        ];
+        let selected = select_results_with_strategy_aware_mmr(
+            direct,
+            graph,
+            2,
+            "DIRECT_FIRST",
+            1,
+            1,
+            true,
+            0.75,
+            0.80,
+            0.60,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            5,
+        );
+        assert_eq!(selected.results.len(), 2);
+        assert!(selected
+            .results
+            .iter()
+            .all(|r| r.matched_chunk_id.starts_with('d')));
+    }
+
+    #[test]
+    fn graph_append_preserves_separate_budgets_after_group_mmr() {
+        let direct = vec![test_result("d1", "direct one", 0.9)];
+        let graph = vec![
+            test_result("g1", "graph one", 0.99),
+            test_result("g2", "graph two", 0.98),
+        ];
+        let selected = select_results_with_strategy_aware_mmr(
+            direct,
+            graph,
+            8,
+            "GRAPH_AS_CONTEXT_APPEND",
+            6,
+            1,
+            true,
+            0.75,
+            0.80,
+            0.60,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            5,
+        );
+        assert_eq!(selected.results.len(), 2);
+        assert_eq!(
+            selected
+                .results
+                .iter()
+                .filter(|r| r.matched_chunk_id.starts_with('g'))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn embedding_mmr_uses_mixed_similarity_when_one_embedding_missing() {
+        let mut a = test_result("a", "loan repayment", 0.95);
+        let b = test_result("b", "credit closure", 0.90);
+        let emb = vec![1.0_f32, 0.0];
+        a.citation.as_mut().unwrap().metadata.insert(
+            "embedding_normalized_json".into(),
+            serde_json::to_string(&emb).unwrap(),
+        );
+        let result = apply_mmr_rerank(
+            vec![a, b],
+            2,
+            true,
+            0.75,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+        );
+        assert_eq!(result.embedding_missing_count, 1);
+        assert!(matches!(
+            result.similarity_source.as_str(),
+            "TOKEN_JACCARD" | "MIXED"
+        ));
+    }
+
+    #[test]
+    fn graph_append_empty_direct_returns_graph_budget() {
+        let direct = Vec::new();
+        let graph = vec![
+            test_result("g1", "graph one", 0.99),
+            test_result("g2", "graph two", 0.98),
+        ];
+        let selected = select_results_with_strategy_aware_mmr(
+            direct,
+            graph,
+            8,
+            "GRAPH_AS_CONTEXT_APPEND",
+            8,
+            2,
+            true,
+            0.75,
+            0.80,
+            0.60,
+            30,
+            "DENSE_EMBEDDING",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            5,
+        );
+        assert_eq!(selected.results.len(), 2);
+        assert!(selected
+            .results
+            .iter()
+            .all(|r| r.matched_chunk_id.starts_with('g')));
+    }
+
+    #[test]
+    fn dimension_mismatch_uses_token_fallback() {
+        let mut a = test_result("a", "loan repayment", 0.95);
+        let mut b = test_result("b", "credit closure", 0.90);
+        a.citation.as_mut().unwrap().metadata.insert(
+            "embedding_normalized_json".into(),
+            serde_json::to_string(&vec![1.0_f32, 0.0]).unwrap(),
+        );
+        b.citation.as_mut().unwrap().metadata.insert(
+            "embedding_normalized_json".into(),
+            serde_json::to_string(&vec![1.0_f32, 0.0, 0.0]).unwrap(),
+        );
+        let a = MmrPreparedCandidate::from_result(a);
+        let b = MmrPreparedCandidate::from_result(b);
+        let (_score, source) = candidate_similarity(&a, &b, "DENSE_EMBEDDING");
+        assert!(matches!(source, SimilaritySource::TokenJaccardFallback));
+    }
+
+    #[test]
+    fn search_result_from_graph_hit_preserves_qdrant_point_identity() {
+        let parent = ParentContextRecord {
+            access_zone_id: uuid::Uuid::nil(),
+            id: uuid::Uuid::nil(),
+            document_id: uuid::Uuid::nil(),
+            document_version: 1,
+            root_chunk_id: uuid::Uuid::nil(),
+            source_chunk_id: uuid::Uuid::nil(),
+            access_level: 1,
+            content: "parent".into(),
+            content_hash: "hash".into(),
+            token_count: 1,
+            metadata: serde_json::json!({}),
+        };
+        let point_id = uuid::Uuid::new_v4();
+        let hit = QdrantSearchHit {
+            id: uuid::Uuid::new_v4(),
+            score: 0.9,
+            dense_score: 0.0,
+            sparse_score: 0.0,
+            fusion_score: 0.9,
+            dense_rank: None,
+            sparse_rank: None,
+            payload: serde_json::json!({
+                "chunk_id": uuid::Uuid::new_v4().to_string(),
+                "chunk_granularity": "GRAPH_EXPANDED",
+                "qdrant_point_id": point_id.to_string(),
+                "representation_type": "ORIGINAL",
+                "dense_version": "dense-v1"
+            }),
+        };
+        let result = search_result_from_hit(&parent, &hit, "matched".into(), None);
+        let metadata = &result.citation.as_ref().unwrap().metadata;
+        assert_eq!(
+            metadata.get("qdrant_point_id").unwrap(),
+            &point_id.to_string()
+        );
+        assert_eq!(metadata.get("representation_type").unwrap(), "ORIGINAL");
+    }
+}
+
+async fn mark_ingestion_session_failed(
+    pool: &sqlx::PgPool,
+    ingestion_session_id: Uuid,
+    error_code: &str,
+    error_message: &str,
+) -> Result<(), sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE astravector.ingestion_sessions_v004
+         SET status='FAILED', error_code=$2, error_message=$3, updated_at=now()
+         WHERE ingestion_session_id=$1 AND status='FINALIZING'",
+    )
+    .bind(ingestion_session_id)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        counter!("ingestion_finalize_failed_update_zero_rows_total").increment(1);
+    }
+    Ok(())
+}
+
+async fn record_nonterminal_ingestion_error(
+    pool: &sqlx::PgPool,
+    ingestion_session_id: Uuid,
+    error_code: &str,
+    error_message: &str,
+    behavior: &str,
+) -> Result<(), sqlx::Error> {
+    let status_sql = match behavior {
+        "KEEP_ACTIVE_WITH_LAST_ERROR" | "RETURN_TO_ACTIVE" => "ACTIVE",
+        other => {
+            counter!("ingestion_nonterminal_error_unknown_behavior_total").increment(1);
+            tracing::warn!(behavior=%other, "unknown nonterminal ingestion failure behavior; returning session to ACTIVE");
+            "ACTIVE"
+        }
+    };
+    let result = sqlx::query(
+        "UPDATE astravector.ingestion_sessions_v004
+         SET status=$2,
+             last_error_code=$3,
+             last_error_message=$4,
+             last_error_at=now(),
+             updated_at=now()
+         WHERE ingestion_session_id=$1 AND status='FINALIZING'",
+    )
+    .bind(ingestion_session_id)
+    .bind(status_sql)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        counter!("ingestion_finalize_lost_ownership_total").increment(1);
+    }
+    Ok(())
+}
+
+async fn validate_staged_batch_consistency(
+    pool: &sqlx::PgPool,
+    ingestion_session_id: Uuid,
+) -> Result<(), Status> {
+    let batches = sqlx::query(
+        "SELECT b.batch_index, b.batch_content_hash, b.block_count, COUNT(s.block_index) AS actual_count
+         FROM astravector.ingestion_session_batches_v004 b
+         LEFT JOIN astravector.ingestion_session_blocks_v004 s
+           ON s.ingestion_session_id = b.ingestion_session_id
+          AND s.batch_index = b.batch_index
+         WHERE b.ingestion_session_id=$1
+         GROUP BY b.batch_index, b.batch_content_hash, b.block_count
+         ORDER BY b.batch_index"
+    )
+    .bind(ingestion_session_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Status::unavailable(format!("postgres ingestion batch consistency: {e}")))?;
+    if batches.is_empty() {
+        return Err(Status::failed_precondition("INGESTION_STAGING_EMPTY"));
+    }
+    let mut expected_next: Option<i32> = None;
+    for row in batches {
+        let batch_index: i32 = row.get("batch_index");
+        if let Some(expected) = expected_next {
+            if batch_index != expected {
+                counter!("ingestion_finalize_batch_gap_total").increment(1);
+                return Err(Status::failed_precondition("INGESTION_BATCH_GAP"));
+            }
+        }
+        expected_next = Some(batch_index + 1);
+        let block_count: i32 = row.get("block_count");
+        let actual_count: i64 = row.get("actual_count");
+        if block_count as i64 != actual_count {
+            counter!("ingestion_finalize_batch_count_mismatch_total").increment(1);
+            counter!("ingestion_staging_corrupted_total", "reason" => "batch_count_mismatch")
+                .increment(1);
+            return Err(Status::data_loss(
+                "INGESTION_STAGING_CORRUPTED: batch block_count mismatch",
+            ));
+        }
+
+        let expected_hash: String = row.get("batch_content_hash");
+        let block_rows = sqlx::query(
+            "SELECT block_json
+             FROM astravector.ingestion_session_blocks_v004
+             WHERE ingestion_session_id=$1 AND batch_index=$2
+             ORDER BY block_index",
+        )
+        .bind(ingestion_session_id)
+        .bind(batch_index)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Status::unavailable(format!("postgres ingestion batch hash rows: {e}")))?;
+        let mut blocks = Vec::with_capacity(block_rows.len());
+        for block_row in block_rows {
+            let value: serde_json::Value = block_row.get("block_json");
+            blocks.push(logical_block_from_json(&value)?);
+        }
+        let actual_hash = compute_batch_content_hash(&blocks).map_err(|e| {
+            Status::data_loss(format!(
+                "INGESTION_STAGING_CORRUPTED: batch hash serialization: {e}"
+            ))
+        })?;
+        if normalize_sha256_hex(&expected_hash).unwrap_or_default() != actual_hash {
+            counter!("ingestion_finalize_batch_hash_mismatch_total").increment(1);
+            counter!("ingestion_staging_corrupted_total", "reason" => "batch_hash_mismatch")
+                .increment(1);
+            return Err(Status::data_loss(
+                "INGESTION_STAGING_CORRUPTED_BATCH_HASH_MISMATCH",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fix463_stabilization_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_grpc_timeout_100m() {
+        assert_eq!(parse_timeout("100m"), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn test_parse_grpc_timeout_2s_and_1h() {
+        assert_eq!(parse_timeout("2S"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_timeout("1H"), Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn retrieved_context_preserves_access_zone_lineage_in_metadata_and_field() {
+        let zone = Uuid::new_v4().to_string();
+        let result = pb::SearchResultV004 {
+            access_zone_id: zone.clone(),
+            document_id: Uuid::new_v4().to_string(),
+            document_version: 7,
+            matched_chunk_id: Uuid::new_v4().to_string(),
+            parent_chunk_id: Uuid::new_v4().to_string(),
+            matched_text: "matched".into(),
+            parent_text: "parent".into(),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: std::collections::HashMap::new(),
+            }),
+            scores: None,
+            ..Default::default()
+        };
+        let ctx = retrieved_context_from_search_result(result);
+        assert_eq!(ctx.access_zone_id, zone);
+        assert_eq!(ctx.metadata.get("access_zone_id"), Some(&zone));
+        assert!(ctx.metadata.contains_key("document_id"));
+        assert!(ctx.metadata.contains_key("matched_chunk_id"));
     }
 }

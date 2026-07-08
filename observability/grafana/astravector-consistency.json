@@ -1,0 +1,12 @@
+{
+  "title": "AstraVector Consistency",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {"type":"timeseries","title":"Outbox stale events skipped","targets":[{"expr":"rate(vector_outbox_stale_event_skipped_total[5m])"}]},
+    {"type":"timeseries","title":"Outbox mark_synced rejected","targets":[{"expr":"rate(vector_outbox_mark_synced_rejected_total[5m])"}]},
+    {"type":"timeseries","title":"Outbox version mismatch","targets":[{"expr":"rate(vector_outbox_binding_version_mismatch_total[5m])"}]},
+    {"type":"timeseries","title":"Reconciliation repaired","targets":[{"expr":"rate(reconciliation_bindings_repaired_total[5m])"}]},
+    {"type":"timeseries","title":"Reconciliation skipped legal hold","targets":[{"expr":"rate(reconciliation_skipped_legal_hold_total[5m])"}]}
+  ]
+}

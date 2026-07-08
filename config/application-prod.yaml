@@ -1,0 +1,37 @@
+# Production profile. Loaded after config/application.yaml when ASTRAVECTOR_ENV=prod or production.
+service:
+  environment: production
+
+security:
+  enabled: ${ASTRAVECTOR_AUTH_ENABLED:-true}
+  api_key: ${ASTRAVECTOR_API_KEY:-}
+  protect_health: ${ASTRAVECTOR_PROTECT_HEALTH:-true}
+  trust_forwarded_identity_headers: ${ASTRAVECTOR_TRUST_FORWARDED_IDENTITY_HEADERS:-false}
+  gateway_trust_header: ${ASTRAVECTOR_GATEWAY_TRUST_HEADER:-x-astravector-gateway-trust}
+  gateway_trust_token: ${ASTRAVECTOR_GATEWAY_TRUST_TOKEN:-}
+
+postgres:
+  url: ${ASTRAVECTOR_DB_URL:-}
+  max_connections: ${ASTRAVECTOR_POSTGRES_MAX_CONNECTIONS:-80}
+  min_connections: ${ASTRAVECTOR_POSTGRES_MIN_CONNECTIONS:-8}
+  auto_migrate: ${ASTRAVECTOR_POSTGRES_AUTO_MIGRATE:-false}
+  required_on_startup: true
+  required_for_readiness: true
+
+qdrant:
+  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-true}
+  url: ${ASTRAVECTOR_QDRANT_URL:-}
+  api_key: ${ASTRAVECTOR_QDRANT_API_KEY:-}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_v004}
+  auto_create_collection: ${ASTRAVECTOR_QDRANT_AUTO_CREATE_COLLECTION:-false}
+  validate_collection_schema: true
+  ensure_payload_indexes: ${ASTRAVECTOR_QDRANT_ENSURE_PAYLOAD_INDEXES:-true}
+
+index_ttl:
+  enabled: true
+  cleanup_enabled: ${ASTRAVECTOR_INDEX_TTL_CLEANUP_ENABLED:-true}
+  qdrant_reconciliation_enabled: ${ASTRAVECTOR_INDEX_TTL_QDRANT_RECONCILIATION_ENABLED:-true}
+
+metrics:
+  host: 0.0.0.0
+  port: 9090

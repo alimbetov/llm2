@@ -1,6 +1,6 @@
 [package]
 name = "astravector-runtime"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.82"
 description = "AstraVector canonical dense and BGE learned sparse embedding runtime"
@@ -12,6 +12,7 @@ cpu = []
 cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
 smoke-failpoints = []
+integration-tests = []
 
 [dependencies]
 anyhow = "1"
@@ -35,7 +36,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"
 thiserror = "2"
 tokenizers = "0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
 subtle = "2"
 rand = "0.8"
@@ -50,6 +51,10 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
+rayon = "1.10"
+rustc-hash = "2"
+ordered-float = "4"
+regex = "1"
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -57,3 +62,18 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+
+[[bench]]
+name = "semantic_graph_bench"
+harness = false
+
+[[bench]]
+name = "graph_merge_bench"
+harness = false
+
+[[bench]]
+name = "mmr_bench"
+harness = false

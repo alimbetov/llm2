@@ -2,7 +2,7 @@ use crate::{
     config::AppConfig,
     dense::l2_normalize,
     error::AstraError,
-    sparse::build_sparse,
+    sparse::{build_lexical_sparse, build_sparse},
     tokenizer::{CanonicalTokenizer, TokenizedItem},
 };
 use async_trait::async_trait;
@@ -50,6 +50,7 @@ pub struct OnnxBgeM3Engine {
     tokenizer: CanonicalTokenizer,
     session: Arc<Mutex<Session>>,
     sparse_capability: bool,
+    neural_sparse_capability: bool,
 }
 impl OnnxBgeM3Engine {
     pub fn load(
@@ -83,12 +84,15 @@ impl OnnxBgeM3Engine {
                 cfg.model.dense_output_name, cfg.model.token_output_name
             )));
         }
-        let sparse = output_names.contains(&cfg.model.sparse_output_name) && cfg.sparse.enabled;
+        let neural_sparse =
+            output_names.contains(&cfg.model.sparse_output_name) && cfg.sparse.enabled;
+        let sparse = cfg.sparse.enabled;
         Ok(Self {
             cfg,
             tokenizer,
             session: Arc::new(Mutex::new(s)),
             sparse_capability: sparse,
+            neural_sparse_capability: neural_sparse,
         })
     }
     #[allow(clippy::type_complexity)]
@@ -175,26 +179,37 @@ impl OnnxBgeM3Engine {
             let (si, sv) = if input.want_sparse {
                 if !self.sparse_capability {
                     return Err(AstraError::FailedPrecondition(
-                        "BGE learned sparse requested but lexical output absent".into(),
+                        "sparse requested but sparse encoder unavailable".into(),
                     ));
                 }
-                let all = lexical_data.as_ref().ok_or_else(|| {
-                    AstraError::Internal(
-                        "sparse lexical_data missing while sparse output requested".into(),
-                    )
-                })?;
-                let start = row * seq;
-                let weights = all
-                    .get(start..start + seq)
-                    .ok_or_else(|| AstraError::Internal("lexical output shape mismatch".into()))?;
-                let (i, v) = build_sparse(
-                    &toks[row].input_ids,
-                    &toks[row].attention_mask,
-                    &weights[..toks[row].input_ids.len()],
-                    self.tokenizer.special_ids(),
-                    self.cfg.sparse.min_weight,
-                    self.cfg.sparse.max_non_zero,
-                )?;
+                let (i, v) = if self.neural_sparse_capability {
+                    let all = lexical_data.as_ref().ok_or_else(|| {
+                        AstraError::Internal(
+                            "sparse lexical_data missing while sparse output requested".into(),
+                        )
+                    })?;
+                    let start = row * seq;
+                    let weights = all.get(start..start + seq).ok_or_else(|| {
+                        AstraError::Internal("lexical output shape mismatch".into())
+                    })?;
+                    build_sparse(
+                        &toks[row].input_ids,
+                        &toks[row].attention_mask,
+                        &weights[..toks[row].input_ids.len()],
+                        self.tokenizer.special_ids(),
+                        self.cfg.sparse.min_weight,
+                        self.cfg.sparse.max_non_zero,
+                    )?
+                } else {
+                    build_lexical_sparse(
+                        &input.text,
+                        &toks[row].input_ids,
+                        &toks[row].attention_mask,
+                        self.tokenizer.special_ids(),
+                        self.cfg.sparse.min_weight,
+                        self.cfg.sparse.max_non_zero,
+                    )?
+                };
                 (Some(i), Some(v))
             } else {
                 (None, None)
@@ -220,12 +235,14 @@ impl InferenceEngine for OnnxBgeM3Engine {
         let cfg = self.cfg.clone();
         let tok = self.tokenizer.clone();
         let sparse = self.sparse_capability;
+        let neural_sparse = self.neural_sparse_capability;
         tokio::task::spawn_blocking(move || {
             OnnxBgeM3Engine {
                 cfg,
                 tokenizer: tok,
                 session: this,
                 sparse_capability: sparse,
+                neural_sparse_capability: neural_sparse,
             }
             .run_sync(inputs)
         })

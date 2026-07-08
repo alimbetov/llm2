@@ -1,0 +1,12 @@
+.git
+target
+benchmarks/quality/reports
+models
+**/models
+.venv*
+node_modules
+*.log
+*.tmp
+.DS_Store
+smoke-tests/v004/logs
+smoke-tests/v004/reports

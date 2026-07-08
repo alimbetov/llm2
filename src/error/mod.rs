@@ -17,6 +17,12 @@ pub enum AstraError {
     Cancelled(String),
     #[error("ownership lost: {0}")]
     OwnershipLost(String),
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("unavailable: {0}")]
     Unavailable(String),
     #[error("internal error: {0}")]
@@ -33,6 +39,9 @@ impl From<AstraError> for tonic::Status {
             AstraError::DeadlineExceeded(m) => tonic::Status::deadline_exceeded(m),
             AstraError::Cancelled(m) => tonic::Status::cancelled(m),
             AstraError::OwnershipLost(m) => tonic::Status::aborted(m),
+            AstraError::Unauthenticated(m) => tonic::Status::unauthenticated(m),
+            AstraError::PermissionDenied(m) => tonic::Status::permission_denied(m),
+            AstraError::NotFound(m) => tonic::Status::not_found(m),
             AstraError::Unavailable(m) => tonic::Status::unavailable(m),
             AstraError::Internal(m) => tonic::Status::internal(m),
         }

@@ -1,13 +1,21 @@
 use crate::{
-    chunking::GeneratedChunk, config::PostgresConfig, error::AstraError,
-    inference::EmbeddingResult, pb, smoke_failpoints,
+    chunking::GeneratedChunk,
+    config::PostgresConfig,
+    error::AstraError,
+    graph::{
+        self, ChunkEmbeddingForGraph, GraphBuildLimits, GraphEdge, GraphNode, GraphRelationType,
+        RelatedChunk,
+    },
+    inference::EmbeddingResult,
+    pb, smoke_failpoints,
 };
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use pgvector::Vector;
 use sha2::{Digest, Sha256};
 use sqlx::{
     postgres::{PgPool, PgPoolOptions},
-    Row,
+    Postgres, QueryBuilder, Row, Transaction,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -81,6 +89,24 @@ pub struct V004ChunkForEmbedding {
     pub ttl_days: Option<i32>,
     pub metadata: serde_json::Value,
 }
+
+#[derive(Debug, Clone)]
+pub struct PreparedV004IndexEmbedding {
+    pub chunk: GeneratedChunk,
+    pub embedding: EmbeddingResult,
+}
+
+#[derive(Debug, Clone)]
+pub struct V004IndexPersistenceSummary {
+    pub chunks: Vec<StoredChunkRecord>,
+    pub dense_vectors: u32,
+    pub sparse_vectors: u32,
+    pub bindings: u32,
+    pub outbox_created: u32,
+    pub graph_nodes: u32,
+    pub graph_edges: u32,
+    pub graph_warnings: Vec<String>,
+}
 #[derive(Debug, Clone)]
 pub struct ParentContextRecord {
     pub access_zone_id: Uuid,
@@ -96,6 +122,48 @@ pub struct ParentContextRecord {
     pub metadata: serde_json::Value,
 }
 #[derive(Debug, Clone)]
+pub struct ChunkTraceRecord {
+    pub id: Uuid,
+    pub source_block_id: Option<String>,
+    pub source_location: serde_json::Value,
+    pub source_links: serde_json::Value,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeletableQdrantPoints {
+    pub deletable: Vec<Uuid>,
+    pub skipped_legal_hold: Vec<Uuid>,
+    pub orphan: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphChunkContextRecord {
+    pub chunk_id: Uuid,
+    pub parent_chunk_id: Option<Uuid>,
+    pub parent_record: ParentContextRecord,
+    pub matched_text: String,
+    pub trace: Option<ChunkTraceRecord>,
+    pub qdrant_point_id: Option<Uuid>,
+    pub representation_type: Option<String>,
+    pub dense_version: Option<String>,
+    pub model_version: Option<String>,
+    pub payload_version: Option<i64>,
+    pub source_chunk_granularity: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphSummaryRecord {
+    pub total_nodes: u32,
+    pub total_edges: u32,
+    pub nodes_by_type: serde_json::Value,
+    pub edges_by_relation_type: serde_json::Value,
+    pub semantic_edges_count: u32,
+    pub semantic_avg_weight: Option<f32>,
+    pub semantic_min_weight: Option<f32>,
+    pub semantic_max_weight: Option<f32>,
+}
+
 pub struct ChunkContentRecord {
     pub id: Uuid,
     pub root_chunk_id: Uuid,
@@ -108,6 +176,309 @@ pub struct ChunkContentRecord {
     pub content: String,
 }
 impl Repository {
+    pub async fn fetch_dense_embeddings_for_points(
+        &self,
+        access_zone_id: Uuid,
+        qdrant_point_ids: &[Uuid],
+        dense_representation_name: &str,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<f32>>, AstraError> {
+        let mut result = std::collections::HashMap::new();
+        if qdrant_point_ids.is_empty() {
+            return Ok(result);
+        }
+        let rows = sqlx::query(
+            "SELECT b.qdrant_point_id, ed.vector_value \
+             FROM astravector.vector_bindings_v004 b \
+             JOIN astravector.embedding_dense ed ON ed.cache_entry_id = b.cache_entry_id \
+             JOIN astravector.embedding_cache_entries ce ON ce.id = b.cache_entry_id \
+             JOIN astravector.content_chunks_v004 c ON c.access_zone_id=b.access_zone_id AND c.id=b.chunk_id \
+             JOIN astravector.document_versions dv ON dv.access_zone_id=b.access_zone_id AND dv.document_id=b.document_id AND dv.document_version=b.document_version \
+             WHERE b.access_zone_id = $1 \
+               AND b.qdrant_point_id = ANY($2) \
+               AND b.lifecycle_status = 'ACTIVE' \
+               AND (b.expires_at IS NULL OR b.expires_at > now()) \
+               AND c.lifecycle_status='ACTIVE' \
+               AND c.deleted_at IS NULL \
+               AND (c.expires_at IS NULL OR c.expires_at > now()) \
+               AND dv.status='ACTIVE' AND dv.lifecycle_status='ACTIVE' \
+               AND (dv.expires_at IS NULL OR dv.expires_at > now()) \
+               AND ed.representation_name = $3 \
+               AND ed.representation_version = COALESCE(ce.dense_version, ed.representation_version)"
+        )
+        .bind(access_zone_id)
+        .bind(qdrant_point_ids)
+        .bind(dense_representation_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        for row in rows {
+            let point_id: Uuid = row.get("qdrant_point_id");
+            let vector: Vector = row.get("vector_value");
+            result.insert(point_id, vector.to_vec());
+        }
+        Ok(result)
+    }
+
+    pub async fn fetch_dense_embeddings_for_chunks(
+        &self,
+        access_zone_id: Uuid,
+        chunk_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<f32>>, AstraError> {
+        let mut result = std::collections::HashMap::new();
+        if chunk_ids.is_empty() {
+            return Ok(result);
+        }
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (b.chunk_id) b.chunk_id, ed.vector_value \
+             FROM astravector.vector_bindings_v004 b \
+             JOIN astravector.embedding_dense ed ON ed.cache_entry_id = b.cache_entry_id \
+             JOIN astravector.content_chunks_v004 c ON c.access_zone_id=b.access_zone_id AND c.id=b.chunk_id \
+             JOIN astravector.document_versions dv ON dv.access_zone_id=b.access_zone_id AND dv.document_id=b.document_id AND dv.document_version=b.document_version \
+             WHERE b.access_zone_id = $1 \
+               AND b.chunk_id = ANY($2) \
+               AND b.lifecycle_status = 'ACTIVE' \
+               AND (b.expires_at IS NULL OR b.expires_at > now()) \
+               AND c.lifecycle_status='ACTIVE' \
+               AND c.deleted_at IS NULL \
+               AND (c.expires_at IS NULL OR c.expires_at > now()) \
+               AND dv.status='ACTIVE' AND dv.lifecycle_status='ACTIVE' \
+               AND (dv.expires_at IS NULL OR dv.expires_at > now()) \
+             ORDER BY b.chunk_id, b.updated_at DESC"
+        )
+        .bind(access_zone_id)
+        .bind(chunk_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        for row in rows {
+            let chunk_id: Uuid = row.get("chunk_id");
+            let vector: Vector = row.get("vector_value");
+            result.insert(chunk_id, vector.to_vec());
+        }
+        Ok(result)
+    }
+    pub async fn fetch_dense_embeddings_for_points_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        qdrant_point_ids: &[Uuid],
+        dense_representation_name: &str,
+    ) -> Result<std::collections::HashMap<(Uuid, Uuid), Vec<f32>>, AstraError> {
+        let mut result = std::collections::HashMap::new();
+        if access_zone_ids.is_empty() || qdrant_point_ids.is_empty() {
+            return Ok(result);
+        }
+        let rows = sqlx::query(
+            "SELECT b.access_zone_id, b.qdrant_point_id, ed.vector_value \
+             FROM astravector.vector_bindings_v004 b \
+             JOIN astravector.embedding_dense ed ON ed.cache_entry_id = b.cache_entry_id \
+             JOIN astravector.embedding_cache_entries ce ON ce.id = b.cache_entry_id \
+             JOIN astravector.content_chunks_v004 c ON c.access_zone_id=b.access_zone_id AND c.id=b.chunk_id \
+             JOIN astravector.document_versions dv ON dv.access_zone_id=b.access_zone_id AND dv.document_id=b.document_id AND dv.document_version=b.document_version \
+             WHERE b.access_zone_id = ANY($1::uuid[]) \
+               AND b.qdrant_point_id = ANY($2::uuid[]) \
+               AND b.lifecycle_status = 'ACTIVE' \
+               AND (b.expires_at IS NULL OR b.expires_at > now()) \
+               AND c.lifecycle_status='ACTIVE' AND c.deleted_at IS NULL \
+               AND (c.expires_at IS NULL OR c.expires_at > now()) \
+               AND dv.status='ACTIVE' AND dv.lifecycle_status='ACTIVE' \
+               AND (dv.expires_at IS NULL OR dv.expires_at > now()) \
+               AND ed.representation_name = $3 \
+               AND ed.representation_version = COALESCE(ce.dense_version, ed.representation_version)"
+        )
+        .bind(access_zone_ids)
+        .bind(qdrant_point_ids)
+        .bind(dense_representation_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        for row in rows {
+            let zone: Uuid = row.get("access_zone_id");
+            let point_id: Uuid = row.get("qdrant_point_id");
+            let vector: Vector = row.get("vector_value");
+            result.insert((zone, point_id), vector.to_vec());
+        }
+        Ok(result)
+    }
+
+    pub async fn fetch_dense_embeddings_for_chunks_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        chunk_ids: &[Uuid],
+        dense_representation_name: &str,
+        dense_version: Option<&str>,
+    ) -> Result<std::collections::HashMap<(Uuid, Uuid), Vec<f32>>, AstraError> {
+        let mut result = std::collections::HashMap::new();
+        if access_zone_ids.is_empty() || chunk_ids.is_empty() {
+            return Ok(result);
+        }
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (b.access_zone_id, b.chunk_id) b.access_zone_id, b.chunk_id, ed.vector_value \
+             FROM astravector.vector_bindings_v004 b \
+             JOIN astravector.embedding_dense ed ON ed.cache_entry_id = b.cache_entry_id \
+             JOIN astravector.embedding_cache_entries ce ON ce.id = b.cache_entry_id \
+             JOIN astravector.content_chunks_v004 c ON c.access_zone_id=b.access_zone_id AND c.id=b.chunk_id \
+             JOIN astravector.document_versions dv ON dv.access_zone_id=b.access_zone_id AND dv.document_id=b.document_id AND dv.document_version=b.document_version \
+             WHERE b.access_zone_id = ANY($1::uuid[]) \
+               AND b.chunk_id = ANY($2::uuid[]) \
+               AND b.lifecycle_status = 'ACTIVE' \
+               AND (b.expires_at IS NULL OR b.expires_at > now()) \
+               AND c.lifecycle_status='ACTIVE' AND c.deleted_at IS NULL \
+               AND (c.expires_at IS NULL OR c.expires_at > now()) \
+               AND dv.status='ACTIVE' AND dv.lifecycle_status='ACTIVE' \
+               AND (dv.expires_at IS NULL OR dv.expires_at > now()) \
+               AND ed.representation_name = $3 \
+               AND ($4::text IS NULL OR ed.representation_version = $4::text OR ce.dense_version = $4::text) \
+             ORDER BY b.access_zone_id, b.chunk_id, b.updated_at DESC"
+        )
+        .bind(access_zone_ids)
+        .bind(chunk_ids)
+        .bind(dense_representation_name)
+        .bind(dense_version)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        for row in rows {
+            let zone: Uuid = row.get("access_zone_id");
+            let chunk_id: Uuid = row.get("chunk_id");
+            let vector: Vector = row.get("vector_value");
+            result.insert((zone, chunk_id), vector.to_vec());
+        }
+        Ok(result)
+    }
+
+    pub async fn filter_visible_chunk_ids_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        chunk_ids: &[Uuid],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashSet<(Uuid, Uuid)>, AstraError> {
+        let mut result = std::collections::HashSet::new();
+        if access_zone_ids.is_empty() || chunk_ids.is_empty() {
+            return Ok(result);
+        }
+        let rows = sqlx::query(
+            r#"SELECT c.access_zone_id, c.id
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.id=ANY($2::uuid[])
+  AND c.access_level <= $3
+  AND c.lifecycle_status='ACTIVE'
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())"#,
+        )
+        .bind(access_zone_ids)
+        .bind(chunk_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        for row in rows {
+            result.insert((
+                row.get::<Uuid, _>("access_zone_id"),
+                row.get::<Uuid, _>("id"),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub async fn fetch_qdrant_point_ids_for_document_deletion(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+    ) -> Result<Vec<Uuid>, AstraError> {
+        let rows = sqlx::query(
+            "SELECT qdrant_point_id \
+             FROM astravector.vector_bindings_v004 \
+             WHERE access_zone_id=$1 \
+               AND document_id=$2 \
+               AND document_version=$3 \
+               AND lifecycle_status IN ('ACTIVE','EXPIRED','SUPERSEDED','DELETING','DELETE_FAILED') \
+               AND COALESCE(legal_hold,false) = false \
+               AND qdrant_point_id IS NOT NULL"
+        )
+        .bind(access_zone_id)
+        .bind(document_id)
+        .bind(document_version)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<Uuid, _>("qdrant_point_id"))
+            .collect())
+    }
+
+    /// fix462: classify Qdrant reconciliation points against PostgreSQL bindings before deletion.
+    /// A Qdrant point may be deleted only when it is an orphan projection or it belongs to a non-legal-hold binding
+    /// that is already in a delete-compatible lifecycle. Legal-hold points are never returned here.
+    pub async fn filter_deletable_qdrant_points_for_document(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+        qdrant_point_ids: &[Uuid],
+    ) -> Result<DeletableQdrantPoints, AstraError> {
+        if qdrant_point_ids.is_empty() {
+            return Ok(DeletableQdrantPoints::default());
+        }
+        let rows = sqlx::query(
+            r#"WITH candidate(point_id) AS (
+    SELECT unnest($4::uuid[])
+), binding_state AS (
+    SELECT c.point_id,
+           b.legal_hold,
+           b.lifecycle_status
+    FROM candidate c
+    LEFT JOIN astravector.vector_bindings_v004 b
+      ON b.access_zone_id=$1
+     AND b.document_id=$2
+     AND b.document_version=$3
+     AND b.qdrant_point_id=c.point_id
+)
+SELECT point_id,
+       legal_hold,
+       lifecycle_status
+FROM binding_state"#,
+        )
+        .bind(access_zone_id)
+        .bind(document_id)
+        .bind(document_version)
+        .bind(qdrant_point_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        let mut result = DeletableQdrantPoints::default();
+        for row in rows {
+            let point_id: Uuid = row.get("point_id");
+            let legal_hold: Option<bool> = row.get("legal_hold");
+            let lifecycle_status: Option<String> = row.get("lifecycle_status");
+            match (legal_hold.unwrap_or(false), lifecycle_status.as_deref()) {
+                (true, _) => result.skipped_legal_hold.push(point_id),
+                (_, None) => {
+                    result.orphan.push(point_id);
+                    result.deletable.push(point_id);
+                }
+                (
+                    false,
+                    Some("DELETING" | "DELETED" | "EXPIRED" | "SUPERSEDED" | "DELETE_FAILED"),
+                ) => {
+                    result.deletable.push(point_id);
+                }
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+
     pub async fn connect(c: &PostgresConfig) -> Result<Self, AstraError> {
         let (st, lt, idle) = (
             c.statement_timeout_ms,
@@ -120,15 +491,18 @@ impl Repository {
             .acquire_timeout(Duration::from_millis(c.acquire_timeout_ms))
             .after_connect(move |conn, _| {
                 Box::pin(async move {
-                    sqlx::query(&format!("SET statement_timeout='{st}ms'"))
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(format!("{st}ms"))
                         .execute(&mut *conn)
                         .await?;
-                    sqlx::query(&format!("SET lock_timeout='{lt}ms'"))
+                    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                        .bind(format!("{lt}ms"))
                         .execute(&mut *conn)
                         .await?;
-                    sqlx::query(&format!(
-                        "SET idle_in_transaction_session_timeout='{idle}ms'"
-                    ))
+                    sqlx::query(
+                        "SELECT set_config('idle_in_transaction_session_timeout', $1, false)",
+                    )
+                    .bind(format!("{idle}ms"))
                     .execute(&mut *conn)
                     .await?;
                     Ok(())
@@ -204,6 +578,70 @@ impl Repository {
         })
     }
 
+    pub async fn force_activate_document_version(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+        force_reason: &str,
+    ) -> Result<DocumentVersionRecord, AstraError> {
+        if force_reason.trim().is_empty() {
+            return Err(AstraError::InvalidArgument(
+                "force_reason is required".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let exists = sqlx::query("SELECT 1 FROM astravector.document_versions WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 FOR UPDATE")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .is_some();
+        if !exists {
+            return Err(AstraError::FailedPrecondition(
+                "document version not found".into(),
+            ));
+        }
+        let counts = sqlx::query(
+            r#"SELECT
+              (SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3) AS chunks,
+              (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3) AS bindings"#,
+        )
+        .bind(access_zone_id)
+        .bind(document_id)
+        .bind(document_version)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if counts.get::<i64, _>("chunks") == 0 || counts.get::<i64, _>("bindings") == 0 {
+            return Err(AstraError::FailedPrecondition(
+                "force activation requires chunks and at least one binding".into(),
+            ));
+        }
+        let updated = sqlx::query("UPDATE astravector.document_versions SET status='ACTIVE', lifecycle_status='ACTIVE', indexed_at=COALESCE(indexed_at, now()), activated_at=COALESCE(activated_at,now()), updated_at=now(),metadata=COALESCE(metadata,'{}'::jsonb) || jsonb_build_object('force_activation_reason',$4) WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND delete_operation_id IS NULL RETURNING document_id,document_version,status")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .bind(force_reason)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        let Some(updated) = updated else {
+            counter!("document_lifecycle_update_blocked_by_delete_operation_total", "operation" => "force_activate").increment(1);
+            return Err(AstraError::FailedPrecondition(
+                "force activation blocked by active delete_operation_id".into(),
+            ));
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(DocumentVersionRecord {
+            document_id: updated.get("document_id"),
+            document_version: updated.get("document_version"),
+            status: updated.get("status"),
+        })
+    }
+
     pub async fn activate_document_version(
         &self,
         access_zone_id: Uuid,
@@ -264,7 +702,7 @@ impl Repository {
         }
         let activation_policy: String = row.get("activation_policy");
         if activation_policy == "ACTIVE_LATEST_ONLY" {
-            sqlx::query("UPDATE astravector.document_versions SET status='SUPERSEDED',updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version<>$3 AND status='ACTIVE'")
+            sqlx::query("UPDATE astravector.document_versions SET status='SUPERSEDED', lifecycle_status='SUPERSEDED', expires_at=now(), updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version<>$3 AND status='ACTIVE' AND delete_operation_id IS NULL")
                 .bind(access_zone_id)
                 .bind(document_id)
                 .bind(document_version)
@@ -272,13 +710,19 @@ impl Repository {
                 .await
                 .map_err(db)?;
         }
-        let updated = sqlx::query("UPDATE astravector.document_versions SET status='ACTIVE',activated_at=COALESCE(activated_at,now()),updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 RETURNING document_id,document_version,status")
+        let updated = sqlx::query("UPDATE astravector.document_versions SET status='ACTIVE', lifecycle_status='ACTIVE', indexed_at=COALESCE(indexed_at, now()), activated_at=COALESCE(activated_at,now()), updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND delete_operation_id IS NULL RETURNING document_id,document_version,status")
             .bind(access_zone_id)
             .bind(document_id)
             .bind(document_version)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db)?;
+        let Some(updated) = updated else {
+            counter!("document_lifecycle_update_blocked_by_delete_operation_total", "operation" => "activate").increment(1);
+            return Err(AstraError::FailedPrecondition(
+                "activation blocked by active delete_operation_id".into(),
+            ));
+        };
         tx.commit().await.map_err(db)?;
         Ok(DocumentVersionRecord {
             document_id: updated.get("document_id"),
@@ -304,14 +748,20 @@ impl Repository {
             return Err(AstraError::InvalidArgument("no chunks generated".into()));
         }
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let n=sqlx::query("UPDATE astravector.document_versions SET status='INDEXING',updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND status IN('REGISTERED','INDEXING','FAILED')").bind(access_zone_id).bind(document_id).bind(document_version).execute(&mut*tx).await.map_err(db)?.rows_affected();
+        let processing_owner_id = format!(
+            "{}:{}",
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into()),
+            Uuid::new_v4()
+        );
+        let n=sqlx::query("UPDATE astravector.document_versions SET status='INDEXING',processing_owner_id=$4,processing_started_at=COALESCE(processing_started_at,now()),processing_heartbeat_at=now(),updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND status IN('REGISTERED','FAILED') AND delete_operation_id IS NULL").bind(access_zone_id).bind(document_id).bind(document_version).bind(&processing_owner_id).execute(&mut*tx).await.map_err(db)?.rows_affected();
         if n != 1 {
+            counter!("document_indexing_conflict_total").increment(1);
             return Err(AstraError::FailedPrecondition(
-                "document version must exist and be REGISTERED/INDEXING/FAILED".into(),
+                "document version must be REGISTERED/FAILED and not already INDEXING".into(),
             ));
         }
         for chunk in chunks {
-            let rows=sqlx::query("INSERT INTO astravector.content_chunks_v004(access_zone_id,id,root_chunk_id,source_chunk_id,parent_chunk_id,document_id,document_version,granularity,representation_type,sequence_no,target_token_count,actual_token_count,content,content_hash,tokenizer_version,chunking_profile_version,access_level,ttl_days,expires_at,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'ORIGINAL',$9,$10,$10,$11,$12,$13,$14,$15,$16,CASE WHEN $16 IS NULL THEN NULL ELSE now()+($16*interval '1 day') END,$17) ON CONFLICT(access_zone_id,document_id,document_version,root_chunk_id,parent_chunk_id,granularity,representation_type,sequence_no) DO UPDATE SET content=EXCLUDED.content,content_hash=EXCLUDED.content_hash,actual_token_count=EXCLUDED.actual_token_count,tokenizer_version=EXCLUDED.tokenizer_version,chunking_profile_version=EXCLUDED.chunking_profile_version,access_level=EXCLUDED.access_level,ttl_days=EXCLUDED.ttl_days,expires_at=EXCLUDED.expires_at,metadata=EXCLUDED.metadata,updated_at=now()")
+            let rows=sqlx::query("INSERT INTO astravector.content_chunks_v004(access_zone_id,id,root_chunk_id,source_chunk_id,parent_chunk_id,document_id,document_version,granularity,representation_type,sequence_no,target_token_count,actual_token_count,content,content_hash,tokenizer_version,chunking_profile_version,access_level,ttl_days,expires_at,metadata,source_block_id,source_location,source_links) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'ORIGINAL',$9,$10,$10,$11,$12,$13,$14,$15,$16,CASE WHEN $16 IS NULL THEN NULL ELSE now()+($16*interval '1 day') END,$17,$18,$19,$20) ON CONFLICT(access_zone_id,document_id,document_version,root_chunk_id,parent_chunk_id,granularity,representation_type,sequence_no) DO UPDATE SET content=EXCLUDED.content,content_hash=EXCLUDED.content_hash,actual_token_count=EXCLUDED.actual_token_count,tokenizer_version=EXCLUDED.tokenizer_version,chunking_profile_version=EXCLUDED.chunking_profile_version,access_level=EXCLUDED.access_level,ttl_days=EXCLUDED.ttl_days,expires_at=EXCLUDED.expires_at,metadata=EXCLUDED.metadata,source_block_id=EXCLUDED.source_block_id,source_location=EXCLUDED.source_location,source_links=EXCLUDED.source_links,updated_at=now()")
                 .bind(access_zone_id)
                 .bind(chunk.id)
                 .bind(chunk.root_id)
@@ -329,14 +779,34 @@ impl Repository {
                 .bind(access_level)
                 .bind(ttl_days)
                 .bind(metadata.clone())
+                .bind(chunk.source_block_id.as_deref())
+                .bind(chunk.source_location.clone())
+                .bind(chunk.source_links.clone())
                 .execute(&mut*tx).await.map_err(db)?.rows_affected();
             if rows != 1 {
                 return Err(AstraError::Internal(
                     "chunk upsert did not affect exactly one row".into(),
                 ));
             }
+            for block_id in chunk.source_block_ids.iter() {
+                sqlx::query("INSERT INTO astravector.logical_block_chunk_mapping(access_zone_id,document_id,document_version,block_id,chunk_id,relation_type,source_location,source_links) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(access_zone_id,document_id,document_version,block_id,chunk_id) DO UPDATE SET relation_type=EXCLUDED.relation_type,source_location=EXCLUDED.source_location,source_links=EXCLUDED.source_links")
+                    .bind(access_zone_id)
+                    .bind(document_id)
+                    .bind(document_version)
+                    .bind(block_id)
+                    .bind(chunk.id)
+                    .bind(&chunk.trace_relation_type)
+                    .bind(chunk.source_location.clone())
+                    .bind(chunk.source_links.clone())
+                    .execute(&mut*tx)
+                    .await
+                    .map_err(db)?;
+            }
             smoke_failpoints::hit("required_after_chunk_insert")?;
         }
+        sqlx::query("UPDATE astravector.document_versions SET processing_owner_id=NULL,processing_started_at=NULL,processing_heartbeat_at=NULL,updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND processing_owner_id=$4")
+            .bind(access_zone_id).bind(document_id).bind(document_version).bind(&processing_owner_id)
+            .execute(&mut *tx).await.map_err(db)?;
         let rows=sqlx::query("SELECT id,root_chunk_id,source_chunk_id,parent_chunk_id,granularity,sequence_no,actual_token_count,content_hash FROM astravector.content_chunks_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND root_chunk_id=$4 AND representation_type='ORIGINAL' ORDER BY CASE granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_180' THEN 2 WHEN 'SUB_260' THEN 3 ELSE 9 END,sequence_no")
             .bind(access_zone_id)
             .bind(document_id)
@@ -359,6 +829,1253 @@ impl Repository {
                 content_hash: r.get("content_hash"),
             })
             .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_v004_index_transactionally(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+        chunks: &[GeneratedChunk],
+        embeddings: &[PreparedV004IndexEmbedding],
+        tokenizer_version: &str,
+        chunking_profile_version: &str,
+        access_level: i16,
+        ttl_days: Option<i32>,
+        metadata: serde_json::Value,
+        tenant: &str,
+        workspace: &str,
+        model_version: &str,
+        dense_name: &str,
+        dense_version: &str,
+        sparse_name: &str,
+        sparse_version: &str,
+        min_weight: f32,
+        max_non_zero: i32,
+        qdrant_collection: &str,
+        publish_outbox: bool,
+        graph_enabled: bool,
+        graph_limits: Option<GraphBuildLimits>,
+        graph_bulk_insert_batch_size: usize,
+        graph_failure_warn_and_continue: bool,
+    ) -> Result<V004IndexPersistenceSummary, AstraError> {
+        if chunks.is_empty() {
+            return Err(AstraError::InvalidArgument("no chunks generated".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let processing_owner_id = format!(
+            "{}:{}",
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into()),
+            Uuid::new_v4()
+        );
+        let n = sqlx::query("UPDATE astravector.document_versions SET status='INDEXING',processing_owner_id=$4,processing_started_at=COALESCE(processing_started_at,now()),processing_heartbeat_at=now(),updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND status IN('REGISTERED','FAILED') AND delete_operation_id IS NULL")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .bind(&processing_owner_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        if n != 1 {
+            counter!("document_indexing_conflict_total").increment(1);
+            return Err(AstraError::FailedPrecondition(
+                "document version must be REGISTERED/FAILED and not already INDEXING".into(),
+            ));
+        }
+        for chunk in chunks {
+            let rows = sqlx::query("INSERT INTO astravector.content_chunks_v004(access_zone_id,id,root_chunk_id,source_chunk_id,parent_chunk_id,document_id,document_version,granularity,representation_type,sequence_no,target_token_count,actual_token_count,content,content_hash,tokenizer_version,chunking_profile_version,access_level,ttl_days,expires_at,metadata,source_block_id,source_location,source_links) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'ORIGINAL',$9,$10,$10,$11,$12,$13,$14,$15,$16,CASE WHEN $16 IS NULL THEN NULL ELSE now()+($16*interval '1 day') END,$17,$18,$19,$20) ON CONFLICT(access_zone_id,document_id,document_version,root_chunk_id,parent_chunk_id,granularity,representation_type,sequence_no) DO UPDATE SET content=EXCLUDED.content,content_hash=EXCLUDED.content_hash,actual_token_count=EXCLUDED.actual_token_count,tokenizer_version=EXCLUDED.tokenizer_version,chunking_profile_version=EXCLUDED.chunking_profile_version,access_level=EXCLUDED.access_level,ttl_days=EXCLUDED.ttl_days,expires_at=EXCLUDED.expires_at,metadata=EXCLUDED.metadata,source_block_id=EXCLUDED.source_block_id,source_location=EXCLUDED.source_location,source_links=EXCLUDED.source_links,updated_at=now()")
+                .bind(access_zone_id)
+                .bind(chunk.id)
+                .bind(chunk.root_id)
+                .bind(chunk.source_id)
+                .bind(chunk.parent_id)
+                .bind(document_id)
+                .bind(document_version)
+                .bind(chunk.granularity.as_db_str())
+                .bind(chunk.sequence_no as i32)
+                .bind(chunk.token_count as i32)
+                .bind(&chunk.content)
+                .bind(&chunk.content_hash)
+                .bind(tokenizer_version)
+                .bind(chunking_profile_version)
+                .bind(access_level)
+                .bind(ttl_days)
+                .bind(metadata.clone())
+                .bind(chunk.source_block_id.as_deref())
+                .bind(chunk.source_location.clone())
+                .bind(chunk.source_links.clone())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?
+                .rows_affected();
+            if rows != 1 {
+                return Err(AstraError::Internal(
+                    "chunk upsert did not affect exactly one row".into(),
+                ));
+            }
+            for block_id in chunk.source_block_ids.iter() {
+                sqlx::query("INSERT INTO astravector.logical_block_chunk_mapping(access_zone_id,document_id,document_version,block_id,chunk_id,relation_type,source_location,source_links) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(access_zone_id,document_id,document_version,block_id,chunk_id) DO UPDATE SET relation_type=EXCLUDED.relation_type,source_location=EXCLUDED.source_location,source_links=EXCLUDED.source_links")
+                    .bind(access_zone_id)
+                    .bind(document_id)
+                    .bind(document_version)
+                    .bind(block_id)
+                    .bind(chunk.id)
+                    .bind(&chunk.trace_relation_type)
+                    .bind(chunk.source_location.clone())
+                    .bind(chunk.source_links.clone())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            }
+            smoke_failpoints::hit("required_after_chunk_insert")?;
+        }
+
+        let mut dense_vectors = 0_u32;
+        let mut sparse_vectors = 0_u32;
+        let mut bindings = 0_u32;
+        let mut outbox_created = 0_u32;
+
+        for prepared in embeddings {
+            let chunk = &prepared.chunk;
+            let result = &prepared.embedding;
+            let cache_id = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!(
+                    "v004-cache:{}:{}:{}:{}:{}:{}:{}",
+                    access_zone_id,
+                    chunk.id,
+                    chunk.content_hash,
+                    model_version,
+                    dense_version,
+                    sparse_version,
+                    tokenizer_version
+                )
+                .as_bytes(),
+            );
+            let binding_id = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("v004-binding:{}:{}", access_zone_id, chunk.id).as_bytes(),
+            );
+            let point_id = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("v004-qdrant-point:{}:{}", access_zone_id, binding_id).as_bytes(),
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(format!(
+                "v004-cache-key:{tenant}:{workspace}:{}:{}:{}:{}:{}:{}:{}",
+                access_zone_id,
+                chunk.id,
+                chunk.content_hash,
+                model_version,
+                dense_version,
+                sparse_version,
+                tokenizer_version
+            ));
+            let cache_key = format!("{:x}", hasher.finalize());
+            let rows = sqlx::query("INSERT INTO astravector.embedding_cache_entries(id,tenant_id,workspace_id,cache_key,text_hash,purpose,chunk_type,tokenizer_version,model_version,dense_version,sparse_version,status,model_input_token_count,truncated,completed_at,last_accessed_at) VALUES($1,$2,$3,$4,$5,'DOCUMENT_CHUNK',2,$6,$7,$8,$9,'COMPLETED',$10,$11,now(),now()) ON CONFLICT(cache_key) DO UPDATE SET status='COMPLETED',model_input_token_count=EXCLUDED.model_input_token_count,truncated=EXCLUDED.truncated,completed_at=now(),last_accessed_at=now()")
+                .bind(cache_id)
+                .bind(tenant)
+                .bind(workspace)
+                .bind(&cache_key)
+                .bind(&chunk.content_hash)
+                .bind(tokenizer_version)
+                .bind(model_version)
+                .bind(dense_version)
+                .bind(sparse_version)
+                .bind(result.token_count as i32)
+                .bind(result.truncated)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?
+                .rows_affected();
+            if rows != 1 {
+                return Err(AstraError::Internal(
+                    "cache upsert did not affect one row".into(),
+                ));
+            }
+            smoke_failpoints::hit("required_after_embedding_cache_insert")?;
+            if let Some(v) = &result.dense {
+                let rows = sqlx::query("INSERT INTO astravector.embedding_dense(id,cache_entry_id,representation_name,representation_version,dimension,normalized,distance,vector_value) VALUES($1,$2,$3,$4,$5,true,'COSINE',$6) ON CONFLICT(cache_entry_id,representation_name,representation_version) DO UPDATE SET vector_value=EXCLUDED.vector_value,created_at=now()")
+                    .bind(Uuid::new_v4())
+                    .bind(cache_id)
+                    .bind(dense_name)
+                    .bind(dense_version)
+                    .bind(v.len() as i32)
+                    .bind(Vector::from(v.clone()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?
+                    .rows_affected();
+                if rows != 1 {
+                    return Err(AstraError::Internal(
+                        "dense upsert did not affect one row".into(),
+                    ));
+                }
+                dense_vectors += 1;
+                smoke_failpoints::hit("required_after_dense_insert")?;
+            }
+            if let (Some(indices), Some(values)) = (&result.sparse_indices, &result.sparse_values) {
+                if !indices.is_empty() && !values.is_empty() {
+                    let idx: Vec<i32> = indices.iter().map(|x| *x as i32).collect();
+                    let rows = sqlx::query("INSERT INTO astravector.embedding_sparse(id,cache_entry_id,representation_name,representation_version,indices,values,non_zero_count,min_weight,max_non_zero) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(cache_entry_id,representation_name,representation_version) DO UPDATE SET indices=EXCLUDED.indices,values=EXCLUDED.values,non_zero_count=EXCLUDED.non_zero_count,created_at=now()")
+                        .bind(Uuid::new_v4())
+                        .bind(cache_id)
+                        .bind(sparse_name)
+                        .bind(sparse_version)
+                        .bind(idx)
+                        .bind(values)
+                        .bind(indices.len() as i32)
+                        .bind(min_weight)
+                        .bind(max_non_zero)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?
+                        .rows_affected();
+                    if rows != 1 {
+                        return Err(AstraError::Internal(
+                            "sparse upsert did not affect one row".into(),
+                        ));
+                    }
+                    sparse_vectors += 1;
+                }
+            }
+            let mut binding_metadata = metadata.clone();
+            if let Some(object) = binding_metadata.as_object_mut() {
+                object.insert(
+                    "chunking_profile_version".to_string(),
+                    serde_json::Value::String(chunking_profile_version.to_string()),
+                );
+                if let Some(source_block_id) = &chunk.source_block_id {
+                    object.insert(
+                        "source_block_id".to_string(),
+                        serde_json::Value::String(source_block_id.clone()),
+                    );
+                }
+                object.insert(
+                    "source_block_ids".to_string(),
+                    serde_json::json!(chunk.source_block_ids),
+                );
+                object.insert("source_location".to_string(), chunk.source_location.clone());
+                object.insert("source_links".to_string(), chunk.source_links.clone());
+                object.insert(
+                    "trace_relation_type".to_string(),
+                    serde_json::Value::String(chunk.trace_relation_type.clone()),
+                );
+                object.insert(
+                    "trace_quality".to_string(),
+                    serde_json::Value::String(chunk.trace_quality.clone()),
+                );
+            }
+            let binding_row = sqlx::query(r#"INSERT INTO astravector.vector_bindings_v004(access_zone_id,id,document_id,document_version,root_chunk_id,source_chunk_id,parent_chunk_id,chunk_id,chunk_granularity,representation_type,chunk_sequence_no,token_count,cache_entry_id,access_level,ttl_days,expires_at,qdrant_collection,qdrant_point_id,metadata)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'ORIGINAL',$10,$11,$12,$13,$14,CASE WHEN $14 IS NULL THEN NULL ELSE now()+($14*interval '1 day') END,$15,$16,$17)
+ON CONFLICT(access_zone_id,document_id,document_version,chunk_id,representation_type) DO UPDATE SET
+  cache_entry_id=EXCLUDED.cache_entry_id,
+  token_count=EXCLUDED.token_count,
+  access_level=EXCLUDED.access_level,
+  ttl_days=EXCLUDED.ttl_days,
+  expires_at=EXCLUDED.expires_at,
+  qdrant_collection=EXCLUDED.qdrant_collection,
+  qdrant_sync_status=CASE WHEN (
+    astravector.vector_bindings_v004.cache_entry_id,
+    astravector.vector_bindings_v004.token_count,
+    astravector.vector_bindings_v004.access_level,
+    astravector.vector_bindings_v004.ttl_days,
+    astravector.vector_bindings_v004.qdrant_collection,
+    astravector.vector_bindings_v004.metadata
+  ) IS DISTINCT FROM (
+    EXCLUDED.cache_entry_id,
+    EXCLUDED.token_count,
+    EXCLUDED.access_level,
+    EXCLUDED.ttl_days,
+    EXCLUDED.qdrant_collection,
+    EXCLUDED.metadata
+  ) THEN 'PENDING' ELSE astravector.vector_bindings_v004.qdrant_sync_status END,
+  payload_version=CASE WHEN (
+    astravector.vector_bindings_v004.cache_entry_id,
+    astravector.vector_bindings_v004.token_count,
+    astravector.vector_bindings_v004.access_level,
+    astravector.vector_bindings_v004.ttl_days,
+    astravector.vector_bindings_v004.qdrant_collection,
+    astravector.vector_bindings_v004.metadata
+  ) IS DISTINCT FROM (
+    EXCLUDED.cache_entry_id,
+    EXCLUDED.token_count,
+    EXCLUDED.access_level,
+    EXCLUDED.ttl_days,
+    EXCLUDED.qdrant_collection,
+    EXCLUDED.metadata
+  ) THEN astravector.vector_bindings_v004.payload_version+1 ELSE astravector.vector_bindings_v004.payload_version END,
+  metadata=EXCLUDED.metadata,
+  updated_at=now()
+RETURNING payload_version,qdrant_sync_status"#)
+                .bind(access_zone_id)
+                .bind(binding_id)
+                .bind(document_id)
+                .bind(document_version)
+                .bind(chunk.root_id)
+                .bind(chunk.source_id)
+                .bind(chunk.parent_id)
+                .bind(chunk.id)
+                .bind(chunk.granularity.as_db_str())
+                .bind(chunk.sequence_no as i32)
+                .bind(chunk.token_count as i32)
+                .bind(cache_id)
+                .bind(access_level)
+                .bind(ttl_days)
+                .bind(qdrant_collection)
+                .bind(point_id)
+                .bind(binding_metadata)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+            bindings += 1;
+            let payload_version: i64 = binding_row.get("payload_version");
+            let qdrant_sync_status: String = binding_row.get("qdrant_sync_status");
+            smoke_failpoints::hit("required_after_binding_insert")?;
+            if publish_outbox
+                && (qdrant_sync_status == "PENDING" || qdrant_sync_status == "UPDATE_PENDING")
+            {
+                let rows = sqlx::query("INSERT INTO astravector.vector_outbox(id,binding_access_zone_id,binding_id,operation,operation_version,status) VALUES($1,$2,$3,'UPSERT_POINT',$4,'PENDING') ON CONFLICT(binding_access_zone_id,binding_id,operation,operation_version) DO NOTHING")
+                    .bind(Uuid::new_v4())
+                    .bind(access_zone_id)
+                    .bind(binding_id)
+                    .bind(payload_version)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?
+                    .rows_affected();
+                if rows > 1 {
+                    return Err(AstraError::Internal(
+                        "outbox insert affected too many rows".into(),
+                    ));
+                }
+                outbox_created += rows as u32;
+                smoke_failpoints::hit("required_after_outbox_insert")?;
+            }
+        }
+        let mut graph_nodes = 0_u32;
+        let mut graph_edges = 0_u32;
+        let mut graph_warnings = Vec::new();
+        if graph_enabled {
+            let limits = graph_limits.unwrap_or_default();
+            sqlx::query("SAVEPOINT graph_build")
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+
+            let graph_rebuild_future = async {
+                tracing::info!(
+                    document_id = %document_id,
+                    document_version = document_version,
+                    access_zone_id = %access_zone_id,
+                    "GRAPH_REBUILD_STARTED"
+                );
+
+                if limits.semantic_edges_enabled {
+                    metrics::counter!("graph_semantic_parallel_enabled_total", "enabled" => limits.semantic_parallel_enabled.to_string()).increment(1);
+                }
+
+                self.cleanup_document_graph_tx(
+                    &mut tx,
+                    access_zone_id,
+                    document_id,
+                    document_version,
+                )
+                .await?;
+
+                let mut build = graph::build_limited_structural_graph(
+                    access_zone_id,
+                    document_id,
+                    document_version,
+                    &metadata,
+                    chunks,
+                    access_level,
+                    ttl_days,
+                    &limits,
+                );
+
+                let semantic_inputs: Vec<ChunkEmbeddingForGraph> = embeddings
+                    .iter()
+                    .filter_map(|prepared| {
+                        prepared
+                            .embedding
+                            .dense
+                            .as_ref()
+                            .map(|dense| ChunkEmbeddingForGraph {
+                                chunk_id: prepared.chunk.id,
+                                embedding: dense.clone(),
+                            })
+                    })
+                    .collect();
+
+                tracing::info!(
+                    document_id = %document_id,
+                    document_version = document_version,
+                    access_zone_id = %access_zone_id,
+                    chunk_count = semantic_inputs.len(),
+                    parallel_enabled = limits.semantic_parallel_enabled,
+                    "SEMANTIC_GRAPH_BUILD_STARTED"
+                );
+
+                let (semantic_edges, semantic_summary) = graph::build_semantic_edges_in_memory(
+                    access_zone_id,
+                    document_id,
+                    document_version,
+                    &build.nodes,
+                    &semantic_inputs,
+                    access_level,
+                    ttl_days,
+                    &limits,
+                )
+                .map_err(|e| AstraError::Internal(format!("graph semantic build failed: {e}")))?;
+
+                metrics::counter!("graph_semantic_edges_created_total")
+                    .increment(semantic_summary.semantic_edges_created as u64);
+                metrics::counter!("graph_semantic_edges_skipped_by_score_total")
+                    .increment(semantic_summary.semantic_edges_skipped_by_score as u64);
+                metrics::counter!("graph_semantic_edges_skipped_by_limit_total")
+                    .increment(semantic_summary.semantic_edges_skipped_by_limit as u64);
+                metrics::counter!("graph_semantic_edges_skipped_duplicate_total")
+                    .increment(semantic_summary.semantic_edges_skipped_duplicate as u64);
+                metrics::histogram!("graph_semantic_build_duration_ms")
+                    .record(semantic_summary.semantic_build_duration_ms as f64);
+                if !semantic_summary.warnings.is_empty() {
+                    metrics::counter!("graph_semantic_build_warnings_total")
+                        .increment(semantic_summary.warnings.len() as u64);
+                }
+
+                tracing::info!(
+                    document_id = %document_id,
+                    document_version = document_version,
+                    access_zone_id = %access_zone_id,
+                    semantic_edges_created = semantic_summary.semantic_edges_created,
+                    skipped_by_score = semantic_summary.semantic_edges_skipped_by_score,
+                    skipped_by_limit = semantic_summary.semantic_edges_skipped_by_limit,
+                    skipped_duplicate = semantic_summary.semantic_edges_skipped_duplicate,
+                    duration_ms = semantic_summary.semantic_build_duration_ms as u64,
+                    "SEMANTIC_GRAPH_BUILD_COMPLETED"
+                );
+
+                build.warnings.extend(semantic_summary.warnings.clone());
+                build.warnings.push(format!(
+                    "SEMANTIC_GRAPH_EDGES_CREATED:{}",
+                    semantic_summary.semantic_edges_created
+                ));
+                build.edges.extend(semantic_edges);
+
+                self.save_graph_nodes_edges_batch_tx(
+                    &mut tx,
+                    &build.nodes,
+                    &build.edges,
+                    graph_bulk_insert_batch_size.max(1),
+                )
+                .await?;
+
+                tracing::info!(
+                    document_id = %document_id,
+                    document_version = document_version,
+                    access_zone_id = %access_zone_id,
+                    graph_nodes = build.nodes.len(),
+                    graph_edges = build.edges.len(),
+                    "GRAPH_REBUILD_COMPLETED"
+                );
+
+                Ok::<(u32, u32, Vec<String>), AstraError>((
+                    build.nodes.len() as u32,
+                    build.edges.len() as u32,
+                    build.warnings,
+                ))
+            };
+
+            let strict_fail_indexing_policy = limits
+                .semantic_large_document_policy
+                .eq_ignore_ascii_case("FAIL_INDEXING");
+            let warn_and_continue_for_graph_error =
+                graph_failure_warn_and_continue && !strict_fail_indexing_policy;
+            let graph_rebuild = tokio::time::timeout(
+                Duration::from_millis(limits.semantic_rebuild_timeout_ms),
+                graph_rebuild_future,
+            )
+            .await;
+            match graph_rebuild {
+                Ok(Ok((nodes, edges, warnings))) => {
+                    graph_nodes = nodes;
+                    graph_edges = edges;
+                    graph_warnings.extend(warnings);
+                    metrics::counter!("graph_rebuild_total").increment(1);
+                    sqlx::query("RELEASE SAVEPOINT graph_build")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                }
+                Ok(Err(e)) if warn_and_continue_for_graph_error => {
+                    metrics::counter!("graph_rebuild_failed_total").increment(1);
+                    tracing::warn!(
+                        document_id = %document_id,
+                        document_version = document_version,
+                        access_zone_id = %access_zone_id,
+                        error = %e,
+                        "GRAPH_REBUILD_FAILED"
+                    );
+                    sqlx::query("ROLLBACK TO SAVEPOINT graph_build")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    sqlx::query("RELEASE SAVEPOINT graph_build")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    graph_warnings.push(format!("GRAPH_BUILD_FAILED: {e}"));
+                }
+                Err(_) if warn_and_continue_for_graph_error => {
+                    metrics::counter!("graph_rebuild_timeout_total").increment(1);
+                    tracing::warn!(
+                        document_id = %document_id,
+                        document_version = document_version,
+                        access_zone_id = %access_zone_id,
+                        timeout_ms = limits.semantic_rebuild_timeout_ms,
+                        "GRAPH_REBUILD_TIMEOUT"
+                    );
+                    sqlx::query("ROLLBACK TO SAVEPOINT graph_build")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    sqlx::query("RELEASE SAVEPOINT graph_build")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    graph_warnings.push("GRAPH_REBUILD_TIMEOUT".into());
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(AstraError::DeadlineExceeded(
+                        "graph rebuild timed out".into(),
+                    ))
+                }
+            }
+        }
+        smoke_failpoints::hit("required_before_commit")?;
+        sqlx::query("UPDATE astravector.document_versions SET processing_owner_id=NULL,processing_started_at=NULL,processing_heartbeat_at=NULL,updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND processing_owner_id=$4")
+            .bind(access_zone_id).bind(document_id).bind(document_version).bind(&processing_owner_id)
+            .execute(&mut *tx).await.map_err(db)?;
+        let rows = sqlx::query("SELECT id,root_chunk_id,source_chunk_id,parent_chunk_id,granularity,sequence_no,actual_token_count,content_hash FROM astravector.content_chunks_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND root_chunk_id=$4 AND representation_type='ORIGINAL' ORDER BY CASE granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_180' THEN 2 WHEN 'SUB_260' THEN 3 ELSE 9 END,sequence_no")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .bind(chunks[0].root_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        smoke_failpoints::hit("required_after_commit_before_response")?;
+        Ok(V004IndexPersistenceSummary {
+            chunks: rows
+                .into_iter()
+                .map(|r| StoredChunkRecord {
+                    id: r.get("id"),
+                    root_id: r.get("root_chunk_id"),
+                    source_id: r.get("source_chunk_id"),
+                    parent_id: r.try_get("parent_chunk_id").ok(),
+                    granularity: r.get("granularity"),
+                    sequence_no: r.get("sequence_no"),
+                    token_count: r.get("actual_token_count"),
+                    content_hash: r.get("content_hash"),
+                })
+                .collect(),
+            dense_vectors,
+            sparse_vectors,
+            bindings,
+            outbox_created,
+            graph_nodes,
+            graph_edges,
+            graph_warnings,
+        })
+    }
+
+    pub async fn cleanup_document_graph_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+    ) -> Result<(), AstraError> {
+        sqlx::query("DELETE FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+        sqlx::query("DELETE FROM astravector.rag_graph_nodes WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    pub async fn save_graph_nodes_edges_batch_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        nodes: &[GraphNode],
+        edges: &[GraphEdge],
+        batch_size: usize,
+    ) -> Result<(), AstraError> {
+        for batch in nodes.chunks(batch_size.max(1)) {
+            let mut qb = QueryBuilder::new("INSERT INTO astravector.rag_graph_nodes(access_zone_id,node_id,node_type,external_id,document_id,document_version,chunk_id,block_id,label,properties,lifecycle_status,expires_at,quarantined,access_level) ");
+            qb.push_values(batch, |mut b, n| {
+                b.push_bind(n.access_zone_id)
+                    .push_bind(n.node_id)
+                    .push_bind(n.node_type.as_str())
+                    .push_bind(&n.external_id)
+                    .push_bind(n.document_id)
+                    .push_bind(n.document_version)
+                    .push_bind(n.chunk_id)
+                    .push_bind(n.block_id.as_deref())
+                    .push_bind(n.label.as_deref())
+                    .push_bind(n.properties.clone())
+                    .push_bind(&n.lifecycle_status)
+                    .push_bind(n.expires_at)
+                    .push_bind(n.quarantined)
+                    .push_bind(n.access_level);
+            });
+            qb.push(" ON CONFLICT DO NOTHING");
+            qb.build().execute(&mut **tx).await.map_err(db)?;
+        }
+        let started = std::time::Instant::now();
+        for batch in edges.chunks(batch_size.max(1)) {
+            let mut qb = QueryBuilder::new("INSERT INTO astravector.rag_graph_edges(access_zone_id,edge_id,source_node_type,source_node_id,target_node_type,target_node_id,relation_type,relation_score,relation_source,relation_rank,document_id,document_version,lifecycle_status,expires_at,quarantined,properties) ");
+            qb.push_values(batch, |mut b, e| {
+                b.push_bind(e.access_zone_id)
+                    .push_bind(e.edge_id)
+                    .push_bind(e.source_node_type.as_str())
+                    .push_bind(e.source_node_id)
+                    .push_bind(e.target_node_type.as_str())
+                    .push_bind(e.target_node_id)
+                    .push_bind(e.relation_type.as_str())
+                    .push_bind(e.relation_score)
+                    .push_bind(&e.relation_source)
+                    .push_bind(e.relation_rank)
+                    .push_bind(e.document_id)
+                    .push_bind(e.document_version)
+                    .push_bind(&e.lifecycle_status)
+                    .push_bind(e.expires_at)
+                    .push_bind(e.quarantined)
+                    .push_bind(e.properties.clone());
+            });
+            qb.push(" ON CONFLICT (access_zone_id,relation_type,document_id,document_version,source_node_id,target_node_id) DO UPDATE SET relation_score=EXCLUDED.relation_score, relation_source=EXCLUDED.relation_source, relation_rank=EXCLUDED.relation_rank, properties=EXCLUDED.properties");
+            qb.build().execute(&mut **tx).await.map_err(db)?;
+        }
+        metrics::counter!("graph_edges_batch_insert_total").increment(edges.len() as u64);
+        metrics::histogram!("graph_edges_batch_insert_duration_ms")
+            .record(started.elapsed().as_millis() as f64);
+        for edge in edges {
+            metrics::counter!("graph_edges_by_relation_persisted_total", "relation_type" => edge.relation_type.as_str().to_string()).increment(1);
+        }
+        Ok(())
+    }
+
+    pub async fn expand_chunks_1hop(
+        &self,
+        access_zone_id: Uuid,
+        seed_chunk_ids: &[Uuid],
+        caller_access_level: i16,
+        max_related_chunks: u32,
+        max_seed_chunks: usize,
+        max_edges_visited: usize,
+        allowed_relations: &[String],
+    ) -> Result<Vec<RelatedChunk>, AstraError> {
+        if seed_chunk_ids.is_empty() || max_related_chunks == 0 {
+            return Ok(Vec::new());
+        }
+        let started = std::time::Instant::now();
+        let seed_chunk_ids = seed_chunk_ids
+            .iter()
+            .copied()
+            .take(max_seed_chunks.max(1))
+            .collect::<Vec<_>>();
+        let allowed_relations = allowed_relations
+            .iter()
+            .map(|r| r.to_uppercase())
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(r#"
+WITH seed_node_ids AS (
+    SELECT access_zone_id, node_id, chunk_id AS seed_chunk_id
+    FROM astravector.rag_graph_nodes_chunk
+    WHERE access_zone_id = $1
+      AND chunk_id = ANY($2::uuid[])
+      AND lifecycle_status = 'ACTIVE'
+      AND quarantined = false
+      AND (expires_at IS NULL OR expires_at > now())
+), expanded AS (
+    SELECT s.access_zone_id AS seed_access_zone_id,s.seed_chunk_id,e.access_zone_id,e.source_node_id,e.target_node_id,e.relation_type,e.relation_score,e.relation_rank
+    FROM astravector.rag_graph_edges e
+    JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id
+    WHERE e.access_zone_id=$1
+      AND e.relation_type = ANY($5::text[])
+      AND e.lifecycle_status='ACTIVE'
+      AND e.quarantined=false
+      AND (e.expires_at IS NULL OR e.expires_at > now())
+    ORDER BY e.relation_score DESC, e.relation_rank NULLS LAST
+    LIMIT $6
+)
+SELECT n.access_zone_id AS access_zone_id, n.chunk_id, expanded.seed_access_zone_id, expanded.seed_chunk_id, expanded.relation_type, expanded.relation_score, expanded.relation_rank
+FROM expanded
+JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.target_node_id
+JOIN astravector.content_chunks_v004 c ON c.access_zone_id=n.access_zone_id AND c.id=n.chunk_id
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE n.lifecycle_status='ACTIVE'
+  AND n.quarantined=false
+  AND (n.expires_at IS NULL OR n.expires_at > now())
+  AND c.lifecycle_status='ACTIVE'
+  AND c.access_level <= $3
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
+ORDER BY expanded.relation_score DESC, expanded.relation_rank NULLS LAST
+LIMIT $4
+"#)
+            .bind(access_zone_id)
+            .bind(&seed_chunk_ids)
+            .bind(caller_access_level)
+            .bind(max_related_chunks as i64)
+            .bind(&allowed_relations)
+            .bind(max_edges_visited.max(max_related_chunks as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        metrics::counter!("graph_expansion_requests_total").increment(1);
+        metrics::counter!("graph_expansion_seed_chunks_total")
+            .increment(seed_chunk_ids.len() as u64);
+        metrics::counter!("graph_expansion_candidates_total").increment(rows.len() as u64);
+        metrics::histogram!("graph_expansion_duration_ms")
+            .record(started.elapsed().as_millis() as f64);
+        let mut out = Vec::new();
+        for row in rows {
+            let relation = match row.get::<String, _>("relation_type").as_str() {
+                "CHUNK_HAS_PARENT" => GraphRelationType::ChunkHasParent,
+                "CHUNK_PREVIOUS_SIBLING" => GraphRelationType::ChunkPreviousSibling,
+                "CHUNK_NEXT_SIBLING" => GraphRelationType::ChunkNextSibling,
+                "CHUNK_SAME_TABLE" => GraphRelationType::ChunkSameTable,
+                "CHUNK_SEMANTIC_SIMILAR" => GraphRelationType::ChunkSemanticSimilar,
+                _ => continue,
+            };
+            out.push(RelatedChunk {
+                access_zone_id: row.get("access_zone_id"),
+                chunk_id: row.get("chunk_id"),
+                seed_access_zone_id: row.get("seed_access_zone_id"),
+                seed_chunk_id: row.get("seed_chunk_id"),
+                relation_type: relation,
+                relation_score: row.get::<f32, _>("relation_score"),
+                relation_rank: row
+                    .try_get::<Option<i32>, _>("relation_rank")
+                    .ok()
+                    .flatten(),
+                hop_distance: 1,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn expand_chunks_1hop_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        seed_chunk_ids: &[Uuid],
+        caller_access_level: i16,
+        max_related_chunks: u32,
+        max_seed_chunks: usize,
+        max_edges_visited: usize,
+        allowed_relations: &[String],
+    ) -> Result<Vec<RelatedChunk>, AstraError> {
+        // Backward-compatible wrapper. Production retrieval should prefer
+        // expand_chunks_1hop_by_seed_keys to avoid cartesian zone/chunk seed expansion.
+        let seed_keys = access_zone_ids
+            .iter()
+            .flat_map(|zone| seed_chunk_ids.iter().map(move |chunk| (*zone, *chunk)))
+            .collect::<Vec<_>>();
+        self.expand_chunks_1hop_by_seed_keys(
+            &seed_keys,
+            caller_access_level,
+            max_related_chunks,
+            max_seed_chunks,
+            max_edges_visited,
+            allowed_relations,
+        )
+        .await
+    }
+
+    pub async fn expand_chunks_1hop_by_seed_keys(
+        &self,
+        seed_keys: &[(Uuid, Uuid)],
+        caller_access_level: i16,
+        max_related_chunks: u32,
+        max_seed_chunks: usize,
+        max_edges_visited: usize,
+        allowed_relations: &[String],
+    ) -> Result<Vec<RelatedChunk>, AstraError> {
+        if seed_keys.is_empty() || max_related_chunks == 0 {
+            return Ok(Vec::new());
+        }
+        let started = std::time::Instant::now();
+        let seed_keys = seed_keys
+            .iter()
+            .copied()
+            .take(max_seed_chunks.max(1))
+            .collect::<Vec<_>>();
+        let seed_zone_ids = seed_keys.iter().map(|(zone, _)| *zone).collect::<Vec<_>>();
+        let seed_chunk_ids = seed_keys
+            .iter()
+            .map(|(_, chunk)| *chunk)
+            .collect::<Vec<_>>();
+        let allowed_relations = allowed_relations
+            .iter()
+            .map(|r| r.to_uppercase())
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(r#"
+WITH seed_keys(access_zone_id, chunk_id) AS (
+    SELECT * FROM UNNEST($1::uuid[], $2::uuid[])
+), seed_node_ids AS (
+    SELECT n.access_zone_id, n.node_id, n.chunk_id AS seed_chunk_id
+    FROM astravector.rag_graph_nodes_chunk n
+    JOIN seed_keys s
+      ON s.access_zone_id = n.access_zone_id
+     AND s.chunk_id = n.chunk_id
+    WHERE n.lifecycle_status = 'ACTIVE'
+      AND n.quarantined = false
+      AND (n.expires_at IS NULL OR n.expires_at > now())
+), expanded AS (
+    SELECT s.access_zone_id AS seed_access_zone_id,
+           s.seed_chunk_id,
+           e.access_zone_id,
+           e.source_node_id,
+           e.target_node_id,
+           e.relation_type,
+           e.relation_score,
+           e.relation_rank
+    FROM astravector.rag_graph_edges e
+    JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id
+    WHERE e.relation_type = ANY($5::text[])
+      AND e.lifecycle_status='ACTIVE'
+      AND e.quarantined=false
+      AND (e.expires_at IS NULL OR e.expires_at > now())
+    ORDER BY e.relation_score DESC, e.relation_rank NULLS LAST
+    LIMIT $6
+)
+SELECT n.access_zone_id AS access_zone_id,
+       n.chunk_id,
+       expanded.seed_access_zone_id,
+       expanded.seed_chunk_id,
+       expanded.relation_type,
+       expanded.relation_score,
+       expanded.relation_rank
+FROM expanded
+JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.target_node_id
+JOIN astravector.content_chunks_v004 c ON c.access_zone_id=n.access_zone_id AND c.id=n.chunk_id
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE n.lifecycle_status='ACTIVE'
+  AND n.quarantined=false
+  AND (n.expires_at IS NULL OR n.expires_at > now())
+  AND c.lifecycle_status='ACTIVE'
+  AND c.access_level <= $3
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
+ORDER BY expanded.relation_score DESC, expanded.relation_rank NULLS LAST
+LIMIT $4
+"#)
+            .bind(&seed_zone_ids)
+            .bind(&seed_chunk_ids)
+            .bind(caller_access_level)
+            .bind(max_related_chunks as i64)
+            .bind(&allowed_relations)
+            .bind(max_edges_visited.max(max_related_chunks as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        metrics::counter!("graph_expansion_requests_total").increment(1);
+        metrics::counter!("graph_expansion_seed_chunks_total").increment(seed_keys.len() as u64);
+        metrics::counter!("graph_expansion_candidates_total").increment(rows.len() as u64);
+        metrics::histogram!("graph_expansion_duration_ms")
+            .record(started.elapsed().as_millis() as f64);
+        let mut out = Vec::new();
+        for row in rows {
+            let relation = match row.get::<String, _>("relation_type").as_str() {
+                "CHUNK_HAS_PARENT" => GraphRelationType::ChunkHasParent,
+                "CHUNK_PREVIOUS_SIBLING" => GraphRelationType::ChunkPreviousSibling,
+                "CHUNK_NEXT_SIBLING" => GraphRelationType::ChunkNextSibling,
+                "CHUNK_SAME_TABLE" => GraphRelationType::ChunkSameTable,
+                "CHUNK_SEMANTIC_SIMILAR" => GraphRelationType::ChunkSemanticSimilar,
+                _ => continue,
+            };
+            out.push(RelatedChunk {
+                access_zone_id: row.get("access_zone_id"),
+                chunk_id: row.get("chunk_id"),
+                seed_access_zone_id: row.get("seed_access_zone_id"),
+                seed_chunk_id: row.get("seed_chunk_id"),
+                relation_type: relation,
+                relation_score: row.get::<f32, _>("relation_score"),
+                relation_rank: row
+                    .try_get::<Option<i32>, _>("relation_rank")
+                    .ok()
+                    .flatten(),
+                hop_distance: 1,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn fetch_contexts_for_graph_related_chunks(
+        &self,
+        access_zone_id: Uuid,
+        chunk_ids: &[Uuid],
+        caller_access_level: i16,
+    ) -> Result<Vec<GraphChunkContextRecord>, AstraError> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT DISTINCT ON (c.access_zone_id, c.id)
+  c.id AS chunk_id,
+  c.parent_chunk_id,
+  c.content AS matched_text,
+  c.source_block_id,
+  c.source_location,
+  c.source_links,
+  c.metadata AS chunk_metadata,
+  c.granularity AS source_chunk_granularity,
+  b.qdrant_point_id,
+  b.representation_type,
+  ce.dense_version,
+  ce.model_version,
+  b.payload_version,
+  COALESCE(p.access_zone_id,c.access_zone_id) AS p_access_zone_id,
+  COALESCE(p.id,c.id) AS p_id,
+  COALESCE(p.document_id,c.document_id) AS p_document_id,
+  COALESCE(p.document_version,c.document_version) AS p_document_version,
+  COALESCE(p.root_chunk_id,c.root_chunk_id) AS p_root_chunk_id,
+  COALESCE(p.source_chunk_id,c.source_chunk_id) AS p_source_chunk_id,
+  COALESCE(p.access_level,c.access_level) AS p_access_level,
+  COALESCE(p.content,c.content) AS p_content,
+  COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
+  COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
+  COALESCE(p.metadata,c.metadata) AS p_metadata
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+ AND d.status='ACTIVE'
+ AND d.lifecycle_status='ACTIVE'
+ AND (d.expires_at IS NULL OR d.expires_at > now())
+LEFT JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=c.access_zone_id
+ AND p.id=COALESCE(c.parent_chunk_id,c.id)
+ AND p.lifecycle_status='ACTIVE'
+ AND p.access_level <= $3
+ AND (p.expires_at IS NULL OR p.expires_at > now())
+ AND p.deleted_at IS NULL
+LEFT JOIN astravector.vector_bindings_v004 b
+  ON b.access_zone_id=c.access_zone_id
+ AND b.chunk_id=c.id
+ AND b.lifecycle_status IN ('ACTIVE','LEGAL_HOLD')
+LEFT JOIN astravector.embedding_cache_entries ce
+  ON ce.id=b.cache_entry_id
+WHERE c.access_zone_id=$1
+  AND c.id=ANY($2::uuid[])
+  AND c.lifecycle_status='ACTIVE'
+  AND c.access_level <= $3
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+ORDER BY c.access_zone_id, c.id,
+  CASE WHEN b.representation_type='ORIGINAL' THEN 0
+       WHEN b.representation_type='SUMMARY' THEN 1
+       WHEN b.representation_type='KEY_FACT' THEN 2
+       WHEN b.representation_type='FAQ' THEN 3
+       WHEN b.representation_type='SYNTHETIC_QUESTION' THEN 4
+       ELSE 9 END,
+  b.updated_at DESC NULLS LAST
+"#,
+        )
+        .bind(access_zone_id)
+        .bind(chunk_ids)
+        .bind(caller_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let trace = ChunkTraceRecord {
+                id: r.get("chunk_id"),
+                source_block_id: r
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten(),
+                source_location: r
+                    .try_get("source_location")
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                source_links: r
+                    .try_get("source_links")
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                metadata: r
+                    .try_get("chunk_metadata")
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            };
+            out.push(GraphChunkContextRecord {
+                chunk_id: r.get("chunk_id"),
+                parent_chunk_id: r
+                    .try_get::<Option<Uuid>, _>("parent_chunk_id")
+                    .ok()
+                    .flatten(),
+                matched_text: r.get("matched_text"),
+                trace: Some(trace),
+                qdrant_point_id: r
+                    .try_get::<Option<Uuid>, _>("qdrant_point_id")
+                    .ok()
+                    .flatten(),
+                representation_type: r
+                    .try_get::<Option<String>, _>("representation_type")
+                    .ok()
+                    .flatten(),
+                dense_version: r
+                    .try_get::<Option<String>, _>("dense_version")
+                    .ok()
+                    .flatten(),
+                model_version: r
+                    .try_get::<Option<String>, _>("model_version")
+                    .ok()
+                    .flatten(),
+                payload_version: r
+                    .try_get::<Option<i64>, _>("payload_version")
+                    .ok()
+                    .flatten(),
+                source_chunk_granularity: r
+                    .try_get::<Option<String>, _>("source_chunk_granularity")
+                    .ok()
+                    .flatten(),
+                parent_record: ParentContextRecord {
+                    access_zone_id: r.get("p_access_zone_id"),
+                    id: r.get("p_id"),
+                    document_id: r.get("p_document_id"),
+                    document_version: r.get("p_document_version"),
+                    root_chunk_id: r.get("p_root_chunk_id"),
+                    source_chunk_id: r.get("p_source_chunk_id"),
+                    access_level: r.get("p_access_level"),
+                    content: r.get("p_content"),
+                    content_hash: r.get("p_content_hash"),
+                    token_count: r.get("p_token_count"),
+                    metadata: r.get("p_metadata"),
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn fetch_contexts_for_graph_related_chunks_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        chunk_ids: &[Uuid],
+        caller_access_level: i16,
+    ) -> Result<Vec<GraphChunkContextRecord>, AstraError> {
+        if chunk_ids.is_empty() || access_zone_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT DISTINCT ON (c.access_zone_id, c.id)
+  c.id AS chunk_id,
+  c.parent_chunk_id,
+  c.content AS matched_text,
+  c.source_block_id,
+  c.source_location,
+  c.source_links,
+  c.metadata AS chunk_metadata,
+  c.granularity AS source_chunk_granularity,
+  b.qdrant_point_id,
+  b.representation_type,
+  ce.dense_version,
+  ce.model_version,
+  b.payload_version,
+  COALESCE(p.access_zone_id,c.access_zone_id) AS p_access_zone_id,
+  COALESCE(p.id,c.id) AS p_id,
+  COALESCE(p.document_id,c.document_id) AS p_document_id,
+  COALESCE(p.document_version,c.document_version) AS p_document_version,
+  COALESCE(p.root_chunk_id,c.root_chunk_id) AS p_root_chunk_id,
+  COALESCE(p.source_chunk_id,c.source_chunk_id) AS p_source_chunk_id,
+  COALESCE(p.access_level,c.access_level) AS p_access_level,
+  COALESCE(p.content,c.content) AS p_content,
+  COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
+  COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
+  COALESCE(p.metadata,c.metadata) AS p_metadata
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+ AND d.status='ACTIVE'
+ AND d.lifecycle_status='ACTIVE'
+ AND (d.expires_at IS NULL OR d.expires_at > now())
+LEFT JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=c.access_zone_id
+ AND p.id=COALESCE(c.parent_chunk_id,c.id)
+ AND p.lifecycle_status='ACTIVE'
+ AND p.access_level <= $3
+ AND (p.expires_at IS NULL OR p.expires_at > now())
+ AND p.deleted_at IS NULL
+LEFT JOIN astravector.vector_bindings_v004 b
+  ON b.access_zone_id=c.access_zone_id
+ AND b.chunk_id=c.id
+ AND b.lifecycle_status IN ('ACTIVE','LEGAL_HOLD')
+LEFT JOIN astravector.embedding_cache_entries ce
+  ON ce.id=b.cache_entry_id
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.id=ANY($2::uuid[])
+  AND c.lifecycle_status='ACTIVE'
+  AND c.access_level <= $3
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+ORDER BY c.access_zone_id, c.id,
+  CASE WHEN b.representation_type='ORIGINAL' THEN 0
+       WHEN b.representation_type='SUMMARY' THEN 1
+       WHEN b.representation_type='KEY_FACT' THEN 2
+       WHEN b.representation_type='FAQ' THEN 3
+       WHEN b.representation_type='SYNTHETIC_QUESTION' THEN 4
+       ELSE 9 END,
+  b.updated_at DESC NULLS LAST
+"#,
+        )
+        .bind(access_zone_ids)
+        .bind(chunk_ids)
+        .bind(caller_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let trace = ChunkTraceRecord {
+                id: r.get("chunk_id"),
+                source_block_id: r
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten(),
+                source_location: r
+                    .try_get("source_location")
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                source_links: r
+                    .try_get("source_links")
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                metadata: r
+                    .try_get("chunk_metadata")
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            };
+            out.push(GraphChunkContextRecord {
+                chunk_id: r.get("chunk_id"),
+                parent_chunk_id: r
+                    .try_get::<Option<Uuid>, _>("parent_chunk_id")
+                    .ok()
+                    .flatten(),
+                matched_text: r.get("matched_text"),
+                trace: Some(trace),
+                qdrant_point_id: r
+                    .try_get::<Option<Uuid>, _>("qdrant_point_id")
+                    .ok()
+                    .flatten(),
+                representation_type: r
+                    .try_get::<Option<String>, _>("representation_type")
+                    .ok()
+                    .flatten(),
+                dense_version: r
+                    .try_get::<Option<String>, _>("dense_version")
+                    .ok()
+                    .flatten(),
+                model_version: r
+                    .try_get::<Option<String>, _>("model_version")
+                    .ok()
+                    .flatten(),
+                payload_version: r
+                    .try_get::<Option<i64>, _>("payload_version")
+                    .ok()
+                    .flatten(),
+                source_chunk_granularity: r
+                    .try_get::<Option<String>, _>("source_chunk_granularity")
+                    .ok()
+                    .flatten(),
+                parent_record: ParentContextRecord {
+                    access_zone_id: r.get("p_access_zone_id"),
+                    id: r.get("p_id"),
+                    document_id: r.get("p_document_id"),
+                    document_version: r.get("p_document_version"),
+                    root_chunk_id: r.get("p_root_chunk_id"),
+                    source_chunk_id: r.get("p_source_chunk_id"),
+                    access_level: r.get("p_access_level"),
+                    content: r.get("p_content"),
+                    content_hash: r.get("p_content_hash"),
+                    token_count: r.get("p_token_count"),
+                    metadata: r.get("p_metadata"),
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn fetch_graph_summary(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+    ) -> Result<GraphSummaryRecord, AstraError> {
+        let row = sqlx::query(r#"
+SELECT
+  (SELECT count(*) FROM astravector.rag_graph_nodes WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3) AS total_nodes,
+  (SELECT count(*) FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3) AS total_edges,
+  COALESCE((SELECT jsonb_object_agg(node_type, cnt) FROM (SELECT node_type, count(*) cnt FROM astravector.rag_graph_nodes WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 GROUP BY node_type) s),'{}'::jsonb) AS nodes_by_type,
+  COALESCE((SELECT jsonb_object_agg(relation_type, cnt) FROM (SELECT relation_type, count(*) cnt FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 GROUP BY relation_type) s),'{}'::jsonb) AS edges_by_relation_type,
+  (SELECT count(*) FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND relation_type='CHUNK_SEMANTIC_SIMILAR') AS semantic_edges_count,
+  (SELECT avg(relation_score) FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND relation_type='CHUNK_SEMANTIC_SIMILAR') AS semantic_avg_weight,
+  (SELECT min(relation_score) FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND relation_type='CHUNK_SEMANTIC_SIMILAR') AS semantic_min_weight,
+  (SELECT max(relation_score) FROM astravector.rag_graph_edges WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND relation_type='CHUNK_SEMANTIC_SIMILAR') AS semantic_max_weight
+"#)
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(GraphSummaryRecord {
+            total_nodes: row.get::<i64, _>("total_nodes") as u32,
+            total_edges: row.get::<i64, _>("total_edges") as u32,
+            nodes_by_type: row.get("nodes_by_type"),
+            edges_by_relation_type: row.get("edges_by_relation_type"),
+            semantic_edges_count: row.get::<i64, _>("semantic_edges_count") as u32,
+            semantic_avg_weight: row
+                .try_get::<Option<f32>, _>("semantic_avg_weight")
+                .ok()
+                .flatten(),
+            semantic_min_weight: row
+                .try_get::<Option<f32>, _>("semantic_min_weight")
+                .ok()
+                .flatten(),
+            semantic_max_weight: row
+                .try_get::<Option<f32>, _>("semantic_max_weight")
+                .ok()
+                .flatten(),
+        })
     }
 
     pub async fn fetch_v004_chunks_by_idempotency_key(
@@ -438,6 +2155,8 @@ WHERE c.access_zone_id=$1
   AND c.access_level <= $3
   AND c.lifecycle_status='ACTIVE'
   AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
   AND (c.expires_at IS NULL OR c.expires_at > now())"#,
         )
         .bind(access_zone_id)
@@ -464,6 +2183,295 @@ WHERE c.access_zone_id=$1
             .collect())
     }
 
+    pub async fn fetch_parent_contexts_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        parent_ids: &[Uuid],
+        caller_access_level: i16,
+    ) -> Result<Vec<ParentContextRecord>, AstraError> {
+        if parent_ids.is_empty() || access_zone_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.metadata
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.id=ANY($2::uuid[])
+  AND c.granularity='PARENT'
+  AND c.representation_type='ORIGINAL'
+  AND c.access_level <= $3
+  AND c.lifecycle_status='ACTIVE'
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND (c.expires_at IS NULL OR c.expires_at > now())"#,
+        )
+        .bind(access_zone_ids)
+        .bind(parent_ids)
+        .bind(caller_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ParentContextRecord {
+                access_zone_id: r.get("access_zone_id"),
+                id: r.get("id"),
+                document_id: r.get("document_id"),
+                document_version: r.get("document_version"),
+                root_chunk_id: r.get("root_chunk_id"),
+                source_chunk_id: r.get("source_chunk_id"),
+                access_level: r.get("access_level"),
+                content: r.get("content"),
+                content_hash: r.get("content_hash"),
+                token_count: r.get("actual_token_count"),
+                metadata: r.get("metadata"),
+            })
+            .collect())
+    }
+
+    pub async fn fetch_active_parent_context_candidates_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        caller_access_level: i16,
+        quality_run_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ParentContextRecord>, AstraError> {
+        if access_zone_ids.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.metadata
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.granularity='PARENT'
+  AND c.representation_type='ORIGINAL'
+  AND c.access_level <= $2
+  AND c.lifecycle_status='ACTIVE'
+  AND c.deleted_at IS NULL
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND ($3::text IS NULL OR c.metadata->>'quality_run_id'=$3)
+ORDER BY c.updated_at DESC, c.sequence_no ASC
+LIMIT $4"#,
+        )
+        .bind(access_zone_ids)
+        .bind(caller_access_level)
+        .bind(quality_run_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ParentContextRecord {
+                access_zone_id: r.get("access_zone_id"),
+                id: r.get("id"),
+                document_id: r.get("document_id"),
+                document_version: r.get("document_version"),
+                root_chunk_id: r.get("root_chunk_id"),
+                source_chunk_id: r.get("source_chunk_id"),
+                access_level: r.get("access_level"),
+                content: r.get("content"),
+                content_hash: r.get("content_hash"),
+                token_count: r.get("actual_token_count"),
+                metadata: r.get("metadata"),
+            })
+            .collect())
+    }
+
+    pub async fn fetch_chunk_texts_by_ids(
+        &self,
+        access_zone_id: Uuid,
+        chunk_ids: &[Uuid],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashMap<Uuid, String>, AstraError> {
+        if chunk_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"SELECT id, content
+FROM astravector.content_chunks_v004
+WHERE access_zone_id=$1
+  AND id = ANY($2)
+  AND access_level <= $3
+  AND lifecycle_status='ACTIVE'"#,
+        )
+        .bind(access_zone_id)
+        .bind(chunk_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<Uuid, _>("id"), r.get::<String, _>("content")))
+            .collect())
+    }
+
+    pub async fn fetch_chunk_traces_by_ids(
+        &self,
+        access_zone_id: Uuid,
+        chunk_ids: &[Uuid],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashMap<Uuid, ChunkTraceRecord>, AstraError> {
+        if chunk_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"SELECT id, source_block_id, source_location, source_links, metadata
+FROM astravector.content_chunks_v004
+WHERE access_zone_id=$1
+  AND id = ANY($2)
+  AND access_level <= $3
+  AND lifecycle_status='ACTIVE'"#,
+        )
+        .bind(access_zone_id)
+        .bind(chunk_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let id: Uuid = r.get("id");
+                (
+                    id,
+                    ChunkTraceRecord {
+                        id,
+                        source_block_id: r
+                            .try_get::<Option<String>, _>("source_block_id")
+                            .ok()
+                            .flatten(),
+                        source_location: r
+                            .try_get("source_location")
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                        source_links: r
+                            .try_get("source_links")
+                            .unwrap_or_else(|_| serde_json::json!([])),
+                        metadata: r
+                            .try_get("metadata")
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    pub async fn fetch_chunk_texts_by_ids_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        chunk_ids: &[Uuid],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashMap<(Uuid, Uuid), String>, AstraError> {
+        if chunk_ids.is_empty() || access_zone_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"SELECT c.access_zone_id, c.id, c.content
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.id = ANY($2::uuid[])
+  AND c.access_level <= $3
+  AND c.lifecycle_status='ACTIVE'
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())"#,
+        )
+        .bind(access_zone_ids)
+        .bind(chunk_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    (r.get::<Uuid, _>("access_zone_id"), r.get::<Uuid, _>("id")),
+                    r.get::<String, _>("content"),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn fetch_chunk_traces_by_ids_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        chunk_ids: &[Uuid],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashMap<(Uuid, Uuid), ChunkTraceRecord>, AstraError> {
+        if chunk_ids.is_empty() || access_zone_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"SELECT c.access_zone_id, c.id, c.source_block_id, c.source_location, c.source_links, c.metadata
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.id = ANY($2::uuid[])
+  AND c.access_level <= $3
+  AND c.lifecycle_status='ACTIVE'
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND c.deleted_at IS NULL
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())"#,
+        )
+        .bind(access_zone_ids)
+        .bind(chunk_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let zone: Uuid = r.get("access_zone_id");
+                let id: Uuid = r.get("id");
+                (
+                    (zone, id),
+                    ChunkTraceRecord {
+                        id,
+                        source_block_id: r
+                            .try_get::<Option<String>, _>("source_block_id")
+                            .ok()
+                            .flatten(),
+                        source_location: r
+                            .try_get("source_location")
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                        source_links: r
+                            .try_get("source_links")
+                            .unwrap_or_else(|_| serde_json::json!([])),
+                        metadata: r
+                            .try_get("metadata")
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                    },
+                )
+            })
+            .collect())
+    }
+
     pub async fn fetch_chunk_group(
         &self,
         access_zone_id: Uuid,
@@ -483,6 +2491,8 @@ WHERE c.access_zone_id=$1
   AND c.access_level <= $3
   AND c.lifecycle_status='ACTIVE'
   AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
   AND (c.expires_at IS NULL OR c.expires_at > now())
 ORDER BY CASE c.granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_180' THEN 2 WHEN 'SUB_260' THEN 3 ELSE 9 END,c.sequence_no"#,
         )
@@ -498,7 +2508,10 @@ ORDER BY CASE c.granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_
                 id: r.get("id"),
                 root_chunk_id: r.get("root_chunk_id"),
                 source_chunk_id: r.get("source_chunk_id"),
-                parent_chunk_id: r.try_get("parent_chunk_id").ok(),
+                parent_chunk_id: r
+                    .try_get::<Option<Uuid>, _>("parent_chunk_id")
+                    .ok()
+                    .flatten(),
                 granularity: r.get("granularity"),
                 sequence_no: r.get("sequence_no"),
                 token_count: r.get("actual_token_count"),
@@ -506,6 +2519,76 @@ ORDER BY CASE c.granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_
                 content: r.get("content"),
             })
             .collect())
+    }
+
+    pub async fn cleanup_v004_document_version_index(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+    ) -> Result<(), AstraError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let binding_ids: Vec<Uuid> = sqlx::query("SELECT id FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?
+            .into_iter()
+            .map(|row| row.get::<Uuid, _>("id"))
+            .collect();
+        for binding_id in binding_ids {
+            sqlx::query("DELETE FROM astravector.vector_outbox WHERE binding_access_zone_id=$1 AND binding_id=$2")
+                .bind(access_zone_id)
+                .bind(binding_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        let cache_ids: Vec<Uuid> = sqlx::query("SELECT cache_entry_id FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?
+            .into_iter()
+            .map(|row| row.get::<Uuid, _>("cache_entry_id"))
+            .collect();
+        sqlx::query("DELETE FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        for cache_id in cache_ids {
+            sqlx::query("DELETE FROM astravector.embedding_dense WHERE cache_entry_id=$1")
+                .bind(cache_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            sqlx::query("DELETE FROM astravector.embedding_sparse WHERE cache_entry_id=$1")
+                .bind(cache_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            sqlx::query("DELETE FROM astravector.embedding_cache_entries WHERE id=$1")
+                .bind(cache_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        sqlx::query("DELETE FROM astravector.content_chunks_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3")
+            .bind(access_zone_id)
+            .bind(document_id)
+            .bind(document_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -526,12 +2609,19 @@ ORDER BY CASE c.granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_
         max_non_zero: i32,
         qdrant_collection: &str,
         chunking_profile_version: &str,
+        publish_outbox: bool,
     ) -> Result<(), AstraError> {
         let cache_id = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
             format!(
-                "v004-cache:{}:{}:{}:{}",
-                chunk.access_zone_id, chunk.chunk_id, text_hash, dense_version
+                "v004-cache:{}:{}:{}:{}:{}:{}:{}",
+                chunk.access_zone_id,
+                chunk.chunk_id,
+                text_hash,
+                model_version,
+                dense_version,
+                sparse_version,
+                tokenizer_version
             )
             .as_bytes(),
         );
@@ -545,8 +2635,14 @@ ORDER BY CASE c.granularity WHEN 'SOURCE' THEN 0 WHEN 'PARENT' THEN 1 WHEN 'SUB_
         );
         let mut hasher = Sha256::new();
         hasher.update(format!(
-            "v004-cache-key:{tenant}:{workspace}:{}:{}:{}",
-            chunk.access_zone_id, chunk.chunk_id, text_hash
+            "v004-cache-key:{tenant}:{workspace}:{}:{}:{}:{}:{}:{}:{}",
+            chunk.access_zone_id,
+            chunk.chunk_id,
+            text_hash,
+            model_version,
+            dense_version,
+            sparse_version,
+            tokenizer_version
         ));
         let cache_key = format!("{:x}", hasher.finalize());
         let mut tx = self.pool.begin().await.map_err(db)?;
@@ -642,7 +2738,9 @@ RETURNING payload_version,qdrant_sync_status"#)
         let payload_version: i64 = binding_row.get("payload_version");
         let qdrant_sync_status: String = binding_row.get("qdrant_sync_status");
         smoke_failpoints::hit("required_after_binding_insert")?;
-        if qdrant_sync_status == "PENDING" || qdrant_sync_status == "UPDATE_PENDING" {
+        if publish_outbox
+            && (qdrant_sync_status == "PENDING" || qdrant_sync_status == "UPDATE_PENDING")
+        {
             let rows=sqlx::query("INSERT INTO astravector.vector_outbox(id,binding_access_zone_id,binding_id,operation,operation_version,status) VALUES($1,$2,$3,'UPSERT_POINT',$4,'PENDING') ON CONFLICT(binding_access_zone_id,binding_id,operation,operation_version) DO NOTHING")
                 .bind(Uuid::new_v4()).bind(chunk.access_zone_id).bind(binding_id).bind(payload_version).execute(&mut*tx).await.map_err(db)?.rows_affected();
             if rows > 1 {

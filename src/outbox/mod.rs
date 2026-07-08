@@ -1,4 +1,5 @@
 use crate::{
+    adaptive::AdaptiveRuntime,
     error::AstraError,
     inference::EmbeddingResult,
     persistence::Repository,
@@ -10,7 +11,7 @@ use serde_json::json;
 use sqlx::Row;
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct OutboxEvent {
@@ -30,12 +31,64 @@ pub fn spawn(
     batch_size: i64,
     poll_ms: u64,
     max_attempts: i32,
+    adaptive: Option<Arc<AdaptiveRuntime>>,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(100)));
         loop {
-            tokio::select! {_=shutdown.cancelled()=>break,_=interval.tick()=>match claim_batch(&repo,&instance_id,batch_size,60).await{Ok(events)=>{gauge!("astravector_qdrant_outbox_claimed").set(events.len() as f64);for event in events{let started=std::time::Instant::now();match process_event(&repo,&qdrant,&event).await{Ok(())=>{counter!("astravector_qdrant_events_total","operation"=>event.operation.clone(),"result"=>"success").increment(1);if let Err(e)=complete(&repo,&event).await{error!(event_id=%event.id,error=%e,"outbox complete update failed; event remains reclaimable");counter!("astravector_outbox_complete_failures_total").increment(1)}},Err(e)=>{counter!("astravector_qdrant_failures_total","operation"=>event.operation.clone()).increment(1);if let Err(db_error)=fail(&repo,&event,e.to_string(),max_attempts).await{error!(event_id=%event.id,error=%db_error,"outbox failure state update failed; event remains reclaimable");counter!("astravector_outbox_fail_update_failures_total").increment(1)}}}histogram!("astravector_qdrant_sync_duration_seconds").record(started.elapsed().as_secs_f64());}},Err(e)=>{warn!(error=%e,"outbox claim failed");counter!("astravector_qdrant_failures_total","operation"=>"CLAIM").increment(1)}}}
+            let effective_poll_ms = adaptive
+                .as_ref()
+                .map(|a| a.get_u64("outbox.poll_interval_ms", poll_ms.max(100)))
+                .unwrap_or(poll_ms.max(100))
+                .max(100);
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(effective_poll_ms)) => {
+                    let effective_batch_size = adaptive
+                        .as_ref()
+                        .map(|a| a.get_i64("publisher.batch_size", batch_size.max(1)))
+                        .unwrap_or(batch_size.max(1))
+                        .max(1);
+                    match claim_batch(&repo, &instance_id, effective_batch_size, 60).await {
+                        Ok(events) => {
+                            gauge!("astravector_qdrant_outbox_claimed").set(events.len() as f64);
+                            if let Some(a) = &adaptive {
+                                a.observe_outbox_claim(events.len(), batch_size.max(1));
+                            }
+                            for event in events {
+                                let started = std::time::Instant::now();
+                                match process_event(&repo, &qdrant, &event).await {
+                                    Ok(()) => {
+                                        counter!("astravector_qdrant_events_total", "operation" => event.operation.clone(), "result" => "success").increment(1);
+                                        if let Err(e) = complete(&repo, &event).await {
+                                            error!(event_id=%event.id,error=%e,"outbox complete update failed; event remains reclaimable");
+                                            counter!("astravector_outbox_complete_failures_total").increment(1)
+                                        }
+                                    }
+                                    Err(e) => {
+                                        counter!("astravector_qdrant_failures_total", "operation" => event.operation.clone()).increment(1);
+                                        if let Some(a) = &adaptive {
+                                            a.observe_outbox_error(batch_size.max(1));
+                                        }
+                                        if let Err(db_error) = fail(&repo, &event, e.to_string(), max_attempts).await {
+                                            error!(event_id=%event.id,error=%db_error,"outbox failure state update failed; event remains reclaimable");
+                                            counter!("astravector_outbox_fail_update_failures_total").increment(1)
+                                        }
+                                    }
+                                }
+                                histogram!("astravector_qdrant_sync_duration_seconds").record(started.elapsed().as_secs_f64());
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error=%e,"outbox claim failed");
+                            if let Some(a) = &adaptive {
+                                a.observe_outbox_error(batch_size.max(1));
+                            }
+                            counter!("astravector_qdrant_failures_total", "operation" => "CLAIM").increment(1)
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -67,39 +120,133 @@ async fn process_event(
     q: &QdrantClient,
     event: &OutboxEvent,
 ) -> Result<(), AstraError> {
-    let row=sqlx::query("SELECT b.qdrant_point_id,b.document_id,b.document_version,b.root_chunk_id,b.source_chunk_id,b.parent_chunk_id,b.chunk_id,b.chunk_granularity,b.representation_type,b.access_level,b.expires_at,b.legal_hold,b.lifecycle_status,b.payload_version,b.qdrant_sync_status,b.metadata,c.cache_key,c.model_version,c.tokenizer_version FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_cache_entries c ON c.id=b.cache_entry_id WHERE b.access_zone_id=$1 AND b.id=$2").bind(event.access_zone_id).bind(event.binding_id).fetch_optional(&repo.pool).await.map_err(db)?.ok_or_else(||AstraError::FailedPrecondition("binding not found".into()))?;
+    let row=sqlx::query("SELECT b.qdrant_point_id,b.document_id,b.document_version,b.root_chunk_id,b.source_chunk_id,b.parent_chunk_id,b.chunk_id,b.chunk_granularity,b.representation_type,b.access_level,b.expires_at,b.legal_hold,b.lifecycle_status,b.payload_version,b.ttl_generation,b.qdrant_sync_status,b.metadata,c.cache_key,c.model_version,c.tokenizer_version,c.dense_version,c.sparse_version,az.access_zone_code FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_cache_entries c ON c.id=b.cache_entry_id LEFT JOIN astravector.access_zones az ON az.access_zone_id=b.access_zone_id WHERE b.access_zone_id=$1 AND b.id=$2").bind(event.access_zone_id).bind(event.binding_id).fetch_optional(&repo.pool).await.map_err(db)?.ok_or_else(||AstraError::FailedPrecondition("binding not found".into()))?;
     let point_id: Uuid = row.get("qdrant_point_id");
     let lifecycle: String = row.get("lifecycle_status");
+    let current_payload_version: i64 = row.get("payload_version");
+    let current_ttl_generation: i64 = row.get("ttl_generation");
+    let qdrant_sync_status: String = row.get("qdrant_sync_status");
+    let legal_hold: bool = row.get("legal_hold");
     let metadata: serde_json::Value = row.get("metadata");
     let chunking_profile_version = metadata
         .get("chunking_profile_version")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let expires_at = row
+    let expires_at_dt = row
         .try_get::<Option<DateTime<Utc>>, _>("expires_at")
         .ok()
-        .flatten()
+        .flatten();
+    let expires_at = expires_at_dt
+        .as_ref()
         .map(|x| x.to_rfc3339_opts(SecondsFormat::Secs, true));
-    let payload = json!({"access_zone_id":event.access_zone_id,"binding_id":event.binding_id,"document_id":row.get::<Uuid,_>("document_id"),"document_version":row.get::<i64,_>("document_version"),"root_chunk_id":row.get::<Uuid,_>("root_chunk_id"),"source_chunk_id":row.get::<Uuid,_>("source_chunk_id"),"parent_chunk_id":row.try_get::<Option<Uuid>,_>("parent_chunk_id").ok().flatten(),"chunk_id":row.get::<Uuid,_>("chunk_id"),"chunk_granularity":row.get::<String,_>("chunk_granularity"),"representation_type":row.get::<String,_>("representation_type"),"access_level":row.get::<i16,_>("access_level"),"lifecycle_status":lifecycle,"expires_at":expires_at,"legal_hold":row.get::<bool,_>("legal_hold"),"payload_version":row.get::<i64,_>("payload_version"),"model_version":row.get::<String,_>("model_version"),"tokenizer_version":row.get::<String,_>("tokenizer_version"),"chunking_profile_version":chunking_profile_version});
+    let expires_at_epoch = expires_at_dt
+        .map(|x| x.timestamp())
+        // fix4.5.3: never-expire legacy or ttl_days=0 points use far-future epoch so Qdrant filters stay range-only.
+        .unwrap_or(253_402_300_799_i64);
+    let source_block_id = metadata
+        .get("source_block_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let trace_quality = metadata
+        .get("trace_quality")
+        .and_then(|v| v.as_str())
+        .unwrap_or("MISSING");
+    let trace_relation_type = metadata
+        .get("trace_relation_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("SYNTHETIC");
+    let access_zone_code = row
+        .try_get::<Option<String>, _>("access_zone_code")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let quality_run_id = metadata
+        .get("quality_run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let quality_runtime_bench = metadata
+        .get("quality_runtime_bench")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let payload = json!({"access_zone_id":event.access_zone_id,"access_zone_code":access_zone_code,"binding_id":event.binding_id,"qdrant_point_id":point_id,"document_id":row.get::<Uuid,_>("document_id"),"document_version":row.get::<i64,_>("document_version"),"root_chunk_id":row.get::<Uuid,_>("root_chunk_id"),"source_chunk_id":row.get::<Uuid,_>("source_chunk_id"),"parent_chunk_id":row.try_get::<Option<Uuid>,_>("parent_chunk_id").ok().flatten(),"chunk_id":row.get::<Uuid,_>("chunk_id"),"source_block_id":source_block_id,"trace_quality":trace_quality,"trace_relation_type":trace_relation_type,"chunk_granularity":row.get::<String,_>("chunk_granularity"),"representation_type":row.get::<String,_>("representation_type"),"access_level":row.get::<i16,_>("access_level"),"lifecycle_status":lifecycle,"expires_at":expires_at,"expires_at_epoch":expires_at_epoch,"legal_hold":row.get::<bool,_>("legal_hold"),"payload_version":row.get::<i64,_>("payload_version"),"model_version":row.get::<String,_>("model_version"),"tokenizer_version":row.get::<String,_>("tokenizer_version"),"dense_version":row.try_get::<Option<String>,_>("dense_version").ok().flatten(),"sparse_version":row.try_get::<Option<String>,_>("sparse_version").ok().flatten(),"chunking_profile_version":chunking_profile_version,"quality_run_id":quality_run_id,"quality_runtime_bench":quality_runtime_bench,"quarantined":false});
     match event.operation.as_str() {
         "UPSERT_POINT" => {
+            if lifecycle != "ACTIVE"
+                || !matches!(qdrant_sync_status.as_str(), "PENDING" | "UPDATE_PENDING")
+                || current_payload_version != event.operation_version
+            {
+                counter!("vector_outbox_stale_event_skipped_total", "operation" => "UPSERT_POINT")
+                    .increment(1);
+                counter!("vector_outbox_binding_version_mismatch_total", "operation" => "UPSERT_POINT").increment((current_payload_version != event.operation_version) as u64);
+                counter!("vector_outbox_binding_lifecycle_mismatch_total", "operation" => "UPSERT_POINT", "lifecycle" => lifecycle.clone()).increment((lifecycle != "ACTIVE") as u64);
+                return Ok(());
+            }
             upsert_from_cache(repo, q, &row, point_id, payload).await?;
             mark_synced(repo, event).await?
         }
         "UPDATE_PAYLOAD" => {
+            if lifecycle != "ACTIVE" || current_payload_version != event.operation_version {
+                counter!("vector_outbox_stale_event_skipped_total", "operation" => "UPDATE_PAYLOAD").increment(1);
+                counter!("vector_outbox_binding_version_mismatch_total", "operation" => "UPDATE_PAYLOAD").increment((current_payload_version != event.operation_version) as u64);
+                return Ok(());
+            }
             if q.point_exists(point_id).await? {
                 q.update_payload(point_id, payload).await?
-            } else if lifecycle == "ACTIVE" {
+            } else {
                 counter!("astravector_qdrant_update_fallback_total").increment(1);
                 upsert_from_cache(repo, q, &row, point_id, payload).await?
-            } else {
-                q.delete(point_id).await?
             }
             mark_synced(repo, event).await?
         }
         "DELETE_POINT" => {
-            q.delete(point_id).await?;
-            sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='DELETED',lifecycle_status='SOFT_DELETED',deleted_at=now(),updated_at=now() WHERE access_zone_id=$1 AND id=$2").bind(event.access_zone_id).bind(event.binding_id).execute(&repo.pool).await.map_err(db)?;
+            if legal_hold {
+                counter!("vector_outbox_stale_event_skipped_total", "operation" => "DELETE_POINT", "reason" => "legal_hold").increment(1);
+                info!(event_id=%event.id, binding_id=%event.binding_id, access_zone_id=%event.access_zone_id, operation=%event.operation, event_operation_version=event.operation_version, current_ttl_generation, qdrant_sync_status=%qdrant_sync_status, legal_hold, "OUTBOX_STALE_DELETE_SKIPPED_LEGAL_HOLD");
+                return Ok(());
+            }
+            if current_ttl_generation != event.operation_version
+                || !matches!(
+                    qdrant_sync_status.as_str(),
+                    "DELETE_PENDING" | "DELETION_PENDING" | "DELETE_IN_PROGRESS"
+                )
+            {
+                counter!("vector_outbox_stale_event_skipped_total", "operation" => "DELETE_POINT")
+                    .increment(1);
+                counter!("vector_outbox_binding_version_mismatch_total", "operation" => "DELETE_POINT").increment((current_ttl_generation != event.operation_version) as u64);
+                counter!("vector_outbox_binding_lifecycle_mismatch_total", "operation" => "DELETE_POINT", "lifecycle" => lifecycle.clone()).increment(1);
+                info!(event_id=%event.id, binding_id=%event.binding_id, access_zone_id=%event.access_zone_id, operation=%event.operation, event_operation_version=event.operation_version, current_payload_version, current_ttl_generation, lifecycle=%lifecycle, qdrant_sync_status=%qdrant_sync_status, legal_hold, "OUTBOX_STALE_DELETE_SKIPPED_BY_BINDING_FENCE");
+                return Ok(());
+            }
+            let claimed = sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='DELETE_IN_PROGRESS',updated_at=now() WHERE access_zone_id=$1 AND id=$2 AND ttl_generation=$3 AND legal_hold=false AND qdrant_sync_status IN('DELETE_PENDING','DELETION_PENDING','DELETE_IN_PROGRESS') RETURNING qdrant_point_id")
+                .bind(event.access_zone_id)
+                .bind(event.binding_id)
+                .bind(event.operation_version)
+                .fetch_optional(&repo.pool)
+                .await
+                .map_err(db)?;
+            let Some(claimed) = claimed else {
+                counter!("vector_outbox_stale_event_skipped_total", "operation" => "DELETE_POINT", "reason" => "claim_rejected").increment(1);
+                info!(event_id=%event.id, binding_id=%event.binding_id, access_zone_id=%event.access_zone_id, event_operation_version=event.operation_version, "OUTBOX_DELETE_POINT_CLAIM_REJECTED");
+                return Err(AstraError::OwnershipLost(
+                    "DELETE_POINT binding claim rejected by current DB state".into(),
+                ));
+            };
+            let claimed_point_id: Uuid = claimed.get("qdrant_point_id");
+            q.delete(claimed_point_id).await?;
+            let rows = sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='DELETED',lifecycle_status='SOFT_DELETED',deleted_at=now(),updated_at=now() WHERE access_zone_id=$1 AND id=$2 AND ttl_generation=$3 AND qdrant_sync_status='DELETE_IN_PROGRESS' AND legal_hold=false")
+                .bind(event.access_zone_id)
+                .bind(event.binding_id)
+                .bind(event.operation_version)
+                .execute(&repo.pool)
+                .await
+                .map_err(db)?
+                .rows_affected();
+            if rows != 1 {
+                counter!("vector_outbox_binding_version_mismatch_total", "operation" => "DELETE_POINT_FINALIZE").increment(1);
+                return Err(AstraError::OwnershipLost(
+                    "DELETE_POINT final DB update rejected by binding fence".into(),
+                ));
+            }
         }
         "QUARANTINE_POINT" => {
             let mut p = payload;
@@ -126,6 +273,9 @@ async fn upsert_from_cache(
         .load_completed(&key)
         .await?
         .ok_or_else(|| AstraError::Internal("canonical vector missing".into()))?;
+    if let Some(dense) = r.dense.as_ref() {
+        q.ensure_collection(dense.len()).await?;
+    }
     q.upsert(&QdrantPoint {
         id: point_id,
         dense: r.dense,
@@ -136,7 +286,21 @@ async fn upsert_from_cache(
     .await
 }
 async fn mark_synced(repo: &Repository, event: &OutboxEvent) -> Result<(), AstraError> {
-    sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED',last_qdrant_sync_version=payload_version,updated_at=now() WHERE access_zone_id=$1 AND id=$2").bind(event.access_zone_id).bind(event.binding_id).execute(&repo.pool).await.map_err(db)?;
+    let rows = sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED',last_qdrant_sync_version=payload_version,updated_at=now() WHERE access_zone_id=$1 AND id=$2 AND payload_version=$3 AND lifecycle_status='ACTIVE'")
+        .bind(event.access_zone_id)
+        .bind(event.binding_id)
+        .bind(event.operation_version)
+        .execute(&repo.pool)
+        .await
+        .map_err(db)?
+        .rows_affected();
+    if rows != 1 {
+        counter!("vector_outbox_binding_version_mismatch_total", "operation" => event.operation.clone()).increment(1);
+        counter!("vector_outbox_mark_synced_rejected_total", "operation" => event.operation.clone()).increment(1);
+        return Err(AstraError::OwnershipLost(
+            "mark_synced rejected by binding version/lifecycle fence".into(),
+        ));
+    }
     Ok(())
 }
 async fn complete(repo: &Repository, e: &OutboxEvent) -> Result<(), AstraError> {

@@ -19,8 +19,13 @@ grpc:
 
 security:
   enabled: ${ASTRAVECTOR_AUTH_ENABLED:-false}
-  api_key: ${ASTRAVECTOR_API_KEY:-}
+  api_key: "${ASTRAVECTOR_API_KEY:-}"
   protect_health: false
+  # Forwarded identity headers (x-astravector-role/access-level) are accepted only from a trusted gateway.
+  # In production, combine this with NetworkPolicy/mTLS so clients cannot reach AstraVector directly.
+  trust_forwarded_identity_headers: ${ASTRAVECTOR_TRUST_FORWARDED_IDENTITY_HEADERS:-false}
+  gateway_trust_header: ${ASTRAVECTOR_GATEWAY_TRUST_HEADER:-x-astravector-gateway-trust}
+  gateway_trust_token: "${ASTRAVECTOR_GATEWAY_TRUST_TOKEN:-}"
 
 shutdown:
   drain_timeout_seconds: 30
@@ -37,15 +42,15 @@ model:
   format: ONNX
   precision: INT8
   path: ${ASTRAVECTOR_MODEL_PATH:-/models/bge-m3/model.int8.onnx}
-  checksum: ${ASTRAVECTOR_MODEL_SHA256:-}
+  checksum: "${ASTRAVECTOR_MODEL_SHA256:-}"
   version: bge_m3_onnx_int8_v1
-  dense_output_name: sentence_embedding
-  token_output_name: last_hidden_state
-  sparse_output_name: lexical_weights
+  dense_output_name: ${ASTRAVECTOR_DENSE_OUTPUT_NAME:-sentence_embedding}
+  token_output_name: ${ASTRAVECTOR_TOKEN_OUTPUT_NAME:-last_hidden_state}
+  sparse_output_name: ${ASTRAVECTOR_SPARSE_OUTPUT_NAME:-lexical_weights}
 
 tokenizer:
   path: ${ASTRAVECTOR_TOKENIZER_PATH:-/models/bge-m3/tokenizer.json}
-  checksum: ${ASTRAVECTOR_TOKENIZER_SHA256:-}
+  checksum: "${ASTRAVECTOR_TOKENIZER_SHA256:-}"
   version: bge_m3_tokenizer_v1
 
 inference:
@@ -65,10 +70,11 @@ dense:
   version: bge_m3_dense_cls_l2_v1_onnx_int8
 
 sparse:
-  enabled: true
+  enabled: ${ASTRAVECTOR_SPARSE_ENABLED:-true}
+  required: ${ASTRAVECTOR_SPARSE_REQUIRED:-true}
   name: bge_sparse_v1
-  min_weight: 0.01
-  max_non_zero: 256
+  min_weight: ${ASTRAVECTOR_SPARSE_MIN_WEIGHT:-0.01}
+  max_non_zero: ${ASTRAVECTOR_SPARSE_MAX_NON_ZERO:-256}
   duplicate_merge: MAX
   version: bge_m3_sparse_max_top256_v1_onnx_int8
 
@@ -112,11 +118,21 @@ retention: { query_requests_days: 7, document_requests_days: 30, failed_requests
 metrics: { host: 0.0.0.0, port: 9090 }
 
 qdrant:
-  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-false}
+  enabled: ${ASTRAVECTOR_QDRANT_ENABLED:-true}
   url: ${ASTRAVECTOR_QDRANT_URL:-http://qdrant:6333}
-  api_key: ${ASTRAVECTOR_QDRANT_API_KEY:-}
-  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_v003}
+  api_key: "${ASTRAVECTOR_QDRANT_API_KEY:-}"
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_v004}
   timeout_ms: 5000
+  auto_create_collection: ${ASTRAVECTOR_QDRANT_AUTO_CREATE_COLLECTION:-true}
+  validate_collection_schema: ${ASTRAVECTOR_QDRANT_VALIDATE_SCHEMA:-true}
+  ensure_payload_indexes: ${ASTRAVECTOR_QDRANT_ENSURE_PAYLOAD_INDEXES:-true}
+  dense_vector_name: ${ASTRAVECTOR_QDRANT_DENSE_VECTOR_NAME:-dense}
+  sparse_vector_name: ${ASTRAVECTOR_QDRANT_SPARSE_VECTOR_NAME:-sparse}
+  scroll_page_size: ${ASTRAVECTOR_QDRANT_SCROLL_PAGE_SIZE:-1000}
+  scroll_max_pages: ${ASTRAVECTOR_QDRANT_SCROLL_MAX_PAGES:-1000}
+  scroll_max_points: ${ASTRAVECTOR_QDRANT_SCROLL_MAX_POINTS:-1000000}
+  scroll_timeout_secs: ${ASTRAVECTOR_QDRANT_SCROLL_TIMEOUT_SECS:-30}
+  scroll_max_concurrency: ${ASTRAVECTOR_QDRANT_SCROLL_MAX_CONCURRENCY:-4}
   publisher:
     enabled: true
     batch_size: 256
@@ -138,10 +154,123 @@ enrichment:
   synthetic_questions_enabled: true
   synthetic_questions_max_count: 5
 
+search:
+  default_mode: ${ASTRAVECTOR_SEARCH_DEFAULT_MODE:-HYBRID}
+  candidate_limit: ${ASTRAVECTOR_SEARCH_CANDIDATE_LIMIT:-50}
+  parent_limit: ${ASTRAVECTOR_SEARCH_PARENT_LIMIT:-5}
+  rrf_k: ${ASTRAVECTOR_SEARCH_RRF_K:-60}
+  hybrid_fusion_method: ${ASTRAVECTOR_HYBRID_FUSION_METHOD:-RRF}
+  hybrid_dense_weight: ${ASTRAVECTOR_HYBRID_DENSE_WEIGHT:-0.6}
+  hybrid_sparse_weight: ${ASTRAVECTOR_HYBRID_SPARSE_WEIGHT:-0.4}
+  no_answer:
+    enabled: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_ENABLED:-true}
+    min_dense_score: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_MIN_DENSE_SCORE:-0.25}
+    min_sparse_score: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_MIN_SPARSE_SCORE:-0.10}
+    min_hybrid_score: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_MIN_HYBRID_SCORE:-0.30}
+    sparse_only_min_matched_terms: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_SPARSE_ONLY_MIN_MATCHED_TERMS:-2}
+    sparse_only_require_technical_token: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_SPARSE_ONLY_REQUIRE_TECHNICAL_TOKEN:-true}
+    exact_technical_boost: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_EXACT_TECHNICAL_BOOST:-0.50}
+    hard_negative_strict: ${ASTRAVECTOR_RETRIEVAL_NO_ANSWER_HARD_NEGATIVE_STRICT:-true}
+    debug_candidates: ${ASTRAVECTOR_RETRIEVAL_DEBUG_CANDIDATES:-false}
+
+explain:
+  top_sparse_tokens: ${ASTRAVECTOR_EXPLAIN_TOP_SPARSE_TOKENS:-5}
+
 relevance:
   enabled: true
   min_candidate_score: 0.65
   min_reuse_score: 0.95
+
+graph_rag:
+  enabled: true
+  build:
+    max_document_graph_nodes: ${ASTRAVECTOR_GRAPH_MAX_DOCUMENT_NODES:-5000}
+    max_document_graph_edges: ${ASTRAVECTOR_GRAPH_MAX_DOCUMENT_EDGES:-20000}
+    max_block_nodes: ${ASTRAVECTOR_GRAPH_MAX_BLOCK_NODES:-3000}
+    max_chunk_nodes: ${ASTRAVECTOR_GRAPH_MAX_CHUNK_NODES:-2000}
+    max_tag_nodes: ${ASTRAVECTOR_GRAPH_MAX_TAG_NODES:-0}
+    max_children_per_block: ${ASTRAVECTOR_GRAPH_MAX_CHILDREN_PER_BLOCK:-100}
+    max_same_parent_edges: ${ASTRAVECTOR_GRAPH_MAX_SAME_PARENT_EDGES:-5000}
+    max_same_table_edges: ${ASTRAVECTOR_GRAPH_MAX_SAME_TABLE_EDGES:-2000}
+    semantic_edges_enabled: ${ASTRAVECTOR_GRAPH_SEMANTIC_EDGES_ENABLED:-true}
+    semantic_backend: ${ASTRAVECTOR_GRAPH_SEMANTIC_BACKEND:-IN_MEMORY}
+    semantic_same_document_only: true
+    semantic_top_k_per_chunk: ${ASTRAVECTOR_GRAPH_SEMANTIC_TOP_K_PER_CHUNK:-3}
+    semantic_min_score: ${ASTRAVECTOR_GRAPH_SEMANTIC_MIN_SCORE:-0.70}
+    semantic_max_edges_per_document: ${ASTRAVECTOR_GRAPH_SEMANTIC_MAX_EDGES_PER_DOCUMENT:-3000}
+    semantic_max_chunks_for_in_memory: ${ASTRAVECTOR_GRAPH_SEMANTIC_MAX_CHUNKS_FOR_IN_MEMORY:-500}
+    semantic_large_document_policy: ${ASTRAVECTOR_GRAPH_SEMANTIC_LARGE_DOCUMENT_POLICY:-SKIP_SEMANTIC}
+    semantic_batch_size: ${ASTRAVECTOR_GRAPH_SEMANTIC_BATCH_SIZE:-256}
+    semantic_normalize_embeddings: true
+    semantic_parallel_enabled: ${ASTRAVECTOR_GRAPH_SEMANTIC_PARALLEL_ENABLED:-false}
+    semantic_parallelism: ${ASTRAVECTOR_GRAPH_SEMANTIC_PARALLELISM:-0}
+    semantic_rebuild_timeout_ms: ${ASTRAVECTOR_GRAPH_SEMANTIC_REBUILD_TIMEOUT_MS:-30000}
+    semantic_warn_build_time_ms: ${ASTRAVECTOR_GRAPH_SEMANTIC_WARN_BUILD_TIME_MS:-3000}
+    cleanup_old_graph_on_reindex: true
+    bulk_insert_batch_size: ${ASTRAVECTOR_GRAPH_BULK_INSERT_BATCH_SIZE:-1000}
+    failure_mode: ${ASTRAVECTOR_GRAPH_BUILD_FAILURE_MODE:-WARN_AND_CONTINUE}
+  retrieval:
+    enabled_by_default: ${ASTRAVECTOR_GRAPH_RETRIEVAL_ENABLED_BY_DEFAULT:-false}
+    max_seed_chunks: ${ASTRAVECTOR_GRAPH_MAX_SEED_CHUNKS:-5}
+    max_hops: ${ASTRAVECTOR_GRAPH_MAX_HOPS:-1}
+    max_nodes_visited: ${ASTRAVECTOR_GRAPH_MAX_NODES_VISITED:-50}
+    max_edges_visited: ${ASTRAVECTOR_GRAPH_MAX_EDGES_VISITED:-200}
+    max_related_chunks: ${ASTRAVECTOR_GRAPH_MAX_RELATED_CHUNKS:-3}
+    direct_result_limit: ${ASTRAVECTOR_GRAPH_DIRECT_RESULT_LIMIT:-10}
+    graph_expansion_result_limit: ${ASTRAVECTOR_GRAPH_EXPANSION_RESULT_LIMIT:-10}
+    final_context_limit: ${ASTRAVECTOR_GRAPH_FINAL_CONTEXT_LIMIT:-8}
+    final_context_limit_mode: ${ASTRAVECTOR_GRAPH_FINAL_CONTEXT_LIMIT_MODE:-STRICT}
+    graph_merge_strategy: ${ASTRAVECTOR_GRAPH_MERGE_STRATEGY:-SCORE_THEN_TRUNCATE}
+    direct_context_limit: ${ASTRAVECTOR_GRAPH_DIRECT_CONTEXT_LIMIT:-6}
+    graph_context_append_limit: ${ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT:-2}
+    timeout_ms: ${ASTRAVECTOR_GRAPH_TIMEOUT_MS:-100}
+    allow_partial_dense_sparse_fallback: true
+    allowed_relations: [CHUNK_HAS_PARENT, CHUNK_PREVIOUS_SIBLING, CHUNK_NEXT_SIBLING, CHUNK_SAME_TABLE, CHUNK_SEMANTIC_SIMILAR]
+  scoring:
+    relation_weights:
+      CHUNK_HAS_PARENT: 0.95
+      CHUNK_PREVIOUS_SIBLING: 0.90
+      CHUNK_NEXT_SIBLING: 0.90
+      CHUNK_SAME_TABLE: 0.85
+      CHUNK_SEMANTIC_SIMILAR: ${ASTRAVECTOR_GRAPH_SEMANTIC_RELATION_WEIGHT:-0.60}
+    default_structural_relation_weight: ${ASTRAVECTOR_GRAPH_DEFAULT_STRUCTURAL_RELATION_WEIGHT:-0.90}
+    default_semantic_relation_weight: ${ASTRAVECTOR_GRAPH_DEFAULT_SEMANTIC_RELATION_WEIGHT:-0.60}
+    graph_hop_penalty:
+      hop_1: 1.00
+      hop_2: 0.70
+      hop_3: 0.50
+    graph_min_score: ${ASTRAVECTOR_GRAPH_MIN_SCORE:-0.05}
+    semantic_power: ${ASTRAVECTOR_GRAPH_SEMANTIC_POWER:-1.0}
+    direct_score_weight: ${ASTRAVECTOR_GRAPH_DIRECT_SCORE_WEIGHT:-1.0}
+    graph_score_weight: ${ASTRAVECTOR_GRAPH_GRAPH_SCORE_WEIGHT:-0.85}
+    graph_score_bias: ${ASTRAVECTOR_GRAPH_GRAPH_SCORE_BIAS:-0.0}
+    score_normalization: ${ASTRAVECTOR_GRAPH_SCORE_NORMALIZATION:-NONE}
+  rerank:
+    mmr_enabled: ${ASTRAVECTOR_GRAPH_MMR_ENABLED:-true}
+    mmr_lambda: ${ASTRAVECTOR_GRAPH_MMR_LAMBDA:-0.75}
+    mmr_lambda_direct: ${ASTRAVECTOR_GRAPH_MMR_LAMBDA_DIRECT:-0.80}
+    mmr_lambda_graph: ${ASTRAVECTOR_GRAPH_MMR_LAMBDA_GRAPH:-0.60}
+    mmr_candidate_limit: ${ASTRAVECTOR_GRAPH_MMR_CANDIDATE_LIMIT:-30}
+    mmr_similarity_source: ${ASTRAVECTOR_GRAPH_MMR_SIMILARITY_SOURCE:-DENSE_EMBEDDING}
+    mmr_fallback_similarity_source: ${ASTRAVECTOR_GRAPH_MMR_FALLBACK_SIMILARITY_SOURCE:-TOKEN_JACCARD}
+    mmr_allow_graph_candidates: true
+    mmr_allow_direct_candidates: true
+    embedding_fetch_enabled: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_FETCH_ENABLED:-true}
+    embedding_fetch_timeout_ms: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_FETCH_TIMEOUT_MS:-50}
+    embedding_fetch_warn_threshold_ms: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_FETCH_WARN_THRESHOLD_MS:-50}
+    embedding_fetch_min_candidates: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_FETCH_MIN_CANDIDATES:-0}
+    embedding_fetch_identity_mode: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_FETCH_IDENTITY_MODE:-QDRANT_POINT_ID}
+    embedding_fetch_allow_chunk_fallback: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_FETCH_ALLOW_CHUNK_FALLBACK:-false}
+    embedding_dense_representation_name: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_DENSE_REPRESENTATION_NAME:-dense}
+    embedding_cache_enabled: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_CACHE_ENABLED:-true}
+    embedding_cache_max_entries: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_CACHE_MAX_ENTRIES:-10000}
+    embedding_cache_ttl_seconds: ${ASTRAVECTOR_GRAPH_MMR_EMBEDDING_CACHE_TTL_SECONDS:-3600}
+    learned_reranker_enabled: false
+    learned_reranker_provider: NONE
+    learned_reranker_top_n: 30
+    learned_reranker_timeout_ms: 300
+    learned_reranker_weight: 0.60
+    retrieval_score_weight: 0.40
 
 partitioning:
   access_zone_partitions: 32
@@ -151,9 +280,218 @@ chunking:
   parent: { target_tokens: 520, min_tokens: 350, max_tokens: 700, overlap_tokens: 80 }
   sub_180: { target_tokens: 180, min_tokens: 130, max_tokens: 220, overlap_tokens: 35 }
   sub_260: { target_tokens: 260, min_tokens: 200, max_tokens: 320, overlap_tokens: 50 }
+  source_chunk_storage_mode: ${ASTRAVECTOR_SOURCE_CHUNK_STORAGE_MODE:-METADATA_ONLY}
 reconciliation:
   enabled: true
   incremental_interval_minutes: 360
   full_interval_hours: 168
   orphan_policy: QUARANTINE
   batch_size: 1000
+
+
+adaptive:
+  mode: ${ASTRAVECTOR_ADAPTIVE_MODE:-DRY_RUN}
+  window_secs: ${ASTRAVECTOR_ADAPTIVE_WINDOW_SECS:-300}
+  default_outbox_poll_interval_ms: ${ASTRAVECTOR_ADAPTIVE_DEFAULT_OUTBOX_POLL_INTERVAL_MS:-500}
+  policies:
+    qdrant_scroll_page_size:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_QDRANT_SCROLL_PAGE_SIZE_ENABLED:-true}
+      min: 500
+      max: 5000
+      step: 500
+      cooldown_secs: 300
+      ttl_secs: 3600
+    qdrant_scroll_max_concurrency:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_QDRANT_SCROLL_MAX_CONCURRENCY_ENABLED:-false}
+      min: 1
+      max: 16
+      step: 1
+      cooldown_secs: 300
+      ttl_secs: 1800
+    publisher_batch_size:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_PUBLISHER_BATCH_SIZE_ENABLED:-true}
+      min: 10
+      max: 500
+      step: 25
+      cooldown_secs: 120
+      ttl_secs: 1800
+    outbox_poll_interval_ms:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_OUTBOX_POLL_INTERVAL_ENABLED:-true}
+      min: 100
+      max: 5000
+      step: 100
+      cooldown_secs: 120
+      ttl_secs: 1800
+    embedding_batch_size:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_EMBEDDING_BATCH_SIZE_ENABLED:-false}
+      min: 1
+      max: 64
+      step: 1
+      cooldown_secs: 300
+      ttl_secs: 1800
+    qdrant_timeout_ms:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_QDRANT_TIMEOUT_ENABLED:-false}
+      min: 500
+      max: 30000
+      step: 500
+      cooldown_secs: 300
+      ttl_secs: 1800
+    max_concurrent_search:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_MAX_CONCURRENT_SEARCH_ENABLED:-false}
+      min: 4
+      max: 256
+      step: 4
+      cooldown_secs: 300
+      ttl_secs: 1800
+    max_concurrent_indexing:
+      enabled: ${ASTRAVECTOR_ADAPTIVE_MAX_CONCURRENT_INDEXING_ENABLED:-false}
+      min: 1
+      max: 64
+      step: 1
+      cooldown_secs: 300
+      ttl_secs: 1800
+
+ingestion:
+  single_request_max_bytes: ${ASTRAVECTOR_INGESTION_SINGLE_REQUEST_MAX_BYTES:-2097152}
+  large_document_mode: ${ASTRAVECTOR_LARGE_DOCUMENT_MODE:-REQUIRE_CHUNKED}
+  chunked_ingestion_enabled: ${ASTRAVECTOR_CHUNKED_INGESTION_ENABLED:-true}
+  chunked_ingestion_max_batch_bytes: ${ASTRAVECTOR_CHUNKED_INGESTION_MAX_BATCH_BYTES:-1048576}
+  chunked_ingestion_max_blocks_per_batch: ${ASTRAVECTOR_CHUNKED_INGESTION_MAX_BLOCKS_PER_BATCH:-500}
+  chunked_ingestion_session_ttl_seconds: ${ASTRAVECTOR_CHUNKED_INGESTION_SESSION_TTL_SECONDS:-3600}
+  max_concurrent_ingestion_sessions: ${ASTRAVECTOR_MAX_CONCURRENT_INGESTION_SESSIONS:-1000}
+  max_sessions_per_access_zone: ${ASTRAVECTOR_MAX_SESSIONS_PER_ACCESS_ZONE:-100}
+  max_sessions_per_document: ${ASTRAVECTOR_MAX_SESSIONS_PER_DOCUMENT:-3}
+  max_blocks_per_document: ${ASTRAVECTOR_MAX_BLOCKS_PER_DOCUMENT:-100000}
+  max_chunks_per_document: ${ASTRAVECTOR_MAX_CHUNKS_PER_DOCUMENT:-50000}
+  max_embeddings_per_request: ${ASTRAVECTOR_MAX_EMBEDDINGS_PER_REQUEST:-50000}
+  staging_cleanup_interval_seconds: ${ASTRAVECTOR_STAGING_CLEANUP_INTERVAL_SECONDS:-300}
+  staging_completed_retention_seconds: ${ASTRAVECTOR_STAGING_COMPLETED_RETENTION_SECONDS:-86400}
+  staging_aborted_retention_seconds: ${ASTRAVECTOR_STAGING_ABORTED_RETENTION_SECONDS:-3600}
+  staging_expired_retention_seconds: ${ASTRAVECTOR_STAGING_EXPIRED_RETENTION_SECONDS:-3600}
+  staging_max_bytes: ${ASTRAVECTOR_STAGING_MAX_BYTES:-10737418240}
+  finalize_read_batch_size: ${ASTRAVECTOR_FINALIZE_READ_BATCH_SIZE:-1000}
+  finalize_max_in_memory_blocks: ${ASTRAVECTOR_FINALIZE_MAX_IN_MEMORY_BLOCKS:-5000}
+  finalize_streaming_required_above_blocks: ${ASTRAVECTOR_FINALIZE_STREAMING_REQUIRED_ABOVE_BLOCKS:-5000}
+  staging_completed_blocks_retention_seconds: ${ASTRAVECTOR_STAGING_COMPLETED_BLOCKS_RETENTION_SECONDS:-86400}
+  completed_session_result_retention_seconds: ${ASTRAVECTOR_COMPLETED_SESSION_RESULT_RETENTION_SECONDS:-604800}
+  failed_session_retention_seconds: ${ASTRAVECTOR_FAILED_SESSION_RETENTION_SECONDS:-86400}
+  finalizing_stale_timeout_seconds: ${ASTRAVECTOR_FINALIZING_STALE_TIMEOUT_SECONDS:-7200}
+  finalizing_heartbeat_enabled: ${ASTRAVECTOR_FINALIZING_HEARTBEAT_ENABLED:-true}
+  finalizing_heartbeat_interval_seconds: ${ASTRAVECTOR_FINALIZING_HEARTBEAT_INTERVAL_SECONDS:-30}
+  finalize_mode: ${ASTRAVECTOR_FINALIZE_MODE:-BOUNDED_IN_MEMORY}
+  finalize_memory_guard_exceeded_status: ${ASTRAVECTOR_FINALIZE_MEMORY_GUARD_EXCEEDED_STATUS:-RETURN_TO_ACTIVE}
+  staging_cleanup_batch_size: ${ASTRAVECTOR_STAGING_CLEANUP_BATCH_SIZE:-1000}
+
+embedding:
+  document_submit_mode: ${ASTRAVECTOR_DOCUMENT_SUBMIT_MODE:-BOUNDED_CONCURRENT}
+  document_max_in_flight_chunks: ${ASTRAVECTOR_DOCUMENT_MAX_IN_FLIGHT_CHUNKS:-32}
+  document_preserve_order: ${ASTRAVECTOR_DOCUMENT_PRESERVE_ORDER:-true}
+  cancel_on_error: ${ASTRAVECTOR_DOCUMENT_CANCEL_ON_ERROR:-true}
+  partial_embedding_failure_mode: ${ASTRAVECTOR_PARTIAL_EMBEDDING_FAILURE_MODE:-FAIL_DOCUMENT}
+
+resilience:
+  inference_retry:
+    enabled: ${ASTRAVECTOR_INFERENCE_RETRY_ENABLED:-true}
+    max_attempts: ${ASTRAVECTOR_INFERENCE_RETRY_MAX_ATTEMPTS:-3}
+    base_delay_ms: ${ASTRAVECTOR_INFERENCE_RETRY_BASE_DELAY_MS:-100}
+    max_delay_ms: ${ASTRAVECTOR_INFERENCE_RETRY_MAX_DELAY_MS:-1000}
+    jitter_enabled: ${ASTRAVECTOR_INFERENCE_RETRY_JITTER_ENABLED:-true}
+    retry_on_statuses: []
+    retry_on_timeout: ${ASTRAVECTOR_INFERENCE_RETRY_ON_TIMEOUT:-true}
+    retry_on_unavailable: ${ASTRAVECTOR_INFERENCE_RETRY_ON_UNAVAILABLE:-true}
+  qdrant_retry:
+    enabled: ${ASTRAVECTOR_QDRANT_RETRY_ENABLED:-true}
+    max_attempts: ${ASTRAVECTOR_QDRANT_RETRY_MAX_ATTEMPTS:-3}
+    base_delay_ms: ${ASTRAVECTOR_QDRANT_RETRY_BASE_DELAY_MS:-100}
+    max_delay_ms: ${ASTRAVECTOR_QDRANT_RETRY_MAX_DELAY_MS:-1000}
+    jitter_enabled: ${ASTRAVECTOR_QDRANT_RETRY_JITTER_ENABLED:-true}
+    retry_on_statuses: [429, 502, 503, 504]
+    retry_on_timeout: ${ASTRAVECTOR_QDRANT_RETRY_ON_TIMEOUT:-true}
+    retry_on_unavailable: ${ASTRAVECTOR_QDRANT_RETRY_ON_UNAVAILABLE:-true}
+
+rag_context:
+  token_budget_enabled: ${ASTRAVECTOR_RAG_TOKEN_BUDGET_ENABLED:-true}
+  max_context_tokens: ${ASTRAVECTOR_RAG_MAX_CONTEXT_TOKENS:-6000}
+  reserved_answer_tokens: ${ASTRAVECTOR_RAG_RESERVED_ANSWER_TOKENS:-1000}
+  tokenizer: ${ASTRAVECTOR_RAG_TOKENIZER:-APPROX_CHARS}
+  chars_per_token: ${ASTRAVECTOR_RAG_CHARS_PER_TOKEN:-3}
+  tokenizer_safety_margin_percent: ${ASTRAVECTOR_RAG_TOKENIZER_SAFETY_MARGIN_PERCENT:-20}
+  truncation_strategy: ${ASTRAVECTOR_RAG_TRUNCATION_STRATEGY:-DROP_LOWEST_MMR_SCORE_CHUNKS}
+  huge_chunk_strategy: ${ASTRAVECTOR_RAG_HUGE_CHUNK_STRATEGY:-DROP_ONE_HUGE_CHUNK}
+  allow_chunk_text_truncation: ${ASTRAVECTOR_RAG_ALLOW_CHUNK_TEXT_TRUNCATION:-false}
+
+limits:
+  source_text_max_bytes: ${ASTRAVECTOR_INGESTION_SINGLE_REQUEST_MAX_BYTES:-2097152}
+  source_text_absolute_max_bytes: ${ASTRAVECTOR_SOURCE_TEXT_ABSOLUTE_MAX_BYTES:-52428800}
+  search_top_k_max: ${ASTRAVECTOR_SEARCH_TOP_K_MAX:-50}
+  search_candidate_limit_max: ${ASTRAVECTOR_SEARCH_CANDIDATE_LIMIT_MAX:-200}
+  graph_related_contexts_max: ${ASTRAVECTOR_GRAPH_RELATED_CONTEXTS_MAX:-20}
+  max_chunks_per_document: ${ASTRAVECTOR_MAX_CHUNKS_PER_DOCUMENT:-50000}
+  max_embeddings_per_request: ${ASTRAVECTOR_MAX_EMBEDDINGS_PER_REQUEST:-50000}
+  max_concurrent_retrieve_context: ${ASTRAVECTOR_MAX_CONCURRENT_RETRIEVE_CONTEXT:-128}
+  max_concurrent_qdrant_search: ${ASTRAVECTOR_MAX_CONCURRENT_QDRANT_SEARCH:-256}
+  max_concurrent_graph_expansion: ${ASTRAVECTOR_MAX_CONCURRENT_GRAPH_EXPANSION:-32}
+  max_concurrent_mmr_fetch: ${ASTRAVECTOR_MAX_CONCURRENT_MMR_FETCH:-32}
+  backpressure_acquire_timeout_ms: ${ASTRAVECTOR_BACKPRESSURE_ACQUIRE_TIMEOUT_MS:-50}
+  allow_dangerous_limit_override: ${ASTRAVECTOR_ALLOW_DANGEROUS_LIMIT_OVERRIDE:-false}
+
+embedding_cache:
+  reindex_behavior: ${ASTRAVECTOR_EMBEDDING_CACHE_REINDEX_BEHAVIOR:-CREATE_NEW_POINT_ID}
+  invalidate_memory_cache_on_reindex: ${ASTRAVECTOR_EMBEDDING_CACHE_INVALIDATE_ON_REINDEX:-false}
+
+# AstraVector fix4.5.3 — Index TTL Lifecycle, Multi-Zone Access Contract & Batch Deletion
+index_ttl:
+  enabled: ${ASTRAVECTOR_INDEX_TTL_ENABLED:-true}
+  default_ttl_days: ${ASTRAVECTOR_INDEX_TTL_DEFAULT_TTL_DAYS:-90}
+  min_ttl_days: ${ASTRAVECTOR_INDEX_TTL_MIN_TTL_DAYS:-1}
+  max_ttl_days: ${ASTRAVECTOR_INDEX_TTL_MAX_TTL_DAYS:-3650}
+  allow_never_expire: ${ASTRAVECTOR_INDEX_TTL_ALLOW_NEVER_EXPIRE:-true}
+  # Far-future epoch keeps Qdrant search filters simple: expires_at_epoch > now_epoch.
+  never_expire_epoch_seconds: ${ASTRAVECTOR_INDEX_TTL_NEVER_EXPIRE_EPOCH_SECONDS:-253402300799}
+  cleanup_enabled: ${ASTRAVECTOR_INDEX_TTL_CLEANUP_ENABLED:-true}
+  cleanup_interval_seconds: ${ASTRAVECTOR_INDEX_TTL_CLEANUP_INTERVAL_SECONDS:-300}
+  cleanup_batch_size: ${ASTRAVECTOR_INDEX_TTL_CLEANUP_BATCH_SIZE:-100}
+  qdrant_delete_batch_size: ${ASTRAVECTOR_INDEX_TTL_QDRANT_DELETE_BATCH_SIZE:-500}
+  qdrant_scroll_batch_size: ${ASTRAVECTOR_INDEX_TTL_QDRANT_SCROLL_BATCH_SIZE:-1000}
+  # fix462 rollback flag: when false, TTL cleanup deletes only PostgreSQL-expected binding points and skips Qdrant extra-point reconciliation.
+  qdrant_reconciliation_enabled: ${ASTRAVECTOR_INDEX_TTL_QDRANT_RECONCILIATION_ENABLED:-true}
+  delete_failed_retry_after_seconds: ${ASTRAVECTOR_INDEX_TTL_DELETE_FAILED_RETRY_AFTER_SECONDS:-900}
+  max_delete_attempts: ${ASTRAVECTOR_INDEX_TTL_MAX_DELETE_ATTEMPTS:-10}
+  delete_retry_initial_delay_seconds: ${ASTRAVECTOR_INDEX_TTL_DELETE_RETRY_INITIAL_DELAY_SECONDS:-30}
+  delete_retry_max_delay_seconds: ${ASTRAVECTOR_INDEX_TTL_DELETE_RETRY_MAX_DELAY_SECONDS:-3600}
+  deleting_stale_timeout_seconds: ${ASTRAVECTOR_INDEX_TTL_DELETING_STALE_TIMEOUT_SECONDS:-3600}
+  hard_delete_metadata: ${ASTRAVECTOR_INDEX_TTL_HARD_DELETE_METADATA:-false}
+  keep_tombstone_days: ${ASTRAVECTOR_INDEX_TTL_KEEP_TOMBSTONE_DAYS:-30}
+
+access_zones:
+  require_on_ingestion: ${ASTRAVECTOR_ACCESS_ZONES_REQUIRE_ON_INGESTION:-true}
+  allow_multi_zone_search: ${ASTRAVECTOR_ACCESS_ZONES_ALLOW_MULTI_ZONE_SEARCH:-true}
+  max_search_access_zones: ${ASTRAVECTOR_ACCESS_ZONES_MAX_SEARCH_ACCESS_ZONES:-50}
+  max_access_zone_id_length: ${ASTRAVECTOR_ACCESS_ZONES_MAX_ACCESS_ZONE_ID_LENGTH:-256}
+  access_zone_id_regex: "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+
+
+access_zone_registry:
+  enabled: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_ENABLED:-true}
+  cache_ttl_seconds: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_CACHE_TTL_SECONDS:-5}
+  active_recheck_interval_ms: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_ACTIVE_RECHECK_INTERVAL_MS:-1000}
+  always_recheck_on_ingestion: ${ASTRAVECTOR_ACCESS_ZONE_ALWAYS_RECHECK_ON_INGESTION:-true}
+  fail_if_zone_missing: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_FAIL_IF_ZONE_MISSING:-true}
+  auto_create_on_ingestion: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION:-false}
+  auto_create_on_search: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_SEARCH:-false}
+  auto_create_default_status: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_DEFAULT_STATUS:-ACTIVE}
+  auto_create_require_internal_auth: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_REQUIRE_INTERNAL_AUTH:-true}
+
+access_zone_codes:
+  enabled: ${ASTRAVECTOR_ACCESS_ZONE_CODES_ENABLED:-true}
+  code_regex: "^[0-9]{4}$"
+  min_code: ${ASTRAVECTOR_ACCESS_ZONE_CODES_MIN_CODE:-0}
+  max_code: ${ASTRAVECTOR_ACCESS_ZONE_CODES_MAX_CODE:-9999}
+  code_matrix_enabled: ${ASTRAVECTOR_ACCESS_ZONE_CODES_CODE_MATRIX_ENABLED:-true}
+  never_expire_start: ${ASTRAVECTOR_ACCESS_ZONE_CODES_NEVER_EXPIRE_START:-0}
+  never_expire_end: ${ASTRAVECTOR_ACCESS_ZONE_CODES_NEVER_EXPIRE_END:-999}
+  step_start: ${ASTRAVECTOR_ACCESS_ZONE_CODES_STEP_START:-1000}
+  step_codes: ${ASTRAVECTOR_ACCESS_ZONE_CODES_STEP_CODES:-500}
+  step_months: ${ASTRAVECTOR_ACCESS_ZONE_CODES_STEP_MONTHS:-6}
+  special_max_code_start: ${ASTRAVECTOR_ACCESS_ZONE_CODES_SPECIAL_MAX_CODE_START:-9500}
+  special_max_ttl_days: ${ASTRAVECTOR_ACCESS_ZONE_CODES_SPECIAL_MAX_TTL_DAYS:-3650}

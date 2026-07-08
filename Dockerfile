@@ -1,14 +1,15 @@
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.96-trixie AS builder
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bins --bins
+RUN cargo build --release --bins
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgomp1 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /build/target/release/astravector-runtime /usr/local/bin/astravector-runtime
 COPY --from=builder /build/target/release/astravector-qdrant-publisher /usr/local/bin/astravector-qdrant-publisher
 COPY --from=builder /build/target/release/astravector-lifecycle /usr/local/bin/astravector-lifecycle
+COPY --from=builder /build/target/release/astravector-reconciliation /usr/local/bin/astravector-reconciliation
 COPY config/application.yaml /app/config/application.yaml
 COPY migrations /app/migrations
 ENV ASTRAVECTOR_CONFIG=/app/config/application.yaml

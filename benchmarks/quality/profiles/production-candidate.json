@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0",
+  "name": "production-candidate",
+  "description": "Strict release gate with all enriched quality corpora",
+  "corpora": [
+    "synthetic-mini",
+    "access-zone-mini",
+    "graph-rag-mini",
+    "mmr-diversity-mini",
+    "technical-mini",
+    "legal-mini",
+    "distractor-mini",
+    "long-doc-mini",
+    "ttl-legal-hold-mini"
+  ],
+  "queries": [
+    "retrieval-golden",
+    "access-isolation-golden",
+    "graph-rag-golden",
+    "mmr-diversity-golden",
+    "negative-golden",
+    "technical-golden",
+    "legal-golden",
+    "distractor-golden",
+    "long-document-golden",
+    "ttl-legal-hold-golden"
+  ],
+  "runner": {
+    "mode": "testcontainers-planned",
+    "ingestion": "grpc",
+    "concurrency": 50,
+    "timeout_seconds": 900
+  },
+  "thresholds": {
+    "recall_at_5": 0.92,
+    "mrr": 0.75,
+    "expected_document_hit_rate": 0.92,
+    "expected_block_hit_rate": 0.85,
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0,
+    "forbidden_block_leakage_count": 0,
+    "hard_negative_false_positive_rate": 0.05,
+    "graph_expected_related_hit_rate": 0.75,
+    "mmr_expected_aspect_coverage": 0.70,
+    "long_document_target_block_hit_rate": 0.80,
+    "duplicate_rate_after_mmr": 0.25,
+    "p95_retrieve_context_ms": 2500,
+    "outbox_dead_letter_count": 0,
+    "qdrant_missing_points": 0
+  }
+}

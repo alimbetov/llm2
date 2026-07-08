@@ -1,12 +1,20 @@
+#![allow(dead_code)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::too_many_arguments)]
+
+pub mod access_zone_registry;
+pub mod adaptive;
 pub mod cache;
 pub mod checksum;
 pub mod config;
 pub mod contract;
 pub mod dense;
 pub mod error;
+pub mod graph;
 pub mod grpc;
 pub mod health;
 pub mod inference;
+pub mod ingestion_cleanup;
 pub mod metrics;
 pub mod persistence;
 pub mod provider;

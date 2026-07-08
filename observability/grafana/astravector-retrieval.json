@@ -1,0 +1,12 @@
+{
+  "title": "AstraVector Retrieval",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {"type":"timeseries","title":"Contexts by source","targets":[{"expr":"rate(retrieved_contexts_by_source_total[5m])"}]},
+    {"type":"timeseries","title":"Graph expansion requests","targets":[{"expr":"rate(graph_expansion_requests_total[5m])"}]},
+    {"type":"timeseries","title":"Graph expansion candidates","targets":[{"expr":"rate(graph_expansion_candidates_total[5m])"}]},
+    {"type":"timeseries","title":"MMR fallback rate","targets":[{"expr":"rate(graph_mmr_token_fallback_total[5m])"}]},
+    {"type":"timeseries","title":"MMR candidates","targets":[{"expr":"rate(graph_mmr_candidates_total[5m])"}]}
+  ]
+}

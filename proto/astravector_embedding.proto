@@ -12,6 +12,7 @@ service AstraVectorRuntime {
   rpc ExtendVectorTtl(ExtendVectorTtlRequest) returns (ExtendVectorTtlResponse);
   rpc GetVectorSyncStatus(GetVectorSyncStatusRequest) returns (GetVectorSyncStatusResponse);
   rpc EvaluateRelevance(EvaluateRelevanceRequest) returns (EvaluateRelevanceResponse);
+  rpc PreviewEmbedding(PreviewEmbeddingRequest) returns (PreviewEmbeddingResponse);
 }
 
 enum EncodingPurpose {
@@ -57,6 +58,27 @@ enum PersistenceMode {
   NONE = 1;
   BEST_EFFORT = 2;
   REQUIRED = 3;
+}
+
+
+enum EmbeddingModeV005 {
+  EMBEDDING_MODE_V005_UNSPECIFIED = 0;
+  EMBEDDING_MODE_V005_DENSE_ONLY = 1;
+  EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE = 2;
+  EMBEDDING_MODE_V005_DENSE_SPARSE_REQUIRED = 3;
+}
+
+enum SearchModeV005 {
+  SEARCH_MODE_V005_UNSPECIFIED = 0;
+  SEARCH_MODE_V005_DENSE = 1;
+  SEARCH_MODE_V005_SPARSE = 2;
+  SEARCH_MODE_V005_HYBRID = 3;
+}
+
+enum PublishModeV005 {
+  PUBLISH_MODE_V005_UNSPECIFIED = 0;
+  PUBLISH_MODE_V005_OUTBOX = 1;
+  PUBLISH_MODE_V005_NONE = 2;
 }
 
 enum ItemStatus {
@@ -195,6 +217,54 @@ message EncodeBatchResponse {
   RuntimeMetadata runtime = 7;
 }
 
+
+message PreviewEmbeddingRequest {
+  string correlation_id = 1;
+  string text = 2;
+  EncodingPurpose purpose = 3;
+  EmbeddingModeV005 embedding_mode = 4;
+  bool include_dense = 10;
+  bool include_sparse = 11;
+  bool include_full_dense = 12;
+  uint32 top_sparse = 13;
+  uint64 timeout_ms = 20;
+}
+
+message DensePreviewV005 {
+  uint32 dimension = 1;
+  float norm = 2;
+  repeated float preview_values = 3;
+  repeated float full_values = 4;
+}
+
+message SparsePreviewV005 {
+  uint32 non_zero_count = 1;
+  repeated uint32 indices = 2;
+  repeated float values = 3;
+}
+
+message TokenizationPreviewV005 {
+  uint32 token_count = 1;
+  uint32 max_tokens = 2;
+  bool truncated = 3;
+}
+
+message DiagnosticWarningV005 {
+  string code = 1;
+  string message = 2;
+}
+
+message PreviewEmbeddingResponse {
+  string model_version = 1;
+  string tokenizer_version = 2;
+  string dense_version = 3;
+  string sparse_version = 4;
+  DensePreviewV005 dense = 10;
+  SparsePreviewV005 sparse = 11;
+  TokenizationPreviewV005 tokenization = 12;
+  repeated DiagnosticWarningV005 warnings = 20;
+}
+
 message GetContractRequest {}
 message GetContractResponse {
   ContractVersions versions = 1;
@@ -228,8 +298,33 @@ message UpdateVectorMetadataRequest { string tenant_id = 1; string workspace_id 
 message UpdateVectorMetadataResponse { string binding_id = 1; string status = 2; }
 message ExtendVectorTtlRequest { string tenant_id = 1; string workspace_id = 2; string binding_id = 3; uint32 ttl_days = 4; bool replace = 5; }
 message ExtendVectorTtlResponse { string binding_id = 1; string expires_at = 2; string status = 3; }
-message GetVectorSyncStatusRequest { string tenant_id = 1; string workspace_id = 2; string binding_id = 3; }
-message GetVectorSyncStatusResponse { string binding_id = 1; string lifecycle_status = 2; string qdrant_sync_status = 3; optional string last_error = 4; }
+message GetVectorSyncStatusRequest { string access_zone_id = 1; string document_id = 2; uint64 document_version = 3; bool include_qdrant = 10; }
+message GetVectorSyncStatusResponse {
+  string document_status = 1;
+  uint32 expected_bindings = 10;
+  uint32 synced_bindings = 11;
+  uint32 pending_bindings = 12;
+  uint32 failed_bindings = 13;
+  uint32 dense_vectors_expected = 20;
+  uint32 dense_vectors_found = 21;
+  uint32 sparse_vectors_expected = 22;
+  uint32 sparse_vectors_found = 23;
+  uint32 outbox_pending = 30;
+  uint32 outbox_retry_pending = 31;
+  uint32 outbox_completed = 32;
+  uint32 outbox_failed = 33;
+  string qdrant_collection = 40;
+  bool qdrant_collection_exists = 41;
+  uint32 qdrant_points_expected = 42;
+  uint32 qdrant_points_found = 43;
+  uint32 qdrant_points_missing = 44;
+  uint32 qdrant_points_extra = 45;
+  bool ready_to_activate = 50;
+  string last_sync_attempt_at = 60;
+  string last_sync_error_code = 61;
+  string last_sync_error_message = 62;
+  repeated DiagnosticWarningV005 warnings = 70;
+}
 message EvaluateRelevanceRequest { string tenant_id = 1; string workspace_id = 2; string question = 3; string candidate_text = 4; optional string answer = 5; repeated string source_texts = 6; }
 message EvaluateRelevanceResponse { float dense_score = 1; float lexical_score = 2; float consistency_score = 3; float final_score = 4; string decision = 5; string evaluation_id = 6; }
 
@@ -242,36 +337,448 @@ service AstraVectorV004Control {
   rpc ResolveParentContext(ResolveParentContextRequest) returns (ResolveParentContextResponse);
   rpc RegisterDocumentVersion(RegisterDocumentVersionRequest) returns (DocumentVersionResponse);
   rpc ActivateDocumentVersion(ActivateDocumentVersionRequest) returns (DocumentVersionResponse);
-  rpc DeleteChunkGroup(DeleteChunkGroupRequest) returns (DeleteChunkGroupResponse);
-  rpc UpdateChunkGroupTtl(UpdateChunkGroupTtlRequest) returns (UpdateChunkGroupTtlResponse);
-  rpc SetChunkGroupLegalHold(SetChunkGroupLegalHoldRequest) returns (SetChunkGroupLegalHoldResponse);
-  rpc GetRelevanceEvaluationV004(GetRelevanceEvaluationRequest) returns (GetRelevanceEvaluationResponse);
-  rpc SubmitRelevanceFeedbackV004(SubmitRelevanceFeedbackRequest) returns (SubmitRelevanceFeedbackResponse);
-  rpc ListQuarantinedPoints(ListQuarantinedPointsRequest) returns (ListQuarantinedPointsResponse);
-  rpc ResolveQuarantinedPoint(ResolveQuarantinedPointRequest) returns (ResolveQuarantinedPointResponse);
+  rpc ExplainSearch(ExplainSearchRequest) returns (ExplainSearchResponse);
+  rpc DebugDocumentState(DebugDocumentStateRequest) returns (DebugDocumentStateResponse);
+  rpc RetryVectorOutbox(RetryVectorOutboxRequest) returns (RetryVectorOutboxResponse);
+}
+
+
+// v007 public facade contracts. These APIs simplify integration for llm_indexator and ai_bro
+// while keeping v004/v005 reliability mechanisms internal: outbox, sync, activation,
+// Qdrant reconciliation, TTL, diagnostics, and safe adaptive runtime.
+service AstraVectorIngestionFacade {
+  rpc IndexLogicalDocument(IndexLogicalDocumentRequest) returns (IndexLogicalDocumentResponse);
+  rpc StartLogicalDocumentIngestion(StartLogicalDocumentIngestionRequest) returns (StartLogicalDocumentIngestionResponse);
+  rpc AppendLogicalDocumentBlocks(AppendLogicalDocumentBlocksRequest) returns (AppendLogicalDocumentBlocksResponse);
+  rpc FinalizeLogicalDocumentIngestion(FinalizeLogicalDocumentIngestionRequest) returns (IndexLogicalDocumentResponse);
+  rpc AbortLogicalDocumentIngestion(AbortLogicalDocumentIngestionRequest) returns (AbortLogicalDocumentIngestionResponse);
+  rpc GetLogicalDocumentIngestionStatus(GetLogicalDocumentIngestionStatusRequest) returns (GetLogicalDocumentIngestionStatusResponse);
+  rpc GetDocumentVectorStatus(GetDocumentVectorStatusRequest) returns (GetDocumentVectorStatusResponse);
+  rpc DeleteDocumentVectorsFacade(DeleteDocumentVectorsFacadeRequest) returns (DeleteDocumentVectorsFacadeResponse);
+}
+
+service AstraVectorRetrievalFacade {
+  rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
+  rpc ExplainRetrieve(ExplainRetrieveRequest) returns (ExplainRetrieveResponse);
+}
+
+service AstraVectorAdminFacade {
+  rpc DebugDocument(DebugDocumentRequest) returns (DebugDocumentResponse);
+  rpc RetryOutbox(RetryOutboxFacadeRequest) returns (RetryOutboxFacadeResponse);
+  rpc RetryDocumentDeletion(RetryDocumentDeletionRequest) returns (RetryDocumentDeletionResponse);
+  rpc GetRuntimeHealth(GetRuntimeHealthRequest) returns (GetRuntimeHealthResponse);
+}
+
+message RequestContext {
+  string correlation_id = 1;
+  string idempotency_key = 2;
+  string caller_service = 3;
+  string caller_user_id = 4;
+  AccessLevel caller_access_level = 5;
+}
+
+message DocumentRef {
+  string access_zone_id = 1;
+  string document_id = 2;
+  uint64 document_version = 3;
+}
+
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_ACCEPTED = 1;
+  OPERATION_STATE_INDEXING = 2;
+  OPERATION_STATE_VECTORING = 3;
+  OPERATION_STATE_PUBLISHING = 4;
+  OPERATION_STATE_SYNCING = 5;
+  OPERATION_STATE_READY_TO_ACTIVATE = 6;
+  OPERATION_STATE_ACTIVE = 7;
+  OPERATION_STATE_FAILED = 8;
+  OPERATION_STATE_EXPIRED = 9;
+  OPERATION_STATE_DELETED = 10;
+  // v007 fix1: asynchronous deletion states. DELETE_POINT is scheduled via outbox
+  // and must not be reported as DELETED until publisher/reconciliation confirms it.
+  OPERATION_STATE_DELETE_SCHEDULED = 11;
+  OPERATION_STATE_DELETING = 12;
+}
+
+message OperationError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  string remediation = 4;
+}
+
+message OperationStatus {
+  string operation_id = 1;
+  OperationState state = 2;
+  string message = 3;
+  repeated DiagnosticWarningV005 warnings = 10;
+  repeated OperationError errors = 11;
+}
+
+message DocumentIdentity {
+  string external_document_id = 1;
+  string document_id = 2;
+  uint64 document_version = 3;
+  string title = 4;
+  string source_uri = 5;
+  string source_type = 6;
+  string mime_type = 7;
+  string content_hash = 10;
+  repeated SourceLink source_links = 20;
+}
+
+enum BlockType {
+  BLOCK_TYPE_UNSPECIFIED = 0;
+  BLOCK_TYPE_DOCUMENT = 1;
+  BLOCK_TYPE_SECTION = 2;
+  BLOCK_TYPE_SUBSECTION = 3;
+  BLOCK_TYPE_PARAGRAPH = 4;
+  BLOCK_TYPE_TABLE = 5;
+  BLOCK_TYPE_TABLE_ROW = 6;
+  BLOCK_TYPE_LIST = 7;
+  BLOCK_TYPE_LIST_ITEM = 8;
+  BLOCK_TYPE_FAQ_ITEM = 9;
+  BLOCK_TYPE_CODE_BLOCK = 10;
+  BLOCK_TYPE_CAPTION = 11;
+}
+
+message LogicalBlock {
+  string block_id = 1;
+  string parent_block_id = 2;
+  BlockType block_type = 3;
+  string text = 10;
+  uint32 order_index = 20;
+  SourceLocation source_location = 30;
+  repeated SourceLink source_links = 31;
+  map<string, string> metadata = 40;
+}
+
+message SourceLocation {
+  uint32 page_start = 1;
+  uint32 page_end = 2;
+  uint32 char_start = 3;
+  uint32 char_end = 4;
+  string section_path = 10;
+  string heading = 11;
+  string table_id = 20;
+  uint32 row_index = 21;
+  uint32 column_index = 22;
+}
+
+enum SourceLinkType {
+  SOURCE_LINK_TYPE_UNSPECIFIED = 0;
+  SOURCE_LINK_TYPE_ORIGINAL_DOCUMENT = 1;
+  SOURCE_LINK_TYPE_PREVIEW = 2;
+  SOURCE_LINK_TYPE_DOWNLOAD = 3;
+  SOURCE_LINK_TYPE_PAGE = 4;
+  SOURCE_LINK_TYPE_SECTION = 5;
+  SOURCE_LINK_TYPE_CHUNK = 6;
+  SOURCE_LINK_TYPE_EXTERNAL_SYSTEM = 7;
+}
+
+message SourceLink {
+  SourceLinkType type = 1;
+  string url = 2;
+  string label = 3;
+  string mime_type = 4;
+  bool requires_auth = 5;
+  string expires_at = 6;
+  map<string, string> attributes = 20;
+}
+
+enum ChunkingProfile {
+  CHUNKING_PROFILE_UNSPECIFIED = 0;
+  CHUNKING_PROFILE_DEFAULT = 1;
+  CHUNKING_PROFILE_LEGAL = 2;
+  CHUNKING_PROFILE_TECHNICAL = 3;
+  CHUNKING_PROFILE_FAQ = 4;
+  CHUNKING_PROFILE_TABLE_HEAVY = 5;
+}
+
+message TokenAwareChunkingOptions {
+  ChunkingProfile profile = 1;
+  uint32 parent_target_tokens = 10;
+  uint32 parent_max_tokens = 11;
+  uint32 child_target_tokens = 20;
+  uint32 child_max_tokens = 21;
+  uint32 child_overlap_tokens = 22;
+  uint32 min_chunk_tokens = 30;
+  bool preserve_block_boundaries = 40;
+  bool allow_split_inside_paragraph = 41;
+  bool allow_split_inside_table = 42;
+  bool create_parent_context = 50;
+}
+
+enum ActivationPolicy {
+  ACTIVATION_POLICY_UNSPECIFIED = 0;
+  ACTIVATION_POLICY_MANUAL = 1;
+  ACTIVATION_POLICY_AUTO_WHEN_READY = 2;
+  ACTIVATION_POLICY_SKIP = 3;
+}
+
+enum TtlMode {
+  TTL_MODE_UNSPECIFIED = 0;
+  TTL_MODE_NONE = 1;
+  TTL_MODE_RELATIVE = 2;
+  TTL_MODE_ABSOLUTE = 3;
+}
+
+message TtlPolicy {
+  TtlMode mode = 1;
+  uint64 ttl_seconds = 2;
+  string expires_at = 3;
+  bool delete_from_qdrant_on_expire = 10;
+  bool keep_metadata_after_expire = 11;
+}
+
+message VectorIndexingOptions {
+  ActivationPolicy activation_policy = 1;
+  EmbeddingModeV005 embedding_mode = 2;
+  PublishModeV005 publish_mode = 3;
+  TtlPolicy ttl_policy = 10;
+  bool replace_existing_version = 20;
+}
+
+message IndexLogicalDocumentRequest {
+  RequestContext context = 1;
+  string access_zone_id = 2;
+  string access_zone_code = 51;
+  DocumentIdentity document = 10;
+  repeated LogicalBlock blocks = 20;
+  TokenAwareChunkingOptions chunking_options = 30;
+  VectorIndexingOptions indexing_options = 40;
+  map<string, string> metadata = 50;
+}
+
+message IndexingSummary {
+  uint32 blocks_received = 1;
+  uint32 blocks_accepted = 2;
+  uint32 blocks_rejected = 3;
+  uint32 chunks_created = 10;
+  uint32 parent_chunks_created = 11;
+  uint32 child_chunks_created = 12;
+  uint32 atomic_chunks_created = 13;
+  uint32 dense_vectors_created = 20;
+  uint32 sparse_vectors_created = 21;
+  uint32 qdrant_points_scheduled = 30;
+  bool already_indexed = 40;
+}
+
+message IndexLogicalDocumentResponse {
+  DocumentRef document = 1;
+  OperationStatus operation = 2;
+  IndexingSummary summary = 10;
+}
+
+
+
+message StartLogicalDocumentIngestionRequest { string access_zone_id=1; string document_id=2; uint32 document_version=3; string source_uri=4; string file_name=5; string content_hash=6; string idempotency_key=7; uint64 total_bytes_estimate=8; uint32 total_blocks_estimate=9; uint32 total_pages_estimate=10; map<string,string> metadata=11; uint32 ttl_days=20; string access_zone_code=21; }
+message StartLogicalDocumentIngestionResponse { string ingestion_session_id=1; string status=2; string expires_at=3; repeated DiagnosticWarningV005 warnings=20; }
+message AppendLogicalDocumentBlocksRequest { string ingestion_session_id=1; repeated LogicalBlock blocks=2; uint32 batch_index=3; bool is_last_batch=4; string batch_content_hash=5; }
+message AppendLogicalDocumentBlocksResponse { string ingestion_session_id=1; string status=2; uint32 accepted_blocks=3; uint32 accepted_batch_index=4; repeated DiagnosticWarningV005 warnings=20; }
+message FinalizeLogicalDocumentIngestionRequest { string ingestion_session_id=1; string final_content_hash=2; }
+message AbortLogicalDocumentIngestionRequest { string ingestion_session_id=1; string reason=2; }
+message AbortLogicalDocumentIngestionResponse { string ingestion_session_id=1; string status=2; }
+message GetLogicalDocumentIngestionStatusRequest { string ingestion_session_id=1; }
+message GetLogicalDocumentIngestionStatusResponse { string ingestion_session_id=1; string status=2; uint32 received_batches=3; uint64 received_blocks=4; uint64 received_bytes=5; string expires_at=6; string error_code=7; string error_message=8; }
+message GetDocumentVectorStatusRequest {
+  RequestContext context = 1;
+  DocumentRef document = 2;
+  bool include_qdrant = 10;
+}
+
+message DocumentVectorStatus {
+  OperationState state = 1;
+  float progress_percent = 2;
+  bool searchable = 3;
+  string message = 4;
+  bool ready_to_activate = 10;
+  GetVectorSyncStatusResponse sync = 20;
+}
+
+message GetDocumentVectorStatusResponse {
+  DocumentRef document = 1;
+  DocumentVectorStatus status = 2;
+}
+
+message DeleteDocumentVectorsFacadeRequest {
+  RequestContext context = 1;
+  DocumentRef document = 2;
+  string reason = 10;
+}
+
+message DeleteDocumentVectorsFacadeResponse {
+  DocumentRef document = 1;
+  OperationStatus operation = 2;
+}
+
+enum RetrievalProfile {
+  RETRIEVAL_PROFILE_UNSPECIFIED = 0;
+  RETRIEVAL_PROFILE_BALANCED = 1;
+  RETRIEVAL_PROFILE_LEGAL = 2;
+  RETRIEVAL_PROFILE_TECHNICAL = 3;
+  RETRIEVAL_PROFILE_SEMANTIC = 4;
+  RETRIEVAL_PROFILE_LEXICAL_STRICT = 5;
+}
+
+enum ResponseDetail {
+  RESPONSE_DETAIL_UNSPECIFIED = 0;
+  RESPONSE_DETAIL_COMPACT = 1;
+  RESPONSE_DETAIL_STANDARD = 2;
+  RESPONSE_DETAIL_DEBUG = 3;
+}
+
+message RetrieveContextRequest {
+  RequestContext context = 1;
+  string access_zone_id = 2;
+  string question = 3;
+  repeated string access_zone_ids = 50;
+  string access_zone_code = 51;
+  repeated string access_zone_codes = 52;
+  RetrievalProfile profile = 10;
+  uint32 max_contexts = 11;
+  repeated SearchFilterV004 filters = 20;
+  ResponseDetail response_detail = 30;
+  bool enable_graph_expansion = 40;
+  uint32 graph_max_hops = 41;
+  uint32 graph_max_related_contexts = 42;
+}
+
+message Citation {
+  string document_id = 1;
+  uint64 document_version = 2;
+  string source_uri = 3;
+  string title = 4;
+  uint32 page_start = 10;
+  uint32 page_end = 11;
+  string section_path = 20;
+  string heading = 21;
+  string matched_chunk_id = 30;
+  string parent_chunk_id = 31;
+  string source_block_id = 40;
+}
+
+message Scores {
+  float dense_score = 1;
+  float sparse_score = 2;
+  float fusion_score = 3;
+  float final_score = 4;
+}
+
+message RetrievedContext {
+  string matched_text = 1;
+  string parent_text = 2;
+  Citation citation = 10;
+  Scores scores = 11;
+  string document_id = 20;
+  uint64 document_version = 21;
+  string source_block_id = 30;
+  string matched_chunk_id = 31;
+  string parent_chunk_id = 32;
+  string access_zone_id = 33;
+  repeated SourceLink source_links = 40;
+  map<string, string> metadata = 50;
+}
+
+message RetrievalSummary {
+  uint32 total_candidates = 1;
+  uint32 returned_contexts = 2;
+  RetrievalProfile profile = 3;
+}
+
+message RetrieveContextResponse {
+  repeated RetrievedContext contexts = 1;
+  RetrievalSummary summary = 2;
+  repeated DiagnosticWarningV005 warnings = 3;
+}
+
+message ExplainRetrieveRequest {
+  RequestContext context = 1;
+  string access_zone_id = 2;
+  string question = 3;
+  RetrievalProfile profile = 10;
+  uint32 max_contexts = 11;
+  repeated SearchFilterV004 filters = 20;
+}
+
+message ExplainRetrieveResponse {
+  ExplainSearchResponse explain = 1;
+}
+
+message DebugDocumentRequest {
+  RequestContext context = 1;
+  DocumentRef document = 2;
+  bool include_chunks = 10;
+  bool include_vectors = 11;
+  bool include_outbox = 12;
+  bool include_qdrant = 13;
+}
+
+message DebugDocumentResponse {
+  DebugDocumentStateResponse debug = 1;
+}
+
+message RetryOutboxFacadeRequest {
+  RequestContext context = 1;
+  DocumentRef document = 2;
+  string operation = 10;
+  string status = 11;
+}
+
+message RetryOutboxFacadeResponse {
+  RetryVectorOutboxResponse result = 1;
+}
+
+message RetryDocumentDeletionRequest {
+  RequestContext context = 1;
+  string access_zone_id = 2;
+  string access_zone_code = 3;
+  string document_id = 4;
+  uint64 document_version = 5;
+  bool reset_attempts = 10;
+  string reason = 11;
+}
+
+message RetryDocumentDeletionResponse {
+  bool accepted = 1;
+  string previous_lifecycle_status = 2;
+  string new_lifecycle_status = 3;
+  uint32 delete_attempts = 4;
+  string next_delete_attempt_at = 5;
+}
+
+message GetRuntimeHealthRequest {
+  RequestContext context = 1;
+}
+
+message GetRuntimeHealthResponse {
+  string status = 1;
+  string message = 2;
 }
 
 enum ChunkGranularityV004 { CHUNK_GRANULARITY_V004_UNSPECIFIED=0; SOURCE_V004=1; PARENT_V004=2; SUB_180_V004=3; SUB_260_V004=4; }
 enum TtlUpdateModeV004 { TTL_UPDATE_MODE_V004_UNSPECIFIED=0; REPLACE_FROM_NOW_V004=1; EXTEND_FROM_CURRENT_V004=2; KEEP_LONGEST_V004=3; REMOVE_TTL_V004=4; }
 message ChunkSizeProfileV004 { ChunkGranularityV004 granularity=1; uint32 target_tokens=2; uint32 min_tokens=3; uint32 max_tokens=4; uint32 overlap_tokens=5; }
 message ChunkingProfileV004 { ChunkSizeProfileV004 parent=1; repeated ChunkSizeProfileV004 granularities=2; bool preserve_headings=3; bool preserve_paragraphs=4; bool preserve_sentences=5; string profile_version=6; }
-message CreateMultiGranularityChunksRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string source_text=4; AccessLevel access_level=5; optional uint32 ttl_days=6; ChunkingProfileV004 profile=7; map<string,string> metadata=8; string idempotency_key=9; string correlation_id=10; }
+message CreateMultiGranularityChunksRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string source_text=4; AccessLevel access_level=5; optional uint32 ttl_days=6; ChunkingProfileV004 profile=7; map<string,string> metadata=8; string idempotency_key=9; string correlation_id=10; EmbeddingModeV005 embedding_mode=20; PublishModeV005 publish_mode=21; string access_zone_code=50; }
 message CreatedChunkV004 { string chunk_id=1; string root_chunk_id=2; string source_chunk_id=3; optional string parent_chunk_id=4; ChunkGranularityV004 granularity=5; uint32 sequence_no=6; uint32 token_count=7; string content_hash=8; }
-message CreateMultiGranularityChunksResponse { string root_chunk_id=1; repeated CreatedChunkV004 parent_chunks=2; repeated CreatedChunkV004 sub_chunks_180=3; repeated CreatedChunkV004 sub_chunks_260=4; uint32 total_chunks=5; string status=6; }
+message IndexSummaryV005 { uint32 chunks_total=1; uint32 source_chunks=2; uint32 parent_chunks=3; uint32 sub180_chunks=4; uint32 sub260_chunks=5; uint32 dense_vectors=10; uint32 sparse_vectors=11; uint32 bindings=12; uint32 outbox_created=13; string status=20; }
+message CreateMultiGranularityChunksResponse { string root_chunk_id=1; repeated CreatedChunkV004 parent_chunks=2; repeated CreatedChunkV004 sub_chunks_180=3; repeated CreatedChunkV004 sub_chunks_260=4; uint32 total_chunks=5; string status=6; IndexSummaryV005 summary=20; }
 message GetChunkGroupRequest { string access_zone_id=1; string root_chunk_id=2; AccessLevel caller_access_level=3; }
 message ChunkContentV004 { CreatedChunkV004 chunk=1; string content=2; SearchRepresentationType representation_type=3; }
 message GetChunkGroupResponse { repeated ChunkContentV004 chunks=1; }
 message ResolveParentContextRequest { string access_zone_id=1; repeated string chunk_ids=2; uint32 max_context_tokens=3; AccessLevel caller_access_level=4; }
 message ResolveParentContextResponse { repeated ChunkContentV004 contexts=1; }
 message SearchFilterV004 { string key=1; string value=2; }
-message SearchRequestV004 { string correlation_id=1; string access_zone_id=2; AccessLevel caller_access_level=3; string query=4; uint32 top_k=5; uint32 candidate_limit=6; uint32 parent_limit=7; repeated SearchFilterV004 filters=8; uint32 timeout_ms=9; }
-message SearchScoresV004 { float dense_score=1; float final_score=2; }
+message SearchRequestV004 { string correlation_id=1; string access_zone_id=2; AccessLevel caller_access_level=3; string query=4; uint32 top_k=5; uint32 candidate_limit=6; uint32 parent_limit=7; repeated SearchFilterV004 filters=8; uint32 timeout_ms=9; SearchModeV005 search_mode=20; bool include_debug=21; bool include_vectors=22; EmbeddingModeV005 embedding_mode=23; optional string model_version=30; optional string tokenizer_version=31; optional string dense_version=32; optional string sparse_version=33; optional string chunking_version=34; bool enable_graph_expansion=40; uint32 graph_max_hops=41; uint32 graph_max_related_contexts=42; repeated string access_zone_ids=50; string access_zone_code=51; repeated string access_zone_codes=52; }
+message SearchScoresV004 { float dense_score=1; float sparse_score=2; float fusion_score=3; float final_score=4; }
 message SearchCitationV004 { map<string,string> metadata=1; }
-message SearchResultV004 { string document_id=1; uint64 document_version=2; string root_chunk_id=3; string source_chunk_id=4; string parent_chunk_id=5; string matched_chunk_id=6; ChunkGranularityV004 matched_granularity=7; string parent_text=8; SearchScoresV004 scores=9; SearchCitationV004 citation=10; string access_zone_id=11; AccessLevel access_level=12; }
-message SearchDiagnosticsV004 { uint64 query_embedding_ms=1; uint64 qdrant_search_ms=2; uint64 parent_fetch_ms=3; uint64 total_ms=4; uint32 candidate_count=5; uint32 parent_group_count=6; }
-message SearchResponseV004 { repeated SearchResultV004 results=1; SearchDiagnosticsV004 diagnostics=2; }
-message RegisterDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string content_hash=4; string activation_policy=5; string idempotency_key=6; }
-message ActivateDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; }
+message SearchResultV004 { string document_id=1; uint64 document_version=2; string root_chunk_id=3; string source_chunk_id=4; string parent_chunk_id=5; string matched_chunk_id=6; ChunkGranularityV004 matched_granularity=7; string parent_text=8; SearchScoresV004 scores=9; SearchCitationV004 citation=10; string access_zone_id=11; AccessLevel access_level=12; string matched_text=20; }
+message SearchDiagnosticsV004 { uint64 query_embedding_ms=1; uint64 qdrant_search_ms=2; uint64 parent_fetch_ms=3; uint64 total_ms=4; uint32 candidate_count=5; uint32 parent_group_count=6; uint32 direct_candidates_count=20; uint32 graph_candidates_count=21; uint32 merged_candidates_count=22; uint32 final_candidates_count=23; uint32 deduplicated_candidates_count=24; string graph_candidates_by_relation_json=25; uint64 graph_expansion_duration_ms=26; uint64 graph_merge_duration_ms=27; string graph_merge_strategy=28; uint32 final_context_limit=29; string final_context_limit_mode=30; float graph_min_score=31; float semantic_power=32; bool mmr_enabled=33; float mmr_lambda=34; uint32 mmr_candidate_count=35; uint32 mmr_selected_count=36; uint64 mmr_duration_ms=37; string mmr_similarity_source=38; bool learned_reranker_enabled=39; string learned_reranker_provider=40; uint32 direct_context_limit=41; uint32 graph_context_append_limit=42; float direct_score_weight=43; float graph_score_weight=44; float graph_score_bias=45; string score_normalization=46; float mmr_lambda_direct=47; float mmr_lambda_graph=48; uint32 mmr_embedding_fetch_requested=49; uint32 mmr_embedding_fetch_found=50; uint32 mmr_embedding_fetch_missing=51; uint64 mmr_embedding_fetch_duration_ms=52; uint32 mmr_embedding_cache_hits=53; uint32 mmr_embedding_cache_misses=54; uint32 mmr_embedding_fetch_errors=55; uint32 mmr_embedding_fetch_timeouts=56; bool mmr_embedding_fetch_skipped_all_present=57; bool mmr_embedding_fetch_skipped_small_pool=58; uint32 mmr_dense_pair_comparisons=59; uint32 mmr_token_pair_comparisons=60; string mmr_effective_similarity_source=61; repeated string warning_codes=62; bool token_budget_enabled=70; uint32 max_context_tokens=71; uint32 estimated_context_tokens_before=72; uint32 estimated_context_tokens_after=73; uint32 context_chunks_dropped_by_token_budget=74; string token_truncation_strategy=75; repeated string dropped_chunk_ids=76; string huge_chunk_strategy=77; }
+message SearchResponseV004 { repeated SearchResultV004 results=1; SearchDiagnosticsV004 diagnostics=2; repeated DiagnosticWarningV005 warnings=20; }
+message RegisterDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string content_hash=4; string activation_policy=5; string idempotency_key=6; string access_zone_code=50; }
+message ActivateDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; bool force_activate=10; string force_reason=11; }
 message DocumentVersionResponse { string document_id=1; uint64 document_version=2; string status=3; }
 message DeleteChunkGroupRequest { string access_zone_id=1; string root_chunk_id=2; string correlation_id=3; }
 message DeleteChunkGroupResponse { uint64 affected_bindings=1; string status=2; }
@@ -289,3 +796,24 @@ message QuarantinedPointV004 { string point_id=1; optional string binding_id=2; 
 message ListQuarantinedPointsResponse { repeated QuarantinedPointV004 points=1; optional string next_page_token=2; }
 message ResolveQuarantinedPointRequest { string access_zone_id=1; string point_id=2; string resolution=3; optional string binding_id=4; }
 message ResolveQuarantinedPointResponse { string status=1; }
+
+message SparseTokenPreviewV005 { uint32 token_id=1; float weight=2; }
+message QueryEmbeddingSummaryV005 { uint32 dense_dimension=1; uint32 sparse_non_zero_count=2; repeated SparseTokenPreviewV005 top_sparse_tokens=3; }
+message ExplainSearchRequest { string correlation_id=1; string access_zone_id=2; AccessLevel caller_access_level=3; string query=4; SearchModeV005 search_mode=10; EmbeddingModeV005 embedding_mode=11; uint32 top_k=20; uint32 candidate_limit=21; uint64 timeout_ms=22; optional string model_version=30; optional string tokenizer_version=31; optional string dense_version=32; optional string sparse_version=33; optional string chunking_version=34; }
+message ExplainCandidateV005 { uint32 rank=1; float score=2; string qdrant_point_id=3; string chunk_id=4; string parent_chunk_id=5; ChunkGranularityV004 granularity=6; }
+message ExplainFusionCandidateV005 { uint32 rank=1; string chunk_id=2; optional uint32 dense_rank=3; optional uint32 sparse_rank=4; float dense_score=5; float sparse_score=6; float fusion_score=7; string reason=8; }
+message ExplainSelectedParentV005 { string parent_chunk_id=1; string selected_because=2; }
+message AppliedFilterV005 { string key=1; string op=2; string value=3; }
+message ExplainSearchResponse { string query=1; QueryEmbeddingSummaryV005 query_embedding=2; repeated ExplainCandidateV005 dense_candidates=10; repeated ExplainCandidateV005 sparse_candidates=11; repeated ExplainFusionCandidateV005 fusion=12; repeated ExplainSelectedParentV005 selected_parents=13; repeated AppliedFilterV005 applied_filters=20; SearchDiagnosticsV004 diagnostics=30; }
+message DebugDocumentStateRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; bool include_chunks=10; bool include_vectors=11; bool include_outbox=12; bool include_qdrant=13; }
+message DebugDocumentInfoV005 { string status=1; string content_hash=2; string model_version=3; string tokenizer_version=4; string chunking_version=5; }
+message DebugChunkInfoV005 { string chunk_id=1; string parent_chunk_id=2; string root_chunk_id=3; ChunkGranularityV004 granularity=4; uint32 actual_token_count=5; string lifecycle_status=6; string source_block_id=20; string trace_relation_type=21; string trace_quality=22; string source_location_json=23; string source_links_json=24; repeated string qdrant_point_ids=30; }
+message DebugVectorInfoV005 { uint32 dense_count=1; uint32 sparse_count=2; uint32 bindings_count=3; }
+message DebugOutboxInfoV005 { uint32 pending=1; uint32 retry_pending=2; uint32 completed=3; uint32 failed=4; }
+message MissingQdrantPointV005 { string chunk_id=1; string binding_id=2; string qdrant_point_id=3; string reason=4; }
+message DebugQdrantInfoV005 { string collection=1; bool collection_exists=2; uint32 points_expected=3; uint32 points_found=4; repeated MissingQdrantPointV005 points_missing=10; string scroll_status=20; uint32 scroll_pages_read=21; uint32 scroll_points_read=22; }
+message DebugGraphSummaryV005 { uint32 total_graph_nodes=1; uint32 total_graph_edges=2; string nodes_by_type_json=3; string edges_by_relation_type_json=4; string graph_partitions_status=5; uint32 semantic_edges_count=6; float semantic_avg_weight=7; float semantic_min_weight=8; float semantic_max_weight=9; string allowed_relations_json=10; string relation_weights_json=11; }
+message DebugDocumentStateResponse { DebugDocumentInfoV005 document=1; repeated DebugChunkInfoV005 chunks=2; DebugVectorInfoV005 vectors=3; DebugOutboxInfoV005 outbox=4; DebugQdrantInfoV005 qdrant=5; bool ready_to_activate=6; repeated DiagnosticWarningV005 warnings=7; DebugGraphSummaryV005 graph=8; }
+message RetryVectorOutboxRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; optional string operation=4; optional string status=5; }
+message RetryVectorOutboxResponse { uint32 matched=1; uint32 reset_to_pending=2; repeated string affected_outbox_ids=3; }
+

@@ -12,7 +12,7 @@ spec:
     spec:
       containers:
         - name: publisher
-          image: astravector-runtime:0.3.0
+          image: astravector-runtime:0.4.1-fix465-p2-production-hardening
           command: ["/usr/local/bin/astravector-qdrant-publisher"]
           envFrom:
             - configMapRef: { name: astravector-config }
