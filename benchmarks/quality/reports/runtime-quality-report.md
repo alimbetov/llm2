@@ -13,39 +13,39 @@
 - dense_available: `true`
 - sparse_available: `true`
 - hybrid_available: `true`
-- graph_rag_available: `false`
+- graph_rag_available: `true`
 - mmr_available: `true`
 - require_dense: `true`
-- require_sparse: `true`
-- require_hybrid: `true`
-- require_graph: `false`
+- require_sparse: `false`
+- require_hybrid: `false`
+- require_graph: `true`
 - require_mmr: `false`
-- sparse_embeddings_count: `19923`
+- sparse_embeddings_count: `26610`
 - qdrant_sparse_config_present: `true`
 - qdrant_sparse_points_sampled: `256`
-- qdrant_sparse_points_with_vectors: `232`
-- relations_loaded_count: `12`
-- relations_ingested_count: `0`
-- graph_edges_available_count: `128613`
-- graph_expanded_contexts_count: `0`
-- fixtures_ingested_count: `29`
-- documents_registered_count: `29`
-- documents_indexed_count: `1591`
+- qdrant_sparse_points_with_vectors: `236`
+- relations_loaded_count: `27`
+- relations_ingested_count: `243`
+- graph_edges_available_count: `168237`
+- graph_expanded_contexts_count: `8`
+- fixtures_ingested_count: `25`
+- documents_registered_count: `25`
+- documents_indexed_count: `1976`
 - access_zones_auto_created_count: `3`
-- outbox_created_count: `21483`
-- outbox_completed_count: `21483`
+- outbox_created_count: `28182`
+- outbox_completed_count: `28182`
 - outbox_dead_letter_count: `0`
 - qdrant_collection_count: `1`
-- qdrant_points_count: `21483`
+- qdrant_points_count: `28170`
 - qdrant_payload_verified: `true`
-- retrieve_context_queries_total: `64`
-- retrieve_context_queries_passed: `64`
+- retrieve_context_queries_total: `3`
+- retrieve_context_queries_passed: `3`
 - retrieve_context_queries_failed: `0`
 - retrieve_context_queries_blocked: `0`
 
 ## By Reason
 
-- PRE_MMR_WEAK_CANDIDATE_FILTERED: 64
+- PRE_MMR_WEAK_CANDIDATE_FILTERED: 3
 
 ## Failures
 

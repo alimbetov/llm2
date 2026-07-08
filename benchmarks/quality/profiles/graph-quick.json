@@ -4,11 +4,13 @@
   "description": "Runtime profile that requires fixture relation ingestion and GraphRAG expanded context evidence",
   "corpora": [
     "graph-rag-mini",
+    "synthetic-mini",
     "technical-mini",
+    "legal-mini",
     "long-doc-mini"
   ],
   "queries": [
-    "graph-rag-golden"
+    "graph-rag-quick-golden"
   ],
   "runner": {
     "mode": "remote-runtime",

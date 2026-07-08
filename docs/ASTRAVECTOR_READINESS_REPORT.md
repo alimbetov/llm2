@@ -2,7 +2,7 @@
 
 Date: 2026-07-08
 
-Final status: `RUNTIME_READY`
+Final status: `GRAPH_RAG_READY`
 
 This report is based on the live local runtime in `/Users/ruslanalimbetov/Documents/llm2/astravector`. Static checks, skipped profiles, and stale generated reports are not counted as runtime proof.
 
@@ -31,6 +31,7 @@ Mandatory profiles passed in live ingest-and-retrieve mode:
 | Dense | `MODEL_BACKED_E2E_CONFIRMED` | `PASS` |
 | Sparse | `MODEL_BACKED_E2E_CONFIRMED` | `PASS` |
 | Hybrid | `MODEL_BACKED_E2E_CONFIRMED` | `PASS` |
+| Graph quick | `MODEL_BACKED_E2E_CONFIRMED` | `PASS` |
 
 The final hybrid profile returned:
 
@@ -78,11 +79,17 @@ The following gates passed after the retrieval changes:
 
 ## GraphRAG Policy
 
-- `graph_rag_available = false`
+- `graph_rag_available = true`
 - `graph_rag_required_for_ready = false`
 - `graph_rag_required_for_production_candidate = true`
+- `relations_loaded_count = 27`
+- `relations_persisted_count = 243`
+- `relations_queryable_count = 243`
+- `graph_expansion_used_count = 8`
+- `graph_expected_related_hit_rate = 1.0`
+- `graph_fp_rate = 0.0`
 
-Graph diagnostic or skipped cases are not counted as PASS. GraphRAG remains a blocker for `PRODUCTION_CANDIDATE`, not for `RUNTIME_READY`.
+Graph diagnostic or skipped cases are not counted as PASS. The focused GraphRAG quick profile now passes with production relation ingestion and 1-hop expansion. A larger GraphRAG production-candidate proof remains required for `PRODUCTION_CANDIDATE`.
 
 ## Distractor Handling
 
@@ -90,9 +97,9 @@ Distractor fixture labels are used for evaluation and reporting only. Production
 
 ## Remaining Blockers To Production Candidate
 
-`RUNTIME_READY` is now reached. `PRODUCTION_CANDIDATE` still requires additional gates:
+`GRAPH_RAG_READY` is now reached. `PRODUCTION_CANDIDATE` still requires additional gates:
 
-1. GraphRAG production-candidate proof.
+1. Larger GraphRAG production-candidate proof beyond the focused quick profile.
 2. Full all-target test suite proof beyond the focused runtime readiness gates.
 3. Deployment validation against the packaged image and Kubernetes manifests.
 4. Load, soak, recovery, backup/restore, rollback, capacity, and alerting proof.

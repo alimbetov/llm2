@@ -1075,7 +1075,27 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let mut graph_expansion_duration_ms = 0_u64;
         let mut graph_candidates_by_relation: HashMap<String, usize> = HashMap::new();
-        if r.enable_graph_expansion && self.cfg.graph_rag.enabled && !matched_chunk_ids.is_empty() {
+        let mut graph_seed_keys = Vec::new();
+        seed_scores.clear();
+        for result in &direct_results {
+            let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
+                continue;
+            };
+            let Ok(matched_chunk_id) = Uuid::parse_str(&result.matched_chunk_id) else {
+                continue;
+            };
+            let key = (access_zone_id, matched_chunk_id);
+            graph_seed_keys.push(key);
+            let seed_score = result
+                .scores
+                .as_ref()
+                .map(|scores| scores.final_score.max(scores.fusion_score))
+                .unwrap_or(0.5);
+            seed_scores.entry(key).or_insert(seed_score);
+        }
+        graph_seed_keys.sort_unstable();
+        graph_seed_keys.dedup();
+        if r.enable_graph_expansion && self.cfg.graph_rag.enabled && !graph_seed_keys.is_empty() {
             let maybe_graph_permit = Self::acquire_backpressure_permit(
                 self.graph_expansion_semaphore.clone(),
                 self.cfg.limits.backpressure_acquire_timeout_ms,
@@ -1111,7 +1131,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         .min(self.cfg.limits.graph_related_contexts_max as u32)
                 };
                 let graph_call = self.repo()?.expand_chunks_1hop_by_seed_keys(
-                    &matched_chunk_keys,
+                    &graph_seed_keys,
                     caller_access_level as i16,
                     max_related,
                     self.cfg.graph_rag.retrieval.max_seed_chunks,
@@ -8741,13 +8761,12 @@ fn search_result_from_lexical_parent(
     metadata.insert("chunk_granularity".into(), "PARENT".into());
     metadata.insert("representation_type".into(), "ORIGINAL".into());
     let score = lexical_parent_score(parent, query);
-    let (source_block_id, matched_text) = best_logical_block_for_query(&parent.metadata, query)
-        .unwrap_or_else(|| {
-            (
-                metadata.get("source_block_id").cloned().unwrap_or_default(),
-                parent.content.clone(),
-            )
-        });
+    let source_block_id = parent
+        .source_block_id
+        .clone()
+        .or_else(|| metadata.get("source_block_id").cloned())
+        .unwrap_or_default();
+    let matched_text = parent.content.clone();
     if !source_block_id.is_empty() {
         metadata.insert("source_block_id".into(), source_block_id);
     }
@@ -9414,6 +9433,7 @@ mod v007_fix1_tests {
             content: "parent".into(),
             content_hash: "hash".into(),
             token_count: 1,
+            source_block_id: Some("parent-block".into()),
             metadata: serde_json::json!({}),
         };
         let point_id = uuid::Uuid::new_v4();

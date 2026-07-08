@@ -4,7 +4,7 @@
 
 ## Текущий статус
 
-`RUNTIME_READY`
+`GRAPH_RAG_READY`
 
 Локальный runtime поднимается, `grpcurl -plaintext 127.0.0.1:50051 list` отвечает, а model-backed confidence gate проходит в ingest-and-retrieve режиме:
 
@@ -54,7 +54,7 @@ make quality-runtime-confidence-remote
 
 ## Главные ограничения
 
-- GraphRAG: не требуется для `RUNTIME_READY`, но остаётся blocker для `PRODUCTION_CANDIDATE`.
+- GraphRAG: focused quick profile PASS; larger production-candidate proof остаётся blocker для `PRODUCTION_CANDIDATE`.
 - Full all-target suite: требует отдельного production-candidate proof.
 - Deployment/Kubernetes validation: не закрыт.
 - Load/Backpressure/soak: не закрыт.

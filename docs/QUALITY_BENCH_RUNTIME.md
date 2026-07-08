@@ -38,11 +38,11 @@ The preflight records model and tokenizer file presence. Model-backed inference 
 
 GraphRAG policy:
 
-- `graph_rag_available = false`
+- `graph_rag_available = true`
 - `graph_rag_required_for_ready = false`
 - `graph_rag_required_for_production_candidate = true`
 
-Graph diagnostic or skipped cases are not counted as PASS. GraphRAG remains a blocker for `PRODUCTION_CANDIDATE`, not for `RUNTIME_READY`.
+Graph diagnostic or skipped cases are not counted as PASS. The focused graph quick profile proves production relation ingestion and 1-hop expansion. Larger graph coverage remains required for `PRODUCTION_CANDIDATE`.
 
 Distractor fixture labels are used for evaluation/reporting only. Production retrieval rejects weak common-overlap candidates based on evidence, not by hardcoded distractor IDs or fixture labels.
 
@@ -113,6 +113,8 @@ make quality-runtime-hybrid-quick-remote
 make quality-runtime-graph-quick-remote
 make quality-runtime-full-capability-quick-remote
 ```
+
+`quality-runtime-graph-quick-remote` uses `graph-rag-quick-golden` for focused 1-hop GraphRAG proof. The extended `graph-rag-golden` file remains a diagnostic bank for broader/multi-hop retrieval hardening and is not silently counted as PASS.
 
 Confidence gate:
 

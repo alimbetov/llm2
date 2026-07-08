@@ -7,16 +7,16 @@
       "RESTRICTED": 2
     },
     "postgres_distribution": {
-      "1": 15951,
-      "2": 4113,
+      "1": 19860,
+      "2": 6165,
       "3": 0,
-      "4": 1419
+      "4": 1599
     },
     "qdrant_distribution": {
-      "1": 15951,
-      "2": 4113,
+      "1": 18377,
+      "2": 5721,
       "3": 0,
-      "4": 1419
+      "4": 1502
     },
     "reason": null,
     "status": "PASS"
@@ -102,7 +102,9 @@
   },
   "capabilities": {
     "dense_available": true,
-    "graph_rag_available": false,
+    "graph_rag_available": true,
+    "graph_rag_required_for_production_candidate": true,
+    "graph_rag_required_for_runtime_ready": false,
     "hybrid_available": true,
     "mmr_available": true,
     "sparse_available": true
@@ -116,30 +118,94 @@
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 21483,
-    "sparse_embeddings_count": 19923
+    "dense_embeddings_count": 27636,
+    "sparse_embeddings_count": 26076
   },
   "failures": [],
   "forced_caller_access_level": null,
   "graph": {
-    "graph_edges_available_count": 128613,
+    "graph_access_violation_count": 0,
+    "graph_cycle_guard": {
+      "cycle_detected": false,
+      "duplicate_suppressed_count": 0,
+      "max_hop_depth": 1,
+      "visited_count": 0
+    },
+    "graph_db_error_count": 0,
+    "graph_duplicate_suppressed_count": 0,
+    "graph_edges_available_count": 164995,
     "graph_expanded_contexts_count": 0,
+    "graph_expansion_used_count": 0,
     "graph_expected_related_hit_rate": 0.0,
     "graph_expected_related_hits": 0,
     "graph_expected_related_total": 0,
-    "relations_ingested_count": 0,
-    "relations_loaded_count": 12
+    "graph_false_positive": {
+      "ci_95_upper": null,
+      "ci_method": "diagnostic_small_sample",
+      "false_positive_expanded": 0,
+      "graph_fp_rate": null,
+      "sample_size_warning": true,
+      "total_expanded": 0,
+      "true_positive_expanded": 0
+    },
+    "graph_fp_rate": null,
+    "graph_impact": {
+      "mean_delta_mrr": null,
+      "mean_delta_ndcg": null,
+      "mrr_with_graph_mean": null,
+      "mrr_without_graph_mean": null,
+      "ndcg_with_graph_mean": null,
+      "ndcg_without_graph_mean": null,
+      "queries_tested": 0,
+      "regressions_count": 0,
+      "statistical_test": {
+        "method": "diagnostic_small_sample",
+        "p_value": null,
+        "sample_size_warning": true,
+        "significant_improvement": false
+      }
+    },
+    "graph_latency": {
+      "lookup_count": 64,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null,
+      "timeout_count": 0,
+      "timeout_ms": 50,
+      "timeout_rate": 0.0
+    },
+    "graph_statistical_tests": {
+      "false_positive": {
+        "ci_95_upper": null,
+        "false_positive_rate": null,
+        "method": "diagnostic_small_sample"
+      },
+      "minimum_sample_size_for_inference": 30,
+      "regression": {
+        "old_dense_profile_pass": true,
+        "old_hybrid_profile_pass": true,
+        "old_sparse_profile_pass": true,
+        "regressions_count": 0
+      },
+      "sample_size": 0,
+      "sample_size_warning": true
+    },
+    "graph_timeout_count": 0,
+    "relations_ingested_count": 108,
+    "relations_loaded_count": 12,
+    "relations_persisted_count": 108,
+    "relations_queryable_count": 108
   },
   "hybrid": {
     "dense_branch_hits": 0,
-    "fused_hits": 166,
+    "fused_hits": 99,
     "fusion_strategy": "RRF",
     "hybrid_available": true,
     "sparse_branch_hits": 0
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 1591,
+    "documents_indexed_count": 1951,
     "documents_registered_count": 29,
     "fixtures_ingested_count": 29
   },
@@ -171,8 +237,8 @@
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 21483,
-    "outbox_created_count": 21483,
+    "outbox_completed_count": 27648,
+    "outbox_created_count": 27648,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -189,10 +255,10 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 21483,
+    "points_count": 27636,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "fix474f-20260708-202920",
+  "quality_run_id": "fix474f-20260708-213952",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
@@ -213,7 +279,7 @@
   },
   "retrieval_diagnostics": {
     "likely_failure_stage": "UNKNOWN",
-    "qdrant_points_available": 21483,
+    "qdrant_points_available": 27636,
     "queries_with_empty_contexts": 16,
     "queries_with_retrieve_errors": 0
   },
@@ -228,10 +294,10 @@
     "numeric_token_count": 5,
     "qdrant_sparse_config_present": true,
     "qdrant_sparse_points_sampled": 256,
-    "qdrant_sparse_points_with_vectors": 232,
-    "qdrant_sparse_vectors_in_sample": 232,
+    "qdrant_sparse_points_with_vectors": 236,
+    "qdrant_sparse_vectors_in_sample": 236,
     "sparse_available": true,
-    "sparse_embeddings_count": 19923,
+    "sparse_embeddings_count": 26076,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "special_token_count": 40,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",

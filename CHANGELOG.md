@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## v007/fix475 — Focused GraphRAG Runtime Proof
+
+- Added focused GraphRAG runtime proof: production relation fixtures are ingested through metadata, persisted/queryable in PostgreSQL graph tables, expanded through runtime 1-hop retrieval, and validated by `make quality-runtime-graph-quick-remote`.
+- Updated readiness status to `GRAPH_RAG_READY` while keeping `production_candidate=false`; larger GraphRAG production-candidate proof remains open.
+
 ## v007/fix474j — Runtime Ready Final Evidence Closure
 
 - Closed the final sparse/hybrid retrieval quality failures without weakening expected fixtures or treating SKIP/static output as PASS.

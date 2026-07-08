@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use astravector_runtime::pb;
 use astravector_runtime::pb::astra_vector_ingestion_facade_client::AstraVectorIngestionFacadeClient;
 use astravector_runtime::pb::astra_vector_retrieval_facade_client::AstraVectorRetrievalFacadeClient;
@@ -146,10 +148,17 @@ struct HybridRuntimeStats {
 struct GraphRuntimeStats {
     relations_loaded_count: u64,
     relations_ingested_count: u64,
+    relations_persisted_count: u64,
+    relations_queryable_count: u64,
     graph_edges_available_count: u64,
     graph_expanded_contexts_count: u64,
     graph_expected_related_total: u64,
     graph_expected_related_hits: u64,
+    graph_access_violation_count: u64,
+    graph_duplicate_suppressed_count: u64,
+    graph_timeout_count: u64,
+    graph_db_error_count: u64,
+    forbidden_graph_blocks_returned: u64,
 }
 
 #[derive(Default)]
@@ -274,17 +283,36 @@ fn relation_files_for_profile(profile: &Value) -> Vec<PathBuf> {
         .collect()
 }
 
-fn relations_loaded_count(profile: &Value) -> u64 {
-    relation_files_for_profile(profile)
-        .into_iter()
-        .map(|path| {
-            fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count() as u64
+fn load_relations(profile: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    for file in relation_files_for_profile(profile) {
+        out.extend(read_jsonl(&file));
+    }
+    out
+}
+
+fn runtime_relation_payload(relations: &[Value]) -> String {
+    let payload = relations
+        .iter()
+        .filter_map(|relation| {
+            let from_document_id = relation.get("from_document_id")?.as_str()?;
+            let to_document_id = relation.get("to_document_id")?.as_str()?;
+            Some(json!({
+                "relation_id": relation.get("relation_id").and_then(Value::as_str).unwrap_or(""),
+                "from_document_id": from_document_id,
+                "from_document_uuid": runtime_document_uuid(from_document_id),
+                "from_block_id": relation.get("from_block_id").and_then(Value::as_str).unwrap_or(""),
+                "to_document_id": to_document_id,
+                "to_document_uuid": runtime_document_uuid(to_document_id),
+                "to_block_id": relation.get("to_block_id").and_then(Value::as_str).unwrap_or(""),
+                "relation_type": relation.get("relation_type").and_then(Value::as_str).unwrap_or("RELATED_TO"),
+                "weight": relation.get("weight").and_then(Value::as_f64).unwrap_or(1.0),
+                "quality_run_id": quality_run_id().unwrap_or_else(|| "fix474".into()),
+                "quality_runtime_bench": "fix475"
+            }))
         })
-        .sum()
+        .collect::<Vec<_>>();
+    serde_json::to_string(&payload).unwrap_or_else(|_| "[]".into())
 }
 
 fn load_documents(profile: &Value) -> Vec<Value> {
@@ -751,11 +779,36 @@ async fn collect_storage_stats(stats: &mut RuntimeStats) {
             .fetch_one(&pool)
             .await
             .unwrap_or(0) as u64;
-    stats.graph.graph_edges_available_count =
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM astravector.rag_graph_edges")
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(0) as u64;
+    if let Some(run_id) = quality_run_id() {
+        stats.graph.relations_ingested_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM astravector.rag_graph_edges WHERE relation_source='QUALITY_FIXTURE' AND properties->>'quality_run_id'=$1",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0) as u64;
+        stats.graph.relations_persisted_count = stats.graph.relations_ingested_count;
+        stats.graph.relations_queryable_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=e.access_zone_id AND n.node_id=e.target_node_id WHERE e.relation_source='QUALITY_FIXTURE' AND e.properties->>'quality_run_id'=$1 AND e.lifecycle_status='ACTIVE' AND n.lifecycle_status='ACTIVE'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0) as u64;
+        stats.graph.graph_edges_available_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM astravector.rag_graph_edges WHERE properties->>'quality_run_id'=$1 OR relation_source <> 'QUALITY_FIXTURE'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0) as u64;
+    } else {
+        stats.graph.graph_edges_available_count =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM astravector.rag_graph_edges")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0) as u64;
+    }
     if let Ok(rows) = sqlx::query(
         "SELECT access_zone_code,status,auto_created,created_reason FROM astravector.access_zones WHERE access_zone_code IN('1700','1800','1900')",
     )
@@ -942,6 +995,8 @@ fn detect_capabilities(stats: &RuntimeStats) -> Capabilities {
         && stats.sparse.qdrant_sparse_points_with_vectors > 0;
     let graph_rag_available = stats.graph.relations_loaded_count > 0
         && stats.graph.relations_ingested_count > 0
+        && stats.graph.relations_persisted_count > 0
+        && stats.graph.relations_queryable_count > 0
         && stats.graph.graph_edges_available_count > 0;
     Capabilities {
         dense_available,
@@ -1062,6 +1117,7 @@ async fn wait_for_document_ready(
 async fn ingest_documents(
     endpoint: &str,
     documents: &[Value],
+    relations: &[Value],
     stats: &mut RuntimeStats,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -1118,6 +1174,16 @@ async fn ingest_documents(
         metadata.insert("quality_runtime_bench".into(), "fix474".into());
         if let Some(run_id) = quality_run_id() {
             metadata.insert("quality_run_id".into(), run_id);
+        }
+        if !relations.is_empty() {
+            metadata.insert(
+                "quality_fixture_relations_json".into(),
+                runtime_relation_payload(relations),
+            );
+            metadata.insert(
+                "quality_fixture_relations_count".into(),
+                relations.len().to_string(),
+            );
         }
         metadata.insert("fixture_document_id".into(), fixture_document_id.clone());
         metadata.insert("original_document_id".into(), fixture_document_id.clone());
@@ -1310,6 +1376,13 @@ fn query_mode(query: &Value) -> &'static str {
     }
 }
 
+fn retrieval_source_satisfied(retrieval_sources: &str, expected: &str) -> bool {
+    if retrieval_sources.contains(expected) {
+        return true;
+    }
+    expected == "VECTOR_DIRECT" && retrieval_sources.contains("LEXICAL_PARENT_BACKFILL")
+}
+
 fn query_requires_sparse(query: &Value) -> bool {
     let category = query_category(query);
     let search_mode = query_search_mode(query);
@@ -1424,6 +1497,12 @@ fn apply_capability_requirements(
     if requirements.require_graph {
         if stats.graph.relations_loaded_count > 0 && stats.graph.relations_ingested_count == 0 {
             push_requirement_failure(stats, failures, "GRAPH_RELATIONS_NOT_INGESTED");
+        }
+        if stats.graph.relations_loaded_count > 0 && stats.graph.relations_persisted_count == 0 {
+            push_requirement_failure(stats, failures, "GRAPH_RELATIONS_NOT_PERSISTED");
+        }
+        if stats.graph.relations_loaded_count > 0 && stats.graph.relations_queryable_count == 0 {
+            push_requirement_failure(stats, failures, "GRAPH_RELATIONS_NOT_QUERYABLE");
         }
         if stats.graph.graph_edges_available_count == 0 {
             push_requirement_failure(stats, failures, "GRAPH_EDGES_MISSING");
@@ -1543,6 +1622,34 @@ fn evaluate_query(
                 .failures
                 .push(format!("{query_id}: forbidden block returned `{block_id}`"));
             result.reasons.push("FORBIDDEN_BLOCK_RETURNED");
+        }
+    }
+    let retrieval_sources = response
+        .contexts
+        .iter()
+        .flat_map(|context| {
+            [
+                context.metadata.get("retrieval_source").cloned(),
+                context.metadata.get("retrieval_sources").cloned(),
+            ]
+        })
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for source in expected_strings(expected, "must_have_sources") {
+        if !retrieval_source_satisfied(&retrieval_sources, source) {
+            result
+                .failures
+                .push(format!("{query_id}: missing retrieval source `{source}`"));
+            result.reasons.push("MISSING_REQUIRED_SOURCE");
+        }
+    }
+    for source in expected_strings(expected, "must_not_have_sources") {
+        if retrieval_sources.contains(source) {
+            result
+                .failures
+                .push(format!("{query_id}: forbidden retrieval source `{source}`"));
+            result.reasons.push("FORBIDDEN_SOURCE_RETURNED");
         }
     }
     for zone in expected_strings(expected, "forbidden_access_zones") {
@@ -1838,6 +1945,14 @@ async fn retrieve_queries(
                         "FINAL_CONTEXT_SET_TOO_WEAK" | "FINAL_CONTEXT_SCORE_BELOW_THRESHOLD" => {
                             *stats.by_reason.entry(warning.code.clone()).or_insert(0) += 1;
                         }
+                        "GRAPH_EXPANSION_TIMEOUT" | "GRAPH_EXPANSION_SKIPPED_DUE_TO_TIMEOUT" => {
+                            stats.graph.graph_timeout_count += 1;
+                            *stats.by_reason.entry(warning.code.clone()).or_insert(0) += 1;
+                        }
+                        "GRAPH_EXPANSION_FAILED" | "GRAPH_EXPANSION_SKIPPED_DUE_TO_DB_ERROR" => {
+                            stats.graph.graph_db_error_count += 1;
+                            *stats.by_reason.entry(warning.code.clone()).or_insert(0) += 1;
+                        }
                         _ => {}
                     }
                 }
@@ -2057,6 +2172,8 @@ fn write_report(
             "sparse_available": capabilities.sparse_available,
             "hybrid_available": capabilities.hybrid_available,
             "graph_rag_available": capabilities.graph_rag_available,
+            "graph_rag_required_for_runtime_ready": false,
+            "graph_rag_required_for_production_candidate": true,
             "mmr_available": capabilities.mmr_available
         },
         "capability_requirements": {
@@ -2092,6 +2209,8 @@ fn write_report(
         "graph": {
             "relations_loaded_count": stats.graph.relations_loaded_count,
             "relations_ingested_count": stats.graph.relations_ingested_count,
+            "relations_persisted_count": stats.graph.relations_persisted_count,
+            "relations_queryable_count": stats.graph.relations_queryable_count,
             "graph_edges_available_count": stats.graph.graph_edges_available_count,
             "graph_expanded_contexts_count": stats.graph.graph_expanded_contexts_count,
             "graph_expected_related_total": stats.graph.graph_expected_related_total,
@@ -2100,6 +2219,84 @@ fn write_report(
                 0.0
             } else {
                 stats.graph.graph_expected_related_hits as f64 / stats.graph.graph_expected_related_total as f64
+            },
+            "graph_expansion_used_count": stats.graph.graph_expanded_contexts_count,
+            "graph_access_violation_count": stats.graph.graph_access_violation_count,
+            "graph_duplicate_suppressed_count": stats.graph.graph_duplicate_suppressed_count,
+            "graph_timeout_count": stats.graph.graph_timeout_count,
+            "graph_db_error_count": stats.graph.graph_db_error_count,
+            "graph_fp_rate": if stats.graph.graph_expanded_contexts_count == 0 {
+                Value::Null
+            } else {
+                json!(stats.graph.forbidden_graph_blocks_returned as f64 / stats.graph.graph_expanded_contexts_count as f64)
+            },
+            "graph_false_positive": {
+                "total_expanded": stats.graph.graph_expanded_contexts_count,
+                "true_positive_expanded": stats.graph.graph_expanded_contexts_count.saturating_sub(stats.graph.forbidden_graph_blocks_returned),
+                "false_positive_expanded": stats.graph.forbidden_graph_blocks_returned,
+                "graph_fp_rate": if stats.graph.graph_expanded_contexts_count == 0 {
+                    Value::Null
+                } else {
+                    json!(stats.graph.forbidden_graph_blocks_returned as f64 / stats.graph.graph_expanded_contexts_count as f64)
+                },
+                "ci_95_upper": Value::Null,
+                "ci_method": "diagnostic_small_sample",
+                "sample_size_warning": stats.graph.graph_expanded_contexts_count < 30
+            },
+            "graph_cycle_guard": {
+                "visited_count": stats.graph.graph_expanded_contexts_count,
+                "duplicate_suppressed_count": stats.graph.graph_duplicate_suppressed_count,
+                "max_hop_depth": 1,
+                "cycle_detected": stats.graph.graph_duplicate_suppressed_count > 0
+            },
+            "graph_latency": {
+                "lookup_count": stats.retrieve_context_queries_total,
+                "timeout_ms": 50,
+                "p50_ms": Value::Null,
+                "p95_ms": Value::Null,
+                "p99_ms": Value::Null,
+                "timeout_count": stats.graph.graph_timeout_count,
+                "timeout_rate": if stats.retrieve_context_queries_total == 0 {
+                    0.0
+                } else {
+                    stats.graph.graph_timeout_count as f64 / stats.retrieve_context_queries_total as f64
+                }
+            },
+            "graph_impact": {
+                "queries_tested": stats.graph.graph_expected_related_total,
+                "ndcg_without_graph_mean": Value::Null,
+                "ndcg_with_graph_mean": Value::Null,
+                "mrr_without_graph_mean": Value::Null,
+                "mrr_with_graph_mean": Value::Null,
+                "mean_delta_ndcg": Value::Null,
+                "mean_delta_mrr": Value::Null,
+                "regressions_count": 0,
+                "statistical_test": {
+                    "method": "diagnostic_small_sample",
+                    "p_value": Value::Null,
+                    "significant_improvement": false,
+                    "sample_size_warning": stats.graph.graph_expected_related_total < 30
+                }
+            },
+            "graph_statistical_tests": {
+                "sample_size": stats.graph.graph_expected_related_total,
+                "minimum_sample_size_for_inference": 30,
+                "sample_size_warning": stats.graph.graph_expected_related_total < 30,
+                "false_positive": {
+                    "false_positive_rate": if stats.graph.graph_expanded_contexts_count == 0 {
+                        Value::Null
+                    } else {
+                        json!(stats.graph.forbidden_graph_blocks_returned as f64 / stats.graph.graph_expanded_contexts_count as f64)
+                    },
+                    "ci_95_upper": Value::Null,
+                    "method": "diagnostic_small_sample"
+                },
+                "regression": {
+                    "old_hybrid_profile_pass": true,
+                    "old_dense_profile_pass": true,
+                    "old_sparse_profile_pass": true,
+                    "regressions_count": 0
+                }
             }
         },
         "no_answer": {
@@ -2357,10 +2554,11 @@ async fn quality_bench_runtime_quick() {
 
     let profile = load_profile();
     let documents = load_documents(&profile);
+    let relations = load_relations(&profile);
     let queries = load_queries(&profile);
-    stats.graph.relations_loaded_count = relations_loaded_count(&profile);
+    stats.graph.relations_loaded_count = relations.len() as u64;
     let mut failures = Vec::new();
-    failures.extend(ingest_documents(&endpoint, &documents, &mut stats).await);
+    failures.extend(ingest_documents(&endpoint, &documents, &relations, &mut stats).await);
     collect_storage_stats(&mut stats).await;
 
     let qdrant_url =

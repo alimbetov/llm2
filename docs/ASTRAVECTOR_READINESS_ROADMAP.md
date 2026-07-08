@@ -1,6 +1,6 @@
 # AstraVector Readiness Roadmap
 
-Current final status: `RUNTIME_READY`
+Current final status: `GRAPH_RAG_READY`
 
 The model-backed runtime confidence gate is now green for dense, sparse and hybrid quick profiles. This is a runtime readiness milestone, not a production-candidate declaration.
 
@@ -31,11 +31,11 @@ Required final readiness fields:
 
 ## GraphRAG Policy
 
-- `graph_rag_available = false`
+- `graph_rag_available = true`
 - `graph_rag_required_for_ready = false`
 - `graph_rag_required_for_production_candidate = true`
 
-Graph diagnostic or skipped cases must not be counted as PASS. GraphRAG remains a blocker for `PRODUCTION_CANDIDATE`, not for `RUNTIME_READY`.
+Graph diagnostic or skipped cases must not be counted as PASS. The focused GraphRAG quick profile passes; broader GraphRAG production-candidate proof remains required for `PRODUCTION_CANDIDATE`.
 
 ## Distractor And Hard-Negative Policy
 
@@ -50,7 +50,7 @@ Hard-negative target for runtime ready:
 
 `PRODUCTION_CANDIDATE` requires:
 
-- GraphRAG production-candidate proof.
+- Larger GraphRAG production-candidate proof beyond the focused quick profile.
 - Full all-target test suite proof beyond the focused runtime readiness gates.
 - Clean migration validation on an empty database.
 - Docker/Kubernetes deployment validation against the packaged artifact.
@@ -58,4 +58,4 @@ Hard-negative target for runtime ready:
 - Load, soak, backpressure, recovery, backup/restore, rollback, capacity and alerting proof.
 - Reviewed/staged ownership for the large quality fixture and readiness evidence file set.
 
-Until those gates pass, the correct status is `RUNTIME_READY`, not production-ready.
+Until those gates pass, the correct status is `GRAPH_RAG_READY`, not production-ready.

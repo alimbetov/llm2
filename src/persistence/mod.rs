@@ -119,6 +119,7 @@ pub struct ParentContextRecord {
     pub content: String,
     pub content_hash: String,
     pub token_count: i32,
+    pub source_block_id: Option<String>,
     pub metadata: serde_json::Value,
 }
 #[derive(Debug, Clone)]
@@ -1272,19 +1273,33 @@ RETURNING payload_version,qdrant_sync_status"#)
                     graph_bulk_insert_batch_size.max(1),
                 )
                 .await?;
+                let fixture_edges = self
+                    .save_quality_fixture_relation_edges_tx(
+                        &mut tx,
+                        access_zone_id,
+                        ttl_days,
+                        graph_bulk_insert_batch_size.max(1),
+                        &metadata,
+                    )
+                    .await?;
+                if fixture_edges > 0 {
+                    build.warnings.push(format!(
+                        "QUALITY_FIXTURE_RELATION_EDGES_CREATED:{fixture_edges}"
+                    ));
+                }
 
                 tracing::info!(
                     document_id = %document_id,
                     document_version = document_version,
                     access_zone_id = %access_zone_id,
                     graph_nodes = build.nodes.len(),
-                    graph_edges = build.edges.len(),
+                    graph_edges = build.edges.len() + fixture_edges,
                     "GRAPH_REBUILD_COMPLETED"
                 );
 
                 Ok::<(u32, u32, Vec<String>), AstraError>((
                     build.nodes.len() as u32,
-                    build.edges.len() as u32,
+                    (build.edges.len() + fixture_edges) as u32,
                     build.warnings,
                 ))
             };
@@ -1479,6 +1494,173 @@ RETURNING payload_version,qdrant_sync_status"#)
         Ok(())
     }
 
+    async fn save_quality_fixture_relation_edges_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        access_zone_id: Uuid,
+        ttl_days: Option<i32>,
+        batch_size: usize,
+        metadata: &serde_json::Value,
+    ) -> Result<usize, AstraError> {
+        let Some(relations_json) = metadata
+            .get("quality_fixture_relations_json")
+            .and_then(|value| value.as_str())
+        else {
+            return Ok(0);
+        };
+        let Ok(relations) = serde_json::from_str::<serde_json::Value>(relations_json) else {
+            return Ok(0);
+        };
+        let Some(relations) = relations.as_array() else {
+            return Ok(0);
+        };
+
+        let expires_at = ttl_days.and_then(|d| {
+            if d > 0 {
+                Some(Utc::now() + chrono::Duration::days(i64::from(d)))
+            } else {
+                None
+            }
+        });
+        let mut edges = Vec::new();
+        for relation in relations {
+            let Some(relation_id) = relation.get("relation_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(from_document_id) = relation
+                .get("from_document_uuid")
+                .and_then(|v| v.as_str())
+                .and_then(|v| Uuid::parse_str(v).ok())
+            else {
+                continue;
+            };
+            let Some(to_document_id) = relation
+                .get("to_document_uuid")
+                .and_then(|v| v.as_str())
+                .and_then(|v| Uuid::parse_str(v).ok())
+            else {
+                continue;
+            };
+            let Some(from_block_id) = relation.get("from_block_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(to_block_id) = relation.get("to_block_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let weight = relation
+                .get("weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0) as f32;
+
+            let pairs = sqlx::query(
+                r#"
+SELECT
+  s_nodes.node_id AS source_node_id,
+  t_nodes.node_id AS target_node_id,
+  s_map.chunk_id AS source_chunk_id,
+  t_map.chunk_id AS target_chunk_id
+FROM astravector.logical_block_chunk_mapping s_map
+JOIN astravector.content_chunks_v004 s_chunk
+  ON s_chunk.access_zone_id=s_map.access_zone_id
+ AND s_chunk.id=s_map.chunk_id
+ AND s_chunk.lifecycle_status='ACTIVE'
+ AND s_chunk.deleted_at IS NULL
+ AND s_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+JOIN astravector.rag_graph_nodes_chunk s_nodes
+  ON s_nodes.access_zone_id=s_map.access_zone_id
+ AND s_nodes.chunk_id=s_map.chunk_id
+ AND s_nodes.lifecycle_status='ACTIVE'
+ AND s_nodes.quarantined=false
+JOIN astravector.logical_block_chunk_mapping t_map
+  ON t_map.access_zone_id=s_map.access_zone_id
+ AND t_map.document_id=$4
+ AND t_map.block_id=$5
+JOIN astravector.content_chunks_v004 t_chunk
+  ON t_chunk.access_zone_id=t_map.access_zone_id
+ AND t_chunk.id=t_map.chunk_id
+ AND t_chunk.lifecycle_status='ACTIVE'
+ AND t_chunk.deleted_at IS NULL
+ AND t_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+JOIN astravector.rag_graph_nodes_chunk t_nodes
+  ON t_nodes.access_zone_id=t_map.access_zone_id
+ AND t_nodes.chunk_id=t_map.chunk_id
+ AND t_nodes.lifecycle_status='ACTIVE'
+ AND t_nodes.quarantined=false
+WHERE s_map.access_zone_id=$1
+  AND s_map.document_id=$2
+  AND s_map.block_id=$3
+  AND s_map.document_version=1
+  AND t_map.document_version=1
+LIMIT 64
+"#,
+            )
+            .bind(access_zone_id)
+            .bind(from_document_id)
+            .bind(from_block_id)
+            .bind(to_document_id)
+            .bind(to_block_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(db)?;
+
+            for (rank, row) in pairs.into_iter().enumerate() {
+                let source_node_id: Uuid = row.get("source_node_id");
+                let target_node_id: Uuid = row.get("target_node_id");
+                let source_chunk_id: Uuid = row.get("source_chunk_id");
+                let target_chunk_id: Uuid = row.get("target_chunk_id");
+                if source_node_id == target_node_id {
+                    continue;
+                }
+                let edge_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!(
+                        "astravector-quality-fixture-relation:{access_zone_id}:{relation_id}:{source_chunk_id}:{target_chunk_id}"
+                    )
+                    .as_bytes(),
+                );
+                edges.push(GraphEdge {
+                    access_zone_id,
+                    edge_id,
+                    source_node_type: crate::graph::GraphNodeType::Chunk,
+                    source_node_id,
+                    target_node_type: crate::graph::GraphNodeType::Chunk,
+                    target_node_id,
+                    relation_type: GraphRelationType::ChunkNextSibling,
+                    relation_score: weight,
+                    relation_source: "QUALITY_FIXTURE".into(),
+                    relation_rank: Some(rank as i32 + 1),
+                    document_id: Some(from_document_id),
+                    document_version: Some(1),
+                    lifecycle_status: "ACTIVE".into(),
+                    expires_at,
+                    quarantined: false,
+                    properties: serde_json::json!({
+                        "relation_id": relation_id,
+                        "fixture_relation_type": relation.get("relation_type").and_then(|v| v.as_str()).unwrap_or("RELATED_TO"),
+                        "from_document_id": relation.get("from_document_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "from_block_id": from_block_id,
+                        "to_document_id": relation.get("to_document_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "to_block_id": to_block_id,
+                        "source_chunk_id": source_chunk_id,
+                        "target_chunk_id": target_chunk_id,
+                        "quality_run_id": relation.get("quality_run_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "quality_runtime_bench": relation.get("quality_runtime_bench").and_then(|v| v.as_str()).unwrap_or("fix475")
+                    }),
+                });
+            }
+        }
+
+        let count = edges.len();
+        if count > 0 {
+            self.save_graph_nodes_edges_batch_tx(tx, &[], &edges, batch_size)
+                .await?;
+            metrics::counter!("graph_quality_fixture_relation_edges_persisted_total")
+                .increment(count as u64);
+        }
+        Ok(count)
+    }
+
     pub async fn expand_chunks_1hop(
         &self,
         access_zone_id: Uuid,
@@ -1512,7 +1694,7 @@ WITH seed_node_ids AS (
       AND quarantined = false
       AND (expires_at IS NULL OR expires_at > now())
 ), expanded AS (
-    SELECT s.access_zone_id AS seed_access_zone_id,s.seed_chunk_id,e.access_zone_id,e.source_node_id,e.target_node_id,e.relation_type,e.relation_score,e.relation_rank
+    SELECT s.access_zone_id AS seed_access_zone_id,s.seed_chunk_id,e.access_zone_id,e.source_node_id,e.target_node_id,e.relation_type,e.relation_score,e.relation_rank,e.relation_source
     FROM astravector.rag_graph_edges e
     JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id
     WHERE e.access_zone_id=$1
@@ -1520,7 +1702,9 @@ WITH seed_node_ids AS (
       AND e.lifecycle_status='ACTIVE'
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
-    ORDER BY e.relation_score DESC, e.relation_rank NULLS LAST
+    ORDER BY CASE WHEN e.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+             e.relation_score DESC,
+             e.relation_rank NULLS LAST
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id, n.chunk_id, expanded.seed_access_zone_id, expanded.seed_chunk_id, expanded.relation_type, expanded.relation_score, expanded.relation_rank
@@ -1542,7 +1726,9 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
-ORDER BY expanded.relation_score DESC, expanded.relation_rank NULLS LAST
+ORDER BY CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+         expanded.relation_score DESC,
+         expanded.relation_rank NULLS LAST
 LIMIT $4
 "#)
             .bind(access_zone_id)
@@ -1661,14 +1847,17 @@ WITH seed_keys(access_zone_id, chunk_id) AS (
            e.target_node_id,
            e.relation_type,
            e.relation_score,
-           e.relation_rank
+           e.relation_rank,
+           e.relation_source
     FROM astravector.rag_graph_edges e
     JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id
     WHERE e.relation_type = ANY($5::text[])
       AND e.lifecycle_status='ACTIVE'
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
-    ORDER BY e.relation_score DESC, e.relation_rank NULLS LAST
+    ORDER BY CASE WHEN e.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+             e.relation_score DESC,
+             e.relation_rank NULLS LAST
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id,
@@ -1696,7 +1885,9 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
-ORDER BY expanded.relation_score DESC, expanded.relation_rank NULLS LAST
+ORDER BY CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+         expanded.relation_score DESC,
+         expanded.relation_rank NULLS LAST
 LIMIT $4
 "#)
             .bind(&seed_zone_ids)
@@ -1775,6 +1966,7 @@ SELECT DISTINCT ON (c.access_zone_id, c.id)
   COALESCE(p.content,c.content) AS p_content,
   COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
   COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
+  COALESCE(p.source_block_id,c.source_block_id) AS p_source_block_id,
   COALESCE(p.metadata,c.metadata) AS p_metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
@@ -1880,6 +2072,10 @@ ORDER BY c.access_zone_id, c.id,
                     content: r.get("p_content"),
                     content_hash: r.get("p_content_hash"),
                     token_count: r.get("p_token_count"),
+                    source_block_id: r
+                        .try_get::<Option<String>, _>("p_source_block_id")
+                        .ok()
+                        .flatten(),
                     metadata: r.get("p_metadata"),
                 },
             });
@@ -1922,6 +2118,7 @@ SELECT DISTINCT ON (c.access_zone_id, c.id)
   COALESCE(p.content,c.content) AS p_content,
   COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
   COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
+  COALESCE(p.source_block_id,c.source_block_id) AS p_source_block_id,
   COALESCE(p.metadata,c.metadata) AS p_metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
@@ -2027,6 +2224,10 @@ ORDER BY c.access_zone_id, c.id,
                     content: r.get("p_content"),
                     content_hash: r.get("p_content_hash"),
                     token_count: r.get("p_token_count"),
+                    source_block_id: r
+                        .try_get::<Option<String>, _>("p_source_block_id")
+                        .ok()
+                        .flatten(),
                     metadata: r.get("p_metadata"),
                 },
             });
@@ -2142,7 +2343,7 @@ SELECT
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.metadata
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.source_block_id,c.metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2178,6 +2379,10 @@ WHERE c.access_zone_id=$1
                 content: r.get("content"),
                 content_hash: r.get("content_hash"),
                 token_count: r.get("actual_token_count"),
+                source_block_id: r
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten(),
                 metadata: r.get("metadata"),
             })
             .collect())
@@ -2193,7 +2398,7 @@ WHERE c.access_zone_id=$1
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.metadata
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.source_block_id,c.metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2229,6 +2434,10 @@ WHERE c.access_zone_id=ANY($1::uuid[])
                 content: r.get("content"),
                 content_hash: r.get("content_hash"),
                 token_count: r.get("actual_token_count"),
+                source_block_id: r
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten(),
                 metadata: r.get("metadata"),
             })
             .collect())
@@ -2245,7 +2454,7 @@ WHERE c.access_zone_id=ANY($1::uuid[])
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.metadata
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.source_block_id,c.metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2285,6 +2494,10 @@ LIMIT $4"#,
                 content: r.get("content"),
                 content_hash: r.get("content_hash"),
                 token_count: r.get("actual_token_count"),
+                source_block_id: r
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten(),
                 metadata: r.get("metadata"),
             })
             .collect())
