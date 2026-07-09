@@ -427,9 +427,13 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
     let document_id = Uuid::new_v4();
     let document_version = 1_i64;
     let chunk_id = Uuid::new_v4();
+    let seed_chunk_id = Uuid::new_v4();
+    let related_parent_id = Uuid::new_v4();
     let related_chunk_id = Uuid::new_v4();
     let content_hash = "a".repeat(64);
     let chunk_hash = "b".repeat(64);
+    let seed_chunk_hash = "d".repeat(64);
+    let related_parent_hash = "e".repeat(64);
     let related_chunk_hash = "c".repeat(64);
 
     sqlx::query(
@@ -468,12 +472,29 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
         trace_relation_type: "EXACT".to_string(),
         trace_quality: "EXACT".to_string(),
     };
-    let related_chunk = GeneratedChunk {
-        id: related_chunk_id,
+    let seed_chunk = GeneratedChunk {
+        id: seed_chunk_id,
         root_id: chunk_id,
         source_id: chunk_id,
-        parent_id: None,
-        granularity: Granularity::Parent,
+        parent_id: Some(chunk_id),
+        granularity: Granularity::Sub180,
+        sequence_no: 0,
+        token_count: 4,
+        content: "hello production candidate".to_string(),
+        content_hash: seed_chunk_hash.clone(),
+        source_block_id: Some("block-1".to_string()),
+        source_block_ids: vec!["block-1".to_string()],
+        source_location: json!({"page": 1}),
+        source_links: json!([]),
+        trace_relation_type: "EXACT".to_string(),
+        trace_quality: "EXACT".to_string(),
+    };
+    let related_chunk = GeneratedChunk {
+        id: related_chunk_id,
+        root_id: related_parent_id,
+        source_id: related_parent_id,
+        parent_id: Some(related_parent_id),
+        granularity: Granularity::Sub180,
         sequence_no: 1,
         token_count: 4,
         content: "graph expanded production evidence".to_string(),
@@ -485,8 +506,25 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
         trace_relation_type: "EXACT".to_string(),
         trace_quality: "EXACT".to_string(),
     };
+    let related_parent = GeneratedChunk {
+        id: related_parent_id,
+        root_id: related_parent_id,
+        source_id: related_parent_id,
+        parent_id: None,
+        granularity: Granularity::Parent,
+        sequence_no: 1,
+        token_count: 4,
+        content: "graph expanded production evidence".to_string(),
+        content_hash: related_parent_hash.clone(),
+        source_block_id: Some("block-2".to_string()),
+        source_block_ids: vec!["block-2".to_string()],
+        source_location: json!({"page": 2}),
+        source_links: json!([]),
+        trace_relation_type: "EXACT".to_string(),
+        trace_quality: "EXACT".to_string(),
+    };
     let prepared = PreparedV004IndexEmbedding {
-        chunk: chunk.clone(),
+        chunk: seed_chunk.clone(),
         embedding: EmbeddingResult {
             dense: Some(vec![0.03125; 1024]),
             sparse_indices: Some(vec![1, 2, 3]),
@@ -511,13 +549,26 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
             access_zone_id,
             document_id,
             document_version,
-            &[chunk, related_chunk],
+            &[chunk, seed_chunk, related_parent, related_chunk],
             &[prepared, related_prepared],
             "test-tokenizer",
             "test-chunker",
             2,
             Some(1),
-            json!({"test": true}),
+            json!({
+                "test": true,
+                "quality_fixture_relations_json": serde_json::to_string(&json!([{
+                    "relation_id": "e2e-graph-block-1-to-block-2",
+                    "from_document_uuid": document_id.to_string(),
+                    "to_document_uuid": document_id.to_string(),
+                    "from_block_id": "block-1",
+                    "to_block_id": "block-2",
+                    "relation_type": "E2E_RELATED_EVIDENCE",
+                    "weight": 1.0,
+                    "quality_run_id": "fix476-e2e",
+                    "quality_runtime_bench": "mega-validation"
+                }])).expect("serialize quality fixture relation")
+            }),
             "tenant-e2e",
             "workspace-e2e",
             "model-v1",
@@ -529,7 +580,7 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
             64,
             &collection,
             true,
-            false,
+            true,
             Some(GraphBuildLimits::default()),
             100,
             true,
@@ -538,7 +589,10 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
         .expect("persist chunks, embeddings, bindings and outbox through production path");
     assert_eq!(summary.bindings, 2);
     assert_eq!(summary.outbox_created, 2);
-
+    assert!(
+        summary.graph_edges > 0,
+        "graph persistence must create at least one relation edge for graph expansion; summary={summary:?}"
+    );
     // Activate document for retrieval visibility after successful indexing path.
     sqlx::query(
         "UPDATE astravector.document_versions
@@ -551,6 +605,28 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
     .execute(&pool)
     .await
     .expect("activate document version for retrieval");
+    let expanded = repo
+        .expand_chunks_1hop_by_seed_keys(
+            &[(access_zone_id, seed_chunk_id)],
+            2,
+            3,
+            5,
+            200,
+            &[
+                "CHUNK_HAS_PARENT".to_string(),
+                "CHUNK_PREVIOUS_SIBLING".to_string(),
+                "CHUNK_NEXT_SIBLING".to_string(),
+                "CHUNK_SAME_TABLE".to_string(),
+                "CHUNK_SEMANTIC_SIMILAR".to_string(),
+            ],
+            None,
+        )
+        .await
+        .expect("repository graph expansion must execute before RetrieveContext");
+    assert!(
+        expanded.iter().any(|related| related.chunk_id == related_chunk_id),
+        "repository graph expansion must include the adjacent related chunk; expanded={expanded:?}; summary={summary:?}"
+    );
 
     let shutdown = CancellationToken::new();
     outbox::spawn(
@@ -624,6 +700,13 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
     cfg.qdrant.collection = collection.clone();
     cfg.dense.dimension = 1024;
     cfg.graph_rag.retrieval.enabled_by_default = true;
+    cfg.graph_rag.retrieval.max_related_chunks = 5;
+    cfg.graph_rag.retrieval.graph_expansion_result_limit = 10;
+    cfg.graph_rag.retrieval.final_context_limit = 5;
+    cfg.graph_rag.retrieval.graph_merge_strategy = "GRAPH_AS_CONTEXT_APPEND".to_string();
+    cfg.graph_rag.retrieval.direct_context_limit = 2;
+    cfg.graph_rag.retrieval.graph_context_append_limit = 3;
+    cfg.graph_rag.scoring.graph_min_score = 0.0;
     cfg.graph_rag.rerank.mmr_enabled = true;
     cfg.sparse.required = false;
     let cfg = Arc::new(cfg);
@@ -728,7 +811,12 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
                 .get("retrieval_sources")
                 .map(|v| v.contains("VECTOR_DIRECT"))
                 .unwrap_or(false)),
-        "RetrieveContext must prove VECTOR_DIRECT source"
+        "RetrieveContext must prove VECTOR_DIRECT source; contexts={:?}",
+        retrieve_before
+            .contexts
+            .iter()
+            .map(|c| (&c.matched_text, &c.metadata))
+            .collect::<Vec<_>>()
     );
     assert!(
         retrieve_before.contexts.iter().any(|c| c
@@ -754,7 +842,12 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
             .map(|v| v.contains("dense") || v.contains("DENSE"))
             .unwrap_or(false)
             || c.metadata.contains_key("embedding_identity_key")),
-        "RetrieveContext must prove MMR dense embedding mode when dense embeddings exist"
+        "RetrieveContext must prove MMR dense embedding mode when dense embeddings exist; contexts={:?}",
+        retrieve_before
+            .contexts
+            .iter()
+            .map(|c| (&c.matched_text, &c.metadata))
+            .collect::<Vec<_>>()
     );
 
     sqlx::query(

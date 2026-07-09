@@ -1670,6 +1670,7 @@ LIMIT 64
         max_seed_chunks: usize,
         max_edges_visited: usize,
         allowed_relations: &[String],
+        quality_run_id: Option<&str>,
     ) -> Result<Vec<RelatedChunk>, AstraError> {
         if seed_chunk_ids.is_empty() || max_related_chunks == 0 {
             return Ok(Vec::new());
@@ -1702,6 +1703,7 @@ WITH seed_node_ids AS (
       AND e.lifecycle_status='ACTIVE'
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
+      AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
     ORDER BY CASE WHEN e.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
              e.relation_score DESC,
              e.relation_rank NULLS LAST
@@ -1737,6 +1739,7 @@ LIMIT $4
             .bind(max_related_chunks as i64)
             .bind(&allowed_relations)
             .bind(max_edges_visited.max(max_related_chunks as usize) as i64)
+            .bind(quality_run_id)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
@@ -1782,6 +1785,7 @@ LIMIT $4
         max_seed_chunks: usize,
         max_edges_visited: usize,
         allowed_relations: &[String],
+        quality_run_id: Option<&str>,
     ) -> Result<Vec<RelatedChunk>, AstraError> {
         // Backward-compatible wrapper. Production retrieval should prefer
         // expand_chunks_1hop_by_seed_keys to avoid cartesian zone/chunk seed expansion.
@@ -1796,6 +1800,7 @@ LIMIT $4
             max_seed_chunks,
             max_edges_visited,
             allowed_relations,
+            quality_run_id,
         )
         .await
     }
@@ -1808,6 +1813,7 @@ LIMIT $4
         max_seed_chunks: usize,
         max_edges_visited: usize,
         allowed_relations: &[String],
+        quality_run_id: Option<&str>,
     ) -> Result<Vec<RelatedChunk>, AstraError> {
         if seed_keys.is_empty() || max_related_chunks == 0 {
             return Ok(Vec::new());
@@ -1855,6 +1861,7 @@ WITH seed_keys(access_zone_id, chunk_id) AS (
       AND e.lifecycle_status='ACTIVE'
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
+      AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
     ORDER BY CASE WHEN e.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
              e.relation_score DESC,
              e.relation_rank NULLS LAST
@@ -1896,6 +1903,7 @@ LIMIT $4
             .bind(max_related_chunks as i64)
             .bind(&allowed_relations)
             .bind(max_edges_visited.max(max_related_chunks as usize) as i64)
+            .bind(quality_run_id)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;

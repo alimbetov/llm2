@@ -991,11 +991,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             );
             direct_results.push(direct);
         }
+        let quality_run_id_filter = search_quality_run_id_filter(&r.filters);
         if matches!(
             search_mode,
             pb::SearchModeV005::Sparse | pb::SearchModeV005::Hybrid
         ) {
-            let quality_run_id_filter = search_quality_run_id_filter(&r.filters);
             let lexical_candidates = self
                 .repo()?
                 .fetch_active_parent_context_candidates_multi(
@@ -1054,14 +1054,18 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
-        no_answer_stats.pre_mmr_filtered_count = apply_pre_mmr_no_answer_filter(
-            &mut direct_results,
-            query,
-            &query_technical_tokens,
-            search_mode,
-            &self.cfg.search.no_answer,
-            no_answer_debug,
-        );
+        let skip_pre_mmr_no_answer_for_graph =
+            r.enable_graph_expansion && self.cfg.graph_rag.enabled;
+        if !skip_pre_mmr_no_answer_for_graph {
+            no_answer_stats.pre_mmr_filtered_count = apply_pre_mmr_no_answer_filter(
+                &mut direct_results,
+                query,
+                &query_technical_tokens,
+                search_mode,
+                &self.cfg.search.no_answer,
+                no_answer_debug,
+            );
+        }
         if no_answer_stats.pre_mmr_filtered_count > 0 {
             counter!("retrieval_no_answer_pre_mmr_filtered_total")
                 .increment(no_answer_stats.pre_mmr_filtered_count as u64);
@@ -1137,6 +1141,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     self.cfg.graph_rag.retrieval.max_seed_chunks,
                     self.cfg.graph_rag.retrieval.max_edges_visited,
                     &self.cfg.graph_rag.retrieval.allowed_relations,
+                    quality_run_id_filter.as_deref(),
                 );
                 match tokio::time::timeout(graph_timeout, graph_call).await {
                     Ok(Ok(related)) => {

@@ -20,9 +20,9 @@
     "verdict": "PASS",
     "production_pass": true,
     "not_production_pass": false,
-    "quality_run_id": "fix474f-20260708-213952",
-    "started_at": "2026-07-08T21:39:52+05:00",
-    "finished_at": "2026-07-08T21:43:40+05:00",
+    "quality_run_id": "fix474f-20260709-212825",
+    "started_at": "2026-07-09T21:28:25+05:00",
+    "finished_at": "2026-07-09T21:30:01+05:00",
     "timeout_triggered": false,
     "skipped_profiles_count": 0,
     "data_isolation_mode": "quality_run_id_namespace",
@@ -32,7 +32,7 @@
   },
   "versions": {
     "astravector_version": "UNKNOWN",
-    "git_commit": "4ab62bee908ef8e7329491b2a6d7bd5d6b069595",
+    "git_commit": "fec447226ef6d2f3dca4e614707d1e9894410413",
     "model_version": "UNKNOWN",
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "sparse_encoder_version": "technical-v2",
@@ -43,7 +43,7 @@
     "fix_version": "fix474c",
     "forbidden_total": 15,
     "fixtures_profile": "hybrid-quick",
-    "fixtures_checksum": "e23b312ef9b97347bb187e66480219f4fc619e6db9eca1eec47c1d9d4737bfe5",
+    "fixtures_checksum": "8563cef3aa2e0c7fc323d27108f3ef96b8666e9c5904551f53900353d4536669",
     "fixtures_checksum_status": "COMPUTED"
   },
   "profiles": {

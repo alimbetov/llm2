@@ -92,8 +92,9 @@ async fn test_smoke_load_retrieve_context_50_concurrent_testcontainers() {
         .get_host_port_ipv4(5432)
         .await
         .expect("PostgreSQL mapped port");
-    let database_url =
-        format!("postgres://astravector:astravector@127.0.0.1:{pg_port}/astravector");
+    let database_url = format!(
+        "postgres://astravector:astravector@127.0.0.1:{pg_port}/astravector?sslmode=disable"
+    );
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect PostgreSQL testcontainer");
@@ -124,8 +125,8 @@ async fn test_smoke_load_retrieve_context_50_concurrent_testcontainers() {
         10_000,
         10,
         2,
-        8,
-        50,
+        64,
+        1_000,
         None,
         RetryPolicyConfig::default(),
     )
@@ -275,8 +276,9 @@ async fn test_smoke_load_retrieve_context_50_concurrent_testcontainers() {
     cfg.sparse.required = false;
     cfg.graph_rag.retrieval.enabled_by_default = true;
     cfg.graph_rag.rerank.mmr_enabled = true;
-    cfg.limits.max_concurrent_qdrant_search = 16;
+    cfg.limits.max_concurrent_qdrant_search = 64;
     cfg.limits.max_concurrent_retrieve_context = 64;
+    cfg.limits.backpressure_acquire_timeout_ms = 1_000;
     let cfg = Arc::new(cfg);
     let engine = Arc::new(FixedSmokeEngine);
     let scheduler = Scheduler::start(

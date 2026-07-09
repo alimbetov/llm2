@@ -1,5 +1,7 @@
 name: ci
 on: [push, pull_request]
+env:
+  ASTRAVECTOR_IMAGE_TAG: 0.4.1-fix465-p2-production-hardening
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -13,3 +15,13 @@ jobs:
       - run: cargo check --all-targets
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo sqlx prepare --check -- --all-targets --all-features
+      - run: cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture
+  smoke-load-testcontainers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.82.0
+      - run: cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture

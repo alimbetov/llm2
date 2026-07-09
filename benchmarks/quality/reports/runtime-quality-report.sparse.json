@@ -7,16 +7,16 @@
       "RESTRICTED": 2
     },
     "postgres_distribution": {
-      "1": 19770,
-      "2": 6165,
+      "1": 22623,
+      "2": 7584,
       "3": 0,
-      "4": 1599
+      "4": 1776
     },
     "qdrant_distribution": {
-      "1": 18348,
-      "2": 5742,
+      "1": 18099,
+      "2": 6096,
       "3": 0,
-      "4": 1510
+      "4": 1405
     },
     "reason": null,
     "status": "PASS"
@@ -110,8 +110,8 @@
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 27546,
-    "sparse_embeddings_count": 25986
+    "dense_embeddings_count": 32019,
+    "sparse_embeddings_count": 30459
   },
   "failures": [],
   "forced_caller_access_level": null,
@@ -125,7 +125,7 @@
     },
     "graph_db_error_count": 0,
     "graph_duplicate_suppressed_count": 0,
-    "graph_edges_available_count": 164455,
+    "graph_edges_available_count": 190888,
     "graph_expanded_contexts_count": 0,
     "graph_expansion_used_count": 0,
     "graph_expected_related_hit_rate": 0.0,
@@ -197,7 +197,7 @@
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 1945,
+    "documents_indexed_count": 2220,
     "documents_registered_count": 23,
     "fixtures_ingested_count": 23
   },
@@ -229,8 +229,8 @@
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 27558,
-    "outbox_created_count": 27558,
+    "outbox_completed_count": 32055,
+    "outbox_created_count": 32055,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -247,10 +247,10 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 27546,
+    "points_count": 32007,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "fix474f-20260708-213952",
+  "quality_run_id": "fix474f-20260709-212825",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
@@ -271,7 +271,7 @@
   },
   "retrieval_diagnostics": {
     "likely_failure_stage": "UNKNOWN",
-    "qdrant_points_available": 27546,
+    "qdrant_points_available": 32007,
     "queries_with_empty_contexts": 6,
     "queries_with_retrieve_errors": 0
   },
@@ -286,10 +286,10 @@
     "numeric_token_count": 5,
     "qdrant_sparse_config_present": true,
     "qdrant_sparse_points_sampled": 256,
-    "qdrant_sparse_points_with_vectors": 236,
-    "qdrant_sparse_vectors_in_sample": 236,
+    "qdrant_sparse_points_with_vectors": 240,
+    "qdrant_sparse_vectors_in_sample": 240,
     "sparse_available": true,
-    "sparse_embeddings_count": 25986,
+    "sparse_embeddings_count": 30459,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "special_token_count": 39,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",
