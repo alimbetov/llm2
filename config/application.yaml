@@ -223,7 +223,7 @@ graph_rag:
     graph_merge_strategy: ${ASTRAVECTOR_GRAPH_MERGE_STRATEGY:-SCORE_THEN_TRUNCATE}
     direct_context_limit: ${ASTRAVECTOR_GRAPH_DIRECT_CONTEXT_LIMIT:-6}
     graph_context_append_limit: ${ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT:-2}
-    timeout_ms: ${ASTRAVECTOR_GRAPH_TIMEOUT_MS:-100}
+    timeout_ms: ${ASTRAVECTOR_GRAPH_TIMEOUT_MS:-500}
     allow_partial_dense_sparse_fallback: true
     allowed_relations: [CHUNK_HAS_PARENT, CHUNK_PREVIOUS_SIBLING, CHUNK_NEXT_SIBLING, CHUNK_SAME_TABLE, CHUNK_SEMANTIC_SIMILAR]
   scoring:

@@ -216,6 +216,7 @@ pub struct GraphScoringOptions {
     pub default_semantic_relation_weight: f32,
     pub graph_hop_penalty: HashMap<String, f32>,
     pub graph_min_score: f32,
+    pub structural_seed_score_floor: f32,
     pub semantic_power: f32,
 }
 
@@ -237,6 +238,7 @@ impl Default for GraphScoringOptions {
                 ("hop_3".into(), 0.50),
             ]),
             graph_min_score: 0.05,
+            structural_seed_score_floor: 0.10,
             semantic_power: 1.0,
         }
     }
@@ -878,12 +880,18 @@ pub fn score_graph_candidate_with_options(
     hop_distance: u32,
     scoring: &GraphScoringOptions,
 ) -> f32 {
-    let adjusted_edge = if relation_type == GraphRelationType::ChunkSemanticSimilar {
+    let semantic_relation = relation_type == GraphRelationType::ChunkSemanticSimilar;
+    let adjusted_edge = if semantic_relation {
         relation_score.powf(scoring.semantic_power)
     } else {
         relation_score
     };
-    seed_score
+    let effective_seed_score = if semantic_relation {
+        seed_score
+    } else {
+        seed_score.max(scoring.structural_seed_score_floor)
+    };
+    effective_seed_score
         * adjusted_edge
         * relation_weight(scoring, relation_type)
         * hop_penalty(scoring, hop_distance)
@@ -1289,6 +1297,32 @@ mod tests {
     fn graph_score_uses_boost() {
         let s = score_graph_candidate(1.0, GraphRelationType::ChunkNextSibling, 0.8);
         assert!((s - 0.6).abs() < 0.0001);
+    }
+
+    #[test]
+    fn structural_graph_score_uses_seed_floor() {
+        let scoring = GraphScoringOptions::default();
+        let s = score_graph_candidate_with_options(
+            0.01,
+            GraphRelationType::ChunkNextSibling,
+            0.92,
+            1,
+            &scoring,
+        );
+        assert!(s >= scoring.graph_min_score);
+    }
+
+    #[test]
+    fn semantic_graph_score_does_not_use_structural_seed_floor() {
+        let scoring = GraphScoringOptions::default();
+        let s = score_graph_candidate_with_options(
+            0.01,
+            GraphRelationType::ChunkSemanticSimilar,
+            0.92,
+            1,
+            &scoring,
+        );
+        assert!(s < scoring.graph_min_score);
     }
 
     #[test]

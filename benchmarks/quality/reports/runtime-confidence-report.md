@@ -1,13 +1,13 @@
 # Runtime Confidence Report
 
-- started_at: `2026-07-09T21:28:25+05:00`
-- finished_at: `2026-07-09T21:30:01+05:00`
-- quality_run_id: `fix474f-20260709-212825`
+- started_at: `2026-07-10T01:09:50+05:00`
+- finished_at: `2026-07-10T01:12:57+05:00`
+- quality_run_id: `fix474f-20260710-010950`
 - verdict: `PASS`
 - runtime_execution: `CONFIDENCE_GATE_CONFIRMED`
 - production_pass: `true`
 - astraVector version: `UNKNOWN`
-- git commit: `fec447226ef6d2f3dca4e614707d1e9894410413`
+- git commit: `402d088009d1c93e5ac490bdeeabc92ccb480bc7`
 - model version: `UNKNOWN`
 
 ## Mandatory Profiles
@@ -58,4 +58,4 @@
 
 ## Warnings
 
-- none
+- OPTIONAL_FULL_CAPABILITY_PROFILE_FAILED

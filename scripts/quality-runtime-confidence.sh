@@ -372,6 +372,18 @@ write_reports() {
         cross_zone_leakage_count: ($hybrid[0].retrieval.cross_zone_leakage_count // 0),
         access_level_violation_count: ($hybrid[0].retrieval.access_level_violation_count // 0)
       },
+      graph: {
+        available: (($graph[0].runtime_execution // "") == "MODEL_BACKED_E2E_CONFIRMED" and ($graph[0].verdict // "") == "PASS"),
+        quick_verdict: ($graph[0].verdict // "MISSING"),
+        runtime_execution: ($graph[0].runtime_execution // "MISSING"),
+        required_for_runtime_ready: false,
+        required_for_production_candidate: true,
+        graph_expansion_used_count: ($graph[0].graph.graph_expansion_used_count // 0),
+        graph_expanded_contexts_count: ($graph[0].graph.graph_expanded_contexts_count // 0),
+        graph_expected_related_hit_rate: ($graph[0].graph.graph_expected_related_hit_rate // 0),
+        graph_fp_rate: ($graph[0].graph.graph_fp_rate // null),
+        access_violation_count: ($graph[0].graph.graph_access_violation_count // 0)
+      },
       optional_profiles: {
         graph: ($graph[0]? // null),
         full_capability: ($full[0]? // null)
@@ -402,10 +414,20 @@ write_reports() {
         hybrid: (.profiles.hybrid.runtime_execution // "MISSING")
       },
       graph: {
-        available: false,
+        available: (.graph.available // false),
+        quick_verdict: (.graph.quick_verdict // "MISSING"),
+        runtime_execution: (.graph.runtime_execution // "MISSING"),
+        graph_expansion_used_count: (.graph.graph_expansion_used_count // 0),
+        graph_expanded_contexts_count: (.graph.graph_expanded_contexts_count // 0),
+        graph_expected_related_hit_rate: (.graph.graph_expected_related_hit_rate // 0),
+        graph_fp_rate: (.graph.graph_fp_rate // null),
+        access_violation_count: (.graph.access_violation_count // 0),
         required_for_runtime_ready: false,
         required_for_production_candidate: true,
-        policy: "GraphRAG remains a blocker for PRODUCTION_CANDIDATE, not for RUNTIME_READY."
+        policy: (if (.graph.available // false)
+          then "GraphRAG quick profile passed; full-capability and production-candidate gates remain required for PRODUCTION_CANDIDATE."
+          else "GraphRAG remains a blocker for PRODUCTION_CANDIDATE, not for RUNTIME_READY."
+          end)
       },
       security: {
         cross_zone_leakage_count: (.security.cross_zone_leakage_count // 0),

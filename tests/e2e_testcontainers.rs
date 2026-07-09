@@ -38,6 +38,33 @@ use uuid::Uuid;
 
 struct FixedE2eEngine;
 
+const E2E_DENSE_DIMENSION: usize = 1024;
+const E2E_DENSE_COMPONENT: f32 = 0.03125;
+
+fn e2e_seed_dense() -> Vec<f32> {
+    vec![E2E_DENSE_COMPONENT; E2E_DENSE_DIMENSION]
+}
+
+fn e2e_graph_related_dense() -> Vec<f32> {
+    (0..E2E_DENSE_DIMENSION)
+        .map(|idx| {
+            if idx % 2 == 0 {
+                E2E_DENSE_COMPONENT
+            } else {
+                -E2E_DENSE_COMPONENT
+            }
+        })
+        .collect()
+}
+
+fn e2e_dense_for_text(text: &str) -> Vec<f32> {
+    if text.contains("graph expanded production evidence") {
+        e2e_graph_related_dense()
+    } else {
+        e2e_seed_dense()
+    }
+}
+
 #[async_trait]
 impl InferenceEngine for FixedE2eEngine {
     async fn encode_batch(
@@ -46,8 +73,8 @@ impl InferenceEngine for FixedE2eEngine {
     ) -> Result<Vec<EmbeddingResult>, AstraError> {
         Ok(inputs
             .into_iter()
-            .map(|_| EmbeddingResult {
-                dense: Some(vec![0.03125; 1024]),
+            .map(|input| EmbeddingResult {
+                dense: Some(e2e_dense_for_text(&input.text)),
                 sparse_indices: Some(vec![1, 2, 3]),
                 sparse_values: Some(vec![0.9, 0.7, 0.5]),
                 token_count: 4,
@@ -524,9 +551,19 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
         trace_quality: "EXACT".to_string(),
     };
     let prepared = PreparedV004IndexEmbedding {
+        chunk: chunk.clone(),
+        embedding: EmbeddingResult {
+            dense: Some(e2e_seed_dense()),
+            sparse_indices: Some(vec![1, 2, 3]),
+            sparse_values: Some(vec![0.9, 0.7, 0.5]),
+            token_count: 4,
+            truncated: false,
+        },
+    };
+    let seed_prepared = PreparedV004IndexEmbedding {
         chunk: seed_chunk.clone(),
         embedding: EmbeddingResult {
-            dense: Some(vec![0.03125; 1024]),
+            dense: Some(e2e_seed_dense()),
             sparse_indices: Some(vec![1, 2, 3]),
             sparse_values: Some(vec![0.9, 0.7, 0.5]),
             token_count: 4,
@@ -536,7 +573,7 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
     let related_prepared = PreparedV004IndexEmbedding {
         chunk: related_chunk.clone(),
         embedding: EmbeddingResult {
-            dense: Some(vec![0.03125; 1024]),
+            dense: Some(e2e_graph_related_dense()),
             sparse_indices: Some(vec![1, 2, 3]),
             sparse_values: Some(vec![0.8, 0.6, 0.4]),
             token_count: 4,
@@ -550,7 +587,7 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
             document_id,
             document_version,
             &[chunk, seed_chunk, related_parent, related_chunk],
-            &[prepared, related_prepared],
+            &[prepared, seed_prepared, related_prepared],
             "test-tokenizer",
             "test-chunker",
             2,
@@ -587,8 +624,8 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
         )
         .await
         .expect("persist chunks, embeddings, bindings and outbox through production path");
-    assert_eq!(summary.bindings, 2);
-    assert_eq!(summary.outbox_created, 2);
+    assert_eq!(summary.bindings, 3);
+    assert_eq!(summary.outbox_created, 3);
     assert!(
         summary.graph_edges > 0,
         "graph persistence must create at least one relation edge for graph expansion; summary={summary:?}"
@@ -653,7 +690,7 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
         .fetch_one(&pool)
         .await
         .expect("check sync status");
-        if row.get::<i64, _>("cnt") >= 2 {
+        if row.get::<i64, _>("cnt") >= 3 {
             synced = true;
             break;
         }
@@ -666,7 +703,7 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
     );
 
     let hits = qdrant_client
-        .search_dense(&vec![0.03125; 1024], &[access_zone_id], 2, 5, None)
+        .search_dense(&e2e_seed_dense(), &[access_zone_id], 2, 5, None)
         .await
         .expect("qdrant dense search must work after outbox publish");
     assert!(

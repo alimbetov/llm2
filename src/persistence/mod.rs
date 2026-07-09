@@ -1686,16 +1686,29 @@ LIMIT 64
             .map(|r| r.to_uppercase())
             .collect::<Vec<_>>();
         let rows = sqlx::query(r#"
-WITH seed_node_ids AS (
-    SELECT access_zone_id, node_id, chunk_id AS seed_chunk_id
-    FROM astravector.rag_graph_nodes_chunk
-    WHERE access_zone_id = $1
-      AND chunk_id = ANY($2::uuid[])
-      AND lifecycle_status = 'ACTIVE'
-      AND quarantined = false
-      AND (expires_at IS NULL OR expires_at > now())
-), expanded AS (
-    SELECT s.access_zone_id AS seed_access_zone_id,s.seed_chunk_id,e.access_zone_id,e.source_node_id,e.target_node_id,e.relation_type,e.relation_score,e.relation_rank,e.relation_source
+WITH seed_input AS (
+    SELECT input.chunk_id, input.seed_rank
+    FROM UNNEST($2::uuid[]) WITH ORDINALITY AS input(chunk_id, seed_rank)
+), seed_node_ids AS (
+    SELECT n.access_zone_id, n.node_id, n.chunk_id AS seed_chunk_id, s.seed_rank
+    FROM astravector.rag_graph_nodes_chunk n
+    JOIN seed_input s ON s.chunk_id=n.chunk_id
+    WHERE n.access_zone_id = $1
+      AND n.lifecycle_status = 'ACTIVE'
+      AND n.quarantined = false
+      AND (n.expires_at IS NULL OR n.expires_at > now())
+), edge_candidates AS (
+    SELECT s.seed_rank,
+           s.access_zone_id AS seed_access_zone_id,
+           s.seed_chunk_id,
+           e.access_zone_id,
+           e.source_node_id,
+           e.target_node_id,
+           e.target_node_id AS related_node_id,
+           e.relation_type,
+           e.relation_score,
+           e.relation_rank,
+           e.relation_source
     FROM astravector.rag_graph_edges e
     JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id
     WHERE e.access_zone_id=$1
@@ -1704,14 +1717,38 @@ WITH seed_node_ids AS (
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
       AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
-    ORDER BY CASE WHEN e.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
-             e.relation_score DESC,
-             e.relation_rank NULLS LAST
+    UNION ALL
+    SELECT s.seed_rank,
+           s.access_zone_id AS seed_access_zone_id,
+           s.seed_chunk_id,
+           e.access_zone_id,
+           e.source_node_id,
+           e.target_node_id,
+           e.source_node_id AS related_node_id,
+           e.relation_type,
+           e.relation_score,
+           e.relation_rank,
+           e.relation_source
+    FROM astravector.rag_graph_edges e
+    JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.target_node_id
+    WHERE e.access_zone_id=$1
+      AND e.relation_type = ANY($5::text[])
+      AND e.lifecycle_status='ACTIVE'
+      AND e.quarantined=false
+      AND (e.expires_at IS NULL OR e.expires_at > now())
+      AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
+), expanded AS (
+    SELECT *
+    FROM edge_candidates
+    ORDER BY seed_rank ASC,
+             CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+             relation_score DESC,
+             relation_rank NULLS LAST
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id, n.chunk_id, expanded.seed_access_zone_id, expanded.seed_chunk_id, expanded.relation_type, expanded.relation_score, expanded.relation_rank
 FROM expanded
-JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.target_node_id
+JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.related_node_id
 JOIN astravector.content_chunks_v004 c ON c.access_zone_id=n.access_zone_id AND c.id=n.chunk_id
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -1728,7 +1765,8 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
-ORDER BY CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+ORDER BY expanded.seed_rank ASC,
+         CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
          expanded.relation_rank NULLS LAST
 LIMIT $4
@@ -1743,6 +1781,15 @@ LIMIT $4
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
+        tracing::debug!(
+            seed_keys_count = seed_chunk_ids.len(),
+            rows_count = rows.len(),
+            quality_run_id = quality_run_id.unwrap_or(""),
+            allowed_relations = ?allowed_relations,
+            max_related_chunks,
+            max_edges_visited,
+            "GRAPH_EXPANSION_SQL_ROWS"
+        );
         metrics::counter!("graph_expansion_requests_total").increment(1);
         metrics::counter!("graph_expansion_seed_chunks_total")
             .increment(seed_chunk_ids.len() as u64);
@@ -1834,10 +1881,11 @@ LIMIT $4
             .map(|r| r.to_uppercase())
             .collect::<Vec<_>>();
         let rows = sqlx::query(r#"
-WITH seed_keys(access_zone_id, chunk_id) AS (
-    SELECT * FROM UNNEST($1::uuid[], $2::uuid[])
+WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
+    SELECT input.access_zone_id, input.chunk_id, input.seed_rank
+    FROM UNNEST($1::uuid[], $2::uuid[]) WITH ORDINALITY AS input(access_zone_id, chunk_id, seed_rank)
 ), seed_node_ids AS (
-    SELECT n.access_zone_id, n.node_id, n.chunk_id AS seed_chunk_id
+    SELECT n.access_zone_id, n.node_id, n.chunk_id AS seed_chunk_id, s.seed_rank
     FROM astravector.rag_graph_nodes_chunk n
     JOIN seed_keys s
       ON s.access_zone_id = n.access_zone_id
@@ -1845,12 +1893,14 @@ WITH seed_keys(access_zone_id, chunk_id) AS (
     WHERE n.lifecycle_status = 'ACTIVE'
       AND n.quarantined = false
       AND (n.expires_at IS NULL OR n.expires_at > now())
-), expanded AS (
-    SELECT s.access_zone_id AS seed_access_zone_id,
+), edge_candidates AS (
+    SELECT s.seed_rank,
+           s.access_zone_id AS seed_access_zone_id,
            s.seed_chunk_id,
            e.access_zone_id,
            e.source_node_id,
            e.target_node_id,
+           e.target_node_id AS related_node_id,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -1862,9 +1912,32 @@ WITH seed_keys(access_zone_id, chunk_id) AS (
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
       AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
-    ORDER BY CASE WHEN e.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
-             e.relation_score DESC,
-             e.relation_rank NULLS LAST
+    UNION ALL
+    SELECT s.seed_rank,
+           s.access_zone_id AS seed_access_zone_id,
+           s.seed_chunk_id,
+           e.access_zone_id,
+           e.source_node_id,
+           e.target_node_id,
+           e.source_node_id AS related_node_id,
+           e.relation_type,
+           e.relation_score,
+           e.relation_rank,
+           e.relation_source
+    FROM astravector.rag_graph_edges e
+    JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.target_node_id
+    WHERE e.relation_type = ANY($5::text[])
+      AND e.lifecycle_status='ACTIVE'
+      AND e.quarantined=false
+      AND (e.expires_at IS NULL OR e.expires_at > now())
+      AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
+), expanded AS (
+    SELECT *
+    FROM edge_candidates
+    ORDER BY seed_rank ASC,
+             CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+             relation_score DESC,
+             relation_rank NULLS LAST
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id,
@@ -1875,7 +1948,7 @@ SELECT n.access_zone_id AS access_zone_id,
        expanded.relation_score,
        expanded.relation_rank
 FROM expanded
-JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.target_node_id
+JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.related_node_id
 JOIN astravector.content_chunks_v004 c ON c.access_zone_id=n.access_zone_id AND c.id=n.chunk_id
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -1892,7 +1965,8 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
-ORDER BY CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+ORDER BY expanded.seed_rank ASC,
+         CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
          expanded.relation_rank NULLS LAST
 LIMIT $4
@@ -1907,6 +1981,15 @@ LIMIT $4
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
+        tracing::debug!(
+            seed_keys_count = seed_keys.len(),
+            rows_count = rows.len(),
+            quality_run_id = quality_run_id.unwrap_or(""),
+            allowed_relations = ?allowed_relations,
+            max_related_chunks,
+            max_edges_visited,
+            "GRAPH_EXPANSION_SQL_ROWS"
+        );
         metrics::counter!("graph_expansion_requests_total").increment(1);
         metrics::counter!("graph_expansion_seed_chunks_total").increment(seed_keys.len() as u64);
         metrics::counter!("graph_expansion_candidates_total").increment(rows.len() as u64);

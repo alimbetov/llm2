@@ -417,6 +417,8 @@ pub struct GraphRagScoringConfig {
     pub graph_hop_penalty: HashMap<String, f32>,
     #[serde(default = "default_graph_min_score")]
     pub graph_min_score: f32,
+    #[serde(default = "default_structural_seed_score_floor")]
+    pub structural_seed_score_floor: f32,
     #[serde(default = "default_semantic_power")]
     pub semantic_power: f32,
     #[serde(default = "default_direct_score_weight")]
@@ -437,6 +439,7 @@ impl Default for GraphRagScoringConfig {
             default_semantic_relation_weight: default_semantic_relation_weight(),
             graph_hop_penalty: default_graph_hop_penalty(),
             graph_min_score: default_graph_min_score(),
+            structural_seed_score_floor: default_structural_seed_score_floor(),
             semantic_power: default_semantic_power(),
             direct_score_weight: default_direct_score_weight(),
             graph_score_weight: default_graph_score_weight(),
@@ -598,6 +601,9 @@ fn default_semantic_relation_weight() -> f32 {
 }
 fn default_graph_min_score() -> f32 {
     0.05
+}
+fn default_structural_seed_score_floor() -> f32 {
+    0.10
 }
 fn default_semantic_power() -> f32 {
     1.0
@@ -1532,6 +1538,10 @@ impl AppConfig {
         anyhow::ensure!(
             (0.0..=1.0).contains(&self.graph_rag.scoring.graph_min_score),
             "graph_rag.scoring.graph_min_score must be in range [0.0, 1.0]"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.graph_rag.scoring.structural_seed_score_floor),
+            "graph_rag.scoring.structural_seed_score_floor must be in range [0.0, 1.0]"
         );
         anyhow::ensure!(
             self.graph_rag.scoring.direct_score_weight >= 0.0,

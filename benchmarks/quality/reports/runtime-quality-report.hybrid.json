@@ -7,16 +7,16 @@
       "RESTRICTED": 2
     },
     "postgres_distribution": {
-      "1": 22713,
-      "2": 7584,
+      "1": 32307,
+      "2": 13881,
       "3": 0,
-      "4": 1776
+      "4": 2385
     },
     "qdrant_distribution": {
-      "1": 18121,
-      "2": 6077,
+      "1": 17061,
+      "2": 7319,
       "3": 0,
-      "4": 1402
+      "4": 1220
     },
     "reason": null,
     "status": "PASS"
@@ -118,8 +118,8 @@
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 32109,
-    "sparse_embeddings_count": 30549
+    "dense_embeddings_count": 48609,
+    "sparse_embeddings_count": 47049
   },
   "failures": [],
   "forced_caller_access_level": null,
@@ -133,7 +133,7 @@
     },
     "graph_db_error_count": 0,
     "graph_duplicate_suppressed_count": 0,
-    "graph_edges_available_count": 191428,
+    "graph_edges_available_count": 288201,
     "graph_expanded_contexts_count": 0,
     "graph_expansion_used_count": 0,
     "graph_expected_related_hit_rate": 0.0,
@@ -198,14 +198,14 @@
   },
   "hybrid": {
     "dense_branch_hits": 0,
-    "fused_hits": 103,
+    "fused_hits": 142,
     "fusion_strategy": "RRF",
     "hybrid_available": true,
     "sparse_branch_hits": 0
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 2226,
+    "documents_indexed_count": 3121,
     "documents_registered_count": 29,
     "fixtures_ingested_count": 29
   },
@@ -237,8 +237,8 @@
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 32145,
-    "outbox_created_count": 32145,
+    "outbox_completed_count": 48645,
+    "outbox_created_count": 48645,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -255,10 +255,10 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 32097,
+    "points_count": 48597,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "fix474f-20260709-212825",
+  "quality_run_id": "fix474f-20260710-010950",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
@@ -279,7 +279,7 @@
   },
   "retrieval_diagnostics": {
     "likely_failure_stage": "UNKNOWN",
-    "qdrant_points_available": 32097,
+    "qdrant_points_available": 48597,
     "queries_with_empty_contexts": 16,
     "queries_with_retrieve_errors": 0
   },
@@ -294,10 +294,10 @@
     "numeric_token_count": 5,
     "qdrant_sparse_config_present": true,
     "qdrant_sparse_points_sampled": 256,
-    "qdrant_sparse_points_with_vectors": 240,
-    "qdrant_sparse_vectors_in_sample": 240,
+    "qdrant_sparse_points_with_vectors": 245,
+    "qdrant_sparse_vectors_in_sample": 245,
     "sparse_available": true,
-    "sparse_embeddings_count": 30549,
+    "sparse_embeddings_count": 47049,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "special_token_count": 40,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",

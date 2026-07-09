@@ -6,8 +6,8 @@
   "production_pass_meaning": "confidence gate passed, not PRODUCTION_CANDIDATE",
   "production_candidate": false,
   "production_ready": false,
-  "generated_at": "2026-07-09T21:30:01+05:00",
-  "quality_run_id": "fix474f-20260709-212825",
+  "generated_at": "2026-07-10T01:12:57+05:00",
+  "quality_run_id": "fix474f-20260710-010950",
   "runtime_execution": "CONFIDENCE_GATE_CONFIRMED",
   "verdict": "PASS",
   "profiles": {
@@ -21,10 +21,17 @@
     "hybrid": "MODEL_BACKED_E2E_CONFIRMED"
   },
   "graph": {
-    "available": false,
+    "available": true,
+    "quick_verdict": "PASS",
+    "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+    "graph_expansion_used_count": 11,
+    "graph_expanded_contexts_count": 11,
+    "graph_expected_related_hit_rate": 1.0,
+    "graph_fp_rate": 0.0,
+    "access_violation_count": 0,
     "required_for_runtime_ready": false,
     "required_for_production_candidate": true,
-    "policy": "GraphRAG remains a blocker for PRODUCTION_CANDIDATE, not for RUNTIME_READY."
+    "policy": "GraphRAG quick profile passed; full-capability and production-candidate gates remain required for PRODUCTION_CANDIDATE."
   },
   "security": {
     "cross_zone_leakage_count": 0,
@@ -38,10 +45,12 @@
   },
   "fixtures": {
     "checksum_status": "COMPUTED",
-    "checksum": "8563cef3aa2e0c7fc323d27108f3ef96b8666e9c5904551f53900353d4536669"
+    "checksum": "58be22b2a7b174957771c04fd16d6c2f1d3261c45f0a752cd11fc477fa297bce"
   },
   "blockers": [],
-  "warnings": [],
+  "warnings": [
+    "OPTIONAL_FULL_CAPABILITY_PROFILE_FAILED"
+  ],
   "remaining_to_production_candidate": [
     "GraphRAG production-candidate proof",
     "full all-target test suite proof",
