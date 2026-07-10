@@ -9272,6 +9272,7 @@ fn is_broad_coverage_query(query: &str) -> bool {
         "checklist",
         "inspect",
         "coverage",
+        " and ",
     ]
     .iter()
     .any(|needle| query.contains(needle))
@@ -9341,7 +9342,7 @@ fn reinforce_broad_coverage_results(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
         });
-        for candidate in group.iter().take(4) {
+        for candidate in group.iter().take(6) {
             let key = result_identity_key(candidate);
             if selected.contains(&key) {
                 continue;
@@ -9934,6 +9935,16 @@ mod v007_fix1_tests {
             0.5,
         );
         assert!(is_negative_mention_evidence(&result));
+    }
+
+    #[test]
+    fn conjunction_query_enables_broad_coverage_reinforcement() {
+        assert!(is_broad_coverage_query(
+            "How does repair handle missing and orphan points?"
+        ));
+        assert!(!is_broad_coverage_query(
+            "How does repair handle missing points?"
+        ));
     }
 
     #[test]

@@ -7,16 +7,16 @@
       "RESTRICTED": 3
     },
     "postgres_distribution": {
-      "1": 46155,
-      "2": 20829,
+      "1": 47604,
+      "2": 21576,
       "3": 0,
-      "4": 3321
+      "4": 3420
     },
     "qdrant_distribution": {
-      "1": 16777,
-      "2": 7629,
+      "1": 16726,
+      "2": 7670,
       "3": 0,
-      "4": 1194
+      "4": 1204
     },
     "reason": null,
     "status": "PASS"
@@ -63,8 +63,8 @@
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 70353,
-    "sparse_embeddings_count": 68793
+    "dense_embeddings_count": 72648,
+    "sparse_embeddings_count": 71088
   },
   "failures": [
     "mmr-extra-002: missing MMR aspect `metrics`"
@@ -81,7 +81,7 @@
     },
     "graph_db_error_count": 0,
     "graph_duplicate_suppressed_count": 0,
-    "graph_edges_available_count": 416766,
+    "graph_edges_available_count": 430320,
     "graph_expanded_contexts_count": 0,
     "graph_expansion_used_count": 0,
     "graph_expected_related_hit_rate": 0.0,
@@ -178,7 +178,7 @@
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 4400,
+    "documents_indexed_count": 4532,
     "documents_registered_count": 44,
     "fixtures_ingested_count": 44
   },
@@ -210,8 +210,8 @@
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 70401,
-    "outbox_created_count": 70401,
+    "outbox_completed_count": 72696,
+    "outbox_created_count": 72696,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -228,10 +228,10 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 70341,
+    "points_count": 72636,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "fix477-mmr-20260710-233712",
+  "quality_run_id": "wave08-mmr-analysis-002",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
@@ -252,7 +252,7 @@
   },
   "retrieval_diagnostics": {
     "likely_failure_stage": "NONE",
-    "qdrant_points_available": 70341,
+    "qdrant_points_available": 72636,
     "queries_with_empty_contexts": 0,
     "queries_with_retrieve_errors": 0
   },
@@ -270,7 +270,7 @@
     "qdrant_sparse_points_with_vectors": 250,
     "qdrant_sparse_vectors_in_sample": 250,
     "sparse_available": true,
-    "sparse_embeddings_count": 68793,
+    "sparse_embeddings_count": 71088,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "special_token_count": 2,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",
