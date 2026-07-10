@@ -1,0 +1,11 @@
+{
+  "query_id": "mmr-extra-002",
+  "quality_run_id": "fix477-mmr-20260711-002718",
+  "search_mode": "HYBRID",
+  "mmr_enabled": true,
+  "mmr_lambda": 0.75,
+  "candidate_limit": 30,
+  "final_limit": 10,
+  "expected_aspects": ["missing point", "orphan point", "legal hold", "metrics"],
+  "min_expected_aspect_coverage": 0.6
+}

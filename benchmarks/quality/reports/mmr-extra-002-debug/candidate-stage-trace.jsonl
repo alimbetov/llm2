@@ -1,0 +1,6 @@
+{"query_id":"mmr-extra-002","quality_run_id":"fix477-mmr-20260711-002718","stage":"FINAL_MMR","rank":1,"source_block_id":"qdrant-003","mmr_score":0.53571427,"retrieval_sources":["VECTOR_DIRECT","LEXICAL_PARENT_BACKFILL"]}
+{"query_id":"mmr-extra-002","quality_run_id":"fix477-mmr-20260711-002718","stage":"FINAL_MMR","rank":3,"source_block_id":"tech-recon-run-002","mmr_score":0.44875774,"retrieval_sources":["VECTOR_DIRECT","LEXICAL_PARENT_BACKFILL"]}
+{"query_id":"mmr-extra-002","quality_run_id":"fix477-mmr-20260711-002718","stage":"FINAL_MMR","rank":5,"source_block_id":"tech-recon-run-001","mmr_score":0.41998446,"retrieval_sources":["VECTOR_DIRECT","LEXICAL_PARENT_BACKFILL"]}
+{"query_id":"mmr-extra-002","quality_run_id":"fix477-mmr-20260711-002718","stage":"FINAL_MMR","rank":6,"source_block_id":"tech-recon-run-004","mmr_score":0.39140478,"retrieval_sources":["LEXICAL_PARENT_BACKFILL"]}
+{"query_id":"mmr-extra-002","quality_run_id":"fix477-mmr-20260711-002718","stage":"FINAL_MMR","rank":7,"source_block_id":"tech-recon-run-005","mmr_score":0.38895378,"retrieval_sources":["LEXICAL_PARENT_BACKFILL"],"expected_aspect":"metrics"}
+{"query_id":"mmr-extra-002","quality_run_id":"fix477-mmr-20260711-002718","stage":"FINAL_MMR","rank":9,"source_block_id":"tech-recon-run-003","mmr_score":0.34424534,"retrieval_sources":["VECTOR_DIRECT","LEXICAL_PARENT_BACKFILL"]}

@@ -7611,11 +7611,7 @@ fn merge_score_then_truncate(
     }
     let merged_count = by_chunk.len();
     let mut merged = by_chunk.into_values().collect::<Vec<_>>();
-    merged.sort_by(|a, b| {
-        score_of(b)
-            .partial_cmp(&score_of(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    merged.sort_by(stable_result_rank);
     merged.truncate(final_limit);
     SearchMergeResult {
         results: merged,
@@ -7791,11 +7787,7 @@ fn dedup_results_by_chunk(
     mut results: Vec<pb::SearchResultV004>,
     max_relations: usize,
 ) -> (Vec<pb::SearchResultV004>, usize) {
-    results.sort_by(|a, b| {
-        score_of(b)
-            .partial_cmp(&score_of(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(stable_result_rank);
     let mut by_chunk: HashMap<String, pb::SearchResultV004> = HashMap::new();
     let mut dedup = 0usize;
     for result in results {
@@ -7813,11 +7805,7 @@ fn dedup_results_by_chunk(
         }
     }
     let mut out = by_chunk.into_values().collect::<Vec<_>>();
-    out.sort_by(|a, b| {
-        score_of(b)
-            .partial_cmp(&score_of(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    out.sort_by(stable_result_rank);
     (out, dedup)
 }
 
@@ -8014,11 +8002,7 @@ pub fn apply_mmr_rerank(
     let started = std::time::Instant::now();
     let requested_similarity_source = similarity_source.to_string();
     if !enabled {
-        candidates.sort_by(|a, b| {
-            score_of(b)
-                .partial_cmp(&score_of(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(stable_result_rank);
         candidates.truncate(final_limit);
         let selected_count = candidates.len();
         return SearchMmrResult {
@@ -8036,11 +8020,7 @@ pub fn apply_mmr_rerank(
     }
 
     let input_count = candidates.len();
-    candidates.sort_by(|a, b| {
-        score_of(b)
-            .partial_cmp(&score_of(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    candidates.sort_by(stable_result_rank);
     let truncate_limit = candidate_limit.max(final_limit);
     if candidates.len() > truncate_limit {
         metrics::counter!("graph_mmr_candidates_truncated_total").increment(1);
@@ -8084,7 +8064,15 @@ pub fn apply_mmr_rerank(
                 })
                 .fold(0.0_f32, f32::max);
             let mmr_score = lambda * relevance - (1.0 - lambda) * max_similarity;
-            if mmr_score > best_mmr {
+            let best_candidate = &prepared[best_idx];
+            let tie_break_wins = (mmr_score - best_mmr).abs() <= f32::EPSILON
+                && (relevance > score_of(&best_candidate.result)
+                    || ((relevance - score_of(&best_candidate.result)).abs() <= f32::EPSILON
+                        && (max_similarity < best_similarity
+                            || ((max_similarity - best_similarity).abs() <= f32::EPSILON
+                                && result_identity_key(&candidate.result)
+                                    < result_identity_key(&best_candidate.result)))));
+            if mmr_score > best_mmr || tie_break_wins {
                 best_mmr = mmr_score;
                 best_idx = idx;
                 best_similarity = max_similarity;
@@ -8467,6 +8455,16 @@ fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
 
 fn score_of(result: &pb::SearchResultV004) -> f32 {
     result.scores.as_ref().map(|s| s.final_score).unwrap_or(0.0)
+}
+
+fn stable_result_rank(
+    left: &pb::SearchResultV004,
+    right: &pb::SearchResultV004,
+) -> std::cmp::Ordering {
+    score_of(right)
+        .partial_cmp(&score_of(left))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| result_identity_key(left).cmp(&result_identity_key(right)))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -8858,6 +8856,44 @@ fn no_answer_partial_mmr_evidence_passes(
         && (matched_discriminating_terms >= 1 || exact_technical_match)
 }
 
+fn partial_multi_aspect_candidate_passes(
+    result: &pb::SearchResultV004,
+    query: &str,
+    search_mode: pb::SearchModeV005,
+    exact_technical_match: bool,
+    sparse_after_boost: f32,
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    strongly_seeded_document: bool,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    if !is_multi_aspect_query(query)
+        || !strongly_seeded_document
+        || is_root_container_result(result)
+        || is_negative_mention_evidence(result)
+        || matched_terms == 0
+        || (matched_discriminating_terms == 0 && !exact_technical_match)
+    {
+        return false;
+    }
+    let Some(scores) = result.scores.as_ref() else {
+        return false;
+    };
+    match search_mode {
+        pb::SearchModeV005::Dense => {
+            scores.dense_score >= cfg.min_dense_score || scores.final_score >= cfg.min_dense_score
+        }
+        pb::SearchModeV005::Sparse => {
+            sparse_after_boost >= cfg.min_sparse_score || scores.final_score >= cfg.min_sparse_score
+        }
+        pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
+            scores.final_score >= cfg.min_hybrid_score
+                || scores.fusion_score >= cfg.min_hybrid_score
+                || sparse_after_boost >= cfg.min_sparse_score
+        }
+    }
+}
+
 fn is_negative_mention_evidence(result: &pb::SearchResultV004) -> bool {
     let text = format!("{}\n{}", result.matched_text, result.parent_text).to_lowercase();
     [
@@ -8900,6 +8936,35 @@ fn apply_pre_mmr_no_answer_filter(
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
         apply_no_answer_exact_technical_boost(result, &matched_tokens, cfg, debug_enabled);
     }
+    let strongly_seeded_documents = results
+        .iter()
+        .filter_map(|result| {
+            let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+            let exact_technical_match = !matched_tokens.is_empty();
+            let sparse_after_boost = result
+                .scores
+                .as_ref()
+                .map(|scores| scores.sparse_score)
+                .unwrap_or(0.0);
+            let matched_terms = matched_term_count(result, query);
+            let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+            let leading_discriminating_match =
+                leading_discriminating_query_term_matches(result, query);
+            (!is_negative_mention_evidence(result)
+                && no_answer_candidate_passes(
+                    result,
+                    search_mode,
+                    exact_technical_match,
+                    sparse_after_boost,
+                    matched_terms,
+                    matched_discriminating_terms,
+                    leading_discriminating_match,
+                    query_terms,
+                    cfg,
+                ))
+            .then(|| no_answer_document_key(result))
+        })
+        .collect::<HashSet<_>>();
     results.retain(|result| {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
         let exact_technical_match = !matched_tokens.is_empty();
@@ -8928,7 +8993,7 @@ fn apply_pre_mmr_no_answer_filter(
             return true;
         }
         preserve_partial_evidence_for_mmr
-            && no_answer_partial_mmr_evidence_passes(
+            && (no_answer_partial_mmr_evidence_passes(
                 result,
                 search_mode,
                 exact_technical_match,
@@ -8936,7 +9001,17 @@ fn apply_pre_mmr_no_answer_filter(
                 matched_terms,
                 matched_discriminating_terms,
                 cfg,
-            )
+            ) || partial_multi_aspect_candidate_passes(
+                result,
+                query,
+                search_mode,
+                exact_technical_match,
+                sparse_after_boost,
+                matched_terms,
+                matched_discriminating_terms,
+                strongly_seeded_documents.contains(&no_answer_document_key(result)),
+                cfg,
+            ))
     });
     before.saturating_sub(results.len())
 }
@@ -9272,10 +9347,27 @@ fn is_broad_coverage_query(query: &str) -> bool {
         "checklist",
         "inspect",
         "coverage",
-        " and ",
     ]
     .iter()
     .any(|needle| query.contains(needle))
+}
+
+fn is_multi_aspect_query(query: &str) -> bool {
+    let normalized = query.to_lowercase();
+    let clauses = normalized
+        .split([',', ';'])
+        .flat_map(|segment| segment.split(" and "))
+        .flat_map(|segment| segment.split(" or "))
+        .filter(|segment| {
+            ordered_lexical_terms(segment)
+                .into_iter()
+                .any(|term| !is_common_retrieval_overlap_term(&term))
+        })
+        .count();
+    clauses >= 2
+        || ["aspect", "aspects", "checklist", "coverage"]
+            .iter()
+            .any(|needle| normalized.contains(needle))
 }
 
 fn reinforce_broad_coverage_results(
@@ -9938,13 +10030,74 @@ mod v007_fix1_tests {
     }
 
     #[test]
-    fn conjunction_query_enables_broad_coverage_reinforcement() {
-        assert!(is_broad_coverage_query(
+    fn multi_aspect_query_requires_multiple_meaningful_clauses() {
+        assert!(is_multi_aspect_query(
             "How does repair handle missing and orphan points?"
         ));
-        assert!(!is_broad_coverage_query(
+        assert!(!is_multi_aspect_query(
             "How does repair handle missing points?"
         ));
+        assert!(!is_broad_coverage_query(
+            "How does repair handle missing and orphan points?"
+        ));
+    }
+
+    #[test]
+    fn multi_aspect_mmr_admission_preserves_strong_document_sibling() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How does repair handle missing and orphan points?";
+        let mut seed = test_result(
+            "repair",
+            "Repair handles orphan points and missing point recovery.",
+            0.8,
+        );
+        seed.citation.as_mut().unwrap().metadata.insert(
+            "fixture_document_id".into(),
+            "reconciliation-runbook".into(),
+        );
+        let mut metrics = test_result(
+            "metrics",
+            "Reconciliation repair metrics report scanned and repaired counts.",
+            0.5,
+        );
+        metrics.citation.as_mut().unwrap().metadata.insert(
+            "fixture_document_id".into(),
+            "reconciliation-runbook".into(),
+        );
+        let mut negative = test_result(
+            "negative",
+            "This repair note is separate from orphan point reconciliation metrics.",
+            0.9,
+        );
+        negative.citation.as_mut().unwrap().metadata.insert(
+            "fixture_document_id".into(),
+            "reconciliation-runbook".into(),
+        );
+
+        let mut candidates = vec![seed, metrics, negative];
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.matched_chunk_id == "repair"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.matched_chunk_id == "metrics"));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.matched_chunk_id == "negative"));
     }
 
     #[test]
@@ -10031,6 +10184,49 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .contains_key("mmr_score"));
+    }
+
+    #[test]
+    fn mmr_tie_breaking_is_deterministic_across_candidate_order() {
+        let baseline = vec![
+            test_result("d", "delta reconciliation", 0.8),
+            test_result("b", "beta reconciliation", 0.8),
+            test_result("a", "alpha reconciliation", 0.8),
+            test_result("c", "gamma reconciliation", 0.8),
+        ];
+        let expected = apply_mmr_rerank(
+            baseline.clone(),
+            3,
+            true,
+            0.75,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+        )
+        .results
+        .into_iter()
+        .map(|result| result.matched_chunk_id)
+        .collect::<Vec<_>>();
+
+        for offset in 0..50 {
+            let mut shuffled = baseline.clone();
+            let len = shuffled.len();
+            shuffled.rotate_left(offset % len);
+            let actual = apply_mmr_rerank(
+                shuffled,
+                3,
+                true,
+                0.75,
+                30,
+                "TOKEN_JACCARD",
+                "TOKEN_JACCARD",
+            )
+            .results
+            .into_iter()
+            .map(|result| result.matched_chunk_id)
+            .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "candidate rotation {offset}");
+        }
     }
 
     #[test]

@@ -7,16 +7,16 @@
       "RESTRICTED": 3
     },
     "postgres_distribution": {
-      "1": 47604,
-      "2": 21576,
+      "1": 48570,
+      "2": 22074,
       "3": 0,
-      "4": 3420
+      "4": 3486
     },
     "qdrant_distribution": {
-      "1": 16726,
-      "2": 7670,
+      "1": 16713,
+      "2": 7684,
       "3": 0,
-      "4": 1204
+      "4": 1203
     },
     "reason": null,
     "status": "PASS"
@@ -24,9 +24,9 @@
   "by_category": {
     "mmr_diversity": {
       "blocked": 0,
-      "failed": 1,
-      "passed": 9,
-      "recall_at_5": 0.9,
+      "failed": 0,
+      "passed": 10,
+      "recall_at_5": 1.0,
       "skipped": 0,
       "total": 10
     }
@@ -34,15 +34,14 @@
   "by_mode": {
     "mmr": {
       "blocked": 0,
-      "failed": 1,
-      "passed": 9,
-      "recall_at_5": 0.9,
+      "failed": 0,
+      "passed": 10,
+      "recall_at_5": 1.0,
       "skipped": 0,
       "total": 10
     }
   },
   "by_reason": {
-    "MMR_ASPECT_COVERAGE_LOW": 1,
     "PRE_MMR_WEAK_CANDIDATE_FILTERED": 10
   },
   "capabilities": {
@@ -63,12 +62,10 @@
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 72648,
-    "sparse_embeddings_count": 71088
+    "dense_embeddings_count": 74178,
+    "sparse_embeddings_count": 72618
   },
-  "failures": [
-    "mmr-extra-002: missing MMR aspect `metrics`"
-  ],
+  "failures": [],
   "forced_caller_access_level": null,
   "graph": {
     "aliased_relation_edges_count": 0,
@@ -81,7 +78,7 @@
     },
     "graph_db_error_count": 0,
     "graph_duplicate_suppressed_count": 0,
-    "graph_edges_available_count": 430320,
+    "graph_edges_available_count": 439356,
     "graph_expanded_contexts_count": 0,
     "graph_expansion_used_count": 0,
     "graph_expected_related_hit_rate": 0.0,
@@ -178,7 +175,7 @@
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 4532,
+    "documents_indexed_count": 4620,
     "documents_registered_count": 44,
     "fixtures_ingested_count": 44
   },
@@ -210,8 +207,8 @@
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 72696,
-    "outbox_created_count": 72696,
+    "outbox_completed_count": 74226,
+    "outbox_created_count": 74226,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -228,35 +225,35 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 72636,
+    "points_count": 74166,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "wave08-mmr-analysis-002",
+  "quality_run_id": "fix477-mmr-20260711-002718",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
     "cross_zone_leakage_count": 0,
-    "expected_block_hit_rate": 0.9,
-    "expected_document_hit_rate": 0.9,
+    "expected_block_hit_rate": 1.0,
+    "expected_document_hit_rate": 1.0,
     "graph_expected_related_hit_rate": 0.0,
     "hard_negative_false_positive_rate": 0.0,
     "mmr_expected_aspect_coverage": 0.0,
     "mrr": 0.0,
     "queries_blocked": 0,
-    "queries_failed": 1,
-    "queries_passed": 9,
+    "queries_failed": 0,
+    "queries_passed": 10,
     "queries_skipped": 0,
     "queries_total": 10,
-    "recall_at_5": 0.9,
+    "recall_at_5": 1.0,
     "retrieve_context_p95_ms": 0
   },
   "retrieval_diagnostics": {
     "likely_failure_stage": "NONE",
-    "qdrant_points_available": 72636,
+    "qdrant_points_available": 74166,
     "queries_with_empty_contexts": 0,
     "queries_with_retrieve_errors": 0
   },
-  "runtime_execution": "MODEL_BACKED_E2E_FAILED",
+  "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
   "runtime_mode": "ingest-and-retrieve",
   "schema_version": "1.0",
   "skipped_reason": null,
@@ -267,14 +264,14 @@
     "numeric_token_count": 0,
     "qdrant_sparse_config_present": true,
     "qdrant_sparse_points_sampled": 256,
-    "qdrant_sparse_points_with_vectors": 250,
-    "qdrant_sparse_vectors_in_sample": 250,
+    "qdrant_sparse_points_with_vectors": 251,
+    "qdrant_sparse_vectors_in_sample": 251,
     "sparse_available": true,
-    "sparse_embeddings_count": 71088,
+    "sparse_embeddings_count": 72618,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "special_token_count": 2,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",
     "technical_token_count": 2
   },
-  "verdict": "FAIL"
+  "verdict": "PASS"
 }
