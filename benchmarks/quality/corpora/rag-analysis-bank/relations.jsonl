@@ -1,0 +1,2 @@
+{"schema_version":"1.0","relation_id":"rag-bank-rel-001","corpus":"rag-analysis-bank","from_document_id":"rag-bank-incident-001","from_block_id":"incident-symptoms-001","to_document_id":"rag-bank-incident-001","to_block_id":"incident-cause-001","relation_type":"EXPLAINS","weight":0.96}
+{"schema_version":"1.0","relation_id":"rag-bank-rel-002","corpus":"rag-analysis-bank","from_document_id":"rag-bank-incident-001","from_block_id":"incident-cause-
