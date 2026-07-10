@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use astravector_runtime::graph::GraphRelationType;
 use astravector_runtime::pb;
 use astravector_runtime::pb::astra_vector_ingestion_facade_client::AstraVectorIngestionFacadeClient;
 use astravector_runtime::pb::astra_vector_retrieval_facade_client::AstraVectorRetrievalFacadeClient;
@@ -159,6 +160,10 @@ struct GraphRuntimeStats {
     graph_timeout_count: u64,
     graph_db_error_count: u64,
     forbidden_graph_blocks_returned: u64,
+    relations_persisted_by_type: BTreeMap<String, u64>,
+    relations_queryable_by_type: BTreeMap<String, u64>,
+    unsupported_relation_types: Vec<String>,
+    aliased_relation_edges_count: u64,
 }
 
 #[derive(Default)]
@@ -790,6 +795,39 @@ async fn collect_storage_stats(stats: &mut RuntimeStats) {
         stats.graph.relations_persisted_count = stats.graph.relations_ingested_count;
         stats.graph.relations_queryable_count = sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=e.access_zone_id AND n.node_id=e.target_node_id WHERE e.relation_source='QUALITY_FIXTURE' AND e.properties->>'quality_run_id'=$1 AND e.lifecycle_status='ACTIVE' AND n.lifecycle_status='ACTIVE'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0) as u64;
+        for row in sqlx::query(
+            "SELECT relation_type, count(*) AS count FROM astravector.rag_graph_edges WHERE relation_source='QUALITY_FIXTURE' AND properties->>'quality_run_id'=$1 GROUP BY relation_type",
+        )
+        .bind(&run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        {
+            stats.graph.relations_persisted_by_type.insert(
+                row.get::<String, _>("relation_type"),
+                row.get::<i64, _>("count") as u64,
+            );
+        }
+        for row in sqlx::query(
+            "SELECT e.relation_type, count(*) AS count FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=e.access_zone_id AND n.node_id=e.target_node_id WHERE e.relation_source='QUALITY_FIXTURE' AND e.properties->>'quality_run_id'=$1 AND e.lifecycle_status='ACTIVE' AND n.lifecycle_status='ACTIVE' GROUP BY e.relation_type",
+        )
+        .bind(&run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        {
+            stats.graph.relations_queryable_by_type.insert(
+                row.get::<String, _>("relation_type"),
+                row.get::<i64, _>("count") as u64,
+            );
+        }
+        stats.graph.aliased_relation_edges_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM astravector.rag_graph_edges WHERE relation_source='QUALITY_FIXTURE' AND properties->>'quality_run_id'=$1 AND relation_type='CHUNK_NEXT_SIBLING' AND properties ? 'fixture_relation_type'",
         )
         .bind(&run_id)
         .fetch_one(&pool)
@@ -2226,6 +2264,10 @@ fn write_report(
             "relations_ingested_count": stats.graph.relations_ingested_count,
             "relations_persisted_count": stats.graph.relations_persisted_count,
             "relations_queryable_count": stats.graph.relations_queryable_count,
+            "relations_persisted_by_type": stats.graph.relations_persisted_by_type,
+            "relations_queryable_by_type": stats.graph.relations_queryable_by_type,
+            "unsupported_relation_types": stats.graph.unsupported_relation_types,
+            "aliased_relation_edges_count": stats.graph.aliased_relation_edges_count,
             "graph_edges_available_count": stats.graph.graph_edges_available_count,
             "graph_expanded_contexts_count": stats.graph.graph_expanded_contexts_count,
             "graph_expected_related_total": stats.graph.graph_expected_related_total,
@@ -2266,7 +2308,7 @@ fn write_report(
             },
             "graph_latency": {
                 "lookup_count": stats.retrieve_context_queries_total,
-                "timeout_ms": 50,
+                "timeout_ms": env_u32("ASTRAVECTOR_GRAPH_TIMEOUT_MS", 500),
                 "p50_ms": Value::Null,
                 "p95_ms": Value::Null,
                 "p99_ms": Value::Null,
@@ -2573,6 +2615,21 @@ async fn quality_bench_runtime_quick() {
     let queries = load_queries(&profile);
     stats.graph.relations_loaded_count = relations.len() as u64;
     let mut failures = Vec::new();
+    let mut unsupported_relation_types = relations
+        .iter()
+        .filter_map(|relation| relation.get("relation_type").and_then(Value::as_str))
+        .filter(|relation_type| relation_type.parse::<GraphRelationType>().is_err())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    unsupported_relation_types.sort();
+    unsupported_relation_types.dedup();
+    stats.graph.unsupported_relation_types = unsupported_relation_types;
+    if !stats.graph.unsupported_relation_types.is_empty() {
+        failures.push(format!(
+            "GRAPH_RELATION_TYPE_REJECTED:{}",
+            stats.graph.unsupported_relation_types.join(",")
+        ));
+    }
     failures.extend(ingest_documents(&endpoint, &documents, &relations, &mut stats).await);
     collect_storage_stats(&mut stats).await;
 

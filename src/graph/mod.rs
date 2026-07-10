@@ -6,6 +6,7 @@ use rustc_hash::FxHashSet;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -33,6 +34,8 @@ pub enum GraphRagError {
     Database(#[from] sqlx::Error),
     #[error("failed to build dedicated rayon pool: {message}")]
     ParallelPoolBuild { message: String },
+    #[error("unsupported graph relation type: {relation_type}")]
+    UnsupportedRelationType { relation_type: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,7 +67,25 @@ pub enum GraphRelationType {
     ChunkNextSibling,
     ChunkSameTable,
     ChunkSemanticSimilar,
+    Explains,
+    RelatedTo,
+    RepairedBy,
+    ObservedBy,
+    ConstrainedBy,
+    Produces,
+    Constrains,
+    ProtectedBy,
+    Requires,
+    PublishesTo,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphRelationClass {
+    Structural,
+    SemanticSimilarity,
+    SemanticDomain,
+}
+
 impl GraphRelationType {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -77,16 +98,93 @@ impl GraphRelationType {
             Self::ChunkNextSibling => "CHUNK_NEXT_SIBLING",
             Self::ChunkSameTable => "CHUNK_SAME_TABLE",
             Self::ChunkSemanticSimilar => "CHUNK_SEMANTIC_SIMILAR",
+            Self::Explains => "EXPLAINS",
+            Self::RelatedTo => "RELATED_TO",
+            Self::RepairedBy => "REPAIRED_BY",
+            Self::ObservedBy => "OBSERVED_BY",
+            Self::ConstrainedBy => "CONSTRAINED_BY",
+            Self::Produces => "PRODUCES",
+            Self::Constrains => "CONSTRAINS",
+            Self::ProtectedBy => "PROTECTED_BY",
+            Self::Requires => "REQUIRES",
+            Self::PublishesTo => "PUBLISHES_TO",
         }
     }
+
+    pub fn relation_class(self) -> GraphRelationClass {
+        match self {
+            Self::ChunkSemanticSimilar => GraphRelationClass::SemanticSimilarity,
+            Self::Explains
+            | Self::RelatedTo
+            | Self::RepairedBy
+            | Self::ObservedBy
+            | Self::ConstrainedBy
+            | Self::Produces
+            | Self::Constrains
+            | Self::ProtectedBy
+            | Self::Requires
+            | Self::PublishesTo => GraphRelationClass::SemanticDomain,
+            _ => GraphRelationClass::Structural,
+        }
+    }
+
+    pub fn is_structural(self) -> bool {
+        self.relation_class() == GraphRelationClass::Structural
+    }
+
+    pub fn is_domain_semantic(self) -> bool {
+        self.relation_class() == GraphRelationClass::SemanticDomain
+    }
+
     pub fn boost(self) -> f32 {
         match self {
             Self::ChunkHasParent => 0.90,
             Self::ChunkPreviousSibling | Self::ChunkNextSibling => 0.75,
             Self::ChunkSameTable => 0.60,
             Self::ChunkSemanticSimilar => 0.60,
+            Self::Explains
+            | Self::RelatedTo
+            | Self::RepairedBy
+            | Self::ObservedBy
+            | Self::ConstrainedBy
+            | Self::Produces
+            | Self::Constrains
+            | Self::ProtectedBy
+            | Self::Requires
+            | Self::PublishesTo => 0.70,
             Self::BlockProducedChunk | Self::ChunkProducedByBlock => 0.70,
             _ => 0.50,
+        }
+    }
+}
+
+impl FromStr for GraphRelationType {
+    type Err = GraphRagError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "DOCUMENT_CONTAINS_BLOCK" => Ok(Self::DocumentContainsBlock),
+            "BLOCK_CONTAINS_BLOCK" => Ok(Self::BlockContainsBlock),
+            "BLOCK_PRODUCED_CHUNK" => Ok(Self::BlockProducedChunk),
+            "CHUNK_PRODUCED_BY_BLOCK" => Ok(Self::ChunkProducedByBlock),
+            "CHUNK_HAS_PARENT" => Ok(Self::ChunkHasParent),
+            "CHUNK_PREVIOUS_SIBLING" => Ok(Self::ChunkPreviousSibling),
+            "CHUNK_NEXT_SIBLING" => Ok(Self::ChunkNextSibling),
+            "CHUNK_SAME_TABLE" => Ok(Self::ChunkSameTable),
+            "CHUNK_SEMANTIC_SIMILAR" => Ok(Self::ChunkSemanticSimilar),
+            "EXPLAINS" => Ok(Self::Explains),
+            "RELATED_TO" => Ok(Self::RelatedTo),
+            "REPAIRED_BY" => Ok(Self::RepairedBy),
+            "OBSERVED_BY" => Ok(Self::ObservedBy),
+            "CONSTRAINED_BY" => Ok(Self::ConstrainedBy),
+            "PRODUCES" => Ok(Self::Produces),
+            "CONSTRAINS" => Ok(Self::Constrains),
+            "PROTECTED_BY" => Ok(Self::ProtectedBy),
+            "REQUIRES" => Ok(Self::Requires),
+            "PUBLISHES_TO" => Ok(Self::PublishesTo),
+            other => Err(GraphRagError::UnsupportedRelationType {
+                relation_type: other.to_string(),
+            }),
         }
     }
 }
@@ -857,7 +955,7 @@ pub fn relation_weight(scoring: &GraphScoringOptions, relation_type: GraphRelati
         .get(relation_type.as_str())
         .copied()
         .unwrap_or_else(|| {
-            if relation_type == GraphRelationType::ChunkSemanticSimilar {
+            if !relation_type.is_structural() {
                 scoring.default_semantic_relation_weight
             } else {
                 scoring.default_structural_relation_weight
@@ -880,7 +978,7 @@ pub fn score_graph_candidate_with_options(
     hop_distance: u32,
     scoring: &GraphScoringOptions,
 ) -> f32 {
-    let semantic_relation = relation_type == GraphRelationType::ChunkSemanticSimilar;
+    let semantic_relation = !relation_type.is_structural();
     let adjusted_edge = if semantic_relation {
         relation_score.powf(scoring.semantic_power)
     } else {
@@ -1323,6 +1421,52 @@ mod tests {
             &scoring,
         );
         assert!(s < scoring.graph_min_score);
+    }
+
+    #[test]
+    fn domain_relation_types_round_trip_and_use_semantic_scoring() {
+        for raw in [
+            "EXPLAINS",
+            "RELATED_TO",
+            "REPAIRED_BY",
+            "OBSERVED_BY",
+            "CONSTRAINED_BY",
+            "PRODUCES",
+            "CONSTRAINS",
+            "PROTECTED_BY",
+            "REQUIRES",
+            "PUBLISHES_TO",
+        ] {
+            let relation = raw.parse::<GraphRelationType>().unwrap();
+            assert_eq!(relation.as_str(), raw);
+            assert_eq!(
+                relation.relation_class(),
+                GraphRelationClass::SemanticDomain
+            );
+            assert!(relation.is_domain_semantic());
+            assert!(!relation.is_structural());
+        }
+
+        let scoring = GraphScoringOptions::default();
+        let score = score_graph_candidate_with_options(
+            0.01,
+            GraphRelationType::RepairedBy,
+            0.92,
+            1,
+            &scoring,
+        );
+        assert!(score < scoring.graph_min_score);
+    }
+
+    #[test]
+    fn unsupported_relation_types_fail_closed() {
+        for raw in ["", "UNKNOWN", "REPAIR_BY", "RELATED-TO", "related to"] {
+            assert!(raw.parse::<GraphRelationType>().is_err(), "{raw}");
+        }
+        assert_eq!(
+            "related_to".parse::<GraphRelationType>().unwrap(),
+            GraphRelationType::RelatedTo
+        );
     }
 
     #[test]

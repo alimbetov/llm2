@@ -1528,6 +1528,36 @@ RETURNING payload_version,qdrant_sync_status"#)
             let Some(relation_id) = relation.get("relation_id").and_then(|v| v.as_str()) else {
                 continue;
             };
+            let raw_relation_type = relation
+                .get("relation_type")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    AstraError::InvalidArgument(format!(
+                        "quality fixture relation {relation_id} is missing relation_type"
+                    ))
+                })?;
+            let relation_type =
+                raw_relation_type
+                    .parse::<GraphRelationType>()
+                    .map_err(|error| {
+                        metrics::counter!(
+                            "graph_relation_type_rejected_total",
+                            "relation_type" => raw_relation_type.to_string()
+                        )
+                        .increment(1);
+                        AstraError::InvalidArgument(format!(
+                            "quality fixture relation {relation_id}: {error}"
+                        ))
+                    })?;
+            let quality_run_id = relation
+                .get("quality_run_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AstraError::InvalidArgument(format!(
+                        "quality fixture relation {relation_id} is missing quality_run_id"
+                    ))
+                })?;
             let Some(from_document_id) = relation
                 .get("from_document_uuid")
                 .and_then(|v| v.as_str())
@@ -1568,6 +1598,7 @@ JOIN astravector.content_chunks_v004 s_chunk
  AND s_chunk.lifecycle_status='ACTIVE'
  AND s_chunk.deleted_at IS NULL
  AND s_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+ AND COALESCE(s_chunk.metadata->>'quality_run_id','')=$6
 JOIN astravector.rag_graph_nodes_chunk s_nodes
   ON s_nodes.access_zone_id=s_map.access_zone_id
  AND s_nodes.chunk_id=s_map.chunk_id
@@ -1583,6 +1614,7 @@ JOIN astravector.content_chunks_v004 t_chunk
  AND t_chunk.lifecycle_status='ACTIVE'
  AND t_chunk.deleted_at IS NULL
  AND t_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+ AND COALESCE(t_chunk.metadata->>'quality_run_id','')=$6
 JOIN astravector.rag_graph_nodes_chunk t_nodes
   ON t_nodes.access_zone_id=t_map.access_zone_id
  AND t_nodes.chunk_id=t_map.chunk_id
@@ -1601,6 +1633,7 @@ LIMIT 64
             .bind(from_block_id)
             .bind(to_document_id)
             .bind(to_block_id)
+            .bind(quality_run_id)
             .fetch_all(&mut **tx)
             .await
             .map_err(db)?;
@@ -1616,7 +1649,8 @@ LIMIT 64
                 let edge_id = Uuid::new_v5(
                     &Uuid::NAMESPACE_URL,
                     format!(
-                        "astravector-quality-fixture-relation:{access_zone_id}:{relation_id}:{source_chunk_id}:{target_chunk_id}"
+                        "astravector-quality-fixture-relation:{access_zone_id}:{relation_id}:{source_chunk_id}:{target_chunk_id}:{}",
+                        relation_type.as_str()
                     )
                     .as_bytes(),
                 );
@@ -1627,7 +1661,7 @@ LIMIT 64
                     source_node_id,
                     target_node_type: crate::graph::GraphNodeType::Chunk,
                     target_node_id,
-                    relation_type: GraphRelationType::ChunkNextSibling,
+                    relation_type,
                     relation_score: weight,
                     relation_source: "QUALITY_FIXTURE".into(),
                     relation_rank: Some(rank as i32 + 1),
@@ -1638,14 +1672,14 @@ LIMIT 64
                     quarantined: false,
                     properties: serde_json::json!({
                         "relation_id": relation_id,
-                        "fixture_relation_type": relation.get("relation_type").and_then(|v| v.as_str()).unwrap_or("RELATED_TO"),
+                        "fixture_relation_type": relation_type.as_str(),
                         "from_document_id": relation.get("from_document_id").and_then(|v| v.as_str()).unwrap_or_default(),
                         "from_block_id": from_block_id,
                         "to_document_id": relation.get("to_document_id").and_then(|v| v.as_str()).unwrap_or_default(),
                         "to_block_id": to_block_id,
                         "source_chunk_id": source_chunk_id,
                         "target_chunk_id": target_chunk_id,
-                        "quality_run_id": relation.get("quality_run_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "quality_run_id": quality_run_id,
                         "quality_runtime_bench": relation.get("quality_runtime_bench").and_then(|v| v.as_str()).unwrap_or("fix475")
                     }),
                 });
@@ -1799,13 +1833,18 @@ LIMIT $4
             .record(started.elapsed().as_millis() as f64);
         let mut out = Vec::new();
         for row in rows {
-            let relation = match row.get::<String, _>("relation_type").as_str() {
-                "CHUNK_HAS_PARENT" => GraphRelationType::ChunkHasParent,
-                "CHUNK_PREVIOUS_SIBLING" => GraphRelationType::ChunkPreviousSibling,
-                "CHUNK_NEXT_SIBLING" => GraphRelationType::ChunkNextSibling,
-                "CHUNK_SAME_TABLE" => GraphRelationType::ChunkSameTable,
-                "CHUNK_SEMANTIC_SIMILAR" => GraphRelationType::ChunkSemanticSimilar,
-                _ => continue,
+            let raw_relation_type: String = row.get("relation_type");
+            let relation = match raw_relation_type.parse::<GraphRelationType>() {
+                Ok(relation) => relation,
+                Err(error) => {
+                    tracing::warn!(relation_type = %raw_relation_type, %error, "GRAPH_RELATION_TYPE_REJECTED");
+                    metrics::counter!(
+                        "graph_relation_type_rejected_total",
+                        "relation_type" => raw_relation_type
+                    )
+                    .increment(1);
+                    continue;
+                }
             };
             out.push(RelatedChunk {
                 access_zone_id: row.get("access_zone_id"),
@@ -1998,13 +2037,18 @@ LIMIT $4
             .record(started.elapsed().as_millis() as f64);
         let mut out = Vec::new();
         for row in rows {
-            let relation = match row.get::<String, _>("relation_type").as_str() {
-                "CHUNK_HAS_PARENT" => GraphRelationType::ChunkHasParent,
-                "CHUNK_PREVIOUS_SIBLING" => GraphRelationType::ChunkPreviousSibling,
-                "CHUNK_NEXT_SIBLING" => GraphRelationType::ChunkNextSibling,
-                "CHUNK_SAME_TABLE" => GraphRelationType::ChunkSameTable,
-                "CHUNK_SEMANTIC_SIMILAR" => GraphRelationType::ChunkSemanticSimilar,
-                _ => continue,
+            let raw_relation_type: String = row.get("relation_type");
+            let relation = match raw_relation_type.parse::<GraphRelationType>() {
+                Ok(relation) => relation,
+                Err(error) => {
+                    tracing::warn!(relation_type = %raw_relation_type, %error, "GRAPH_RELATION_TYPE_REJECTED");
+                    metrics::counter!(
+                        "graph_relation_type_rejected_total",
+                        "relation_type" => raw_relation_type
+                    )
+                    .increment(1);
+                    continue;
+                }
             };
             out.push(RelatedChunk {
                 access_zone_id: row.get("access_zone_id"),

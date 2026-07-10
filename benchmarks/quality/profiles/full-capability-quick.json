@@ -39,7 +39,7 @@
     "forbidden_block_leakage_count": 0,
     "hard_negative_false_positive_rate": 0.1,
     "duplicate_rate_after_mmr": 0.35,
-    "graph_expected_related_hit_rate": 0.6,
+    "graph_expected_related_hit_rate": 1.0,
     "mmr_expected_aspect_coverage": 0.6,
     "p95_retrieve_context_ms": 5000,
     "outbox_dead_letter_count": 0,

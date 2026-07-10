@@ -1,3 +1,4 @@
+use crate::graph::GraphRelationType;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -675,6 +676,16 @@ fn default_relation_weights() -> HashMap<String, f32> {
         ("CHUNK_NEXT_SIBLING".into(), 0.90),
         ("CHUNK_SAME_TABLE".into(), 0.85),
         ("CHUNK_SEMANTIC_SIMILAR".into(), 0.60),
+        ("EXPLAINS".into(), 0.75),
+        ("RELATED_TO".into(), 0.65),
+        ("REPAIRED_BY".into(), 0.80),
+        ("OBSERVED_BY".into(), 0.70),
+        ("CONSTRAINED_BY".into(), 0.75),
+        ("PRODUCES".into(), 0.75),
+        ("CONSTRAINS".into(), 0.75),
+        ("PROTECTED_BY".into(), 0.75),
+        ("REQUIRES".into(), 0.75),
+        ("PUBLISHES_TO".into(), 0.75),
     ])
 }
 fn default_graph_hop_penalty() -> HashMap<String, f32> {
@@ -1509,6 +1520,35 @@ impl AppConfig {
             self.graph_rag.retrieval.timeout_ms > 0,
             "graph_rag.retrieval.timeout_ms must be positive"
         );
+        let mut allowed_graph_relations = std::collections::HashSet::new();
+        for relation in &self.graph_rag.retrieval.allowed_relations {
+            let canonical = relation.trim().to_ascii_uppercase();
+            anyhow::ensure!(
+                !canonical.is_empty(),
+                "Invalid GraphRAG configuration: allowed relation type must not be empty"
+            );
+            canonical.parse::<GraphRelationType>().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid GraphRAG configuration: unsupported allowed relation type `{canonical}`"
+                )
+            })?;
+            anyhow::ensure!(
+                allowed_graph_relations.insert(canonical.clone()),
+                "Invalid GraphRAG configuration: duplicate allowed relation type `{canonical}`"
+            );
+        }
+        for (relation, weight) in &self.graph_rag.scoring.relation_weights {
+            let canonical = relation.trim().to_ascii_uppercase();
+            canonical.parse::<GraphRelationType>().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid GraphRAG configuration: unsupported relation weight key `{canonical}`"
+                )
+            })?;
+            anyhow::ensure!(
+                weight.is_finite() && *weight > 0.0 && *weight <= 1.0,
+                "Invalid GraphRAG configuration: relation weight `{canonical}` must be finite and in (0, 1]"
+            );
+        }
         anyhow::ensure!(
             self.graph_rag.retrieval.final_context_limit > 0,
             "graph_rag.retrieval.final_context_limit must be positive"

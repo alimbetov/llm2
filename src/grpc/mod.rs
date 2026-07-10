@@ -1373,9 +1373,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             let relation_weight =
                                 crate::graph::relation_weight(&scoring, rel.relation_type);
                             let hop_penalty = crate::graph::hop_penalty(&scoring, rel.hop_distance);
-                            let adjusted_edge_weight = if rel.relation_type
-                                == crate::graph::GraphRelationType::ChunkSemanticSimilar
-                            {
+                            let adjusted_edge_weight = if !rel.relation_type.is_structural() {
                                 rel.relation_score.powf(scoring.semantic_power)
                             } else {
                                 rel.relation_score
@@ -1445,9 +1443,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 );
                                 citation.metadata.insert(
                                     "graph_semantic_power".into(),
-                                    if rel.relation_type
-                                        == crate::graph::GraphRelationType::ChunkSemanticSimilar
-                                    {
+                                    if !rel.relation_type.is_structural() {
                                         scoring.semantic_power.to_string()
                                     } else {
                                         String::new()
