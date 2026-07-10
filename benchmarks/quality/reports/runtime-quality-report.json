@@ -7,21 +7,93 @@
       "RESTRICTED": 3
     },
     "postgres_distribution": {
-      "1": 48570,
-      "2": 22074,
+      "1": 53511,
+      "2": 24528,
       "3": 0,
-      "4": 3486
+      "4": 3822
     },
     "qdrant_distribution": {
-      "1": 16713,
-      "2": 7684,
+      "1": 16724,
+      "2": 7676,
       "3": 0,
-      "4": 1203
+      "4": 1200
     },
     "reason": null,
     "status": "PASS"
   },
   "by_category": {
+    "access_isolation": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 15,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 15
+    },
+    "dense_access": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 1,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 1
+    },
+    "dense_semantic": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 4,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 4
+    },
+    "distractor": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 5,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 5
+    },
+    "exact_lookup": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 12,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 12
+    },
+    "graph_rag": {
+      "blocked": 0,
+      "failed": 1,
+      "passed": 13,
+      "recall_at_5": 0.9285714285714286,
+      "skipped": 0,
+      "total": 14
+    },
+    "hard_negative": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 19,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 19
+    },
+    "hybrid": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 2,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 2
+    },
+    "lexical_sparse": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 12,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 12
+    },
     "mmr_diversity": {
       "blocked": 0,
       "failed": 0,
@@ -29,9 +101,41 @@
       "recall_at_5": 1.0,
       "skipped": 0,
       "total": 10
+    },
+    "paraphrase": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 3,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 3
     }
   },
   "by_mode": {
+    "dense": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 5,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 5
+    },
+    "graph": {
+      "blocked": 0,
+      "failed": 1,
+      "passed": 13,
+      "recall_at_5": 0.9285714285714286,
+      "skipped": 0,
+      "total": 14
+    },
+    "hybrid": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 56,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 56
+    },
     "mmr": {
       "blocked": 0,
       "failed": 0,
@@ -39,10 +143,23 @@
       "recall_at_5": 1.0,
       "skipped": 0,
       "total": 10
+    },
+    "sparse": {
+      "blocked": 0,
+      "failed": 0,
+      "passed": 12,
+      "recall_at_5": 1.0,
+      "skipped": 0,
+      "total": 12
     }
   },
   "by_reason": {
-    "PRE_MMR_WEAK_CANDIDATE_FILTERED": 10
+    "FINAL_CONTEXT_SET_TOO_WEAK": 14,
+    "GRAPH_EXPECTED_RELATED_BLOCK_MISSING": 1,
+    "MISSING_EXPECTED_BLOCK": 1,
+    "MISSING_EXPECTED_DOCUMENT": 1,
+    "POST_MMR_NO_ANSWER_TRIGGERED": 14,
+    "PRE_MMR_WEAK_CANDIDATE_FILTERED": 81
   },
   "capabilities": {
     "dense_available": true,
@@ -55,17 +172,21 @@
   },
   "capability_requirements": {
     "require_dense": true,
-    "require_graph": false,
+    "require_graph": true,
     "require_hybrid": true,
     "require_mmr": true,
     "require_sparse": true
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 74178,
-    "sparse_embeddings_count": 72618
+    "dense_embeddings_count": 81909,
+    "sparse_embeddings_count": 80349
   },
-  "failures": [],
+  "failures": [
+    "graph-extra-006: missing document `tech-ttl-cleanup-001`",
+    "graph-extra-006: missing block `tech-ttl-clean-002`",
+    "graph-extra-006: graph related block missing `tech-recon-run-004`"
+  ],
   "forced_caller_access_level": null,
   "graph": {
     "aliased_relation_edges_count": 0,
@@ -74,26 +195,26 @@
       "cycle_detected": false,
       "duplicate_suppressed_count": 0,
       "max_hop_depth": 1,
-      "visited_count": 0
+      "visited_count": 48
     },
     "graph_db_error_count": 0,
     "graph_duplicate_suppressed_count": 0,
-    "graph_edges_available_count": 439356,
-    "graph_expanded_contexts_count": 0,
-    "graph_expansion_used_count": 0,
-    "graph_expected_related_hit_rate": 0.0,
-    "graph_expected_related_hits": 0,
-    "graph_expected_related_total": 0,
+    "graph_edges_available_count": 485028,
+    "graph_expanded_contexts_count": 48,
+    "graph_expansion_used_count": 48,
+    "graph_expected_related_hit_rate": 0.9230769230769231,
+    "graph_expected_related_hits": 12,
+    "graph_expected_related_total": 13,
     "graph_false_positive": {
       "ci_95_upper": null,
       "ci_method": "diagnostic_small_sample",
       "false_positive_expanded": 0,
-      "graph_fp_rate": null,
-      "sample_size_warning": true,
-      "total_expanded": 0,
-      "true_positive_expanded": 0
+      "graph_fp_rate": 0.0,
+      "sample_size_warning": false,
+      "total_expanded": 48,
+      "true_positive_expanded": 48
     },
-    "graph_fp_rate": null,
+    "graph_fp_rate": 0.0,
     "graph_impact": {
       "mean_delta_mrr": null,
       "mean_delta_ndcg": null,
@@ -101,7 +222,7 @@
       "mrr_without_graph_mean": null,
       "ndcg_with_graph_mean": null,
       "ndcg_without_graph_mean": null,
-      "queries_tested": 0,
+      "queries_tested": 13,
       "regressions_count": 0,
       "statistical_test": {
         "method": "diagnostic_small_sample",
@@ -111,7 +232,7 @@
       }
     },
     "graph_latency": {
-      "lookup_count": 10,
+      "lookup_count": 97,
       "p50_ms": null,
       "p95_ms": null,
       "p99_ms": null,
@@ -122,7 +243,7 @@
     "graph_statistical_tests": {
       "false_positive": {
         "ci_95_upper": null,
-        "false_positive_rate": null,
+        "false_positive_rate": 0.0,
         "method": "diagnostic_small_sample"
       },
       "minimum_sample_size_for_inference": 30,
@@ -132,7 +253,7 @@
         "old_sparse_profile_pass": true,
         "regressions_count": 0
       },
-      "sample_size": 0,
+      "sample_size": 13,
       "sample_size_warning": true
     },
     "graph_timeout_count": 0,
@@ -168,14 +289,14 @@
   },
   "hybrid": {
     "dense_branch_hits": 0,
-    "fused_hits": 0,
+    "fused_hits": 192,
     "fusion_strategy": "RRF",
     "hybrid_available": true,
     "sparse_branch_hits": 0
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 4620,
+    "documents_indexed_count": 5079,
     "documents_registered_count": 44,
     "fixtures_ingested_count": 44
   },
@@ -201,14 +322,14 @@
     "min_hybrid_score": 0.3,
     "min_sparse_score": 0.1,
     "non_zero_max_false_positive_contexts_warnings": 0,
-    "post_mmr_no_answer_triggered_count": 0,
-    "pre_mmr_filtered_candidate_count": 10,
+    "post_mmr_no_answer_triggered_count": 14,
+    "pre_mmr_filtered_candidate_count": 81,
     "sparse_only_min_matched_terms": 2,
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 74226,
-    "outbox_created_count": 74226,
+    "outbox_completed_count": 81957,
+    "outbox_created_count": 81957,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -225,53 +346,53 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 74166,
+    "points_count": 81897,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "fix477-mmr-20260711-002718",
+  "quality_run_id": "wave10-full-retry-005",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
     "cross_zone_leakage_count": 0,
-    "expected_block_hit_rate": 1.0,
-    "expected_document_hit_rate": 1.0,
-    "graph_expected_related_hit_rate": 0.0,
+    "expected_block_hit_rate": 0.9896907216494846,
+    "expected_document_hit_rate": 0.9896907216494846,
+    "graph_expected_related_hit_rate": 0.9230769230769231,
     "hard_negative_false_positive_rate": 0.0,
     "mmr_expected_aspect_coverage": 0.0,
     "mrr": 0.0,
     "queries_blocked": 0,
-    "queries_failed": 0,
-    "queries_passed": 10,
+    "queries_failed": 1,
+    "queries_passed": 96,
     "queries_skipped": 0,
-    "queries_total": 10,
-    "recall_at_5": 1.0,
+    "queries_total": 97,
+    "recall_at_5": 0.9896907216494846,
     "retrieve_context_p95_ms": 0
   },
   "retrieval_diagnostics": {
-    "likely_failure_stage": "NONE",
-    "qdrant_points_available": 74166,
-    "queries_with_empty_contexts": 0,
+    "likely_failure_stage": "UNKNOWN",
+    "qdrant_points_available": 81897,
+    "queries_with_empty_contexts": 20,
     "queries_with_retrieve_errors": 0
   },
-  "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+  "runtime_execution": "MODEL_BACKED_E2E_FAILED",
   "runtime_mode": "ingest-and-retrieve",
   "schema_version": "1.0",
   "skipped_reason": null,
   "sparse": {
-    "alphanumeric_token_count": 0,
+    "alphanumeric_token_count": 5,
     "document_query_encoder_consistency_checked": true,
     "encoder_version": "technical-v2",
-    "numeric_token_count": 0,
+    "numeric_token_count": 5,
     "qdrant_sparse_config_present": true,
     "qdrant_sparse_points_sampled": 256,
-    "qdrant_sparse_points_with_vectors": 251,
-    "qdrant_sparse_vectors_in_sample": 251,
+    "qdrant_sparse_points_with_vectors": 252,
+    "qdrant_sparse_vectors_in_sample": 252,
     "sparse_available": true,
-    "sparse_embeddings_count": 72618,
+    "sparse_embeddings_count": 80349,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
-    "special_token_count": 2,
+    "special_token_count": 44,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",
-    "technical_token_count": 2
+    "technical_token_count": 54
   },
-  "verdict": "PASS"
+  "verdict": "FAIL"
 }

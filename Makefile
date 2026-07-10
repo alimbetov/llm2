@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate verify-fix463 verify-fix465 verify-fix467 verify-fix468 quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote verify-fix463 verify-fix465 verify-fix467 verify-fix468 quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -117,8 +117,10 @@ quality-runtime-graph-quick-remote:
 	ASTRAVECTOR_QUALITY_REQUIRE_DENSE=true \
 	ASTRAVECTOR_QUALITY_REQUIRE_GRAPH=true \
 	ASTRAVECTOR_GRAPH_MAX_RELATED_CHUNKS=8 \
+	ASTRAVECTOR_GRAPH_MAX_SEED_CHUNKS=16 \
 	ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT=5 \
 	ASTRAVECTOR_GRAPH_EXPANSION_RESULT_LIMIT=12 \
+	ASTRAVECTOR_GRAPH_MERGE_STRATEGY=GRAPH_AS_CONTEXT_APPEND \
 	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true \
 	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_SEARCH=false \
 	ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
@@ -178,10 +180,17 @@ quality-runtime-full-capability-quick-remote:
 	ASTRAVECTOR_QUALITY_REQUIRE_GRAPH=true \
 	ASTRAVECTOR_QUALITY_REQUIRE_MMR=true \
 	ASTRAVECTOR_GRAPH_MAX_RELATED_CHUNKS=8 \
+	ASTRAVECTOR_GRAPH_MAX_SEED_CHUNKS=16 \
+	ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT=5 \
+	ASTRAVECTOR_GRAPH_EXPANSION_RESULT_LIMIT=12 \
+	ASTRAVECTOR_GRAPH_MERGE_STRATEGY=GRAPH_AS_CONTEXT_APPEND \
 	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true \
 	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_SEARCH=false \
 	ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
 	cargo test --test quality_bench_runtime_quick -- --nocapture
+
+quality-system-smoke-remote:
+	./scripts/quality-system-smoke.sh $${SYSTEM_SMOKE_ARGS:---external-runtime}
 
 quality-runtime-confidence:
 	./scripts/quality-runtime-confidence.sh

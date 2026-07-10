@@ -594,13 +594,14 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
             Some(1),
             json!({
                 "test": true,
+                "quality_run_id": "fix476-e2e",
                 "quality_fixture_relations_json": serde_json::to_string(&json!([{
                     "relation_id": "e2e-graph-block-1-to-block-2",
                     "from_document_uuid": document_id.to_string(),
                     "to_document_uuid": document_id.to_string(),
                     "from_block_id": "block-1",
                     "to_block_id": "block-2",
-                    "relation_type": "E2E_RELATED_EVIDENCE",
+                    "relation_type": "RELATED_TO",
                     "weight": 1.0,
                     "quality_run_id": "fix476-e2e",
                     "quality_runtime_bench": "mega-validation"
@@ -655,6 +656,7 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
                 "CHUNK_NEXT_SIBLING".to_string(),
                 "CHUNK_SAME_TABLE".to_string(),
                 "CHUNK_SEMANTIC_SIMILAR".to_string(),
+                "RELATED_TO".to_string(),
             ],
             None,
         )

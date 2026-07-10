@@ -7742,6 +7742,28 @@ pub fn select_results_with_strategy_aware_mmr(
             mmr_allow_graph_candidates,
             max_graph_relations_debug_per_candidate,
         ),
+        "GRAPH_AS_CONTEXT_APPEND" if graph_results.is_empty() => {
+            let merge = merge_score_then_truncate(
+                direct_results,
+                graph_results,
+                mmr_candidate_limit.max(final_limit),
+            );
+            let mmr = apply_mmr_rerank(
+                merge.results,
+                final_limit,
+                mmr_enabled && mmr_allow_direct_candidates,
+                mmr_lambda_direct,
+                mmr_candidate_limit,
+                similarity_source,
+                fallback_similarity_source,
+            );
+            SearchSelectionResult {
+                results: mmr.results.clone(),
+                merged_count: merge.merged_count,
+                deduplicated_count: merge.deduplicated_count,
+                mmr,
+            }
+        }
         "GRAPH_AS_CONTEXT_APPEND" => select_graph_append_with_group_mmr(
             direct_results,
             graph_results,
