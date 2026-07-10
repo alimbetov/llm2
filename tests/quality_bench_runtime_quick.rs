@@ -1404,6 +1404,14 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_u32(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 fn capability_requirements_from_env() -> CapabilityRequirements {
     CapabilityRequirements {
         require_dense: env_bool("ASTRAVECTOR_QUALITY_REQUIRE_DENSE"),
@@ -1528,7 +1536,14 @@ fn evaluate_query(
     let joined = response
         .contexts
         .iter()
-        .map(|c| format!("{}\n{}", c.matched_text, c.parent_text))
+        .map(|c| {
+            let heading = c.metadata.get("heading").cloned().unwrap_or_default();
+            let section_path = c.metadata.get("section_path").cloned().unwrap_or_default();
+            format!(
+                "{}\n{}\n{}\n{}",
+                c.matched_text, c.parent_text, heading, section_path
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .to_lowercase();
@@ -1922,7 +1937,7 @@ async fn retrieve_queries(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             graph_max_hops: 1,
-            graph_max_related_contexts: 5,
+            graph_max_related_contexts: env_u32("ASTRAVECTOR_GRAPH_MAX_RELATED_CHUNKS", 5),
         });
         api_key_metadata(&mut req);
         let before = Instant::now();

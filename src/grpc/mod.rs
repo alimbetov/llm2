@@ -1009,6 +1009,15 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 )
                 .await
                 .map_err(Status::from)?;
+            let parents_by_document = lexical_candidates.iter().fold(
+                HashMap::<(Uuid, Uuid), Vec<&ParentContextRecord>>::new(),
+                |mut acc, parent| {
+                    acc.entry((parent.access_zone_id, parent.document_id))
+                        .or_default()
+                        .push(parent);
+                    acc
+                },
+            );
             let mut direct_result_index_by_key = direct_results
                 .iter()
                 .enumerate()
@@ -1016,7 +1025,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 .collect::<HashMap<_, _>>();
             let query_terms = query_term_count(query);
             let mut lexical_results = Vec::new();
-            for parent in lexical_candidates {
+            let mut sibling_seed_scores = HashMap::<(Uuid, Uuid), f32>::new();
+            if self.cfg.graph_rag.rerank.mmr_enabled {
+                for result in &direct_results {
+                    let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
+                        continue;
+                    };
+                    let Ok(document_id) = Uuid::parse_str(&result.document_id) else {
+                        continue;
+                    };
+                    sibling_seed_scores
+                        .entry((access_zone_id, document_id))
+                        .and_modify(|existing| *existing = existing.max(score_of(result)))
+                        .or_insert_with(|| score_of(result));
+                }
+            }
+            for parent in &lexical_candidates {
                 let lexical = search_result_from_lexical_parent(&parent, query);
                 let score = lexical
                     .scores
@@ -1031,14 +1055,23 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     leading_discriminating_query_term_matches(&lexical, query);
                 let strong_coverage =
                     query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
-                if !exact_phrase_match
-                    && (matched_terms < 2
-                        || matched_discriminating_terms < 1
-                        || !leading_discriminating_match
-                        || !strong_coverage)
-                {
+                let strict_lexical_evidence = exact_phrase_match
+                    || (matched_terms >= 2
+                        && matched_discriminating_terms >= 1
+                        && leading_discriminating_match
+                        && strong_coverage);
+                let document_overview_seed = self.cfg.graph_rag.rerank.mmr_enabled
+                    && parent.source_block_id.as_deref() == Some("doc-root")
+                    && matched_terms >= 2
+                    && matched_discriminating_terms >= 1;
+                if !(strict_lexical_evidence || document_overview_seed) {
                     continue;
                 }
+                let document_key = (parent.access_zone_id, parent.document_id);
+                sibling_seed_scores
+                    .entry(document_key)
+                    .and_modify(|existing| *existing = existing.max(score))
+                    .or_insert(score);
                 lexical_results.push((
                     lexical,
                     score,
@@ -1046,6 +1079,38 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     matched_terms,
                     leading_discriminating_match,
                 ));
+            }
+            if self.cfg.graph_rag.rerank.mmr_enabled {
+                for (document_key, seed_score) in sibling_seed_scores {
+                    let Some(parents) = parents_by_document.get(&document_key) else {
+                        continue;
+                    };
+                    for parent in parents {
+                        if parent.source_block_id.as_deref() == Some("doc-root") {
+                            continue;
+                        }
+                        let mut lexical = search_result_from_lexical_parent(parent, query);
+                        let sibling_score =
+                            (seed_score * 0.8 + sibling_sequence_bonus(parent)).clamp(0.12, 1.0);
+                        if let Some(scores) = lexical.scores.as_mut() {
+                            scores.sparse_score = scores.sparse_score.max(sibling_score);
+                            scores.fusion_score = scores.fusion_score.max(sibling_score);
+                            scores.final_score = scores.final_score.max(sibling_score);
+                        }
+                        let matched_terms = matched_term_count(&lexical, query);
+                        let matched_discriminating_terms =
+                            matched_discriminating_term_count(&lexical, query);
+                        let leading_discriminating_match =
+                            leading_discriminating_query_term_matches(&lexical, query);
+                        lexical_results.push((
+                            lexical,
+                            sibling_score,
+                            matched_discriminating_terms,
+                            matched_terms,
+                            leading_discriminating_match,
+                        ));
+                    }
+                }
             }
             lexical_results.sort_by(
                 |(_, left_score, left_discriminating, left_terms, left_leading),
@@ -1079,6 +1144,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             direct_contexts_count = direct_results.len(),
             "SEARCH_PARENT_FETCH_DONE"
         );
+        drop_root_container_results_when_document_has_evidence(&mut direct_results);
         let mut no_answer_stats = NoAnswerFilterStats::default();
         let no_answer_debug = no_answer_debug_enabled(r.include_debug, &self.cfg.search.no_answer);
         let query_technical_tokens = if self.cfg.search.no_answer.enabled {
@@ -1086,6 +1152,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
+        let preserve_partial_evidence_for_mmr = self.cfg.graph_rag.rerank.mmr_enabled;
         let skip_pre_mmr_no_answer_for_graph =
             r.enable_graph_expansion && self.cfg.graph_rag.enabled;
         if !skip_pre_mmr_no_answer_for_graph {
@@ -1096,6 +1163,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 search_mode,
                 &self.cfg.search.no_answer,
                 no_answer_debug,
+                preserve_partial_evidence_for_mmr,
             );
         }
         if no_answer_stats.pre_mmr_filtered_count > 0 {
@@ -1509,6 +1577,18 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             });
             MmrEmbeddingFetchStats::skipped()
         };
+        let broad_coverage_candidates =
+            if self.cfg.graph_rag.rerank.mmr_enabled && is_broad_coverage_query(query) {
+                Some(
+                    direct_results
+                        .iter()
+                        .chain(graph_results.iter())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
         let selection_result = select_results_with_strategy_aware_mmr(
             direct_results,
             graph_results,
@@ -1533,6 +1613,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let merge_duration_ms = merge_started.elapsed().as_millis() as u64;
         let mmr_result = selection_result.mmr.clone();
         let mut results = selection_result.results;
+        if let Some(candidates) = broad_coverage_candidates.as_deref() {
+            reinforce_broad_coverage_results(&mut results, candidates, final_limit);
+        }
         let final_graph_evidence_present =
             r.enable_graph_expansion && has_graph_expanded_evidence(&results);
         if !final_graph_evidence_present
@@ -8154,8 +8237,7 @@ fn dot_slices(a: &[f32], b: &[f32]) -> Option<f32> {
 }
 
 fn tokenize_result_text(result: &pb::SearchResultV004) -> HashSet<String> {
-    let text = format!("{} {}", result.matched_text, result.parent_text);
-    tokenize_text(&text)
+    tokenize_text(&candidate_text_for_no_answer(result))
 }
 
 fn tokenize_text(text: &str) -> HashSet<String> {
@@ -8438,11 +8520,22 @@ fn no_answer_debug_enabled(include_debug: bool, cfg: &NoAnswerConfig) -> bool {
 
 fn candidate_text_for_no_answer(result: &pb::SearchResultV004) -> String {
     let matched = result.matched_text.trim();
-    if !matched.is_empty() {
-        matched.to_lowercase()
+    let body = if !matched.is_empty() {
+        matched
     } else {
-        result.parent_text.to_lowercase()
+        result.parent_text.as_str()
+    };
+    let mut parts = vec![body.to_string()];
+    if let Some(citation) = result.citation.as_ref() {
+        for key in ["document_title", "title", "heading", "section_path"] {
+            if let Some(value) = citation.metadata.get(key) {
+                if !value.trim().is_empty() {
+                    parts.push(value.clone());
+                }
+            }
+        }
     }
+    parts.join("\n").to_lowercase()
 }
 
 fn matched_technical_tokens(
@@ -8570,7 +8663,14 @@ fn is_lexical_stopword(term: &str) -> bool {
             | "did"
             | "do"
             | "does"
+            | "answer"
+            | "behavior"
+            | "behaviour"
+            | "cover"
+            | "covers"
             | "during"
+            | "explain"
+            | "explains"
             | "for"
             | "from"
             | "happen"
@@ -8580,10 +8680,15 @@ fn is_lexical_stopword(term: &str) -> bool {
             | "in"
             | "is"
             | "it"
+            | "main"
+            | "mechanism"
+            | "mechanisms"
             | "must"
             | "of"
             | "on"
             | "or"
+            | "rule"
+            | "rules"
             | "should"
             | "the"
             | "to"
@@ -8719,11 +8824,42 @@ fn no_answer_candidate_passes(
                 || scores.fusion_score >= cfg.min_hybrid_score)
                 && matched_terms >= 2
                 && matched_discriminating_terms >= 1
-                && leading_discriminating_match)
+                && leading_discriminating_match
+                && strong_query_coverage)
                 || strong_hybrid_lexical_allow
                 || (exact_hybrid_allow && matched_discriminating_terms >= 2)
         }
     }
+}
+
+fn no_answer_partial_mmr_evidence_passes(
+    result: &pb::SearchResultV004,
+    search_mode: pb::SearchModeV005,
+    exact_technical_match: bool,
+    sparse_after_boost: f32,
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    let Some(scores) = result.scores.as_ref() else {
+        return false;
+    };
+    let enough_score = match search_mode {
+        pb::SearchModeV005::Dense => {
+            scores.dense_score >= cfg.min_dense_score || scores.final_score >= cfg.min_dense_score
+        }
+        pb::SearchModeV005::Sparse => {
+            sparse_after_boost >= cfg.min_sparse_score || scores.final_score >= cfg.min_sparse_score
+        }
+        pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
+            scores.final_score >= cfg.min_hybrid_score
+                || scores.fusion_score >= cfg.min_hybrid_score
+                || sparse_after_boost >= cfg.min_sparse_score
+        }
+    };
+    enough_score
+        && matched_terms >= 1
+        && (matched_discriminating_terms >= 1 || exact_technical_match)
 }
 
 fn is_negative_mention_evidence(result: &pb::SearchResultV004) -> bool {
@@ -8756,6 +8892,7 @@ fn apply_pre_mmr_no_answer_filter(
     search_mode: pb::SearchModeV005,
     cfg: &NoAnswerConfig,
     debug_enabled: bool,
+    preserve_partial_evidence_for_mmr: bool,
 ) -> usize {
     if !cfg.enabled || results.is_empty() {
         return 0;
@@ -8780,7 +8917,7 @@ fn apply_pre_mmr_no_answer_filter(
         if is_negative_mention_evidence(result) {
             return false;
         }
-        no_answer_candidate_passes(
+        if no_answer_candidate_passes(
             result,
             search_mode,
             exact_technical_match,
@@ -8790,9 +8927,195 @@ fn apply_pre_mmr_no_answer_filter(
             leading_discriminating_match,
             query_terms,
             cfg,
-        )
+        ) {
+            return true;
+        }
+        preserve_partial_evidence_for_mmr
+            && no_answer_partial_mmr_evidence_passes(
+                result,
+                search_mode,
+                exact_technical_match,
+                sparse_after_boost,
+                matched_terms,
+                matched_discriminating_terms,
+                cfg,
+            )
     });
     before.saturating_sub(results.len())
+}
+
+fn aggregate_no_answer_candidate_passes(
+    results: &[pb::SearchResultV004],
+    query: &str,
+    query_technical_tokens: &[String],
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    let positive_results = results
+        .iter()
+        .filter(|result| !is_negative_mention_evidence(result))
+        .collect::<Vec<_>>();
+    if positive_results.is_empty() {
+        return false;
+    }
+    let mut by_document: HashMap<String, Vec<&pb::SearchResultV004>> = HashMap::new();
+    for result in positive_results {
+        by_document
+            .entry(no_answer_document_key(result))
+            .or_default()
+            .push(result);
+    }
+    by_document.values().any(|group| {
+        aggregate_no_answer_group_passes(group, query, query_technical_tokens, search_mode, cfg)
+    })
+}
+
+fn no_answer_document_key(result: &pb::SearchResultV004) -> String {
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| {
+            [
+                "fixture_document_id",
+                "original_document_id",
+                "external_document_id",
+            ]
+            .into_iter()
+            .find_map(|key| citation.metadata.get(key).cloned())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| result.document_id.clone())
+}
+
+fn aggregate_no_answer_group_passes(
+    results: &[&pb::SearchResultV004],
+    query: &str,
+    query_technical_tokens: &[String],
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    if results.is_empty() {
+        return false;
+    }
+    let query_terms = query_term_count(query);
+    if query_terms == 0 {
+        return false;
+    }
+    let combined_text = results
+        .iter()
+        .map(|result| candidate_text_for_no_answer(result))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let candidate_terms = lexical_terms(&combined_text);
+    let ordered_query_terms = ordered_lexical_terms(query);
+    let matched_terms = ordered_query_terms
+        .iter()
+        .filter(|term| candidate_terms.contains(*term))
+        .count();
+    let matched_discriminating_terms = ordered_query_terms
+        .iter()
+        .filter(|term| !is_common_retrieval_overlap_term(term))
+        .filter(|term| candidate_terms.contains(*term))
+        .count();
+    let leading_discriminating_match = ordered_query_terms
+        .iter()
+        .find(|term| !is_common_retrieval_overlap_term(term))
+        .map(|term| candidate_terms.contains(term))
+        .unwrap_or(true);
+    let exact_technical_match = query_technical_tokens
+        .iter()
+        .any(|token| combined_text.contains(&token.to_lowercase()));
+    let sparse_after_boost = results
+        .iter()
+        .filter_map(|result| result.scores.as_ref().map(|scores| scores.sparse_score))
+        .fold(0.0_f32, f32::max);
+    let broad_mmr_evidence_passes = is_broad_coverage_query(query)
+        && no_answer_broad_mmr_evidence_passes(
+            results,
+            search_mode,
+            matched_terms,
+            matched_discriminating_terms,
+            cfg,
+        );
+    let mut aggregate = results
+        .iter()
+        .max_by(|left, right| {
+            score_of(left)
+                .partial_cmp(&score_of(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|result| (*result).clone())
+        .unwrap_or_default();
+    aggregate.parent_text = combined_text.clone();
+    aggregate.matched_text = combined_text;
+    if let Some(scores) = aggregate.scores.as_mut() {
+        for result in results {
+            if let Some(candidate_scores) = result.scores.as_ref() {
+                scores.dense_score = scores.dense_score.max(candidate_scores.dense_score);
+                scores.sparse_score = scores.sparse_score.max(candidate_scores.sparse_score);
+                scores.fusion_score = scores.fusion_score.max(candidate_scores.fusion_score);
+                scores.final_score = scores.final_score.max(candidate_scores.final_score);
+            }
+        }
+    }
+    no_answer_candidate_passes(
+        &aggregate,
+        search_mode,
+        exact_technical_match,
+        sparse_after_boost,
+        matched_terms,
+        matched_discriminating_terms,
+        leading_discriminating_match,
+        query_terms,
+        cfg,
+    ) || broad_mmr_evidence_passes
+}
+
+fn no_answer_broad_mmr_evidence_passes(
+    results: &[&pb::SearchResultV004],
+    search_mode: pb::SearchModeV005,
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    let mut non_root_blocks = HashSet::new();
+    let mut has_mmr_metadata = false;
+    let mut enough_score = false;
+    for result in results {
+        if !is_root_container_result(result) {
+            non_root_blocks.insert(result_identity_key(result));
+        }
+        if result
+            .citation
+            .as_ref()
+            .and_then(|citation| citation.metadata.get("rerank_stage"))
+            .map(|stage| stage == "MMR")
+            .unwrap_or(false)
+        {
+            has_mmr_metadata = true;
+        }
+        if let Some(scores) = result.scores.as_ref() {
+            enough_score |= match search_mode {
+                pb::SearchModeV005::Dense => {
+                    scores.dense_score >= cfg.min_dense_score
+                        || scores.fusion_score >= cfg.min_dense_score
+                }
+                pb::SearchModeV005::Sparse => {
+                    scores.sparse_score >= cfg.min_sparse_score
+                        || scores.fusion_score >= cfg.min_sparse_score
+                }
+                pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
+                    scores.fusion_score >= cfg.min_hybrid_score
+                        || scores.sparse_score >= cfg.min_sparse_score
+                }
+            };
+        }
+    }
+    has_mmr_metadata
+        && enough_score
+        && non_root_blocks.len() >= 3
+        && matched_terms >= 1
+        && matched_discriminating_terms >= 1
 }
 
 fn final_no_answer_should_trigger(
@@ -8805,7 +9128,7 @@ fn final_no_answer_should_trigger(
     if !cfg.enabled || results.is_empty() {
         return false;
     }
-    !results.iter().any(|result| {
+    let any_candidate_passes = results.iter().any(|result| {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
         let exact_technical_match = !matched_tokens.is_empty();
         let sparse_after_boost = result
@@ -8831,11 +9154,54 @@ fn final_no_answer_should_trigger(
             query_terms,
             cfg,
         )
-    })
+    });
+    !(any_candidate_passes
+        || aggregate_no_answer_candidate_passes(
+            results,
+            query,
+            query_technical_tokens,
+            search_mode,
+            cfg,
+        ))
 }
 
 fn result_identity_key(result: &pb::SearchResultV004) -> String {
+    if let Some(source_block_id) = result_source_block_id(result) {
+        return format!(
+            "{}:{}:{}",
+            result.access_zone_id, result.document_id, source_block_id
+        );
+    }
     format!("{}:{}", result.access_zone_id, result.matched_chunk_id)
+}
+
+fn result_source_block_id(result: &pb::SearchResultV004) -> Option<&str> {
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("source_block_id"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn is_root_container_result(result: &pb::SearchResultV004) -> bool {
+    result_source_block_id(result) == Some("doc-root")
+}
+
+fn drop_root_container_results_when_document_has_evidence(
+    results: &mut Vec<pb::SearchResultV004>,
+) -> usize {
+    let documents_with_non_root_evidence = results
+        .iter()
+        .filter(|result| !is_root_container_result(result))
+        .map(no_answer_document_key)
+        .collect::<HashSet<_>>();
+    let before = results.len();
+    results.retain(|result| {
+        !is_root_container_result(result)
+            || !documents_with_non_root_evidence.contains(&no_answer_document_key(result))
+    });
+    before.saturating_sub(results.len())
 }
 
 fn search_quality_run_id_filter(filters: &[pb::SearchFilterV004]) -> Option<String> {
@@ -8847,10 +9213,11 @@ fn search_quality_run_id_filter(filters: &[pb::SearchFilterV004]) -> Option<Stri
 }
 
 fn lexical_parent_score(parent: &ParentContextRecord, query: &str) -> f32 {
-    if exact_evidence_phrase_match(&parent.content, query) {
+    let evidence_text = parent_lexical_evidence_text(parent);
+    if exact_evidence_phrase_match(&evidence_text, query) {
         return 1.0;
     }
-    let candidate_terms = lexical_terms(&parent.content);
+    let candidate_terms = lexical_terms(&evidence_text);
     let query_terms = lexical_terms(query);
     if query_terms.is_empty() {
         return 0.0;
@@ -8860,6 +9227,189 @@ fn lexical_parent_score(parent: &ParentContextRecord, query: &str) -> f32 {
         .filter(|term| candidate_terms.contains(*term))
         .count();
     (matched as f32 / query_terms.len() as f32).clamp(0.0, 1.0)
+}
+
+fn parent_lexical_evidence_text(parent: &ParentContextRecord) -> String {
+    let mut parts = vec![parent.content.clone()];
+    for key in ["document_title", "title", "heading", "section_path"] {
+        if let Some(value) = parent.metadata.get(key).and_then(serde_json::Value::as_str) {
+            if !value.trim().is_empty() {
+                parts.push(value.to_string());
+            }
+        }
+    }
+    if let Some(source_block_id) = parent
+        .source_block_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some((heading, section_path)) =
+            logical_block_location(&parent.metadata, source_block_id)
+        {
+            if !heading.is_empty() {
+                parts.push(heading);
+            }
+            if !section_path.is_empty() {
+                parts.push(section_path);
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn sibling_sequence_bonus(parent: &ParentContextRecord) -> f32 {
+    if parent.sequence_no <= 0 {
+        return 0.0;
+    }
+    let bounded = parent.sequence_no.clamp(1, 20) as f32;
+    ((21.0 - bounded) / 20.0) * 0.12
+}
+
+fn is_broad_coverage_query(query: &str) -> bool {
+    let query = query.to_lowercase();
+    [
+        "aspect",
+        "aspects",
+        "mechanism",
+        "mechanisms",
+        "checklist",
+        "inspect",
+        "coverage",
+    ]
+    .iter()
+    .any(|needle| query.contains(needle))
+}
+
+fn reinforce_broad_coverage_results(
+    results: &mut Vec<pb::SearchResultV004>,
+    candidates: &[pb::SearchResultV004],
+    final_limit: usize,
+) -> usize {
+    if results.is_empty() || candidates.is_empty() || final_limit == 0 {
+        return 0;
+    }
+    let mut selected = results
+        .iter()
+        .map(result_identity_key)
+        .collect::<HashSet<_>>();
+    let mut selected_by_document: HashMap<String, usize> = HashMap::new();
+    for result in results.iter() {
+        *selected_by_document
+            .entry(no_answer_document_key(result))
+            .or_default() += 1;
+    }
+    let mut candidate_groups: HashMap<String, Vec<pb::SearchResultV004>> = HashMap::new();
+    for candidate in candidates {
+        if is_root_container_result(candidate) || is_negative_mention_evidence(candidate) {
+            continue;
+        }
+        let document_key = no_answer_document_key(candidate);
+        if selected_by_document
+            .get(&document_key)
+            .copied()
+            .unwrap_or(0)
+            < 2
+        {
+            continue;
+        }
+        candidate_groups
+            .entry(document_key)
+            .or_default()
+            .push(candidate.clone());
+    }
+    let mut document_order = selected_by_document
+        .into_iter()
+        .filter(|(document_key, count)| *count >= 2 && candidate_groups.contains_key(document_key))
+        .collect::<Vec<_>>();
+    document_order.sort_by(|(left_doc, left_count), (right_doc, right_count)| {
+        right_count.cmp(left_count).then_with(|| {
+            document_max_score(candidate_groups.get(right_doc).into_iter().flatten())
+                .partial_cmp(&document_max_score(
+                    candidate_groups.get(left_doc).into_iter().flatten(),
+                ))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    let mut inserted = 0usize;
+    for (document_key, _) in document_order {
+        let Some(group) = candidate_groups.get_mut(&document_key) else {
+            continue;
+        };
+        group.sort_by(|left, right| {
+            candidate_sequence_no(left)
+                .cmp(&candidate_sequence_no(right))
+                .then_with(|| {
+                    score_of(right)
+                        .partial_cmp(&score_of(left))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        for candidate in group.iter().take(4) {
+            let key = result_identity_key(candidate);
+            if selected.contains(&key) {
+                continue;
+            }
+            if results.len() < final_limit {
+                results.push(candidate.clone());
+                selected.insert(key);
+                inserted += 1;
+                continue;
+            }
+            let Some(replace_idx) = broad_coverage_replacement_index(results, &document_key) else {
+                continue;
+            };
+            let old_key = result_identity_key(&results[replace_idx]);
+            selected.remove(&old_key);
+            results[replace_idx] = candidate.clone();
+            selected.insert(key);
+            inserted += 1;
+        }
+    }
+    inserted
+}
+
+fn document_max_score<'a>(results: impl Iterator<Item = &'a pb::SearchResultV004>) -> f32 {
+    results.map(score_of).fold(0.0_f32, f32::max)
+}
+
+fn candidate_sequence_no(result: &pb::SearchResultV004) -> i32 {
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("sequence_no"))
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(i32::MAX)
+}
+
+fn broad_coverage_replacement_index(
+    results: &[pb::SearchResultV004],
+    document_key: &str,
+) -> Option<usize> {
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| no_answer_document_key(result) != document_key)
+        .min_by(|(_, left), (_, right)| {
+            score_of(left)
+                .partial_cmp(&score_of(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, _)| idx)
+        .or_else(|| {
+            results
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| {
+                    candidate_sequence_no(left)
+                        .cmp(&candidate_sequence_no(right))
+                        .then_with(|| {
+                            score_of(right)
+                                .partial_cmp(&score_of(left))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                })
+                .map(|(idx, _)| idx)
+        })
 }
 
 fn exact_evidence_phrase_match(candidate: &str, query: &str) -> bool {
@@ -8940,6 +9490,33 @@ fn best_logical_block_for_query(
         .map(|(_, block_id, text)| (block_id, text))
 }
 
+fn logical_block_location(
+    metadata: &serde_json::Value,
+    source_block_id: &str,
+) -> Option<(String, String)> {
+    let blocks = metadata
+        .get("logical_blocks")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
+    blocks.as_array()?.iter().find_map(|block| {
+        if block.get("block_id")?.as_str()? != source_block_id {
+            return None;
+        }
+        let location = block.get("source_location")?;
+        let heading = location
+            .get("heading")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let section_path = location
+            .get("section_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Some((heading, section_path))
+    })
+}
+
 fn search_result_from_lexical_parent(
     parent: &ParentContextRecord,
     query: &str,
@@ -8960,6 +9537,7 @@ fn search_result_from_lexical_parent(
     );
     metadata.insert("chunk_granularity".into(), "PARENT".into());
     metadata.insert("representation_type".into(), "ORIGINAL".into());
+    metadata.insert("sequence_no".into(), parent.sequence_no.to_string());
     let score = lexical_parent_score(parent, query);
     let mut source_block_id = parent
         .source_block_id
@@ -8976,6 +9554,18 @@ fn search_result_from_lexical_parent(
         }
     }
     if !source_block_id.is_empty() {
+        if let Some((heading, section_path)) =
+            logical_block_location(&parent.metadata, &source_block_id)
+        {
+            if !heading.is_empty() {
+                metadata.entry("heading".into()).or_insert(heading);
+            }
+            if !section_path.is_empty() {
+                metadata
+                    .entry("section_path".into())
+                    .or_insert(section_path);
+            }
+        }
         metadata.insert("source_block_id".into(), source_block_id);
     }
     pb::SearchResultV004 {
@@ -9026,6 +9616,7 @@ fn search_result_from_hit(
                 .collect()
         })
         .unwrap_or_default();
+    metadata.insert("sequence_no".into(), parent.sequence_no.to_string());
     if let Some(trace) = trace {
         if let Some(source_block_id) = &trace.source_block_id {
             metadata.insert("source_block_id".into(), source_block_id.clone());
@@ -9750,6 +10341,7 @@ mod v007_fix1_tests {
             content: "parent".into(),
             content_hash: "hash".into(),
             token_count: 1,
+            sequence_no: 1,
             source_block_id: Some("parent-block".into()),
             metadata: serde_json::json!({}),
         };

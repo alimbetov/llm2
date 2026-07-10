@@ -582,7 +582,7 @@ fn default_graph_merge_strategy() -> String {
     "SCORE_THEN_TRUNCATE".into()
 }
 fn default_final_context_limit_mode() -> String {
-    "STRICT".into()
+    "AT_LEAST_TOP_K".into()
 }
 fn default_direct_context_limit() -> usize {
     6
@@ -627,13 +627,13 @@ fn default_mmr_lambda_graph() -> f32 {
     0.60
 }
 fn default_mmr_candidate_limit() -> usize {
-    30
+    80
 }
 fn default_embedding_fetch_timeout_ms() -> u64 {
-    50
+    250
 }
 fn default_embedding_fetch_warn_threshold_ms() -> u64 {
-    50
+    250
 }
 fn default_embedding_cache_max_entries() -> usize {
     10_000

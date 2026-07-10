@@ -119,6 +119,7 @@ pub struct ParentContextRecord {
     pub content: String,
     pub content_hash: String,
     pub token_count: i32,
+    pub sequence_no: i32,
     pub source_block_id: Option<String>,
     pub metadata: serde_json::Value,
 }
@@ -2057,6 +2058,7 @@ SELECT DISTINCT ON (c.access_zone_id, c.id)
   COALESCE(p.content,c.content) AS p_content,
   COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
   COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
+  COALESCE(p.sequence_no,c.sequence_no) AS p_sequence_no,
   COALESCE(p.source_block_id,c.source_block_id) AS p_source_block_id,
   COALESCE(p.metadata,c.metadata) AS p_metadata
 FROM astravector.content_chunks_v004 c
@@ -2163,6 +2165,10 @@ ORDER BY c.access_zone_id, c.id,
                     content: r.get("p_content"),
                     content_hash: r.get("p_content_hash"),
                     token_count: r.get("p_token_count"),
+                    sequence_no: r
+                        .try_get::<i32, _>("p_sequence_no")
+                        .ok()
+                        .unwrap_or_default(),
                     source_block_id: r
                         .try_get::<Option<String>, _>("p_source_block_id")
                         .ok()
@@ -2209,6 +2215,7 @@ SELECT DISTINCT ON (c.access_zone_id, c.id)
   COALESCE(p.content,c.content) AS p_content,
   COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
   COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
+  COALESCE(p.sequence_no,c.sequence_no) AS p_sequence_no,
   COALESCE(p.source_block_id,c.source_block_id) AS p_source_block_id,
   COALESCE(p.metadata,c.metadata) AS p_metadata
 FROM astravector.content_chunks_v004 c
@@ -2315,6 +2322,10 @@ ORDER BY c.access_zone_id, c.id,
                     content: r.get("p_content"),
                     content_hash: r.get("p_content_hash"),
                     token_count: r.get("p_token_count"),
+                    sequence_no: r
+                        .try_get::<i32, _>("p_sequence_no")
+                        .ok()
+                        .unwrap_or_default(),
                     source_block_id: r
                         .try_get::<Option<String>, _>("p_source_block_id")
                         .ok()
@@ -2434,7 +2445,7 @@ SELECT
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.source_block_id,c.metadata
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.sequence_no,c.source_block_id,c.metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2470,6 +2481,7 @@ WHERE c.access_zone_id=$1
                 content: r.get("content"),
                 content_hash: r.get("content_hash"),
                 token_count: r.get("actual_token_count"),
+                sequence_no: r.get("sequence_no"),
                 source_block_id: r
                     .try_get::<Option<String>, _>("source_block_id")
                     .ok()
@@ -2489,7 +2501,7 @@ WHERE c.access_zone_id=$1
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.source_block_id,c.metadata
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.sequence_no,c.source_block_id,c.metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2525,6 +2537,7 @@ WHERE c.access_zone_id=ANY($1::uuid[])
                 content: r.get("content"),
                 content_hash: r.get("content_hash"),
                 token_count: r.get("actual_token_count"),
+                sequence_no: r.get("sequence_no"),
                 source_block_id: r
                     .try_get::<Option<String>, _>("source_block_id")
                     .ok()
@@ -2545,7 +2558,7 @@ WHERE c.access_zone_id=ANY($1::uuid[])
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.source_block_id,c.metadata
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.sequence_no,c.source_block_id,c.metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2585,6 +2598,7 @@ LIMIT $4"#,
                 content: r.get("content"),
                 content_hash: r.get("content_hash"),
                 token_count: r.get("actual_token_count"),
+                sequence_no: r.get("sequence_no"),
                 source_block_id: r
                     .try_get::<Option<String>, _>("source_block_id")
                     .ok()
