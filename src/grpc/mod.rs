@@ -1041,7 +1041,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
             }
             for parent in &lexical_candidates {
-                let lexical = search_result_from_lexical_parent(&parent, query);
+                let lexical = search_result_from_lexical_parent(parent, query);
                 let score = lexical
                     .scores
                     .as_ref()
@@ -8854,7 +8854,7 @@ fn no_answer_partial_mmr_evidence_passes(
         }
     };
     enough_score
-        && matched_terms >= 1
+        && matched_terms >= 2
         && (matched_discriminating_terms >= 1 || exact_technical_match)
 }
 
@@ -8874,6 +8874,7 @@ fn is_negative_mention_evidence(result: &pb::SearchResultV004) -> bool {
         "not prevent",
         "not reference",
         "does not reference",
+        "separate from",
         "should not be confused",
         "unrelated to",
     ]
@@ -9923,6 +9924,56 @@ mod v007_fix1_tests {
             .metadata
             .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
         assert!(!has_graph_expanded_evidence(&[graph]));
+    }
+
+    #[test]
+    fn separate_from_statement_is_negative_evidence() {
+        let result = test_result(
+            "audit",
+            "Audit evidence uses retention rules separate from vector outbox.",
+            0.5,
+        );
+        assert!(is_negative_mention_evidence(&result));
+    }
+
+    #[test]
+    fn weak_overlap_is_not_preserved_when_request_disables_mmr() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How is the upstream connection pool repaired after HTTP 502 failures?";
+        let mut candidates = vec![
+            test_result(
+                "pool",
+                "Summer membership includes access to a heated swimming pool.",
+                0.2,
+            ),
+            test_result(
+                "repair",
+                "The service center repairs payment terminals and displays.",
+                0.2,
+            ),
+        ];
+        for candidate in &mut candidates {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.sparse_score = 0.2;
+            scores.fusion_score = 0.2;
+            scores.final_score = 0.2;
+        }
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+        );
+
+        assert_eq!(filtered, 2);
+        assert!(candidates.is_empty());
     }
 
     #[test]

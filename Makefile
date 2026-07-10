@@ -13,7 +13,7 @@ test-e2e:
 release:
 	cargo build --release
 migrate:
-	cargo run -- migrate
+	cargo run --bin astravector-runtime -- migrate
 run:
 	cargo run
 run-runtime-local:
