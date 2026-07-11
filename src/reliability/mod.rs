@@ -2,7 +2,47 @@ use crate::{error::AstraError, inference::EmbeddingResult, persistence::Reposito
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use sqlx::Row;
+use std::time::Duration;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadKind {
+    Query,
+    DocumentPublisher,
+    Reconciliation,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationBudget {
+    pub deadline: Instant,
+    pub cancellation: CancellationToken,
+    pub workload: WorkloadKind,
+}
+
+impl OperationBudget {
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.cancellation.is_cancelled() || Instant::now() >= self.deadline
+    }
+
+    pub fn allows_retry(
+        &self,
+        backoff: Duration,
+        minimum_operation_time: Duration,
+        safety_margin: Duration,
+    ) -> bool {
+        !self.is_expired()
+            && self.remaining()
+                >= backoff
+                    .saturating_add(minimum_operation_time)
+                    .saturating_add(safety_margin)
+    }
+}
 #[derive(Debug, Clone)]
 pub struct RequiredPersistCommand {
     pub access_zone_id: Uuid,
@@ -107,4 +147,37 @@ impl Repository {
 }
 fn db(e: sqlx::Error) -> AstraError {
     AstraError::Unavailable(format!("postgres: {e}"))
+}
+
+#[cfg(test)]
+mod operation_budget_tests {
+    use super::*;
+
+    #[test]
+    fn qdrant_retry_respects_deadline_budget() {
+        let budget = OperationBudget {
+            deadline: Instant::now() + Duration::from_millis(199),
+            cancellation: CancellationToken::new(),
+            workload: WorkloadKind::Query,
+        };
+        assert!(!budget.allows_retry(
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        ));
+    }
+
+    #[test]
+    fn qdrant_retry_is_allowed_when_budget_covers_all_components() {
+        let budget = OperationBudget {
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancellation: CancellationToken::new(),
+            workload: WorkloadKind::DocumentPublisher,
+        };
+        assert!(budget.allows_retry(
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        ));
+    }
 }

@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.limits.max_concurrent_qdrant_search,
         cfg.limits.backpressure_acquire_timeout_ms,
         Some(adaptive.clone()),
-        cfg.resilience.qdrant_retry.clone(),
+        cfg.resilience.qdrant_retry.reconciliation.clone(),
     )?;
     let reconciler = Reconciler { repo, qdrant: q };
 

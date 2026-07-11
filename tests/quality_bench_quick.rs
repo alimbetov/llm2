@@ -456,8 +456,9 @@ fn static_report(profile: &Value, queries: &[Value]) -> Value {
 }
 
 fn write_reports(report: &Value, failures: &[String], candidates: &[Value]) {
-    let dir = env::var("ASTRAVECTOR_QUALITY_REPORT_DIR")
-        .unwrap_or_else(|_| "benchmarks/quality/reports".to_string());
+    let dir = env::var("ASTRAVECTOR_QUALITY_OUTPUT_DIR")
+        .or_else(|_| env::var("ASTRAVECTOR_QUALITY_REPORT_DIR"))
+        .unwrap_or_else(|_| "target/quality-reports".to_string());
     fs::create_dir_all(&dir).expect("failed to create quality report directory");
     fs::write(
         Path::new(&dir).join("quality-report.json"),

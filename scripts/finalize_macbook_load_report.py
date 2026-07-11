@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from stage_failure_registry import read_registry, write_atomic
+
 
 def read_json(path: Path):
     with path.open(encoding="utf-8") as handle:
@@ -26,6 +28,31 @@ def error_count(report):
 
 def load_result(path: Path, requested_rps=None):
     report = read_json(path)
+    if report.get("driver") == "retrieval-load-driver":
+        count = report.get("requests_total", 0)
+        statuses = report.get("status_distribution", {})
+        return {
+            "requested_rps": requested_rps,
+            "achieved_rps": count / report.get("wall_duration_seconds", 1),
+            "duration_seconds": report.get("wall_duration_seconds", 0),
+            "count": count,
+            "success_rate": report.get("success_rate"),
+            "error_rate": report.get("error_rate"),
+            "p50_ms": None,
+            "p90_ms": None,
+            "p95_ms": report.get("successful_p95_ms"),
+            "p99_ms": report.get("successful_p99_ms"),
+            "errors": {key: value for key, value in statuses.items() if key != "OK"},
+            "status_codes": statuses,
+            "resource_exhausted_rate": statuses.get("RESOURCE_EXHAUSTED", 0) / count if count else None,
+            "deadline_exceeded_rate": statuses.get("DEADLINE_EXCEEDED", 0) / count if count else None,
+            "unavailable_rate": statuses.get("UNAVAILABLE", 0) / count if count else None,
+            "positive_empty_count": report.get("positive_empty_count"),
+            "critical_wrong_result_count": report.get("critical_wrong_result_count"),
+            "citation_incomplete_count": report.get("citation_incomplete_count"),
+            "citation_grounding_failure_count": report.get("citation_grounding_failure_count"),
+            "stability": report.get("stability"),
+        }
     count = report.get("count", 0)
     errors = error_count(report)
     return {
@@ -181,14 +208,28 @@ def main():
     post = quality(root / "post-load-quality/runtime-quality-report.json")
     runtime_before = (root / "soak/runtime-before.txt").read_text().split()[0]
     runtime_after = (root / "soak/runtime-after.txt").read_text().split()[0]
+    memory_growth_limit = max(256, memory["rss_start_mb"] * .20) if memory["rss_start_mb"] is not None else None
     soak_pass = (soak["duration_seconds"] >= 3600 and soak["success_rate"] >= .995 and
-                 soak["error_rate"] <= .005 and runtime_before == runtime_after and
-                 memory["rss_slope_mb_per_hour"] <= 0 and queue_depth.get("unbounded_growth") is not True)
+                 soak["error_rate"] <= .005 and soak.get("positive_empty_count") == 0 and
+                 soak.get("critical_wrong_result_count") == 0 and
+                 soak.get("citation_incomplete_count") == 0 and
+                 soak.get("citation_grounding_failure_count") == 0 and
+                 soak.get("stability", {}).get("pass") is True and runtime_before == runtime_after and
+                 memory["samples"] >= 100 and memory["rss_slope_mb_per_hour"] <= 50 and
+                 memory["rss_growth_mb"] <= memory_growth_limit and
+                 queue_depth.get("unbounded_growth") is not True)
     spike_errors = spike["error_rate"] or 0
+    spike_pid_before = (root / "spike/runtime-pid-before-spike.txt").read_text().strip()
+    spike_pid_after = (root / "spike/runtime-pid-after-spike.txt").read_text().strip()
+    spike_start_before = (root / "spike/runtime-start-time-before.txt").read_text().strip()
+    spike_start_after = (root / "spike/runtime-start-time-after.txt").read_text().strip()
+    spike_runtime_unchanged = spike_pid_before == spike_pid_after and spike_start_before == spike_start_after
     spike_load_shedding_primary = spike_errors == 0 or (spike["resource_exhausted_rate"] or 0) >= max(
         spike["deadline_exceeded_rate"] or 0, spike["unavailable_rate"] or 0)
-    spike_pass = (runtime_before == runtime_after and (spike["deadline_exceeded_rate"] or 0) <= .01 and
-                  (spike["unavailable_rate"] or 0) <= .01 and spike_load_shedding_primary)
+    spike_pass = (spike_runtime_unchanged and (spike["deadline_exceeded_rate"] or 0) <= .01 and
+                  (spike["unavailable_rate"] or 0) <= .01 and spike_load_shedding_primary and
+                  (spike_errors == 0 or (spike["resource_exhausted_rate"] or 0) / spike_errors >= .80) and
+                  spike.get("positive_empty_count") == 0 and spike.get("critical_wrong_result_count") == 0)
     consecutive = 0
     recovery_finish = None
     for window in recovery_windows:
@@ -238,6 +279,24 @@ def main():
     if invalid_json:
         failures.append("INVALID_OUTPUT")
 
+    registry_path = root / "stage-failures.json"
+    registry = read_registry(registry_path)
+    existing_codes = {failure.get("code") for failure in registry["failures"]}
+    for code in failures:
+        if code in existing_codes:
+            continue
+        classification = "EVIDENCE_FAILURE" if code == "INVALID_OUTPUT" else (
+            "QUALITY_FAILURE" if "QUALITY" in code or "REGRESSION" in code else "RUNTIME_FAILURE"
+        )
+        registry["failures"].append({
+            "stage": "finalization",
+            "code": code,
+            "classification": classification,
+            "timestamp": dt.datetime.now().astimezone().isoformat(),
+            "details": {},
+        })
+    write_atomic(registry_path, registry)
+
     git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     concurrency_exit = int((root / "static/concurrency-smoke/exit-code.txt").read_text().strip())
     report = {
@@ -267,7 +326,9 @@ def main():
                  "runtime_pid_before": int(runtime_before), "runtime_pid_after": int(runtime_after),
                  "swap_start_mb": swap_used(root / "soak/swap-before.txt"), "swap_end_mb": swap_used(root / "soak/swap-after.txt"),
                  "exit_code": int((root / "soak/exit-code.txt").read_text()), "verdict": "PASS" if soak_pass else "FAIL"},
-        "spike": {**spike, "runtime_survived": runtime_before == runtime_after,
+        "spike": {**spike, "runtime_survived": spike_runtime_unchanged,
+                  "runtime_pid_before": spike_pid_before, "runtime_pid_after": spike_pid_after,
+                  "runtime_start_time_before": spike_start_before, "runtime_start_time_after": spike_start_after,
                   "load_shedding_primary": spike_load_shedding_primary,
                   "exit_code": int((root / "spike/exit-code.txt").read_text()), "verdict": "PASS" if spike_pass else "FAIL"},
         "recovery": {"windows": recovery_windows, "healthy_windows_required": 3,
@@ -287,6 +348,21 @@ def main():
         "evidence": {"all_json_valid": not invalid_json, "invalid_json": invalid_json,
                      "checksums_verified": True, "simulation_detected": False, "incomplete_processes": []},
         "overall_verdict": "PASS" if not failures else "FAIL", "failure_reasons": failures,
+        "stage_failure_registry": registry,
+    }
+    report["release_identity"] = {
+        "git_sha": source_git_sha,
+        "binary_sha256": report["runtime"]["binary_sha256"],
+        "effective_config_sha256": (root / "runtime/effective-config.sha256").read_text().strip(),
+        "model_sha256": report["runtime"]["model_sha256"],
+        "tokenizer_sha256": report["runtime"]["tokenizer_sha256"],
+        "migration_head": report["runtime"]["migration_head"],
+        "corpus_snapshot_sha256": (root / "corpus/corpus-snapshot.sha256").read_text().strip(),
+        "query_bank_sha256": (root / "corpus/load-query-bank.sha256").read_text().strip(),
+        "machine_identity": hashlib.sha256((root / "environment/mac-hardware.txt").read_bytes()).hexdigest(),
+        "rust_version": report["tools"]["rustc"],
+        "load_driver_version": "1.0",
+        "report_schema_version": report["report_schema_version"],
     }
     report_path = root / "astravector-macbook-load-report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

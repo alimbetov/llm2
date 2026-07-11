@@ -42,5 +42,6 @@ pub mod qdrant;
 pub mod reconciliation;
 pub mod relevance;
 pub mod reliability;
+pub mod retrieval;
 pub mod shutdown;
 pub mod smoke_failpoints;

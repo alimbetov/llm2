@@ -629,6 +629,13 @@ enum ResponseDetail {
   RESPONSE_DETAIL_DEBUG = 3;
 }
 
+enum EvidenceStatus {
+  EVIDENCE_STATUS_UNSPECIFIED = 0;
+  EVIDENCE_STATUS_FOUND = 1;
+  EVIDENCE_STATUS_INSUFFICIENT = 2;
+  EVIDENCE_STATUS_DEGRADED = 3;
+}
+
 message RetrieveContextRequest {
   RequestContext context = 1;
   string access_zone_id = 2;
@@ -685,6 +692,17 @@ message RetrievalSummary {
   uint32 total_candidates = 1;
   uint32 returned_contexts = 2;
   RetrievalProfile profile = 3;
+  EvidenceStatus evidence_status = 10;
+  bool degraded = 11;
+  repeated string degradation_codes = 12;
+  string corpus_snapshot_id = 13;
+  string effective_config_sha256 = 14;
+  bool dense_branch_executed = 20;
+  bool sparse_branch_executed = 21;
+  bool fusion_executed = 22;
+  uint32 dense_branch_candidate_count = 23;
+  uint32 sparse_branch_candidate_count = 24;
+  uint32 fusion_candidate_count = 25;
 }
 
 message RetrieveContextResponse {
@@ -775,7 +793,7 @@ message SearchRequestV004 { string correlation_id=1; string access_zone_id=2; Ac
 message SearchScoresV004 { float dense_score=1; float sparse_score=2; float fusion_score=3; float final_score=4; }
 message SearchCitationV004 { map<string,string> metadata=1; }
 message SearchResultV004 { string document_id=1; uint64 document_version=2; string root_chunk_id=3; string source_chunk_id=4; string parent_chunk_id=5; string matched_chunk_id=6; ChunkGranularityV004 matched_granularity=7; string parent_text=8; SearchScoresV004 scores=9; SearchCitationV004 citation=10; string access_zone_id=11; AccessLevel access_level=12; string matched_text=20; }
-message SearchDiagnosticsV004 { uint64 query_embedding_ms=1; uint64 qdrant_search_ms=2; uint64 parent_fetch_ms=3; uint64 total_ms=4; uint32 candidate_count=5; uint32 parent_group_count=6; uint32 direct_candidates_count=20; uint32 graph_candidates_count=21; uint32 merged_candidates_count=22; uint32 final_candidates_count=23; uint32 deduplicated_candidates_count=24; string graph_candidates_by_relation_json=25; uint64 graph_expansion_duration_ms=26; uint64 graph_merge_duration_ms=27; string graph_merge_strategy=28; uint32 final_context_limit=29; string final_context_limit_mode=30; float graph_min_score=31; float semantic_power=32; bool mmr_enabled=33; float mmr_lambda=34; uint32 mmr_candidate_count=35; uint32 mmr_selected_count=36; uint64 mmr_duration_ms=37; string mmr_similarity_source=38; bool learned_reranker_enabled=39; string learned_reranker_provider=40; uint32 direct_context_limit=41; uint32 graph_context_append_limit=42; float direct_score_weight=43; float graph_score_weight=44; float graph_score_bias=45; string score_normalization=46; float mmr_lambda_direct=47; float mmr_lambda_graph=48; uint32 mmr_embedding_fetch_requested=49; uint32 mmr_embedding_fetch_found=50; uint32 mmr_embedding_fetch_missing=51; uint64 mmr_embedding_fetch_duration_ms=52; uint32 mmr_embedding_cache_hits=53; uint32 mmr_embedding_cache_misses=54; uint32 mmr_embedding_fetch_errors=55; uint32 mmr_embedding_fetch_timeouts=56; bool mmr_embedding_fetch_skipped_all_present=57; bool mmr_embedding_fetch_skipped_small_pool=58; uint32 mmr_dense_pair_comparisons=59; uint32 mmr_token_pair_comparisons=60; string mmr_effective_similarity_source=61; repeated string warning_codes=62; bool token_budget_enabled=70; uint32 max_context_tokens=71; uint32 estimated_context_tokens_before=72; uint32 estimated_context_tokens_after=73; uint32 context_chunks_dropped_by_token_budget=74; string token_truncation_strategy=75; repeated string dropped_chunk_ids=76; string huge_chunk_strategy=77; }
+message SearchDiagnosticsV004 { uint64 query_embedding_ms=1; uint64 qdrant_search_ms=2; uint64 parent_fetch_ms=3; uint64 total_ms=4; uint32 candidate_count=5; uint32 parent_group_count=6; uint32 direct_candidates_count=20; uint32 graph_candidates_count=21; uint32 merged_candidates_count=22; uint32 final_candidates_count=23; uint32 deduplicated_candidates_count=24; string graph_candidates_by_relation_json=25; uint64 graph_expansion_duration_ms=26; uint64 graph_merge_duration_ms=27; string graph_merge_strategy=28; uint32 final_context_limit=29; string final_context_limit_mode=30; float graph_min_score=31; float semantic_power=32; bool mmr_enabled=33; float mmr_lambda=34; uint32 mmr_candidate_count=35; uint32 mmr_selected_count=36; uint64 mmr_duration_ms=37; string mmr_similarity_source=38; bool learned_reranker_enabled=39; string learned_reranker_provider=40; uint32 direct_context_limit=41; uint32 graph_context_append_limit=42; float direct_score_weight=43; float graph_score_weight=44; float graph_score_bias=45; string score_normalization=46; float mmr_lambda_direct=47; float mmr_lambda_graph=48; uint32 mmr_embedding_fetch_requested=49; uint32 mmr_embedding_fetch_found=50; uint32 mmr_embedding_fetch_missing=51; uint64 mmr_embedding_fetch_duration_ms=52; uint32 mmr_embedding_cache_hits=53; uint32 mmr_embedding_cache_misses=54; uint32 mmr_embedding_fetch_errors=55; uint32 mmr_embedding_fetch_timeouts=56; bool mmr_embedding_fetch_skipped_all_present=57; bool mmr_embedding_fetch_skipped_small_pool=58; uint32 mmr_dense_pair_comparisons=59; uint32 mmr_token_pair_comparisons=60; string mmr_effective_similarity_source=61; repeated string warning_codes=62; bool token_budget_enabled=70; uint32 max_context_tokens=71; uint32 estimated_context_tokens_before=72; uint32 estimated_context_tokens_after=73; uint32 context_chunks_dropped_by_token_budget=74; string token_truncation_strategy=75; repeated string dropped_chunk_ids=76; string huge_chunk_strategy=77; bool dense_branch_executed=80; bool sparse_branch_executed=81; bool fusion_executed=82; uint32 dense_branch_candidate_count=83; uint32 sparse_branch_candidate_count=84; uint32 fusion_candidate_count=85; }
 message SearchResponseV004 { repeated SearchResultV004 results=1; SearchDiagnosticsV004 diagnostics=2; repeated DiagnosticWarningV005 warnings=20; }
 message RegisterDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; string content_hash=4; string activation_policy=5; string idempotency_key=6; string access_zone_code=50; }
 message ActivateDocumentVersionRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; bool force_activate=10; string force_reason=11; }
@@ -816,4 +834,3 @@ message DebugGraphSummaryV005 { uint32 total_graph_nodes=1; uint32 total_graph_e
 message DebugDocumentStateResponse { DebugDocumentInfoV005 document=1; repeated DebugChunkInfoV005 chunks=2; DebugVectorInfoV005 vectors=3; DebugOutboxInfoV005 outbox=4; DebugQdrantInfoV005 qdrant=5; bool ready_to_activate=6; repeated DiagnosticWarningV005 warnings=7; DebugGraphSummaryV005 graph=8; }
 message RetryVectorOutboxRequest { string access_zone_id=1; string document_id=2; uint64 document_version=3; optional string operation=4; optional string status=5; }
 message RetryVectorOutboxResponse { uint32 matched=1; uint32 reset_to_pending=2; repeated string affected_outbox_ids=3; }
-

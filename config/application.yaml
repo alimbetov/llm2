@@ -436,14 +436,38 @@ resilience:
       retry_on_unavailable: true
       min_remaining_budget_ms: 1000
   qdrant_retry:
-    enabled: ${ASTRAVECTOR_QDRANT_RETRY_ENABLED:-true}
-    max_attempts: ${ASTRAVECTOR_QDRANT_RETRY_MAX_ATTEMPTS:-3}
-    base_delay_ms: ${ASTRAVECTOR_QDRANT_RETRY_BASE_DELAY_MS:-100}
-    max_delay_ms: ${ASTRAVECTOR_QDRANT_RETRY_MAX_DELAY_MS:-1000}
-    jitter_enabled: ${ASTRAVECTOR_QDRANT_RETRY_JITTER_ENABLED:-true}
-    retry_on_statuses: [429, 502, 503, 504]
-    retry_on_timeout: ${ASTRAVECTOR_QDRANT_RETRY_ON_TIMEOUT:-true}
-    retry_on_unavailable: ${ASTRAVECTOR_QDRANT_RETRY_ON_UNAVAILABLE:-true}
+    query:
+      enabled: true
+      max_attempts: 2
+      base_delay_ms: 50
+      max_delay_ms: 100
+      jitter_enabled: true
+      retry_on_statuses: [502, 503, 504]
+      retry_on_timeout: false
+      retry_on_unavailable: true
+      retry_on_connect: true
+      min_operation_budget_ms: 150
+      safety_margin_ms: 50
+    publisher:
+      enabled: true
+      max_attempts: 5
+      base_delay_ms: 100
+      max_delay_ms: 1000
+      jitter_enabled: true
+      retry_on_statuses: [429, 502, 503, 504]
+      retry_on_timeout: true
+      retry_on_unavailable: true
+      retry_on_connect: true
+    reconciliation:
+      enabled: true
+      max_attempts: 5
+      base_delay_ms: 100
+      max_delay_ms: 1000
+      jitter_enabled: true
+      retry_on_statuses: [429, 502, 503, 504]
+      retry_on_timeout: true
+      retry_on_unavailable: true
+      retry_on_connect: true
 
 rag_context:
   token_budget_enabled: ${ASTRAVECTOR_RAG_TOKEN_BUDGET_ENABLED:-true}

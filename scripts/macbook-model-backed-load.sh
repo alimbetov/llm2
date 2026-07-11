@@ -32,17 +32,27 @@ FAILURE_REASONS=()
 RECOVERY_P95_SLO_MS="${RECOVERY_P95_SLO_MS:-1000}"
 
 mkdir -p "$EVIDENCE_DIR"/{environment,static,infrastructure,runtime,corpus,contract,warmup,baseline,step,soak,spike,recovery,post-load-quality,system,metrics}
-mkdir -p "$EVIDENCE_DIR/environment/quality-reports-before"
-for report in runtime-quality-report.json runtime-quality-report.md runtime-candidates.jsonl runtime-failures.jsonl; do
-  [[ -f "benchmarks/quality/reports/$report" ]] && cp "benchmarks/quality/reports/$report" "$EVIDENCE_DIR/environment/quality-reports-before/$report"
-done
+FAILURE_REGISTRY="$EVIDENCE_DIR/stage-failures.json"
+python3 "$ROOT_DIR/scripts/stage_failure_registry.py" "$FAILURE_REGISTRY" init
+
+record_failure() {
+  local stage="$1" code="$2" classification="$3" details="${4:-{}}"
+  python3 "$ROOT_DIR/scripts/stage_failure_registry.py" "$FAILURE_REGISTRY" add \
+    --stage "$stage" --code "$code" --classification "$classification" --details-json "$details"
+}
+
+assert_source_tree_clean() {
+  local stage="$1"
+  if [[ -n "$(git status --porcelain)" ]]; then
+    FAILURE_REASONS+=(SOURCE_TREE_MODIFIED_DURING_RUN)
+    record_failure "$stage" SOURCE_TREE_MODIFIED_DURING_RUN EVIDENCE_FAILURE
+    return 1
+  fi
+}
 
 finish_owned_processes() {
   for pid in "$RESOURCE_PID" "$METRICS_PID" "$RUNTIME_PID"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-  done
-  for report in runtime-quality-report.json runtime-quality-report.md runtime-candidates.jsonl runtime-failures.jsonl; do
-    [[ -f "$EVIDENCE_DIR/environment/quality-reports-before/$report" ]] && cp "$EVIDENCE_DIR/environment/quality-reports-before/$report" "benchmarks/quality/reports/$report"
   done
 }
 trap finish_owned_processes EXIT INT TERM
@@ -62,19 +72,12 @@ record() {
 block() {
   OVERALL_VERDICT="BLOCKED"
   FAILURE_REASONS+=("$1")
+  record_failure "preflight" "$1" "BLOCKED"
   write_report
   exit 2
 }
 
 json_valid() { jq -e . "$1" >/dev/null 2>&1; }
-
-copy_quality_reports() {
-  local dest="$1"
-  mkdir -p "$dest"
-  for f in runtime-quality-report.json runtime-quality-report.md runtime-candidates.jsonl runtime-failures.jsonl; do
-    [[ -f "benchmarks/quality/reports/$f" ]] && cp "benchmarks/quality/reports/$f" "$dest/$f"
-  done
-}
 
 quality_passes() {
   jq -e '
@@ -100,15 +103,34 @@ integrity_snapshot() {
 
 latency_ms() {
   local file="$1" percentile="$2"
-  jq -r --argjson p "$percentile" '[.latencyDistribution[] | select(.percentage >= $p)][0].latency / 1000000' "$file"
+  jq -r --argjson p "$percentile" 'if .driver == "retrieval-load-driver" then (if $p >= 99 then .successful_p99_ms else .successful_p95_ms end) else [.latencyDistribution[] | select(.percentage >= $p)][0].latency / 1000000 end' "$file"
 }
 
 error_rate() {
-  jq -r '((.errorDistribution // {} | to_entries | map(.value) | add) // 0) / (.count | if . == 0 then 1 else . end)' "$1"
+  jq -r 'if .driver == "retrieval-load-driver" then .error_rate else ((.errorDistribution // {} | to_entries | map(.value) | add) // 0) / (.count | if . == 0 then 1 else . end) end' "$1"
 }
 
 success_rate() {
-  jq -r '1 - (((.errorDistribution // {} | to_entries | map(.value) | add) // 0) / (.count | if . == 0 then 1 else . end))' "$1"
+  jq -r 'if .driver == "retrieval-load-driver" then .success_rate else 1 - (((.errorDistribution // {} | to_entries | map(.value) | add) // 0) / (.count | if . == 0 then 1 else . end)) end' "$1"
+}
+
+retrieval_run() {
+  local dir="$1" rps="$2" concurrency="$3" duration="$4" baseline="${5:-}"
+  mkdir -p "$dir"
+  local cmd=(target/release/retrieval-load-driver --endpoint http://127.0.0.1:50051
+    --query-bank "$EVIDENCE_DIR/corpus/load-query-bank.jsonl" --target-rps "$rps"
+    --concurrency "$concurrency" --duration "$duration" --seed 478001
+    --output "$dir/results.jsonl" --summary "$dir/result.json"
+    --corpus-snapshot-id "$(cat "$EVIDENCE_DIR/corpus/corpus-snapshot.sha256")"
+    --effective-config-sha256 "$(cat "$EVIDENCE_DIR/runtime/effective-config.sha256")")
+  [[ -n "$baseline" ]] && cmd+=(--baseline "$baseline")
+  printf '%q ' "${cmd[@]}" > "$dir/command.txt"; printf '\n' >> "$dir/command.txt"
+  date -Iseconds > "$dir/started-at.txt"
+  "${cmd[@]}" > "$dir/stdout-stderr.log" 2>&1
+  local rc=$?
+  date -Iseconds > "$dir/finished-at.txt"
+  printf '%s\n' "$rc" > "$dir/exit-code.txt"
+  json_valid "$dir/result.json"
 }
 
 ghz_run() {
@@ -229,7 +251,7 @@ psql "$DB_URL" -Atc 'select max(version) from _sqlx_migrations where success=tru
 [[ -f "$MODEL_PATH" && -f "$TOKENIZER_PATH" ]] || block MODEL_FILES_NOT_FOUND
 shasum -a 256 "$MODEL_PATH" "$TOKENIZER_PATH" > "$EVIDENCE_DIR/runtime/model-tokenizer.sha256"
 cat config/application.yaml config/application-load-m2.yaml | shasum -a 256 > "$EVIDENCE_DIR/runtime/config.sha256"
-record "$EVIDENCE_DIR/runtime/release-build" cargo build --release --bin astravector-runtime || block BLOCKED_BY_RELEASE_BUILD
+record "$EVIDENCE_DIR/runtime/release-build" cargo build --release --bin astravector-runtime --bin retrieval-load-driver || block BLOCKED_BY_RELEASE_BUILD
 shasum -a 256 target/release/astravector-runtime > "$EVIDENCE_DIR/runtime/binary.sha256"
 if lsof -nP -iTCP:50051 -sTCP:LISTEN > "$EVIDENCE_DIR/runtime/port-before.txt" 2>&1; then block BLOCKED_BY_EXISTING_RUNTIME; fi
 
@@ -243,11 +265,23 @@ for _ in {1..60}; do grpcurl -plaintext 127.0.0.1:50051 list > "$EVIDENCE_DIR/ru
 grpcurl -plaintext 127.0.0.1:50051 list >/dev/null || block RUNTIME_NOT_READY
 curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/runtime/metrics-before.prom" || block METRICS_NOT_READY
 
-copy_quality_reports "$EVIDENCE_DIR/corpus/global-reports-before"
-record "$EVIDENCE_DIR/corpus/pre-load-quality" env ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-pre-load-quality" make quality-runtime-full-capability-quick-remote || block BLOCKED_BY_PRE_LOAD_QUALITY
-copy_quality_reports "$EVIDENCE_DIR/corpus/pre-load-quality"
+record "$EVIDENCE_DIR/corpus/pre-load-quality/run" env \
+  ASTRAVECTOR_QUALITY_OUTPUT_DIR="$EVIDENCE_DIR/corpus/pre-load-quality" \
+  ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-pre-load-quality" \
+  make quality-runtime-full-capability-quick-remote || block BLOCKED_BY_PRE_LOAD_QUALITY
 quality_passes "$EVIDENCE_DIR/corpus/pre-load-quality/runtime-quality-report.json" || block BLOCKED_BY_PRE_LOAD_QUALITY
 integrity_snapshot "$EVIDENCE_DIR/corpus/pre-load-integrity" || block BLOCKED_BY_PRE_LOAD_INTEGRITY
+python3 "$ROOT_DIR/scripts/generate_corpus_snapshot.py" --database-url "$DB_URL" \
+  --output "$EVIDENCE_DIR/corpus/corpus-snapshot.json" > "$EVIDENCE_DIR/corpus/corpus-snapshot-id.txt" || block CORPUS_SNAPSHOT_FAILED
+ASTRAVECTOR_PROFILE=load-m2 python3 "$ROOT_DIR/scripts/generate_effective_config.py" \
+  --output "$EVIDENCE_DIR/runtime/effective-config.json" --model "$MODEL_PATH" --tokenizer "$TOKENIZER_PATH" \
+  > "$EVIDENCE_DIR/runtime/effective-config-id.txt" || block EFFECTIVE_CONFIG_FAILED
+python3 "$ROOT_DIR/scripts/build_quality_query_bank.py" \
+  --profile "$ROOT_DIR/benchmarks/quality/profiles/full-capability-quick.json" \
+  --queries-dir "$ROOT_DIR/benchmarks/quality/queries" \
+  --output "$EVIDENCE_DIR/corpus/load-query-bank.jsonl" > "$EVIDENCE_DIR/corpus/load-query-bank-manifest.json" \
+  || block QUERY_BANK_BUILD_FAILED
+assert_source_tree_clean after-pre-load || block SOURCE_TREE_MODIFIED_DURING_RUN
 
 grpcurl -plaintext 127.0.0.1:50051 describe > "$EVIDENCE_DIR/contract/grpc-describe.txt"
 find . -type f -name '*.proto' -print > "$EVIDENCE_DIR/contract/proto-files.txt"
@@ -263,47 +297,55 @@ grpcurl -plaintext -d "$(cat "$EVIDENCE_DIR/contract/single-request.json")" 127.
 jq -e '.contexts | length > 0' "$EVIDENCE_DIR/contract/single-response.json" >/dev/null || block RETRIEVE_CONTEXT_EMPTY
 
 start_samplers
-ghz_run "$EVIDENCE_DIR/warmup" 1 1 2m || block WARMUP_FAILED
+retrieval_run "$EVIDENCE_DIR/warmup" 1 1 2m || block WARMUP_FAILED
+jq -e '.success_rate == 1 and .positive_empty_count == 0 and .verdict == "PASS"' "$EVIDENCE_DIR/warmup/result.json" >/dev/null || block WARMUP_FAILED
+STABILITY_BASELINE="$EVIDENCE_DIR/warmup/results.jsonl"
 sleep 60
-for spec in '2 2' '5 5' '10 10'; do set -- $spec; ghz_run "$EVIDENCE_DIR/baseline/$1-rps" "$1" "$2" 5m || block BASELINE_FAILED; sleep 60; done
+for spec in '2 2' '5 5' '10 10'; do set -- $spec; retrieval_run "$EVIDENCE_DIR/baseline/$1-rps" "$1" "$2" 5m "$STABILITY_BASELINE" || block BASELINE_FAILED; sleep 60; done
 
 stable_rps=0; saturation_rps=null; failure_rps=null; stop_reason=""
 for rps in 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30; do
   concurrency="$rps"; (( concurrency < 4 )) && concurrency=4; (( concurrency > 40 )) && concurrency=40
   dir="$EVIDENCE_DIR/step/$(printf '%03d' "$rps")-rps"
-  if ! ghz_run "$dir" "$rps" "$concurrency" 3m; then failure_rps="$rps"; stop_reason="GHZ_EXIT_OR_INVALID_OUTPUT"; break; fi
+  if ! retrieval_run "$dir" "$rps" "$concurrency" 3m "$STABILITY_BASELINE"; then failure_rps="$rps"; stop_reason="CORRECTNESS_OR_TRANSPORT_GATE"; break; fi
   er="$(error_rate "$dir/result.json")"; sr="$(success_rate "$dir/result.json")"; p95="$(latency_ms "$dir/result.json" 95)"; p99="$(latency_ms "$dir/result.json" 99)"
   jq -n --argjson requested "$rps" --argjson success "$sr" --argjson error "$er" --argjson p95 "$p95" --argjson p99 "$p99" '{requested_rps:$requested,success_rate:$success,error_rate:$error,p95_ms:$p95,p99_ms:$p99}' > "$dir/metrics.json"
-  if awk "BEGIN {exit !($er > 0.02 || $p95 > 5000 || $p99 > 5000)}"; then failure_rps="$rps"; stop_reason="ACCEPTANCE_THRESHOLD"; break; fi
-  if awk "BEGIN {exit !($sr >= 0.99 && $er < 0.01 && $p95 <= 5000)}"; then stable_rps="$rps"; else [[ "$saturation_rps" == null ]] && saturation_rps="$rps"; fi
+  if awk "BEGIN {exit !($er > 0.02 || $p95 > 1000)}"; then failure_rps="$rps"; stop_reason="ACCEPTANCE_THRESHOLD"; break; fi
+  if awk "BEGIN {exit !($sr >= 0.99 && $er < 0.01 && $p95 <= 1000)}"; then stable_rps="$rps"; else [[ "$saturation_rps" == null ]] && saturation_rps="$rps"; fi
   kill -0 "$RUNTIME_PID" 2>/dev/null || { failure_rps="$rps"; stop_reason="RUNTIME_DIED"; break; }
   sleep 60
 done
-(( stable_rps > 0 )) || block NO_STABLE_RPS
+(( stable_rps >= 6 )) || block STABLE_RPS_BELOW_REFERENCE_MINIMUM
 soak_rps=$(( (stable_rps * 65 + 99) / 100 )); (( soak_rps < 1 )) && soak_rps=1
 jq -n --argjson stable "$stable_rps" --argjson saturation "$saturation_rps" --argjson failure "$failure_rps" --arg reason "$stop_reason" --argjson soak "$soak_rps" '{stable_rps:$stable,saturation_rps:$saturation,failure_rps:$failure,stop_reason:$reason,soak_rps:$soak}' > "$EVIDENCE_DIR/soak/selection.json"
 
 ps -p "$RUNTIME_PID" -o pid=,rss=,etime= > "$EVIDENCE_DIR/soak/runtime-before.txt"
 sysctl vm.swapusage > "$EVIDENCE_DIR/soak/swap-before.txt"
-ghz_run "$EVIDENCE_DIR/soak" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 60m || { OVERALL_VERDICT=FAIL; FAILURE_REASONS+=(SOAK_FAILED); write_report; exit 1; }
+retrieval_run "$EVIDENCE_DIR/soak" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 60m "$STABILITY_BASELINE" || { OVERALL_VERDICT=FAIL; FAILURE_REASONS+=(SOAK_FAILED); write_report; exit 1; }
 ps -p "$RUNTIME_PID" -o pid=,rss=,etime= > "$EVIDENCE_DIR/soak/runtime-after.txt" || { OVERALL_VERDICT=FAIL; FAILURE_REASONS+=(RUNTIME_DIED_DURING_SOAK); write_report; exit 1; }
 sysctl vm.swapusage > "$EVIDENCE_DIR/soak/swap-after.txt"
+assert_source_tree_clean after-soak || { OVERALL_VERDICT=FAIL; write_report; exit 1; }
 sleep 120
 
 spike_rps=$(( stable_rps * 2 )); (( spike_rps > 50 )) && spike_rps=50
 spike_concurrency="$spike_rps"; (( spike_concurrency < 10 )) && spike_concurrency=10; (( spike_concurrency > 64 )) && spike_concurrency=64
-ghz_run "$EVIDENCE_DIR/spike" "$spike_rps" "$spike_concurrency" 30s || FAILURE_REASONS+=(SPIKE_NONZERO)
+ps -p "$RUNTIME_PID" -o pid= > "$EVIDENCE_DIR/spike/runtime-pid-before-spike.txt"
+ps -p "$RUNTIME_PID" -o lstart= > "$EVIDENCE_DIR/spike/runtime-start-time-before.txt"
+retrieval_run "$EVIDENCE_DIR/spike" "$spike_rps" "$spike_concurrency" 30s "$STABILITY_BASELINE" || true
+ps -p "$RUNTIME_PID" -o pid= > "$EVIDENCE_DIR/spike/runtime-pid-after-spike.txt" || FAILURE_REASONS+=(RUNTIME_DIED_DURING_SPIKE)
+ps -p "$RUNTIME_PID" -o lstart= > "$EVIDENCE_DIR/spike/runtime-start-time-after.txt" || FAILURE_REASONS+=(RUNTIME_DIED_DURING_SPIKE)
+grpcurl -plaintext 127.0.0.1:50051 grpc.health.v1.Health/Check > "$EVIDENCE_DIR/spike/health-after.json" 2>&1 || FAILURE_REASONS+=(RUNTIME_UNHEALTHY_AFTER_SPIKE)
 consecutive_healthy=0
 recovery_achieved=false
 for window in 1 2 3 4 5 6; do
   dir="$EVIDENCE_DIR/recovery/window-$(printf '%03d' "$window")"
-  if ! ghz_run "$dir" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 10s; then
+  if ! retrieval_run "$dir" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 10s "$STABILITY_BASELINE"; then
     consecutive_healthy=0
     continue
   fi
   sr="$(success_rate "$dir/result.json")"; er="$(error_rate "$dir/result.json")"; p95="$(latency_ms "$dir/result.json" 95)"
-  deadline_rate="$(jq -r '((.statusCodeDistribution.DeadlineExceeded // 0) / (.count | if . == 0 then 1 else . end))' "$dir/result.json")"
-  unavailable_rate="$(jq -r '((.statusCodeDistribution.Unavailable // 0) / (.count | if . == 0 then 1 else . end))' "$dir/result.json")"
+  deadline_rate="$(jq -r '((.status_distribution.DEADLINE_EXCEEDED // 0) / (.requests_total | if . == 0 then 1 else . end))' "$dir/result.json")"
+  unavailable_rate="$(jq -r '((.status_distribution.UNAVAILABLE // 0) / (.requests_total | if . == 0 then 1 else . end))' "$dir/result.json")"
   healthy=false
   if awk "BEGIN {exit !($sr >= 0.99 && $er < 0.01 && $p95 <= $RECOVERY_P95_SLO_MS && $deadline_rate <= 0.005 && $unavailable_rate <= 0.005)}"; then
     healthy=true; consecutive_healthy=$((consecutive_healthy + 1))
@@ -317,13 +359,17 @@ for window in 1 2 3 4 5 6; do
 done
 [[ "$recovery_achieved" == true ]] || FAILURE_REASONS+=(RECOVERY_TTR_FAILED)
 curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-before.prom" || FAILURE_REASONS+=(RECOVERY_METRICS_FAILED)
-ghz_run "$EVIDENCE_DIR/recovery/stabilized" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 5m || FAILURE_REASONS+=(RECOVERY_STABILIZED_FAILED)
+retrieval_run "$EVIDENCE_DIR/recovery/stabilized" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 5m "$STABILITY_BASELINE" || FAILURE_REASONS+=(RECOVERY_STABILIZED_FAILED)
 curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-after.prom" || FAILURE_REASONS+=(RECOVERY_METRICS_FAILED)
 
-record "$EVIDENCE_DIR/post-load-quality/run" env ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-post-load-quality" make quality-runtime-full-capability-quick-remote || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
-copy_quality_reports "$EVIDENCE_DIR/post-load-quality"
+record "$EVIDENCE_DIR/post-load-quality/run" env \
+  ASTRAVECTOR_QUALITY_OUTPUT_DIR="$EVIDENCE_DIR/post-load-quality" \
+  ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-post-load-quality" \
+  make quality-runtime-full-capability-quick-remote || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
 quality_passes "$EVIDENCE_DIR/post-load-quality/runtime-quality-report.json" || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
 integrity_snapshot "$EVIDENCE_DIR/post-load-quality/post-load-integrity" || FAILURE_REASONS+=(POST_LOAD_INTEGRITY_FAILED)
+assert_source_tree_clean after-post-load || FAILURE_REASONS+=(SOURCE_TREE_MODIFIED_DURING_RUN)
 
 kill "$RESOURCE_PID" "$METRICS_PID" 2>/dev/null || true; wait "$RESOURCE_PID" "$METRICS_PID" 2>/dev/null || true; RESOURCE_PID=""; METRICS_PID=""
 python3 "$ROOT_DIR/scripts/finalize_macbook_load_report.py" "$EVIDENCE_DIR" "$SOURCE_GIT_SHA" "$SOURCE_BRANCH" "$SOURCE_ORIGIN_MAIN_SHA" "$EXPECTED_RELEASE_SHA" "$RECOVERY_P95_SLO_MS"
+assert_source_tree_clean after-finalization

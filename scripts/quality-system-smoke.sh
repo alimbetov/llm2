@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT_DIR="$ROOT_DIR/benchmarks/quality/reports"
+REPORT_DIR="${ASTRAVECTOR_QUALITY_OUTPUT_DIR:-$ROOT_DIR/target/quality-reports}"
 SYSTEM_SMOKE_RUN_ID="wave10-system-smoke-$(date +%Y%m%d-%H%M%S)"
-EVIDENCE_DIR="$REPORT_DIR/system-smoke/$SYSTEM_SMOKE_RUN_ID"
+EVIDENCE_ROOT="${ASTRAVECTOR_EVIDENCE_ROOT:-$ROOT_DIR/../astravector-evidence}"
+EVIDENCE_DIR="$EVIDENCE_ROOT/$SYSTEM_SMOKE_RUN_ID"
 PROFILE_TIMEOUT_SECONDS="${SYSTEM_SMOKE_PROFILE_TIMEOUT_SECONDS:-1800}"
 SYSTEM_TIMEOUT_SECONDS="${SYSTEM_SMOKE_TIMEOUT_SECONDS:-7200}"
 RUNTIME_STARTUP_TIMEOUT_SECONDS="${SYSTEM_SMOKE_RUNTIME_STARTUP_TIMEOUT_SECONDS:-120}"
@@ -88,13 +89,6 @@ run_with_timeout() {
   fi
 }
 
-copy_runtime_reports() {
-  local dir="$1"
-  for file in runtime-quality-report.json runtime-quality-report.md runtime-failures.jsonl runtime-candidates.jsonl; do
-    if [[ -f "$REPORT_DIR/$file" ]]; then cp "$REPORT_DIR/$file" "$dir/$file"; else : > "$dir/$file"; fi
-  done
-}
-
 profile_passed() {
   local report="$1"
   local profile="${2:-generic}"
@@ -137,8 +131,8 @@ run_profile() {
     return
   fi
   export ASTRAVECTOR_QUALITY_RUN_ID="$run_id"
-  record "$cycle/$name" "$dir" run_with_timeout "$PROFILE_TIMEOUT_SECONDS" make "$target" || true
-  copy_runtime_reports "$dir"
+  record "$cycle/$name" "$dir" run_with_timeout "$PROFILE_TIMEOUT_SECONDS" env \
+    ASTRAVECTOR_QUALITY_OUTPUT_DIR="$dir" make "$target" || true
   write_manifest "$cycle" "$name"
   if ! profile_passed "$dir/runtime-quality-report.json" "$name"; then
     REQUIRED_FAILURES+=("$cycle/$name:report-assertions")
@@ -246,11 +240,11 @@ run_cross_run_isolation() {
   local run_b="${SYSTEM_SMOKE_RUN_ID}-isolation-b"
   local dir_a="$EVIDENCE_DIR/isolation/run-a" dir_b="$EVIDENCE_DIR/isolation/run-b"
   export ASTRAVECTOR_QUALITY_RUN_ID="$run_a"
-  record isolation-a "$dir_a" run_with_timeout "$PROFILE_TIMEOUT_SECONDS" make quality-runtime-rag-analysis-bank-remote || true
-  copy_runtime_reports "$dir_a"
+  record isolation-a "$dir_a" run_with_timeout "$PROFILE_TIMEOUT_SECONDS" env \
+    ASTRAVECTOR_QUALITY_OUTPUT_DIR="$dir_a" make quality-runtime-rag-analysis-bank-remote || true
   export ASTRAVECTOR_QUALITY_RUN_ID="$run_b"
-  record isolation-b "$dir_b" run_with_timeout "$PROFILE_TIMEOUT_SECONDS" make quality-runtime-rag-analysis-bank-remote || true
-  copy_runtime_reports "$dir_b"
+  record isolation-b "$dir_b" run_with_timeout "$PROFILE_TIMEOUT_SECONDS" env \
+    ASTRAVECTOR_QUALITY_OUTPUT_DIR="$dir_b" make quality-runtime-rag-analysis-bank-remote || true
   local postgres qdrant graph final
   postgres="$(jq -s --arg run "$run_b" '[.[].contexts[]? | select(.metadata.quality_run_id != $run)] | length' "$dir_b/runtime-candidates.jsonl")"
   qdrant="$(jq -s --arg run "$run_b" '[.[].contexts[]? | select((.metadata.retrieval_sources // "") | contains("VECTOR_DIRECT")) | select(.metadata.quality_run_id != $run)] | length' "$dir_b/runtime-candidates.jsonl")"
@@ -394,6 +388,7 @@ main() {
     > "$summary_tmp"
   mv "$summary_tmp" "$EVIDENCE_DIR/summary.json"
   jq . "$EVIDENCE_DIR/summary.json" > "$EVIDENCE_DIR/summary.md"
+  mkdir -p "$REPORT_DIR"
   cp "$EVIDENCE_DIR/summary.json" "$REPORT_DIR/rag-analysis-bank-system-smoke-report.json"
   cp "$EVIDENCE_DIR/summary.md" "$REPORT_DIR/rag-analysis-bank-system-smoke-report.md"
   if [[ "$verdict" != SYSTEM_SMOKE_PASS ]]; then return 1; fi

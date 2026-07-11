@@ -857,7 +857,25 @@ pub struct ResilienceConfig {
     #[serde(default)]
     pub inference_retry: InferenceRetryConfig,
     #[serde(default)]
-    pub qdrant_retry: RetryPolicyConfig,
+    pub qdrant_retry: QdrantRetryConfig,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct QdrantRetryConfig {
+    #[serde(default = "default_qdrant_query_retry_policy")]
+    pub query: RetryPolicyConfig,
+    #[serde(default = "default_qdrant_background_retry_policy")]
+    pub publisher: RetryPolicyConfig,
+    #[serde(default = "default_qdrant_background_retry_policy")]
+    pub reconciliation: RetryPolicyConfig,
+}
+impl Default for QdrantRetryConfig {
+    fn default() -> Self {
+        Self {
+            query: default_qdrant_query_retry_policy(),
+            publisher: default_qdrant_background_retry_policy(),
+            reconciliation: default_qdrant_background_retry_policy(),
+        }
+    }
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct InferenceRetryConfig {
@@ -892,8 +910,14 @@ pub struct RetryPolicyConfig {
     pub retry_on_timeout: bool,
     #[serde(default = "default_true")]
     pub retry_on_unavailable: bool,
+    #[serde(default = "default_true")]
+    pub retry_on_connect: bool,
     #[serde(default = "default_retry_min_remaining_budget_ms")]
     pub min_remaining_budget_ms: u64,
+    #[serde(default = "default_qdrant_min_operation_budget_ms")]
+    pub min_operation_budget_ms: u64,
+    #[serde(default = "default_qdrant_safety_margin_ms")]
+    pub safety_margin_ms: u64,
 }
 impl Default for RetryPolicyConfig {
     fn default() -> Self {
@@ -906,9 +930,42 @@ impl Default for RetryPolicyConfig {
             retry_on_statuses: vec![429, 502, 503, 504],
             retry_on_timeout: true,
             retry_on_unavailable: true,
+            retry_on_connect: true,
             min_remaining_budget_ms: default_retry_min_remaining_budget_ms(),
+            min_operation_budget_ms: default_qdrant_min_operation_budget_ms(),
+            safety_margin_ms: default_qdrant_safety_margin_ms(),
         }
     }
+}
+
+fn default_qdrant_query_retry_policy() -> RetryPolicyConfig {
+    RetryPolicyConfig {
+        max_attempts: 2,
+        retry_on_statuses: vec![502, 503, 504],
+        retry_on_timeout: false,
+        retry_on_connect: true,
+        min_operation_budget_ms: 150,
+        safety_margin_ms: 50,
+        ..RetryPolicyConfig::default()
+    }
+}
+
+fn default_qdrant_background_retry_policy() -> RetryPolicyConfig {
+    RetryPolicyConfig {
+        max_attempts: 5,
+        retry_on_statuses: vec![429, 502, 503, 504],
+        retry_on_timeout: true,
+        retry_on_connect: true,
+        ..RetryPolicyConfig::default()
+    }
+}
+
+fn default_qdrant_min_operation_budget_ms() -> u64 {
+    150
+}
+
+fn default_qdrant_safety_margin_ms() -> u64 {
+    50
 }
 
 fn default_query_retry_policy() -> RetryPolicyConfig {
@@ -1968,14 +2025,23 @@ impl AppConfig {
             self.embedding.partial_embedding_failure_mode == "FAIL_DOCUMENT",
             "embedding.partial_embedding_failure_mode must be FAIL_DOCUMENT in fix4.4"
         );
-        anyhow::ensure!(
-            self.resilience.qdrant_retry.max_attempts >= 1,
-            "resilience.qdrant_retry.max_attempts must be >= 1"
-        );
-        anyhow::ensure!(
-            self.resilience.qdrant_retry.max_delay_ms >= self.resilience.qdrant_retry.base_delay_ms,
-            "qdrant retry max_delay must be >= base_delay"
-        );
+        for (workload, policy) in [
+            ("query", &self.resilience.qdrant_retry.query),
+            ("publisher", &self.resilience.qdrant_retry.publisher),
+            (
+                "reconciliation",
+                &self.resilience.qdrant_retry.reconciliation,
+            ),
+        ] {
+            anyhow::ensure!(
+                policy.max_attempts >= 1,
+                "resilience.qdrant_retry.{workload}.max_attempts must be >= 1"
+            );
+            anyhow::ensure!(
+                policy.max_delay_ms >= policy.base_delay_ms,
+                "qdrant {workload} retry max_delay must be >= base_delay"
+            );
+        }
         anyhow::ensure!(
             self.resilience.inference_retry.query.max_attempts >= 1
                 && self.resilience.inference_retry.document.max_attempts >= 1,

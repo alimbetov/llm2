@@ -2,7 +2,8 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT_DIR="$ROOT_DIR/benchmarks/quality/reports"
+REPORT_DIR="${ASTRAVECTOR_QUALITY_OUTPUT_DIR:-$ROOT_DIR/target/quality-reports}"
+export ASTRAVECTOR_QUALITY_OUTPUT_DIR="$REPORT_DIR"
 BASELINE_FILE="$ROOT_DIR/benchmarks/quality/baseline/hard-negative-baseline.json"
 RUNTIME_REPORT="$REPORT_DIR/runtime-quality-report.json"
 CONFIDENCE_JSON="$REPORT_DIR/runtime-confidence-report.json"

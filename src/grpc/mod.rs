@@ -20,6 +20,7 @@ use crate::{
     persistence::{ChunkContentRecord, ClaimResult, ParentContextRecord, Repository},
     provider::SelectedProvider,
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
+    reliability::{OperationBudget, WorkloadKind},
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
     sparse::{SparseTechnicalEncoder, SparseTokenClass},
 };
@@ -47,6 +48,97 @@ use uuid::Uuid;
 struct AdmissionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     scope: &'static str,
+}
+
+fn postgres_statement_timeout_ms(
+    configured_timeout_ms: u64,
+    remaining_ms: u64,
+    safety_margin_ms: u64,
+) -> Result<u64, AstraError> {
+    if remaining_ms <= safety_margin_ms {
+        return Err(AstraError::DeadlineExceeded(
+            "insufficient_postgres_budget".into(),
+        ));
+    }
+    Ok(configured_timeout_ms
+        .min(remaining_ms - safety_margin_ms)
+        .max(1))
+}
+
+#[cfg(test)]
+mod downstream_budget_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_timeout_respects_deadline_budget() {
+        assert_eq!(postgres_statement_timeout_ms(5_000, 800, 50).unwrap(), 750);
+        assert_eq!(postgres_statement_timeout_ms(500, 800, 50).unwrap(), 500);
+        assert!(postgres_statement_timeout_ms(5_000, 50, 50).is_err());
+    }
+
+    #[test]
+    fn equal_score_order_is_deterministic() {
+        let result = |document: &str, version: u64, chunk: &str| pb::SearchResultV004 {
+            document_id: document.into(),
+            document_version: version,
+            matched_chunk_id: chunk.into(),
+            scores: Some(pb::SearchScoresV004 {
+                final_score: 0.5,
+                fusion_score: 0.4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut values = [
+            result("doc-b", 1, "chunk-a"),
+            result("doc-a", 1, "chunk-b"),
+            result("doc-a", 2, "chunk-c"),
+            result("doc-a", 2, "chunk-a"),
+        ];
+        values.sort_by(stable_result_rank);
+        let identity = values
+            .iter()
+            .map(|value| {
+                (
+                    value.document_id.as_str(),
+                    value.document_version,
+                    value.matched_chunk_id.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identity,
+            vec![
+                ("doc-a", 2, "chunk-a"),
+                ("doc-a", 2, "chunk-c"),
+                ("doc-a", 1, "chunk-b"),
+                ("doc-b", 1, "chunk-a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_qdrant_scores_use_point_id_tiebreak() {
+        let hit = |id: &str| QdrantSearchHit {
+            id: Uuid::parse_str(id).unwrap(),
+            score: 0.5,
+            dense_score: 0.5,
+            sparse_score: 0.0,
+            fusion_score: 0.5,
+            dense_rank: None,
+            sparse_rank: None,
+            payload: Default::default(),
+        };
+        let mut values = [
+            hit("00000000-0000-0000-0000-000000000002"),
+            hit("00000000-0000-0000-0000-000000000001"),
+        ];
+        values.sort_by(stable_qdrant_hit_rank);
+        assert_eq!(
+            values[0].id,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+    }
 }
 
 impl Drop for AdmissionPermit {
@@ -613,6 +705,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         .min(self.cfg.grpc.deadlines.query_ms);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let qdrant_budget = OperationBudget {
+            deadline,
+            cancellation: self.shutdown.child_token(),
+            workload: WorkloadKind::Query,
+        };
         let search_mode = Self::resolve_search_mode(r.search_mode, &self.cfg.search.default_mode);
         let version_filters = Self::version_filters_from_search_request(&r);
         tracing::debug!(
@@ -716,6 +813,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let dense_future = {
             let qdrant = qdrant.clone();
             let version_filters = version_filters.clone();
+            let budget = qdrant_budget.clone();
             async move {
                 if !wants_dense {
                     return Ok::<Option<Vec<QdrantSearchHit>>, Status>(None);
@@ -726,12 +824,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     ));
                 };
                 qdrant
-                    .search_dense(
+                    .search_dense_with_budget(
                         dense,
                         &dense_access_zone_ids,
                         caller_access_level as i16,
                         candidate_limit as usize,
                         Some(&version_filters),
+                        Some(&budget),
                     )
                     .await
                     .map(Some)
@@ -741,6 +840,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let sparse_future = {
             let qdrant = qdrant.clone();
             let version_filters = version_filters.clone();
+            let budget = qdrant_budget.clone();
             async move {
                 if !wants_sparse {
                     return Ok::<Option<Vec<QdrantSearchHit>>, Status>(None);
@@ -748,13 +848,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 match (sparse_indices.as_deref(), sparse_values.as_deref()) {
                     (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
                         qdrant
-                            .search_sparse(
+                            .search_sparse_with_budget(
                                 indices,
                                 values,
                                 &sparse_access_zone_ids,
                                 caller_access_level as i16,
                                 candidate_limit as usize,
                                 Some(&version_filters),
+                                Some(&budget),
                             )
                             .await
                             .map(Some)
@@ -770,7 +871,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
         let mut dense_failed = false;
         let mut sparse_failed = false;
-        let dense_hits = match dense_result {
+        let mut dense_hits = match dense_result {
             Ok(Some(hits)) => hits,
             Ok(None) => Vec::new(),
             Err(e) => {
@@ -782,7 +883,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 Vec::new()
             }
         };
-        let sparse_hits = match sparse_result {
+        let mut sparse_hits = match sparse_result {
             Ok(Some(hits)) => hits,
             Ok(None) => Vec::new(),
             Err(e) if sparse_required => return Err(e),
@@ -795,6 +896,15 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 Vec::new()
             }
         };
+        dense_hits.sort_by(stable_qdrant_hit_rank);
+        sparse_hits.sort_by(stable_qdrant_hit_rank);
+        let dense_branch_executed = wants_dense && !dense_failed;
+        let sparse_branch_executed = wants_sparse && !sparse_failed;
+        let fusion_executed = search_mode == pb::SearchModeV005::Hybrid
+            && dense_branch_executed
+            && sparse_branch_executed;
+        let dense_branch_candidate_count = dense_hits.len() as u32;
+        let sparse_branch_candidate_count = sparse_hits.len() as u32;
         let hits = match search_mode {
             pb::SearchModeV005::Dense => {
                 if dense_hits.is_empty() && dense_failed {
@@ -853,6 +963,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             }
         };
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        let fusion_candidate_count = hits.len() as u32;
         tracing::debug!(
             correlation_id = %r.correlation_id,
             search_mode = ?search_mode,
@@ -921,9 +1032,29 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "SEARCH_PARENT_GROUPS_READY"
         );
         let parent_fetch_started = std::time::Instant::now();
+        let postgres_safety_margin_ms = 50u64;
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        let statement_timeout_ms = postgres_statement_timeout_ms(
+            self.cfg.postgres.statement_timeout_ms,
+            remaining_ms,
+            postgres_safety_margin_ms,
+        )
+        .map_err(|_| {
+            counter!("astravector_deadline_rejected_total", "stage" => "postgres_parent_fetch", "reason" => "insufficient_postgres_budget").increment(1);
+            Status::deadline_exceeded("insufficient_postgres_budget")
+        })?;
+        histogram!("astravector_deadline_remaining_seconds", "stage" => "postgres_parent_fetch")
+            .record(remaining_ms as f64 / 1000.0);
         let parents = self
             .repo()?
-            .fetch_parent_contexts_multi(&access_zone_ids, &parent_ids, caller_access_level as i16)
+            .fetch_parent_contexts_multi_with_timeout(
+                &access_zone_ids,
+                &parent_ids,
+                caller_access_level as i16,
+                statement_timeout_ms,
+            )
             .await
             .map_err(Status::from)?;
         let parent_fetch_ms = parent_fetch_started.elapsed().as_millis() as u64;
@@ -1872,6 +2003,12 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 token_truncation_strategy: self.cfg.rag_context.truncation_strategy.clone(),
                 dropped_chunk_ids: dropped_chunk_ids.iter().take(50).cloned().collect(),
                 huge_chunk_strategy: self.cfg.rag_context.huge_chunk_strategy.clone(),
+                dense_branch_executed,
+                sparse_branch_executed,
+                fusion_executed,
+                dense_branch_candidate_count,
+                sparse_branch_candidate_count,
+                fusion_candidate_count,
             }),
             warnings,
         }))
@@ -2687,6 +2824,12 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 token_truncation_strategy: self.cfg.rag_context.truncation_strategy.clone(),
                 dropped_chunk_ids: Vec::new(),
                 huge_chunk_strategy: self.cfg.rag_context.huge_chunk_strategy.clone(),
+                dense_branch_executed: wants_dense,
+                sparse_branch_executed: wants_sparse,
+                fusion_executed: wants_dense && wants_sparse,
+                dense_branch_candidate_count: dense_hits.len() as u32,
+                sparse_branch_candidate_count: sparse_hits.len() as u32,
+                fusion_candidate_count: fused.len() as u32,
             }),
         }))
     }
@@ -4109,11 +4252,29 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
         let search = <Self as AstraVectorV004Control>::search(self, inner)
             .await?
             .into_inner();
-        let total_candidates = search
-            .diagnostics
-            .as_ref()
-            .map(|d| d.candidate_count)
-            .unwrap_or(search.results.len() as u32);
+        let diagnostics = search.diagnostics.clone().unwrap_or_default();
+        let total_candidates = if diagnostics.candidate_count == 0 {
+            search.results.len() as u32
+        } else {
+            diagnostics.candidate_count
+        };
+        let degradation_codes = search
+            .warnings
+            .iter()
+            .map(|warning| warning.code.clone())
+            .filter(|code| {
+                matches!(
+                    code.as_str(),
+                    "GRAPH_EXPANSION_BACKPRESSURE"
+                        | "GRAPH_EXPANSION_TIMEOUT"
+                        | "MMR_FETCH_BACKPRESSURE"
+                        | "MMR_FETCH_TIMEOUT"
+                        | "TOKEN_SIMILARITY_FALLBACK"
+                        | "DEADLINE_BUDGET_DEGRADATION"
+                )
+            })
+            .collect::<Vec<_>>();
+        let degraded = !degradation_codes.is_empty();
         let contexts = search
             .results
             .into_iter()
@@ -4130,6 +4291,23 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
                 total_candidates,
                 returned_contexts: contexts.len() as u32,
                 profile: profile as i32,
+                evidence_status: if degraded {
+                    pb::EvidenceStatus::Degraded as i32
+                } else if contexts.is_empty() {
+                    pb::EvidenceStatus::Insufficient as i32
+                } else {
+                    pb::EvidenceStatus::Found as i32
+                },
+                degraded,
+                degradation_codes,
+                corpus_snapshot_id: String::new(),
+                effective_config_sha256: String::new(),
+                dense_branch_executed: diagnostics.dense_branch_executed,
+                sparse_branch_executed: diagnostics.sparse_branch_executed,
+                fusion_executed: diagnostics.fusion_executed,
+                dense_branch_candidate_count: diagnostics.dense_branch_candidate_count,
+                sparse_branch_candidate_count: diagnostics.sparse_branch_candidate_count,
+                fusion_candidate_count: diagnostics.fusion_candidate_count,
             }),
             contexts,
             warnings: search.warnings,
@@ -5621,14 +5799,16 @@ fn normalize_scores_for_fusion(scores: &[f32]) -> Vec<f32> {
 }
 
 fn fuse_qdrant_hits(
-    dense_hits: Vec<QdrantSearchHit>,
-    sparse_hits: Vec<QdrantSearchHit>,
+    mut dense_hits: Vec<QdrantSearchHit>,
+    mut sparse_hits: Vec<QdrantSearchHit>,
     limit: usize,
     fusion_method: &str,
     dense_weight: f32,
     sparse_weight: f32,
     rrf_k: f32,
 ) -> Vec<QdrantSearchHit> {
+    dense_hits.sort_by(stable_qdrant_hit_rank);
+    sparse_hits.sort_by(stable_qdrant_hit_rank);
     let mut by_id: std::collections::HashMap<Uuid, QdrantSearchHit> =
         std::collections::HashMap::new();
     let method = fusion_method.to_ascii_uppercase();
@@ -5706,13 +5886,16 @@ fn fuse_qdrant_hits(
 
     metrics::counter!("hybrid_fusion_applied_total", "method" => method.clone()).increment(1);
     let mut hits: Vec<QdrantSearchHit> = by_id.into_values().collect();
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    hits.sort_by(stable_qdrant_hit_rank);
     hits.truncate(limit);
     hits
+}
+
+fn stable_qdrant_hit_rank(left: &QdrantSearchHit, right: &QdrantSearchHit) -> std::cmp::Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn effective_retrieve_access_level(
@@ -8631,10 +8814,19 @@ fn stable_result_rank(
     left: &pb::SearchResultV004,
     right: &pb::SearchResultV004,
 ) -> std::cmp::Ordering {
-    score_of(right)
-        .partial_cmp(&score_of(left))
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| result_identity_key(left).cmp(&result_identity_key(right)))
+    let left_scores = left.scores.as_ref().cloned().unwrap_or_default();
+    let right_scores = right.scores.as_ref().cloned().unwrap_or_default();
+    right_scores
+        .final_score
+        .total_cmp(&left_scores.final_score)
+        .then_with(|| {
+            right_scores
+                .fusion_score
+                .total_cmp(&left_scores.fusion_score)
+        })
+        .then_with(|| left.document_id.cmp(&right.document_id))
+        .then_with(|| right.document_version.cmp(&left.document_version))
+        .then_with(|| left.matched_chunk_id.cmp(&right.matched_chunk_id))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -9485,7 +9677,7 @@ fn parent_lexical_evidence_text(parent: &ParentContextRecord) -> String {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        if let Some((heading, section_path)) =
+        if let Some((heading, section_path, _, _)) =
             logical_block_location(&parent.metadata, source_block_id)
         {
             if !heading.is_empty() {
@@ -9692,68 +9884,10 @@ fn normalized_phrase(text: &str) -> String {
         .join(" ")
 }
 
-fn best_logical_block_for_query(
-    metadata: &serde_json::Value,
-    query: &str,
-) -> Option<(String, String)> {
-    let blocks = metadata
-        .get("logical_blocks")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
-    let query_terms = lexical_terms(query);
-    let ordered_discriminating = ordered_lexical_terms(query)
-        .into_iter()
-        .filter(|term| !is_common_retrieval_overlap_term(term))
-        .collect::<Vec<_>>();
-    let leading = ordered_discriminating.first().cloned();
-    let second = ordered_discriminating.get(1).cloned();
-    blocks
-        .as_array()?
-        .iter()
-        .filter_map(|block| {
-            let block_id = block.get("block_id")?.as_str()?.to_string();
-            if block_id == "doc-root" {
-                return None;
-            }
-            let text = block.get("text")?.as_str()?.to_string();
-            let heading = block
-                .get("source_location")
-                .and_then(|location| location.get("heading"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let section_path = block
-                .get("source_location")
-                .and_then(|location| location.get("section_path"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let block_terms = lexical_terms(&format!("{heading} {section_path} {text}"));
-            let matched = query_terms
-                .iter()
-                .filter(|term| block_terms.contains(*term))
-                .count();
-            let leading_bonus = leading
-                .as_ref()
-                .map(|term| block_terms.contains(term) as usize)
-                .unwrap_or(1);
-            let second_bonus = second
-                .as_ref()
-                .map(|term| block_terms.contains(term) as usize)
-                .unwrap_or(0);
-            Some((
-                (matched * 10) + (leading_bonus * 3) + (second_bonus * 2),
-                block_id,
-                text,
-            ))
-        })
-        .max_by_key(|(score, _, _)| *score)
-        .filter(|(score, _, _)| *score > 0)
-        .map(|(_, block_id, text)| (block_id, text))
-}
-
 fn logical_block_location(
     metadata: &serde_json::Value,
     source_block_id: &str,
-) -> Option<(String, String)> {
+) -> Option<(String, String, u32, u32)> {
     let blocks = metadata
         .get("logical_blocks")
         .and_then(serde_json::Value::as_str)
@@ -9773,7 +9907,15 @@ fn logical_block_location(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
-        Some((heading, section_path))
+        let page_start = location
+            .get("page_start")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default() as u32;
+        let page_end = location
+            .get("page_end")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default() as u32;
+        Some((heading, section_path, page_start, page_end))
     })
 }
 
@@ -9799,22 +9941,14 @@ fn search_result_from_lexical_parent(
     metadata.insert("representation_type".into(), "ORIGINAL".into());
     metadata.insert("sequence_no".into(), parent.sequence_no.to_string());
     let score = lexical_parent_score(parent, query);
-    let mut source_block_id = parent
+    let source_block_id = parent
         .source_block_id
         .clone()
         .or_else(|| metadata.get("source_block_id").cloned())
         .unwrap_or_default();
-    let mut matched_text = parent.content.clone();
-    if source_block_id.is_empty() || source_block_id == "doc-root" {
-        if let Some((best_block_id, best_text)) =
-            best_logical_block_for_query(&parent.metadata, query)
-        {
-            source_block_id = best_block_id;
-            matched_text = best_text;
-        }
-    }
+    let matched_text = parent.content.clone();
     if !source_block_id.is_empty() {
-        if let Some((heading, section_path)) =
+        if let Some((heading, section_path, page_start, page_end)) =
             logical_block_location(&parent.metadata, &source_block_id)
         {
             if !heading.is_empty() {
@@ -9825,6 +9959,8 @@ fn search_result_from_lexical_parent(
                     .entry("section_path".into())
                     .or_insert(section_path);
             }
+            metadata.insert("page_start".into(), page_start.to_string());
+            metadata.insert("page_end".into(), page_end.to_string());
         }
         metadata.insert("source_block_id".into(), source_block_id);
     }

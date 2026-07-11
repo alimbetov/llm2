@@ -2591,6 +2591,75 @@ WHERE c.access_zone_id=ANY($1::uuid[])
             .collect())
     }
 
+    pub async fn fetch_parent_contexts_multi_with_timeout(
+        &self,
+        access_zone_ids: &[Uuid],
+        parent_ids: &[Uuid],
+        caller_access_level: i16,
+        statement_timeout_ms: u64,
+    ) -> Result<Vec<ParentContextRecord>, AstraError> {
+        if parent_ids.is_empty() || access_zone_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if statement_timeout_ms == 0 {
+            return Err(AstraError::DeadlineExceeded(
+                "insufficient_postgres_budget".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(postgres_error)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{statement_timeout_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+        let rows = sqlx::query(
+            r#"SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,c.sequence_no,c.source_block_id,c.metadata
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.id=ANY($2::uuid[])
+  AND c.granularity='PARENT'
+  AND c.representation_type='ORIGINAL'
+  AND c.access_level <= $3
+  AND c.lifecycle_status='ACTIVE'
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND (c.expires_at IS NULL OR c.expires_at > now())"#,
+        )
+        .bind(access_zone_ids)
+        .bind(parent_ids)
+        .bind(caller_access_level)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ParentContextRecord {
+                access_zone_id: r.get("access_zone_id"),
+                id: r.get("id"),
+                document_id: r.get("document_id"),
+                document_version: r.get("document_version"),
+                root_chunk_id: r.get("root_chunk_id"),
+                source_chunk_id: r.get("source_chunk_id"),
+                access_level: r.get("access_level"),
+                content: r.get("content"),
+                content_hash: r.get("content_hash"),
+                token_count: r.get("actual_token_count"),
+                sequence_no: r.get("sequence_no"),
+                source_block_id: r
+                    .try_get::<Option<String>, _>("source_block_id")
+                    .ok()
+                    .flatten(),
+                metadata: r.get("metadata"),
+            })
+            .collect())
+    }
+
     pub async fn fetch_active_parent_context_candidates_multi(
         &self,
         access_zone_ids: &[Uuid],
@@ -3358,4 +3427,19 @@ RETURNING payload_version,qdrant_sync_status"#)
 }
 fn db(e: sqlx::Error) -> AstraError {
     AstraError::Unavailable(format!("postgres: {e}"))
+}
+
+fn postgres_error(error: sqlx::Error) -> AstraError {
+    match &error {
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("57014") => {
+            AstraError::DeadlineExceeded(format!("POSTGRES_STATEMENT_TIMEOUT: {error}"))
+        }
+        sqlx::Error::PoolTimedOut => {
+            AstraError::Unavailable(format!("POSTGRES_POOL_TIMEOUT: {error}"))
+        }
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed => {
+            AstraError::Unavailable(format!("POSTGRES_CONNECTION_UNAVAILABLE: {error}"))
+        }
+        _ => AstraError::Unavailable(format!("POSTGRES_QUERY_FAILED: {error}")),
+    }
 }

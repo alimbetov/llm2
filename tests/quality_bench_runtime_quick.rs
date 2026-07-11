@@ -12,7 +12,7 @@ use astravector_runtime::sparse::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -26,6 +26,13 @@ use uuid::Uuid;
 
 const QUALITY_ROOT: &str = "benchmarks/quality";
 
+fn quality_report_dir() -> PathBuf {
+    env::var("ASTRAVECTOR_QUALITY_OUTPUT_DIR")
+        .or_else(|_| env::var("ASTRAVECTOR_QUALITY_REPORT_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("target/quality-reports"))
+}
+
 #[derive(Default)]
 struct RuntimeStats {
     fixtures_ingested_count: usize,
@@ -38,6 +45,7 @@ struct RuntimeStats {
     qdrant_collection_count: u64,
     qdrant_points_count: u64,
     qdrant_payload_verified: bool,
+    qdrant_comparison: QdrantCanonicalComparison,
     dense_embeddings_count: u64,
     sparse_embeddings_count: u64,
     retrieve_context_queries_total: usize,
@@ -58,7 +66,37 @@ struct RuntimeStats {
     hybrid: HybridRuntimeStats,
     graph: GraphRuntimeStats,
     no_answer: NoAnswerRuntimeStats,
+    safety: SafetyRuntimeStats,
     query_diagnostics: Vec<Value>,
+}
+
+#[derive(Default)]
+struct QdrantCanonicalComparison {
+    expected_points: usize,
+    actual_points: usize,
+    missing_points: usize,
+    extra_points: usize,
+    pages_read: usize,
+    points_read: usize,
+    scroll_status: String,
+    comparison_completed: bool,
+    failure_reason: Option<String>,
+}
+
+#[derive(Default)]
+struct SafetyRuntimeStats {
+    comparisons: usize,
+    returned_contexts_compared: usize,
+    hard_negative_queries: usize,
+    hard_negative_false_positive_count: usize,
+    cross_zone_leakage_count: usize,
+    access_level_violation_count: usize,
+    forbidden_document_return_count: usize,
+    wrong_document_version_count: usize,
+    citation_incomplete_count: usize,
+    citation_text_mismatch_count: usize,
+    positive_query_empty_context_count: usize,
+    silent_degraded_response_count: usize,
 }
 
 struct AccessLevelAudit {
@@ -105,6 +143,28 @@ struct EvalResult {
     graph_expected_related_hits: usize,
     mmr_expected_aspects_total: usize,
     mmr_expected_aspects_hits: usize,
+    hard_negative_query: bool,
+    hard_negative_false_positive_count: usize,
+    cross_zone_leakage_count: usize,
+    access_level_violation_count: usize,
+    forbidden_document_return_count: usize,
+    wrong_document_version_count: usize,
+    citation_incomplete_count: usize,
+    citation_text_mismatch_count: usize,
+    positive_query_empty_context_count: usize,
+    silent_degraded_response_count: usize,
+}
+
+struct CanonicalEvidence {
+    document_id: String,
+    document_version: u64,
+    source_block_id: String,
+    content: String,
+    content_hash: String,
+    access_level: i32,
+    source_uri: String,
+    page_start: u32,
+    page_end: u32,
 }
 
 #[derive(Clone, Default)]
@@ -393,6 +453,16 @@ fn access_level(value: &str) -> i32 {
         "CONFIDENTIAL" => pb::AccessLevel::Confidential as i32,
         "RESTRICTED" => pb::AccessLevel::Restricted as i32,
         _ => pb::AccessLevel::Public as i32,
+    }
+}
+
+fn access_level_rank(value: &str) -> i32 {
+    match value {
+        "PUBLIC" | "1" => 1,
+        "INTERNAL" | "2" => 2,
+        "CONFIDENTIAL" | "3" => 3,
+        "RESTRICTED" | "4" => 4,
+        _ => i32::MAX,
     }
 }
 
@@ -692,6 +762,194 @@ async fn qdrant_sparse_points_sample(base_url: &str, collection: &str) -> (u64, 
     (sampled, with_sparse)
 }
 
+async fn compare_qdrant_canonical_points(
+    base_url: &str,
+    collection: &str,
+) -> QdrantCanonicalComparison {
+    let postgres_url = env::var("ASTRAVECTOR_DB_URL").unwrap_or_else(|_| {
+        "postgres://astravector:astravector@127.0.0.1:55432/astravector".into()
+    });
+    let Ok(pool) = sqlx::PgPool::connect(&postgres_url).await else {
+        return QdrantCanonicalComparison {
+            scroll_status: "POSTGRES_ERROR".into(),
+            failure_reason: Some("POSTGRES_CONNECTION_FAILED".into()),
+            ..Default::default()
+        };
+    };
+    let run_id = quality_run_id();
+    let expected_rows = sqlx::query_scalar::<_, String>(
+        "SELECT vb.qdrant_point_id::text \
+         FROM astravector.vector_bindings_v004 vb \
+         JOIN astravector.content_chunks_v004 c \
+           ON c.access_zone_id=vb.access_zone_id AND c.id=vb.chunk_id \
+         JOIN astravector.document_versions dv \
+           ON dv.access_zone_id=vb.access_zone_id \
+          AND dv.document_id=vb.document_id \
+          AND dv.document_version=vb.document_version \
+         WHERE vb.lifecycle_status='ACTIVE' \
+           AND vb.qdrant_sync_status='SYNCED' \
+           AND vb.chunk_granularity IN('PARENT','SUB_180','SUB_260') \
+           AND dv.status='ACTIVE' \
+           AND ($1::text IS NULL OR c.metadata->>'quality_run_id'=$1)",
+    )
+    .bind(run_id.as_deref())
+    .fetch_all(&pool)
+    .await;
+    let Ok(expected_rows) = expected_rows else {
+        return QdrantCanonicalComparison {
+            scroll_status: "POSTGRES_ERROR".into(),
+            failure_reason: Some("POSTGRES_EXPECTED_SET_QUERY_FAILED".into()),
+            ..Default::default()
+        };
+    };
+    let expected = expected_rows.into_iter().collect::<HashSet<_>>();
+    let max_pages = env_u32("ASTRAVECTOR_QUALITY_QDRANT_SCROLL_MAX_PAGES", 1_000) as usize;
+    let max_points = env_u32("ASTRAVECTOR_QUALITY_QDRANT_SCROLL_MAX_POINTS", 200_000) as usize;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/collections/{}/points/scroll",
+        base_url.trim_end_matches('/'),
+        collection
+    );
+    let mut actual = HashSet::new();
+    let mut offset: Option<Value> = None;
+    let mut seen_offsets = HashSet::new();
+    let mut pages_read = 0;
+    loop {
+        if pages_read >= max_pages {
+            return QdrantCanonicalComparison {
+                expected_points: expected.len(),
+                actual_points: actual.len(),
+                pages_read,
+                points_read: actual.len(),
+                scroll_status: "MAX_PAGES_EXCEEDED".into(),
+                failure_reason: Some("QDRANT_SCROLL_MAX_PAGES".into()),
+                ..Default::default()
+            };
+        }
+        let mut must = vec![
+            json!({"key":"lifecycle_status","match":{"value":"ACTIVE"}}),
+            json!({"key":"chunk_granularity","match":{"any":["PARENT","SUB_180","SUB_260"]}}),
+        ];
+        if let Some(value) = run_id.as_deref() {
+            must.push(json!({"key":"quality_run_id","match":{"value":value}}));
+        }
+        let mut body = json!({
+            "limit": 256,
+            "with_payload": false,
+            "with_vector": false,
+            "filter": {"must": must}
+        });
+        if let Some(value) = offset.take() {
+            body["offset"] = value;
+        }
+        let response = match client.post(&url).json(&body).send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                return QdrantCanonicalComparison {
+                    expected_points: expected.len(),
+                    actual_points: actual.len(),
+                    pages_read,
+                    points_read: actual.len(),
+                    scroll_status: "QDRANT_ERROR".into(),
+                    failure_reason: Some(format!("QDRANT_HTTP_{}", response.status())),
+                    ..Default::default()
+                };
+            }
+            Err(error) => {
+                return QdrantCanonicalComparison {
+                    expected_points: expected.len(),
+                    actual_points: actual.len(),
+                    pages_read,
+                    points_read: actual.len(),
+                    scroll_status: "QDRANT_ERROR".into(),
+                    failure_reason: Some(error.to_string()),
+                    ..Default::default()
+                };
+            }
+        };
+        let Ok(value) = response.json::<Value>().await else {
+            return QdrantCanonicalComparison {
+                expected_points: expected.len(),
+                actual_points: actual.len(),
+                pages_read,
+                points_read: actual.len(),
+                scroll_status: "INVALID_JSON".into(),
+                failure_reason: Some("QDRANT_SCROLL_INVALID_JSON".into()),
+                ..Default::default()
+            };
+        };
+        pages_read += 1;
+        let Some(points) = value.pointer("/result/points").and_then(Value::as_array) else {
+            return QdrantCanonicalComparison {
+                expected_points: expected.len(),
+                actual_points: actual.len(),
+                pages_read,
+                points_read: actual.len(),
+                scroll_status: "INVALID_RESPONSE".into(),
+                failure_reason: Some("QDRANT_SCROLL_POINTS_MISSING".into()),
+                ..Default::default()
+            };
+        };
+        for point in points {
+            if let Some(id) = point.get("id").and_then(Value::as_str) {
+                actual.insert(id.to_string());
+            } else {
+                return QdrantCanonicalComparison {
+                    expected_points: expected.len(),
+                    actual_points: actual.len(),
+                    pages_read,
+                    points_read: actual.len(),
+                    scroll_status: "INVALID_RESPONSE".into(),
+                    failure_reason: Some("QDRANT_POINT_ID_MISSING".into()),
+                    ..Default::default()
+                };
+            }
+        }
+        if actual.len() > max_points {
+            return QdrantCanonicalComparison {
+                expected_points: expected.len(),
+                actual_points: actual.len(),
+                pages_read,
+                points_read: actual.len(),
+                scroll_status: "MAX_POINTS_EXCEEDED".into(),
+                failure_reason: Some("QDRANT_SCROLL_MAX_POINTS".into()),
+                ..Default::default()
+            };
+        }
+        let next = value.pointer("/result/next_page_offset").cloned();
+        if next.as_ref().is_none_or(Value::is_null) {
+            break;
+        }
+        let next_key = next.as_ref().expect("checked next offset").to_string();
+        if !seen_offsets.insert(next_key) {
+            return QdrantCanonicalComparison {
+                expected_points: expected.len(),
+                actual_points: actual.len(),
+                pages_read,
+                points_read: actual.len(),
+                scroll_status: "LOOP_DETECTED".into(),
+                failure_reason: Some("QDRANT_SCROLL_LOOP_DETECTED".into()),
+                ..Default::default()
+            };
+        }
+        offset = next;
+    }
+    let missing_points = expected.difference(&actual).count();
+    let extra_points = actual.difference(&expected).count();
+    QdrantCanonicalComparison {
+        expected_points: expected.len(),
+        actual_points: actual.len(),
+        missing_points,
+        extra_points,
+        pages_read,
+        points_read: actual.len(),
+        scroll_status: "COMPLETED".into(),
+        comparison_completed: true,
+        failure_reason: None,
+    }
+}
+
 async fn preflight(endpoint: &str) -> Preflight {
     let postgres_url = env::var("ASTRAVECTOR_DB_URL").unwrap_or_else(|_| {
         "postgres://astravector:astravector@127.0.0.1:55432/astravector".into()
@@ -864,6 +1122,53 @@ async fn collect_storage_stats(stats: &mut RuntimeStats) {
             0.0
         };
     }
+}
+
+async fn load_canonical_evidence() -> HashMap<String, CanonicalEvidence> {
+    let postgres_url = env::var("ASTRAVECTOR_DB_URL").unwrap_or_else(|_| {
+        "postgres://astravector:astravector@127.0.0.1:55432/astravector".into()
+    });
+    let Ok(pool) = sqlx::PgPool::connect(&postgres_url).await else {
+        return HashMap::new();
+    };
+    let Ok(rows) = sqlx::query(
+        "SELECT c.id::text AS id,c.document_id::text AS document_id,c.document_version, \
+                COALESCE(c.source_block_id,'') AS source_block_id,c.content,dv.content_hash::text AS content_hash,c.access_level, \
+                COALESCE(c.metadata->>'source_uri','') AS source_uri, \
+                COALESCE((c.source_location->>'page_start')::int,0) AS page_start, \
+                COALESCE((c.source_location->>'page_end')::int,0) AS page_end \
+         FROM astravector.content_chunks_v004 c \
+         JOIN astravector.document_versions dv \
+           ON dv.access_zone_id=c.access_zone_id \
+          AND dv.document_id=c.document_id \
+          AND dv.document_version=c.document_version \
+         WHERE c.lifecycle_status='ACTIVE' AND c.representation_type='ORIGINAL' \
+           AND dv.status='ACTIVE' \
+           AND ($1::text IS NULL OR c.metadata->>'quality_run_id'=$1)",
+    )
+    .bind(quality_run_id().as_deref())
+    .fetch_all(&pool)
+    .await
+    else {
+        return HashMap::new();
+    };
+    rows.into_iter()
+        .map(|row| {
+            let id = row.get::<String, _>("id");
+            let evidence = CanonicalEvidence {
+                document_id: row.get("document_id"),
+                document_version: row.get::<i64, _>("document_version") as u64,
+                source_block_id: row.get("source_block_id"),
+                content: row.get("content"),
+                content_hash: row.get::<String, _>("content_hash").trim().to_string(),
+                access_level: row.get::<i16, _>("access_level") as i32,
+                source_uri: row.get("source_uri"),
+                page_start: row.get::<i32, _>("page_start") as u32,
+                page_end: row.get::<i32, _>("page_end") as u32,
+            };
+            (id, evidence)
+        })
+        .collect()
 }
 
 fn access_level_label(value: &str) -> &'static str {
@@ -1353,11 +1658,14 @@ fn expected_strings<'a>(value: &'a Value, key: &str) -> Vec<&'a str> {
         .unwrap_or_default()
 }
 
-fn expected_string_vec(value: &Value, key: &str) -> Vec<String> {
-    expected_strings(value, key)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+fn expected_strings_any<'a>(value: &'a Value, keys: &[&str]) -> Vec<&'a str> {
+    let mut values = keys
+        .iter()
+        .flat_map(|key| expected_strings(value, key))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 fn query_category(query: &Value) -> String {
@@ -1567,6 +1875,7 @@ fn evaluate_query(
     response: &pb::RetrieveContextResponse,
     elapsed_ms: u128,
     effective_caller_access_level: &str,
+    canonical_evidence: &HashMap<String, CanonicalEvidence>,
 ) -> EvalResult {
     let query_id = query.get("id").and_then(Value::as_str).unwrap_or("query");
     let expected = query.get("expected").expect("query missing expected");
@@ -1604,6 +1913,144 @@ fn evaluate_query(
         .iter()
         .map(|c| c.source_block_id.clone())
         .collect::<HashSet<_>>();
+    let allowed_zone_codes = query
+        .pointer("/context/access_zone_codes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_else(|| {
+            query
+                .pointer("/context/access_zone_code")
+                .and_then(Value::as_str)
+                .into_iter()
+                .collect()
+        });
+    let caller_rank = access_level_rank(effective_caller_access_level);
+    let required_versions = expected
+        .get("required_document_versions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect::<HashSet<_>>();
+    let forbidden_versions = expected
+        .get("forbidden_document_versions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect::<HashSet<_>>();
+    for context in &response.contexts {
+        result.cross_zone_leakage_count += usize::from(
+            !allowed_zone_codes.is_empty()
+                && context
+                    .metadata
+                    .get("access_zone_code")
+                    .map(|zone| !allowed_zone_codes.contains(zone.as_str()))
+                    .unwrap_or(true),
+        );
+        let canonical = context
+            .citation
+            .as_ref()
+            .and_then(|citation| canonical_evidence.get(&citation.matched_chunk_id))
+            .or_else(|| canonical_evidence.get(&context.matched_chunk_id));
+        let returned_access_rank = context
+            .metadata
+            .get("access_level")
+            .map(|level| access_level_rank(level))
+            .or_else(|| canonical.map(|evidence| evidence.access_level));
+        result.access_level_violation_count +=
+            usize::from(returned_access_rank.is_some_and(|rank| rank > caller_rank));
+        result.wrong_document_version_count += usize::from(
+            forbidden_versions.contains(&context.document_version)
+                || (!required_versions.is_empty()
+                    && !required_versions.contains(&context.document_version)),
+        );
+        let citation_complete = context.citation.as_ref().is_some_and(|citation| {
+            !citation.document_id.is_empty()
+                && citation.document_version > 0
+                && !citation.source_uri.is_empty()
+                && !citation.matched_chunk_id.is_empty()
+                && !citation.source_block_id.is_empty()
+        });
+        result.citation_incomplete_count += usize::from(!citation_complete);
+        let response_grounded = context.citation.as_ref().is_some_and(|citation| {
+            citation.document_id == context.document_id
+                && citation.document_version == context.document_version
+                && citation.matched_chunk_id == context.matched_chunk_id
+                && citation.source_block_id == context.source_block_id
+                && (context.parent_text.contains(&context.matched_text)
+                    || context.matched_text.contains(&context.parent_text))
+        });
+        let canonical_grounded = if canonical_evidence.is_empty() {
+            response_grounded
+        } else {
+            context.citation.as_ref().is_some_and(|citation| {
+                canonical_evidence
+                    .get(&citation.matched_chunk_id)
+                    .is_some_and(|canonical| {
+                        canonical.document_id == citation.document_id
+                            && canonical.document_version == citation.document_version
+                            && canonical.source_block_id == citation.source_block_id
+                            && canonical.source_uri == citation.source_uri
+                            && context
+                                .metadata
+                                .get("content_hash")
+                                .is_some_and(|hash| hash == &canonical.content_hash)
+                            && canonical.content.contains(&context.matched_text)
+                            && citation.page_start >= canonical.page_start
+                            && citation.page_end <= canonical.page_end
+                    })
+            })
+        };
+        result.citation_text_mismatch_count +=
+            usize::from(!response_grounded || !canonical_grounded);
+    }
+    let evidence_expected = expected
+        .get("evidence_expected")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            query_category(query) != "hard_negative"
+                && (expected
+                    .get("min_contexts_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                    || !expected_strings_any(
+                        expected,
+                        &[
+                            "must_contain_phrases",
+                            "must_contain_document_ids",
+                            "required_document_ids",
+                            "must_contain_block_ids",
+                            "required_block_ids",
+                        ],
+                    )
+                    .is_empty())
+        });
+    result.positive_query_empty_context_count =
+        usize::from(evidence_expected && response.contexts.is_empty());
+    if result.positive_query_empty_context_count > 0 {
+        result.failures.push(format!(
+            "{query_id}: positive query returned empty evidence"
+        ));
+        result.reasons.push("POSITIVE_QUERY_EMPTY_CONTEXT");
+    }
+    let degraded = response
+        .summary
+        .as_ref()
+        .is_some_and(|summary| summary.degraded);
+    result.silent_degraded_response_count = usize::from(
+        degraded
+            && response
+                .summary
+                .as_ref()
+                .is_none_or(|summary| summary.degradation_codes.is_empty()),
+    );
 
     for phrase in expected_strings(expected, "must_contain_phrases") {
         if !joined.contains(&phrase.to_lowercase()) {
@@ -1613,7 +2060,10 @@ fn evaluate_query(
             result.reasons.push("MISSING_REQUIRED_PHRASE");
         }
     }
-    for doc_id in expected_strings(expected, "must_contain_document_ids") {
+    for doc_id in expected_strings_any(
+        expected,
+        &["must_contain_document_ids", "required_document_ids"],
+    ) {
         if !doc_ids.contains(doc_id) {
             result
                 .failures
@@ -1621,7 +2071,9 @@ fn evaluate_query(
             result.reasons.push("MISSING_EXPECTED_DOCUMENT");
         }
     }
-    for block_id in expected_strings(expected, "must_contain_block_ids") {
+    for block_id in
+        expected_strings_any(expected, &["must_contain_block_ids", "required_block_ids"])
+    {
         if !block_ids.contains(block_id) {
             result
                 .failures
@@ -1663,6 +2115,7 @@ fn evaluate_query(
     }
     for doc_id in expected_strings(expected, "forbidden_document_ids") {
         if doc_ids.contains(doc_id) {
+            result.forbidden_document_return_count += 1;
             result.failures.push(format!(
                 "{query_id}: forbidden document returned `{doc_id}`"
             ));
@@ -1689,6 +2142,21 @@ fn evaluate_query(
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
+    if query_mode(query) == "hybrid" {
+        let summary = response.summary.as_ref();
+        if !summary.is_some_and(|value| value.dense_branch_executed) {
+            result.failures.push(format!(
+                "{query_id}: hybrid dense branch did not produce execution evidence"
+            ));
+            result.reasons.push("HYBRID_DENSE_BRANCH_NOT_EXECUTED");
+        }
+        if !summary.is_some_and(|value| value.sparse_branch_executed) {
+            result.failures.push(format!(
+                "{query_id}: hybrid sparse branch did not produce execution evidence"
+            ));
+            result.reasons.push("HYBRID_SPARSE_BRANCH_NOT_EXECUTED");
+        }
+    }
     for source in expected_strings(expected, "must_have_sources") {
         if !retrieval_source_satisfied(&retrieval_sources, source) {
             result
@@ -1714,11 +2182,14 @@ fn evaluate_query(
         }
     }
     if query_category(query) == "hard_negative" {
+        result.hard_negative_query = true;
         let max_false_positive_contexts = expected
             .get("max_false_positive_contexts")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if response.contexts.len() as u64 > max_false_positive_contexts {
+            result.hard_negative_false_positive_count =
+                response.contexts.len() - max_false_positive_contexts as usize;
             result.failures.push(format!(
                 "{query_id}: hard-negative returned {} contexts, max false positives allowed {max_false_positive_contexts}",
                 response.contexts.len()
@@ -1763,6 +2234,23 @@ fn evaluate_query(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let (sparse_debug, _, _, _, _) = sparse_query_debug(question);
+    let summary = response.summary.as_ref();
+    let hybrid_execution = json!({
+        "query_id": query_id,
+        "dense_branch": {
+            "executed": summary.is_some_and(|value| value.dense_branch_executed),
+            "candidate_count": summary.map(|value| value.dense_branch_candidate_count).unwrap_or(0)
+        },
+        "sparse_branch": {
+            "executed": summary.is_some_and(|value| value.sparse_branch_executed),
+            "candidate_count": summary.map(|value| value.sparse_branch_candidate_count).unwrap_or(0)
+        },
+        "fusion": {
+            "executed": summary.is_some_and(|value| value.fusion_executed),
+            "candidate_count": summary.map(|value| value.fusion_candidate_count).unwrap_or(0),
+            "strategy": "RRF"
+        }
+    });
     result.candidates.push(json!({
         "query_id": query_id,
         "quality_run_id": quality_run_id(),
@@ -1785,6 +2273,7 @@ fn evaluate_query(
             "alphanumeric_query_tokens": sparse_debug["alphanumeric_query_tokens"].clone(),
             "special_query_tokens": sparse_debug["special_query_tokens"].clone(),
         },
+        "hybrid_execution": hybrid_execution,
         "contexts": response.contexts.iter().map(|c| json!({
             "document_id": c.document_id,
             "document_version": c.document_version,
@@ -1794,6 +2283,27 @@ fn evaluate_query(
             "parent_chunk_id": c.parent_chunk_id,
             "matched_text": c.matched_text,
             "parent_text": c.parent_text,
+            "citation": c.citation.as_ref().map(|citation| json!({
+                "document_id": citation.document_id,
+                "document_version": citation.document_version,
+                "source_uri": citation.source_uri,
+                "page_start": citation.page_start,
+                "page_end": citation.page_end,
+                "section_path": citation.section_path,
+                "matched_chunk_id": citation.matched_chunk_id,
+                "parent_chunk_id": citation.parent_chunk_id,
+                "source_block_id": citation.source_block_id
+            })),
+            "canonical_citation": c.citation.as_ref().and_then(|citation| canonical_evidence.get(&citation.matched_chunk_id)).map(|canonical| json!({
+                "document_id": canonical.document_id,
+                "document_version": canonical.document_version,
+                "source_uri": canonical.source_uri,
+                "page_start": canonical.page_start,
+                "page_end": canonical.page_end,
+                "source_block_id": canonical.source_block_id,
+                "content_hash": canonical.content_hash,
+                "contains_matched_text": canonical.content.contains(&c.matched_text)
+            })),
             "metadata": c.metadata,
         })).collect::<Vec<_>>()
     }));
@@ -1843,6 +2353,7 @@ async fn retrieve_queries(
     stats: &mut RuntimeStats,
     capabilities: &Capabilities,
     profile_name: &str,
+    canonical_evidence: &HashMap<String, CanonicalEvidence>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     let mut client = match AstraVectorRetrievalFacadeClient::connect(endpoint.to_string()).await {
@@ -1867,8 +2378,18 @@ async fn retrieve_queries(
             .and_then(Value::as_str)
             .unwrap_or("PUBLIC");
         let effective_access_level = forced_access_level.as_deref().unwrap_or(query_access_level);
-        let expected_document_ids = expected_string_vec(expected, "must_contain_document_ids");
-        let expected_block_ids = expected_string_vec(expected, "must_contain_block_ids");
+        let expected_document_ids = expected_strings_any(
+            expected,
+            &["must_contain_document_ids", "required_document_ids"],
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let expected_block_ids =
+            expected_strings_any(expected, &["must_contain_block_ids", "required_block_ids"])
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
         if category == "hard_negative"
             && expected
                 .get("max_false_positive_contexts")
@@ -2014,7 +2535,23 @@ async fn retrieve_queries(
                     &response,
                     before.elapsed().as_millis(),
                     effective_access_level,
+                    canonical_evidence,
                 );
+                stats.safety.comparisons += 1;
+                stats.safety.returned_contexts_compared += eval.contexts_count;
+                stats.safety.hard_negative_queries += usize::from(eval.hard_negative_query);
+                stats.safety.hard_negative_false_positive_count +=
+                    eval.hard_negative_false_positive_count;
+                stats.safety.cross_zone_leakage_count += eval.cross_zone_leakage_count;
+                stats.safety.access_level_violation_count += eval.access_level_violation_count;
+                stats.safety.forbidden_document_return_count +=
+                    eval.forbidden_document_return_count;
+                stats.safety.wrong_document_version_count += eval.wrong_document_version_count;
+                stats.safety.citation_incomplete_count += eval.citation_incomplete_count;
+                stats.safety.citation_text_mismatch_count += eval.citation_text_mismatch_count;
+                stats.safety.positive_query_empty_context_count +=
+                    eval.positive_query_empty_context_count;
+                stats.safety.silent_degraded_response_count += eval.silent_degraded_response_count;
                 if eval.contexts_count == 0 {
                     stats.queries_with_empty_contexts += 1;
                 }
@@ -2113,7 +2650,7 @@ fn tokenizer_path_exists() -> bool {
 }
 
 fn write_jsonl(name: &str, values: &[Value]) {
-    let dir = Path::new(QUALITY_ROOT).join("reports");
+    let dir = quality_report_dir();
     fs::create_dir_all(&dir).expect("failed to create quality reports dir");
     let body = values
         .iter()
@@ -2141,6 +2678,35 @@ fn likely_failure_stage(stats: &RuntimeStats) -> &'static str {
     }
 }
 
+fn calculated_counter(count: usize, sample_size: usize) -> Value {
+    json!({
+        "comparison_completed": true,
+        "sample_size": sample_size,
+        "count": count,
+        "rate": if sample_size == 0 { 0.0 } else { count as f64 / sample_size as f64 },
+        "calculation_method": "returned_contexts_vs_query_expectations_v1"
+    })
+}
+
+fn not_applicable_counter(reason: &str) -> Value {
+    json!({
+        "comparison_completed": true,
+        "applicable": false,
+        "sample_size": 0,
+        "count": 0,
+        "rate": 0.0,
+        "calculation_method": "returned_contexts_vs_query_expectations_v1",
+        "reason": reason
+    })
+}
+
+fn qdrant_comparison_passes(comparison: &QdrantCanonicalComparison) -> bool {
+    comparison.comparison_completed
+        && comparison.scroll_status == "COMPLETED"
+        && comparison.missing_points == 0
+        && comparison.extra_points == 0
+}
+
 fn write_report(
     verdict: &str,
     runtime_execution: &str,
@@ -2150,7 +2716,7 @@ fn write_report(
     failures: &[String],
     skipped_reason: Option<&str>,
 ) {
-    let dir = Path::new(QUALITY_ROOT).join("reports");
+    let dir = quality_report_dir();
     fs::create_dir_all(&dir).expect("failed to create quality reports dir");
     let recall = if stats.retrieve_context_queries_total == 0 {
         0.0
@@ -2398,7 +2964,23 @@ fn write_report(
         "qdrant": {
             "collections_count": stats.qdrant_collection_count,
             "points_count": stats.qdrant_points_count,
-            "qdrant_missing_points": 0,
+            "qdrant_missing_points": if stats.qdrant_comparison.comparison_completed { json!(stats.qdrant_comparison.missing_points) } else { Value::Null },
+            "qdrant_extra_points": if stats.qdrant_comparison.comparison_completed { json!(stats.qdrant_comparison.extra_points) } else { Value::Null },
+            "canonical_comparison": {
+                "comparison_scope": {
+                    "quality_run_id": quality_run_id()
+                },
+                "expected_points": stats.qdrant_comparison.expected_points,
+                "actual_points": stats.qdrant_comparison.actual_points,
+                "missing_points": stats.qdrant_comparison.missing_points,
+                "extra_points": stats.qdrant_comparison.extra_points,
+                "pages_read": stats.qdrant_comparison.pages_read,
+                "points_read": stats.qdrant_comparison.points_read,
+                "scroll_status": stats.qdrant_comparison.scroll_status,
+                "comparison_completed": stats.qdrant_comparison.comparison_completed,
+                "failure_reason": stats.qdrant_comparison.failure_reason,
+                "verdict": if qdrant_comparison_passes(&stats.qdrant_comparison) { "PASS" } else { "FAIL" }
+            },
             "payload_verified": stats.qdrant_payload_verified
         },
         "embeddings": {
@@ -2415,9 +2997,16 @@ fn write_report(
             "mrr": 0.0,
             "expected_document_hit_rate": recall,
             "expected_block_hit_rate": recall,
-            "hard_negative_false_positive_rate": 0.0,
-            "cross_zone_leakage_count": 0,
-            "access_level_violation_count": 0,
+            "hard_negative_false_positive_count": stats.safety.hard_negative_false_positive_count,
+            "hard_negative_false_positive_rate": if stats.safety.hard_negative_queries == 0 { 0.0 } else { stats.safety.hard_negative_false_positive_count as f64 / stats.safety.hard_negative_queries as f64 },
+            "cross_zone_leakage_count": stats.safety.cross_zone_leakage_count,
+            "access_level_violation_count": stats.safety.access_level_violation_count,
+            "forbidden_document_return_count": stats.safety.forbidden_document_return_count,
+            "wrong_document_version_count": stats.safety.wrong_document_version_count,
+            "citation_incomplete_count": stats.safety.citation_incomplete_count,
+            "citation_text_mismatch_count": stats.safety.citation_text_mismatch_count,
+            "positive_query_empty_context_count": stats.safety.positive_query_empty_context_count,
+            "silent_degraded_response_count": stats.safety.silent_degraded_response_count,
             "graph_expected_related_hit_rate": if stats.graph.graph_expected_related_total == 0 {
                 0.0
             } else {
@@ -2426,6 +3015,19 @@ fn write_report(
             "mmr_expected_aspect_coverage": 0.0,
             "retrieve_context_p95_ms": 0,
             "access_zone_conflict_accuracy": stats.access_zone_conflict_accuracy
+        },
+        "quality_counters": {
+            "hard_negative_false_positive": calculated_counter(stats.safety.hard_negative_false_positive_count, stats.safety.hard_negative_queries),
+            "cross_zone_leakage": calculated_counter(stats.safety.cross_zone_leakage_count, stats.safety.returned_contexts_compared),
+            "access_level_violation": calculated_counter(stats.safety.access_level_violation_count, stats.safety.returned_contexts_compared),
+            "forbidden_document_return": calculated_counter(stats.safety.forbidden_document_return_count, stats.safety.returned_contexts_compared),
+            "wrong_document_version": calculated_counter(stats.safety.wrong_document_version_count, stats.safety.returned_contexts_compared),
+            "wrong_jurisdiction": not_applicable_counter("no jurisdiction-labelled queries in this GENERAL profile"),
+            "wrong_population": not_applicable_counter("no population-labelled queries in this GENERAL profile"),
+            "citation_incomplete": calculated_counter(stats.safety.citation_incomplete_count, stats.safety.returned_contexts_compared),
+            "citation_text_mismatch": calculated_counter(stats.safety.citation_text_mismatch_count, stats.safety.returned_contexts_compared),
+            "positive_query_empty_context": calculated_counter(stats.safety.positive_query_empty_context_count, stats.safety.comparisons),
+            "silent_degraded_response": calculated_counter(stats.safety.silent_degraded_response_count, stats.safety.comparisons)
         },
         "retrieval_diagnostics": {
             "queries_with_empty_contexts": stats.queries_with_empty_contexts,
@@ -2642,6 +3244,8 @@ async fn quality_bench_runtime_quick() {
     stats.qdrant_collection_count = qdrant_collection_count(&qdrant_url).await;
     stats.qdrant_points_count = qdrant_points_count(&qdrant_url, &qdrant_collection).await;
     stats.qdrant_payload_verified = qdrant_payload_verified(&qdrant_url, &qdrant_collection).await;
+    stats.qdrant_comparison =
+        compare_qdrant_canonical_points(&qdrant_url, &qdrant_collection).await;
     stats.sparse.qdrant_sparse_config_present =
         qdrant_sparse_config_present(&qdrant_url, &qdrant_collection).await;
     let (sparse_sampled, sparse_with_vectors) =
@@ -2658,6 +3262,25 @@ async fn quality_bench_runtime_quick() {
     if !stats.qdrant_payload_verified && stats.qdrant_points_count > 0 {
         failures.push("QDRANT_PAYLOAD_NOT_VERIFIED".into());
     }
+    if !stats.qdrant_comparison.comparison_completed {
+        failures.push(format!(
+            "QDRANT_CANONICAL_COMPARISON_INCOMPLETE:{}",
+            stats.qdrant_comparison.scroll_status
+        ));
+    } else {
+        if stats.qdrant_comparison.missing_points > 0 {
+            failures.push(format!(
+                "QDRANT_MISSING_POINTS:{}",
+                stats.qdrant_comparison.missing_points
+            ));
+        }
+        if stats.qdrant_comparison.extra_points > 0 {
+            failures.push(format!(
+                "QDRANT_EXTRA_POINTS:{}",
+                stats.qdrant_comparison.extra_points
+            ));
+        }
+    }
     if stats.outbox_completed_count == 0 {
         failures.push("OUTBOX_NOT_FINALIZED".into());
     }
@@ -2670,6 +3293,10 @@ async fn quality_bench_runtime_quick() {
 
     let capabilities = detect_capabilities(&stats);
     apply_capability_requirements(&mut stats, &capabilities, &mut failures);
+    let canonical_evidence = load_canonical_evidence().await;
+    if canonical_evidence.is_empty() {
+        failures.push("CANONICAL_CITATION_EVIDENCE_NOT_LOADED".into());
+    }
     failures.extend(
         retrieve_queries(
             &endpoint,
@@ -2677,9 +3304,49 @@ async fn quality_bench_runtime_quick() {
             &mut stats,
             &capabilities,
             &profile_name,
+            &canonical_evidence,
         )
         .await,
     );
+    for (count, code) in [
+        (
+            stats.safety.hard_negative_false_positive_count,
+            "HARD_NEGATIVE_FALSE_POSITIVE",
+        ),
+        (stats.safety.cross_zone_leakage_count, "CROSS_ZONE_LEAKAGE"),
+        (
+            stats.safety.access_level_violation_count,
+            "ACCESS_LEVEL_VIOLATION",
+        ),
+        (
+            stats.safety.forbidden_document_return_count,
+            "FORBIDDEN_DOCUMENT_RETURNED",
+        ),
+        (
+            stats.safety.wrong_document_version_count,
+            "WRONG_DOCUMENT_VERSION",
+        ),
+        (
+            stats.safety.citation_incomplete_count,
+            "CITATION_INCOMPLETE",
+        ),
+        (
+            stats.safety.citation_text_mismatch_count,
+            "CITATION_TEXT_MISMATCH",
+        ),
+        (
+            stats.safety.positive_query_empty_context_count,
+            "POSITIVE_QUERY_EMPTY_CONTEXT",
+        ),
+        (
+            stats.safety.silent_degraded_response_count,
+            "SILENT_DEGRADED_RESPONSE",
+        ),
+    ] {
+        if count > 0 {
+            failures.push(format!("{code}:{count}"));
+        }
+    }
     if stats.access_level_audit.reason.as_deref() == Some("ACCESS_LEVEL_FIXTURE_MAPPING_MISMATCH")
         && stats.queries_with_empty_contexts > 0
     {
@@ -2722,4 +3389,168 @@ async fn quality_bench_runtime_quick() {
         verdict, "PASS",
         "runtime quality bench failed: {failures:?}"
     );
+}
+
+#[cfg(test)]
+mod truthfulness_tests {
+    use super::*;
+
+    fn query() -> Value {
+        json!({
+            "id": "truthfulness-001",
+            "category": "retrieval",
+            "mode": "dense",
+            "question": "canonical evidence",
+            "context": {"access_zone_code": "1700", "caller_access_level": "PUBLIC", "search_mode": "DENSE"},
+            "expected": {"evidence_expected": true, "max_contexts_count": 10}
+        })
+    }
+
+    fn context(zone: &str, level: &str) -> pb::RetrievedContext {
+        pb::RetrievedContext {
+            matched_text: "canonical evidence".into(),
+            parent_text: "canonical evidence in PostgreSQL".into(),
+            citation: Some(pb::Citation {
+                document_id: "doc-1".into(),
+                document_version: 1,
+                source_uri: "quality://doc-1".into(),
+                matched_chunk_id: "chunk-1".into(),
+                source_block_id: "block-1".into(),
+                ..Default::default()
+            }),
+            document_id: "doc-1".into(),
+            document_version: 1,
+            source_block_id: "block-1".into(),
+            matched_chunk_id: "chunk-1".into(),
+            access_zone_id: "zone-uuid".into(),
+            metadata: std::collections::HashMap::from([
+                ("access_zone_code".into(), zone.into()),
+                ("access_level".into(), level.into()),
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn evaluate(query: &Value, response: &pb::RetrieveContextResponse) -> EvalResult {
+        evaluate_query(query, response, 1, "PUBLIC", &HashMap::new())
+    }
+
+    #[test]
+    fn quality_output_does_not_modify_git_tree() {
+        let output = quality_report_dir();
+        assert!(!output.starts_with("benchmarks/quality/reports"));
+        if let Ok(configured) = env::var("ASTRAVECTOR_QUALITY_OUTPUT_DIR") {
+            assert_eq!(output, PathBuf::from(configured));
+        }
+    }
+
+    #[test]
+    fn cross_zone_leakage_is_detected() {
+        let response = pb::RetrieveContextResponse {
+            contexts: vec![context("1800", "PUBLIC")],
+            ..Default::default()
+        };
+        assert_eq!(evaluate(&query(), &response).cross_zone_leakage_count, 1);
+    }
+
+    #[test]
+    fn access_violation_is_detected() {
+        let response = pb::RetrieveContextResponse {
+            contexts: vec![context("1700", "RESTRICTED")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(&query(), &response).access_level_violation_count,
+            1
+        );
+    }
+
+    #[test]
+    fn citation_mismatch_is_detected() {
+        let mut returned = context("1700", "PUBLIC");
+        returned
+            .citation
+            .as_mut()
+            .expect("citation")
+            .matched_chunk_id = "wrong-chunk".into();
+        let response = pb::RetrieveContextResponse {
+            contexts: vec![returned],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(&query(), &response).citation_text_mismatch_count,
+            1
+        );
+    }
+
+    #[test]
+    fn positive_query_empty_ok_fails() {
+        assert_eq!(
+            evaluate(&query(), &pb::RetrieveContextResponse::default())
+                .positive_query_empty_context_count,
+            1
+        );
+    }
+
+    #[test]
+    fn qdrant_incomplete_scroll_fails_gate() {
+        assert!(!qdrant_comparison_passes(
+            &QdrantCanonicalComparison::default()
+        ));
+    }
+
+    #[test]
+    fn qdrant_missing_point_is_detected() {
+        let comparison = QdrantCanonicalComparison {
+            comparison_completed: true,
+            scroll_status: "COMPLETED".into(),
+            missing_points: 1,
+            ..Default::default()
+        };
+        assert!(!qdrant_comparison_passes(&comparison));
+    }
+
+    #[test]
+    fn hybrid_executes_dense_and_sparse() {
+        let mut hybrid_query = query();
+        hybrid_query["context"]["search_mode"] = json!("HYBRID");
+        let response = pb::RetrieveContextResponse {
+            contexts: vec![context("1700", "PUBLIC")],
+            summary: Some(pb::RetrievalSummary {
+                dense_branch_executed: true,
+                sparse_branch_executed: false,
+                fusion_executed: false,
+                dense_branch_candidate_count: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let evaluation = evaluate(&hybrid_query, &response);
+        assert!(evaluation
+            .reasons
+            .contains(&"HYBRID_SPARSE_BRANCH_NOT_EXECUTED"));
+        assert!(!evaluation
+            .reasons
+            .contains(&"HYBRID_DENSE_BRANCH_NOT_EXECUTED"));
+    }
+
+    #[test]
+    fn hard_negative_empty_insufficient_passes() {
+        let mut negative = query();
+        negative["category"] = json!("hard_negative");
+        negative["expected"] = json!({
+            "evidence_expected": false,
+            "max_false_positive_contexts": 0,
+            "max_contexts_count": 0
+        });
+        let evaluation = evaluate(&negative, &pb::RetrieveContextResponse::default());
+        assert!(
+            evaluation.failures.is_empty(),
+            "unexpected failures: {:?}",
+            evaluation.failures
+        );
+        assert_eq!(evaluation.positive_query_empty_context_count, 0);
+        assert_eq!(evaluation.hard_negative_false_positive_count, 0);
+    }
 }

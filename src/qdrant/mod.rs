@@ -1,5 +1,9 @@
 use crate::{
-    adaptive::AdaptiveRuntime, config::RetryPolicyConfig, error::AstraError, smoke_failpoints,
+    adaptive::AdaptiveRuntime,
+    config::RetryPolicyConfig,
+    error::AstraError,
+    reliability::{OperationBudget, WorkloadKind},
+    smoke_failpoints,
 };
 use metrics::{counter, gauge, histogram};
 use rand::Rng;
@@ -153,6 +157,17 @@ fn retry_delay_ms(policy: &RetryPolicyConfig, attempt: u32) -> u64 {
     }
 }
 
+fn retryable_qdrant_status(
+    policy: &RetryPolicyConfig,
+    workload: WorkloadKind,
+    status: StatusCode,
+) -> bool {
+    if workload == WorkloadKind::Query && status == StatusCode::TOO_MANY_REQUESTS {
+        return false;
+    }
+    policy.retry_on_statuses.contains(&status.as_u16())
+}
+
 impl QdrantClient {
     pub fn new(
         base_url: String,
@@ -213,21 +228,56 @@ impl QdrantClient {
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
+        self.send_with_retry_budget(
+            operation_name,
+            WorkloadKind::DocumentPublisher,
+            None,
+            request_factory,
+        )
+        .await
+    }
+
+    async fn send_with_retry_budget<F>(
+        &self,
+        operation_name: &'static str,
+        workload: WorkloadKind,
+        budget: Option<&OperationBudget>,
+        request_factory: F,
+    ) -> Result<reqwest::Response, AstraError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let workload_label = match workload {
+            WorkloadKind::Query => "query",
+            WorkloadKind::DocumentPublisher => "publisher",
+            WorkloadKind::Reconciliation => "reconciliation",
+        };
         let max_attempts = if self.retry_policy.enabled {
             self.retry_policy.max_attempts.max(1)
         } else {
             1
         };
-        let retry_statuses: Vec<StatusCode> = self
-            .retry_policy
-            .retry_on_statuses
-            .iter()
-            .filter_map(|s| StatusCode::from_u16(*s).ok())
-            .collect();
         let mut attempt = 1u32;
         loop {
+            if let Some(budget) = budget {
+                if budget.cancellation.is_cancelled() {
+                    counter!("astravector_retry_skipped_total", "component" => "qdrant", "workload" => workload_label, "reason" => "cancelled").increment(1);
+                    return Err(AstraError::Cancelled("qdrant operation cancelled".into()));
+                }
+                if budget.is_expired() {
+                    counter!("astravector_retry_skipped_total", "component" => "qdrant", "workload" => workload_label, "reason" => "insufficient_budget").increment(1);
+                    return Err(AstraError::DeadlineExceeded(
+                        "caller deadline expired before qdrant request".into(),
+                    ));
+                }
+            }
             let started = Instant::now();
-            let result = request_factory().send().await;
+            let request = request_factory();
+            let request = match budget {
+                Some(operation_budget) => request.timeout(operation_budget.remaining()),
+                None => request,
+            };
+            let result = request.send().await;
             match result {
                 Ok(response)
                     if response.status().is_success()
@@ -250,19 +300,37 @@ impl QdrantClient {
                 }
                 Ok(response)
                     if self.retry_policy.enabled
-                        && retry_statuses.contains(&response.status())
+                        && retryable_qdrant_status(
+                            &self.retry_policy,
+                            workload,
+                            response.status(),
+                        )
                         && attempt < max_attempts =>
                 {
                     counter!("qdrant_retry_attempts_total", "operation" => operation_name)
                         .increment(1);
                     counter!("retry_attempts_total", "operation" => operation_name).increment(1);
                     let delay_ms = retry_delay_ms(&self.retry_policy, attempt);
+                    if let Some(budget) = budget {
+                        if !budget.allows_retry(
+                            Duration::from_millis(delay_ms),
+                            Duration::from_millis(self.retry_policy.min_operation_budget_ms),
+                            Duration::from_millis(self.retry_policy.safety_margin_ms),
+                        ) {
+                            counter!("astravector_retry_skipped_total", "component" => "qdrant", "workload" => workload_label, "reason" => "insufficient_budget").increment(1);
+                            return Err(AstraError::DeadlineExceeded(
+                                "insufficient qdrant retry budget".into(),
+                            ));
+                        }
+                    }
                     histogram!("retry_delay_ms", "operation" => operation_name)
                         .record(delay_ms as f64);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     attempt += 1;
                 }
-                Ok(response) if retry_statuses.contains(&response.status()) => {
+                Ok(response)
+                    if retryable_qdrant_status(&self.retry_policy, workload, response.status()) =>
+                {
                     counter!("qdrant_retry_exhausted_total", "operation" => operation_name)
                         .increment(1);
                     counter!("retry_exhausted_total", "operation" => operation_name).increment(1);
@@ -279,12 +347,24 @@ impl QdrantClient {
                     if self.retry_policy.enabled
                         && attempt < max_attempts
                         && ((err.is_timeout() && self.retry_policy.retry_on_timeout)
-                            || err.is_connect()) =>
+                            || (err.is_connect() && self.retry_policy.retry_on_connect)) =>
                 {
                     counter!("qdrant_retry_attempts_total", "operation" => operation_name)
                         .increment(1);
                     counter!("retry_attempts_total", "operation" => operation_name).increment(1);
                     let delay_ms = retry_delay_ms(&self.retry_policy, attempt);
+                    if let Some(budget) = budget {
+                        if !budget.allows_retry(
+                            Duration::from_millis(delay_ms),
+                            Duration::from_millis(self.retry_policy.min_operation_budget_ms),
+                            Duration::from_millis(self.retry_policy.safety_margin_ms),
+                        ) {
+                            counter!("astravector_retry_skipped_total", "component" => "qdrant", "workload" => workload_label, "reason" => "insufficient_budget").increment(1);
+                            return Err(AstraError::DeadlineExceeded(
+                                "insufficient qdrant retry budget".into(),
+                            ));
+                        }
+                    }
                     histogram!("retry_delay_ms", "operation" => operation_name)
                         .record(delay_ms as f64);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -623,6 +703,26 @@ impl QdrantClient {
         limit: usize,
         versions: Option<&QdrantVersionFilters>,
     ) -> Result<Vec<QdrantSearchHit>, AstraError> {
+        self.search_dense_with_budget(
+            dense,
+            access_zone_ids,
+            caller_access_level,
+            limit,
+            versions,
+            None,
+        )
+        .await
+    }
+
+    pub async fn search_dense_with_budget(
+        &self,
+        dense: &[f32],
+        access_zone_ids: &[Uuid],
+        caller_access_level: i16,
+        limit: usize,
+        versions: Option<&QdrantVersionFilters>,
+        budget: Option<&OperationBudget>,
+    ) -> Result<Vec<QdrantSearchHit>, AstraError> {
         let _permit = tokio::time::timeout(
             Duration::from_millis(self.search_acquire_timeout_ms),
             self.search_semaphore.clone().acquire_owned(),
@@ -667,7 +767,7 @@ impl QdrantClient {
         let body_for_retry = body.clone();
         let url_for_retry = url.clone();
         let r = self
-            .send_with_retry("search_dense", || {
+            .send_with_retry_budget("search_dense", WorkloadKind::Query, budget, || {
                 self.request(self.http.post(url_for_retry.clone()).json(&body_for_retry))
             })
             .await?;
@@ -718,6 +818,28 @@ impl QdrantClient {
         limit: usize,
         versions: Option<&QdrantVersionFilters>,
     ) -> Result<Vec<QdrantSearchHit>, AstraError> {
+        self.search_sparse_with_budget(
+            indices,
+            values,
+            access_zone_ids,
+            caller_access_level,
+            limit,
+            versions,
+            None,
+        )
+        .await
+    }
+
+    pub async fn search_sparse_with_budget(
+        &self,
+        indices: &[u32],
+        values: &[f32],
+        access_zone_ids: &[Uuid],
+        caller_access_level: i16,
+        limit: usize,
+        versions: Option<&QdrantVersionFilters>,
+        budget: Option<&OperationBudget>,
+    ) -> Result<Vec<QdrantSearchHit>, AstraError> {
         let _permit = tokio::time::timeout(
             Duration::from_millis(self.search_acquire_timeout_ms),
             self.search_semaphore.clone().acquire_owned(),
@@ -751,7 +873,7 @@ impl QdrantClient {
         let body_for_retry = body.clone();
         let url_for_retry = url.clone();
         let r = self
-            .send_with_retry("search_sparse", || {
+            .send_with_retry_budget("search_sparse", WorkloadKind::Query, budget, || {
                 self.request(self.http.post(url_for_retry.clone()).json(&body_for_retry))
             })
             .await?;
@@ -1076,5 +1198,40 @@ impl QdrantClient {
             "qdrant delete status={}",
             r.status()
         )))
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+
+    #[test]
+    fn qdrant_429_query_is_not_retried() {
+        let policy = RetryPolicyConfig {
+            retry_on_statuses: vec![429, 502, 503, 504],
+            ..RetryPolicyConfig::default()
+        };
+        assert!(!retryable_qdrant_status(
+            &policy,
+            WorkloadKind::Query,
+            StatusCode::TOO_MANY_REQUESTS,
+        ));
+        assert!(matches!(
+            qdrant_status_error("search_dense", StatusCode::TOO_MANY_REQUESTS),
+            AstraError::ResourceExhausted(_)
+        ));
+    }
+
+    #[test]
+    fn qdrant_429_publisher_can_retry() {
+        let policy = RetryPolicyConfig {
+            retry_on_statuses: vec![429, 502, 503, 504],
+            ..RetryPolicyConfig::default()
+        };
+        assert!(retryable_qdrant_status(
+            &policy,
+            WorkloadKind::DocumentPublisher,
+            StatusCode::TOO_MANY_REQUESTS,
+        ));
     }
 }
