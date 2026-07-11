@@ -1,0 +1,7 @@
+{
+  "requested_rps": 2,
+  "success_rate": 1,
+  "error_rate": 0,
+  "p95_ms": 456.30725,
+  "p99_ms": 831.691291
+}

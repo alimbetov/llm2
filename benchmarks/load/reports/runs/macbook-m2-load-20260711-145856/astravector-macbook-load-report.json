@@ -1,0 +1,29 @@
+{
+  "schema_version": "2.0",
+  "load_run_id": "macbook-m2-load-20260711-145856",
+  "git_sha": "12823b322ae7a368d82a53e5a4d90fe7c7550bdd",
+  "git_dirty": true,
+  "machine": {
+    "chip": "Apple M2",
+    "cpu_cores": 8,
+    "memory_bytes": 17179869184
+  },
+  "tools": {
+    "ghz": "0.121.0"
+  },
+  "runtime": {
+    "binary_sha256": "b7414cc1cd68a4ebd7fdc65e3ad045e9ef146d65f4dbeaeebfbd6654a8f28fd5",
+    "model_sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
+    "tokenizer_sha256": "21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08",
+    "model_backed": true,
+    "release_build": true
+  },
+  "overall_verdict": "BLOCKED",
+  "failure_reasons": [
+    "METRICS_NOT_READY"
+  ],
+  "evidence": {
+    "simulation_detected": false,
+    "incomplete_processes": []
+  }
+}

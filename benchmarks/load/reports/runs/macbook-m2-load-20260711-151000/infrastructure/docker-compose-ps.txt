@@ -1,0 +1,3 @@
+NAME                     IMAGE                    COMMAND                  SERVICE    CREATED      STATUS                  PORTS
+astravector-postgres-1   pgvector/pgvector:pg16   "docker-entrypoint.s…"   postgres   9 days ago   Up 19 hours (healthy)   0.0.0.0:55432->5432/tcp, [::]:55432->5432/tcp
+astravector-qdrant-1     qdrant/qdrant:v1.14.1    "./entrypoint.sh"        qdrant     9 days ago   Up 19 hours (healthy)   0.0.0.0:6333-6334->6333-6334/tcp, [::]:6333-6334->6333-6334/tcp

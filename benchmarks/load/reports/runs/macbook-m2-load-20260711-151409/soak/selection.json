@@ -1,0 +1,7 @@
+{
+  "stable_rps": 6,
+  "saturation_rps": null,
+  "failure_rps": 8,
+  "stop_reason": "ACCEPTANCE_THRESHOLD",
+  "soak_rps": 3
+}

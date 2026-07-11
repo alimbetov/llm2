@@ -1,0 +1,326 @@
+[
+    {
+        "Id": "f42b553b7972762017aefd7f92b7803e391106c4db48c31bfd657d3eab3f44fb",
+        "Created": "2026-07-01T15:48:25.756599671Z",
+        "Path": "./entrypoint.sh",
+        "Args": [],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 961,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-07-10T15:18:54.934131552Z",
+            "FinishedAt": "2026-07-10T15:06:21.181894751Z",
+            "Health": {
+                "Status": "healthy",
+                "FailingStreak": 0,
+                "Log": [
+                    {
+                        "Start": "2026-07-11T10:13:59.449902713Z",
+                        "End": "2026-07-11T10:13:59.497056297Z",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-11T10:14:04.499653508Z",
+                        "End": "2026-07-11T10:14:04.557262966Z",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-11T10:14:09.558351927Z",
+                        "End": "2026-07-11T10:14:09.608810843Z",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-11T10:14:14.613743429Z",
+                        "End": "2026-07-11T10:14:14.668396679Z",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-11T10:14:19.669450917Z",
+                        "End": "2026-07-11T10:14:19.760387625Z",
+                        "ExitCode": 0,
+                        "Output": ""
+                    }
+                ]
+            }
+        },
+        "Image": "sha256:419d72603f5346ee22ffc4606bdb7beb52fcb63077766fab678e6622ba247366",
+        "ResolvConfPath": "/var/lib/docker/containers/f42b553b7972762017aefd7f92b7803e391106c4db48c31bfd657d3eab3f44fb/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/f42b553b7972762017aefd7f92b7803e391106c4db48c31bfd657d3eab3f44fb/hostname",
+        "HostsPath": "/var/lib/docker/containers/f42b553b7972762017aefd7f92b7803e391106c4db48c31bfd657d3eab3f44fb/hosts",
+        "LogPath": "/var/lib/docker/containers/f42b553b7972762017aefd7f92b7803e391106c4db48c31bfd657d3eab3f44fb/f42b553b7972762017aefd7f92b7803e391106c4db48c31bfd657d3eab3f44fb-json.log",
+        "Name": "/astravector-qdrant-1",
+        "RestartCount": 0,
+        "Driver": "overlayfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "astravector_astravector_qdrant:/qdrant/storage:rw"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "astravector_default",
+            "PortBindings": {
+                "6333/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "6333"
+                    }
+                ],
+                "6334/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "6334"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "no",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": [],
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": [],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/asound",
+                "/proc/acpi",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/sys/firmware",
+                "/sys/devices/virtual/powercap"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": null,
+            "Name": "overlayfs"
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": "astravector_astravector_qdrant",
+                "Source": "/var/lib/docker/volumes/astravector_astravector_qdrant/_data",
+                "Destination": "/qdrant/storage",
+                "Driver": "local",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": ""
+            }
+        ],
+        "Config": {
+            "Hostname": "f42b553b7972",
+            "Domainname": "",
+            "User": "0:0",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "ExposedPorts": {
+                "6333/tcp": {},
+                "6334/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "DIR=",
+                "TZ=Etc/UTC",
+                "RUN_MODE=production"
+            ],
+            "Cmd": [
+                "./entrypoint.sh"
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "bash -c '\u003c/dev/tcp/127.0.0.1/6333'"
+                ],
+                "Interval": 5000000000,
+                "Timeout": 3000000000,
+                "Retries": 20
+            },
+            "Image": "qdrant/qdrant:v1.14.1",
+            "Volumes": null,
+            "WorkingDir": "/qdrant",
+            "Entrypoint": null,
+            "OnBuild": null,
+            "Labels": {
+                "com.docker.compose.config-hash": "fa947392b7cc14c99c4a424213b43f25b2bd1bab6292ffbafb29460a7bf884b7",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "",
+                "com.docker.compose.image": "sha256:419d72603f5346ee22ffc4606bdb7beb52fcb63077766fab678e6622ba247366",
+                "com.docker.compose.oneoff": "False",
+                "com.docker.compose.project": "astravector",
+                "com.docker.compose.project.config_files": "/Users/ruslanalimbetov/Documents/llm2/astravector/docker-compose.yml",
+                "com.docker.compose.project.working_dir": "/Users/ruslanalimbetov/Documents/llm2/astravector",
+                "com.docker.compose.service": "qdrant",
+                "com.docker.compose.version": "2.38.2",
+                "org.opencontainers.image.description": "Official Qdrant image",
+                "org.opencontainers.image.documentation": "https://qdrant.com/docs",
+                "org.opencontainers.image.source": "https://github.com/qdrant/qdrant",
+                "org.opencontainers.image.title": "Qdrant",
+                "org.opencontainers.image.url": "https://qdrant.com/",
+                "org.opencontainers.image.vendor": "Qdrant",
+                "org.opencontainers.image.version": "v1.14.1"
+            }
+        },
+        "NetworkSettings": {
+            "Bridge": "",
+            "SandboxID": "e69f1db4d28b01bf256768faf72a5534943de2ac7cc4219323bbe239943bcbf0",
+            "SandboxKey": "/var/run/docker/netns/e69f1db4d28b",
+            "Ports": {
+                "6333/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "6333"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "6333"
+                    }
+                ],
+                "6334/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "6334"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "6334"
+                    }
+                ]
+            },
+            "HairpinMode": false,
+            "LinkLocalIPv6Address": "",
+            "LinkLocalIPv6PrefixLen": 0,
+            "SecondaryIPAddresses": null,
+            "SecondaryIPv6Addresses": null,
+            "EndpointID": "",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "MacAddress": "",
+            "Networks": {
+                "astravector_default": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": [
+                        "astravector-qdrant-1",
+                        "qdrant"
+                    ],
+                    "MacAddress": "c2:8c:9b:90:00:4b",
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "1e0e48a97ade616d25fe53991b2256afe9c90852323a81330747fd8e2adfa8bf",
+                    "EndpointID": "919e6880d9cc236e499fd41a5fbddf5b71b2ad8b2d7cd37fe397f13788219019",
+                    "Gateway": "172.26.0.1",
+                    "IPAddress": "172.26.0.3",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "astravector-qdrant-1",
+                        "qdrant",
+                        "f42b553b7972"
+                    ]
+                }
+            }
+        },
+        "ImageManifestDescriptor": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:a9dc5625b10e4d3a3b53e3e6686f23e7302f73c0c07e157fc4d1cff6abf607ba",
+            "size": 2938,
+            "platform": {
+                "architecture": "arm64",
+                "os": "linux"
+            }
+        }
+    }
+]

@@ -1,0 +1,314 @@
+[
+    {
+        "Id": "358814d92b02050d33511e356442856b6e56d017952403714077ad0867f99b5e",
+        "Created": "2026-07-01T15:48:25.757216171Z",
+        "Path": "docker-entrypoint.sh",
+        "Args": [
+            "postgres"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 785,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-07-10T15:18:34.127487667Z",
+            "FinishedAt": "2026-07-10T15:06:21.181895001Z",
+            "Health": {
+                "Status": "healthy",
+                "FailingStreak": 0,
+                "Log": [
+                    {
+                        "Start": "2026-07-11T10:10:00.10163013Z",
+                        "End": "2026-07-11T10:10:00.183304839Z",
+                        "ExitCode": 0,
+                        "Output": "/var/run/postgresql:5432 - accepting connections\n"
+                    },
+                    {
+                        "Start": "2026-07-11T10:10:05.187957091Z",
+                        "End": "2026-07-11T10:10:05.276635258Z",
+                        "ExitCode": 0,
+                        "Output": "/var/run/postgresql:5432 - accepting connections\n"
+                    },
+                    {
+                        "Start": "2026-07-11T10:10:10.283125177Z",
+                        "End": "2026-07-11T10:10:10.416374427Z",
+                        "ExitCode": 0,
+                        "Output": "/var/run/postgresql:5432 - accepting connections\n"
+                    },
+                    {
+                        "Start": "2026-07-11T10:10:15.419054304Z",
+                        "End": "2026-07-11T10:10:15.469780388Z",
+                        "ExitCode": 0,
+                        "Output": "/var/run/postgresql:5432 - accepting connections\n"
+                    },
+                    {
+                        "Start": "2026-07-11T10:10:20.470893251Z",
+                        "End": "2026-07-11T10:10:20.517297126Z",
+                        "ExitCode": 0,
+                        "Output": "/var/run/postgresql:5432 - accepting connections\n"
+                    }
+                ]
+            }
+        },
+        "Image": "sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6",
+        "ResolvConfPath": "/var/lib/docker/containers/358814d92b02050d33511e356442856b6e56d017952403714077ad0867f99b5e/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/358814d92b02050d33511e356442856b6e56d017952403714077ad0867f99b5e/hostname",
+        "HostsPath": "/var/lib/docker/containers/358814d92b02050d33511e356442856b6e56d017952403714077ad0867f99b5e/hosts",
+        "LogPath": "/var/lib/docker/containers/358814d92b02050d33511e356442856b6e56d017952403714077ad0867f99b5e/358814d92b02050d33511e356442856b6e56d017952403714077ad0867f99b5e-json.log",
+        "Name": "/astravector-postgres-1",
+        "RestartCount": 0,
+        "Driver": "overlayfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "astravector_astravector_pg:/var/lib/postgresql/data:rw"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "astravector_default",
+            "PortBindings": {
+                "5432/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "55432"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "no",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": [],
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": [],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/asound",
+                "/proc/acpi",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/sys/firmware",
+                "/sys/devices/virtual/powercap"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": null,
+            "Name": "overlayfs"
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": "astravector_astravector_pg",
+                "Source": "/var/lib/docker/volumes/astravector_astravector_pg/_data",
+                "Destination": "/var/lib/postgresql/data",
+                "Driver": "local",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": ""
+            }
+        ],
+        "Config": {
+            "Hostname": "358814d92b02",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "ExposedPorts": {
+                "5432/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "POSTGRES_USER=astravector",
+                "POSTGRES_PASSWORD=astravector",
+                "POSTGRES_DB=astravector",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/16/bin",
+                "GOSU_VERSION=1.19",
+                "LANG=en_US.utf8",
+                "PG_MAJOR=16",
+                "PG_VERSION=16.14-1.pgdg12+1",
+                "PGDATA=/var/lib/postgresql/data"
+            ],
+            "Cmd": [
+                "postgres"
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "pg_isready -U astravector -d astravector"
+                ],
+                "Interval": 5000000000,
+                "Timeout": 3000000000,
+                "Retries": 20
+            },
+            "Image": "pgvector/pgvector:pg16",
+            "Volumes": {
+                "/var/lib/postgresql/data": {}
+            },
+            "WorkingDir": "",
+            "Entrypoint": [
+                "docker-entrypoint.sh"
+            ],
+            "OnBuild": null,
+            "Labels": {
+                "com.docker.compose.config-hash": "60e598cd1025da8b2c984b64702b92763b6193e2f5ceb420bb16ae3cea4ead90",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "",
+                "com.docker.compose.image": "sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6",
+                "com.docker.compose.oneoff": "False",
+                "com.docker.compose.project": "astravector",
+                "com.docker.compose.project.config_files": "/Users/ruslanalimbetov/Documents/llm2/astravector/docker-compose.yml",
+                "com.docker.compose.project.working_dir": "/Users/ruslanalimbetov/Documents/llm2/astravector",
+                "com.docker.compose.service": "postgres",
+                "com.docker.compose.version": "2.38.2"
+            },
+            "StopSignal": "SIGINT"
+        },
+        "NetworkSettings": {
+            "Bridge": "",
+            "SandboxID": "db8bc51cd604a61719bdb7c65091f836e15c8124acf633a96fb1d980e3ebfec6",
+            "SandboxKey": "/var/run/docker/netns/db8bc51cd604",
+            "Ports": {
+                "5432/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "55432"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "55432"
+                    }
+                ]
+            },
+            "HairpinMode": false,
+            "LinkLocalIPv6Address": "",
+            "LinkLocalIPv6PrefixLen": 0,
+            "SecondaryIPAddresses": null,
+            "SecondaryIPv6Addresses": null,
+            "EndpointID": "",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "MacAddress": "",
+            "Networks": {
+                "astravector_default": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": [
+                        "astravector-postgres-1",
+                        "postgres"
+                    ],
+                    "MacAddress": "46:8d:e1:ec:98:7c",
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "1e0e48a97ade616d25fe53991b2256afe9c90852323a81330747fd8e2adfa8bf",
+                    "EndpointID": "3689ca91b991109c68b54a6f88b0b28ba4fa26b6e48e50a6dc664b25a17a88a9",
+                    "Gateway": "172.26.0.1",
+                    "IPAddress": "172.26.0.2",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "astravector-postgres-1",
+                        "postgres",
+                        "358814d92b02"
+                    ]
+                }
+            }
+        },
+        "ImageManifestDescriptor": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:bd417416b591ce6b92ab1e49fbb521ffe47aff1caebd0458e720f9c4531dca96",
+            "size": 3335,
+            "platform": {
+                "architecture": "arm64",
+                "os": "linux"
+            }
+        }
+    }
+]

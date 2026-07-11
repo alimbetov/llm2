@@ -1,0 +1,1 @@
+cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture 

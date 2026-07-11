@@ -218,6 +218,10 @@ write_manifest() {
   while IFS= read -r query_set; do
     jq -r '.id' "$ROOT_DIR/benchmarks/quality/queries/$query_set.jsonl" >> "$expected_raw"
   done < <(jq -r '.queries[]' "$ROOT_DIR/benchmarks/quality/profiles/$profile_name.json")
+  if [[ "$profile" == sparse || "$profile" == hybrid ]]; then
+    awk '$0 !~ /^technical-graph-/' "$expected_raw" > "$expected_raw.filtered"
+    mv "$expected_raw.filtered" "$expected_raw"
+  fi
   if [[ -n "$query_filter" ]]; then
     awk -v pattern="$query_filter" '$0 ~ pattern' "$expected_raw" > "$expected_raw.filtered"
     mv "$expected_raw.filtered" "$expected_raw"

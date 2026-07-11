@@ -1,0 +1,81 @@
+astravector.embedding.v1.AstraVectorRuntime is a service:
+service AstraVectorRuntime {
+  rpc DeleteDocumentVectors ( .astravector.embedding.v1.DeleteDocumentVectorsRequest ) returns ( .astravector.embedding.v1.DeleteDocumentVectorsResponse );
+  rpc Encode ( .astravector.embedding.v1.EncodeRequest ) returns ( .astravector.embedding.v1.EncodeResponse );
+  rpc EncodeBatch ( .astravector.embedding.v1.EncodeBatchRequest ) returns ( .astravector.embedding.v1.EncodeBatchResponse );
+  rpc EvaluateRelevance ( .astravector.embedding.v1.EvaluateRelevanceRequest ) returns ( .astravector.embedding.v1.EvaluateRelevanceResponse );
+  rpc ExtendVectorTtl ( .astravector.embedding.v1.ExtendVectorTtlRequest ) returns ( .astravector.embedding.v1.ExtendVectorTtlResponse );
+  rpc GetCapabilities ( .astravector.embedding.v1.GetCapabilitiesRequest ) returns ( .astravector.embedding.v1.GetCapabilitiesResponse );
+  rpc GetContract ( .astravector.embedding.v1.GetContractRequest ) returns ( .astravector.embedding.v1.GetContractResponse );
+  rpc GetVectorSyncStatus ( .astravector.embedding.v1.GetVectorSyncStatusRequest ) returns ( .astravector.embedding.v1.GetVectorSyncStatusResponse );
+  rpc Health ( .astravector.embedding.v1.HealthRequest ) returns ( .astravector.embedding.v1.HealthResponse );
+  rpc PreviewEmbedding ( .astravector.embedding.v1.PreviewEmbeddingRequest ) returns ( .astravector.embedding.v1.PreviewEmbeddingResponse );
+  rpc UpdateVectorMetadata ( .astravector.embedding.v1.UpdateVectorMetadataRequest ) returns ( .astravector.embedding.v1.UpdateVectorMetadataResponse );
+}
+astravector.embedding.v1.AstraVectorV004Control is a service:
+// v004 control plane. The v1 runtime service remains wire-compatible during migration.
+service AstraVectorV004Control {
+  rpc ActivateDocumentVersion ( .astravector.embedding.v1.ActivateDocumentVersionRequest ) returns ( .astravector.embedding.v1.DocumentVersionResponse );
+  rpc CreateMultiGranularityChunks ( .astravector.embedding.v1.CreateMultiGranularityChunksRequest ) returns ( .astravector.embedding.v1.CreateMultiGranularityChunksResponse );
+  rpc DebugDocumentState ( .astravector.embedding.v1.DebugDocumentStateRequest ) returns ( .astravector.embedding.v1.DebugDocumentStateResponse );
+  rpc ExplainSearch ( .astravector.embedding.v1.ExplainSearchRequest ) returns ( .astravector.embedding.v1.ExplainSearchResponse );
+  rpc GetChunkGroup ( .astravector.embedding.v1.GetChunkGroupRequest ) returns ( .astravector.embedding.v1.GetChunkGroupResponse );
+  rpc RegisterDocumentVersion ( .astravector.embedding.v1.RegisterDocumentVersionRequest ) returns ( .astravector.embedding.v1.DocumentVersionResponse );
+  rpc ResolveParentContext ( .astravector.embedding.v1.ResolveParentContextRequest ) returns ( .astravector.embedding.v1.ResolveParentContextResponse );
+  rpc RetryVectorOutbox ( .astravector.embedding.v1.RetryVectorOutboxRequest ) returns ( .astravector.embedding.v1.RetryVectorOutboxResponse );
+  rpc Search ( .astravector.embedding.v1.SearchRequestV004 ) returns ( .astravector.embedding.v1.SearchResponseV004 );
+}
+astravector.embedding.v1.AstraVectorIngestionFacade is a service:
+// v007 public facade contracts. These APIs simplify integration for llm_indexator and ai_bro
+// while keeping v004/v005 reliability mechanisms internal: outbox, sync, activation,
+// Qdrant reconciliation, TTL, diagnostics, and safe adaptive runtime.
+service AstraVectorIngestionFacade {
+  rpc AbortLogicalDocumentIngestion ( .astravector.embedding.v1.AbortLogicalDocumentIngestionRequest ) returns ( .astravector.embedding.v1.AbortLogicalDocumentIngestionResponse );
+  rpc AppendLogicalDocumentBlocks ( .astravector.embedding.v1.AppendLogicalDocumentBlocksRequest ) returns ( .astravector.embedding.v1.AppendLogicalDocumentBlocksResponse );
+  rpc DeleteDocumentVectorsFacade ( .astravector.embedding.v1.DeleteDocumentVectorsFacadeRequest ) returns ( .astravector.embedding.v1.DeleteDocumentVectorsFacadeResponse );
+  rpc FinalizeLogicalDocumentIngestion ( .astravector.embedding.v1.FinalizeLogicalDocumentIngestionRequest ) returns ( .astravector.embedding.v1.IndexLogicalDocumentResponse );
+  rpc GetDocumentVectorStatus ( .astravector.embedding.v1.GetDocumentVectorStatusRequest ) returns ( .astravector.embedding.v1.GetDocumentVectorStatusResponse );
+  rpc GetLogicalDocumentIngestionStatus ( .astravector.embedding.v1.GetLogicalDocumentIngestionStatusRequest ) returns ( .astravector.embedding.v1.GetLogicalDocumentIngestionStatusResponse );
+  rpc IndexLogicalDocument ( .astravector.embedding.v1.IndexLogicalDocumentRequest ) returns ( .astravector.embedding.v1.IndexLogicalDocumentResponse );
+  rpc StartLogicalDocumentIngestion ( .astravector.embedding.v1.StartLogicalDocumentIngestionRequest ) returns ( .astravector.embedding.v1.StartLogicalDocumentIngestionResponse );
+}
+astravector.embedding.v1.AstraVectorRetrievalFacade is a service:
+service AstraVectorRetrievalFacade {
+  rpc ExplainRetrieve ( .astravector.embedding.v1.ExplainRetrieveRequest ) returns ( .astravector.embedding.v1.ExplainRetrieveResponse );
+  rpc RetrieveContext ( .astravector.embedding.v1.RetrieveContextRequest ) returns ( .astravector.embedding.v1.RetrieveContextResponse );
+}
+astravector.embedding.v1.AstraVectorAdminFacade is a service:
+service AstraVectorAdminFacade {
+  rpc DebugDocument ( .astravector.embedding.v1.DebugDocumentRequest ) returns ( .astravector.embedding.v1.DebugDocumentResponse );
+  rpc GetRuntimeHealth ( .astravector.embedding.v1.GetRuntimeHealthRequest ) returns ( .astravector.embedding.v1.GetRuntimeHealthResponse );
+  rpc RetryDocumentDeletion ( .astravector.embedding.v1.RetryDocumentDeletionRequest ) returns ( .astravector.embedding.v1.RetryDocumentDeletionResponse );
+  rpc RetryOutbox ( .astravector.embedding.v1.RetryOutboxFacadeRequest ) returns ( .astravector.embedding.v1.RetryOutboxFacadeResponse );
+}
+grpc.health.v1.Health is a service:
+service Health {
+  // If the requested service is unknown, the call will fail with status
+  // NOT_FOUND.
+  rpc Check ( .grpc.health.v1.HealthCheckRequest ) returns ( .grpc.health.v1.HealthCheckResponse );
+  // Performs a watch for the serving status of the requested service.
+  // The server will immediately send back a message indicating the current
+  // serving status.  It will then subsequently send a new message whenever
+  // the service's serving status changes.
+  //
+  // If the requested service is unknown when the call is received, the
+  // server will send a message setting the serving status to
+  // SERVICE_UNKNOWN but will *not* terminate the call.  If at some
+  // future point, the serving status of the service becomes known, the
+  // server will send a new message with the service's serving status.
+  //
+  // If the call terminates with status UNIMPLEMENTED, then clients
+  // should assume this method is not supported and should not retry the
+  // call.  If the call terminates with any other status (including OK),
+  // clients should retry the call with appropriate exponential backoff.
+  rpc Watch ( .grpc.health.v1.HealthCheckRequest ) returns ( stream .grpc.health.v1.HealthCheckResponse );
+}
+grpc.reflection.v1.ServerReflection is a service:
+service ServerReflection {
+  // The reflection service is structured as a bidirectional stream, ensuring
+  // all related requests go to a single server.
+  rpc ServerReflectionInfo ( stream .grpc.reflection.v1.ServerReflectionRequest ) returns ( stream .grpc.reflection.v1.ServerReflectionResponse );
+}

@@ -1,0 +1,687 @@
+# TYPE graph_mmr_embedding_missing_total counter
+graph_mmr_embedding_missing_total 424387
+
+# TYPE retrieved_contexts_total counter
+retrieved_contexts_total 47728
+
+# TYPE astravector_adaptive_observations_total counter
+astravector_adaptive_observations_total{parameter="qdrant.scroll_page_size",result="success",reason="ok"} 186
+
+# TYPE graph_edges_batch_insert_total counter
+graph_edges_batch_insert_total 8001
+
+# TYPE graph_candidate_identity_found_total counter
+graph_candidate_identity_found_total 30177
+
+# TYPE astravector_sync_status_consistency_mismatch_total counter
+astravector_sync_status_consistency_mismatch_total 96
+
+# TYPE graph_mmr_embedding_fetch_requested_total counter
+graph_mmr_embedding_fetch_requested_total 151319
+
+# TYPE graph_semantic_edges_skipped_duplicate_total counter
+graph_semantic_edges_skipped_duplicate_total 0
+
+# TYPE ingestion_chunked_session_expired_total counter
+ingestion_chunked_session_expired_total 0
+
+# TYPE ingestion_cleanup_finalizing_stale_total counter
+ingestion_cleanup_finalizing_stale_total 0
+
+# TYPE index_ttl_worker_started_total counter
+index_ttl_worker_started_total 1
+
+# TYPE graph_semantic_parallel_mode_total counter
+graph_semantic_parallel_mode_total{mode="sequential"} 44
+
+# TYPE retrieval_no_answer_pre_mmr_filtered_total counter
+retrieval_no_answer_pre_mmr_filtered_total 4966
+
+# TYPE retention_deleted_total counter
+retention_deleted_total{table="embedding_cache_entries"} 0
+retention_deleted_total{table="embedding_requests"} 0
+
+# TYPE graph_expansion_candidates_filtered_total counter
+graph_expansion_candidates_filtered_total 0
+
+# TYPE index_ttl_worker_iterations_total counter
+index_ttl_worker_iterations_total 7
+
+# TYPE vector_outbox_binding_lifecycle_mismatch_total counter
+vector_outbox_binding_lifecycle_mismatch_total{operation="DELETE_POINT",lifecycle="DELETED"} 12
+
+# TYPE astravector_adaptive_dry_run_decisions_total counter
+astravector_adaptive_dry_run_decisions_total{parameter="outbox.poll_interval_ms",action="increase"} 3985
+
+# TYPE graph_mmr_candidates_total counter
+graph_mmr_candidates_total 431170
+
+# TYPE graph_score_calibration_applied_total counter
+graph_score_calibration_applied_total{source="GRAPH_EXPANDED"} 30177
+graph_score_calibration_applied_total{source="VECTOR_DIRECT"} 172963
+
+# TYPE astravector_qdrant_events_total counter
+astravector_qdrant_events_total{operation="UPSERT_POINT",result="success"} 765
+astravector_qdrant_events_total{operation="DELETE_POINT",result="success"} 12
+
+# TYPE graph_mmr_embedding_fetch_found_total counter
+graph_mmr_embedding_fetch_found_total 0
+
+# TYPE retrieved_contexts_empty_total counter
+retrieved_contexts_empty_total 20
+
+# TYPE ingestion_cleanup_active_expired_total counter
+ingestion_cleanup_active_expired_total 0
+
+# TYPE ingestion_staging_cleanup_deleted_sessions_total counter
+ingestion_staging_cleanup_deleted_sessions_total 0
+
+# TYPE graph_quality_fixture_relation_edges_persisted_total counter
+graph_quality_fixture_relation_edges_persisted_total 3483
+
+# TYPE graph_mmr_candidate_embedding_missing_total counter
+graph_mmr_candidate_embedding_missing_total 151251
+
+# TYPE graph_secondary_sources_merged_total counter
+graph_secondary_sources_merged_total 147508
+
+# TYPE graph_edges_by_relation_persisted_total counter
+graph_edges_by_relation_persisted_total{relation_type="REPAIRED_BY"} 207
+graph_edges_by_relation_persisted_total{relation_type="OBSERVED_BY"} 180
+graph_edges_by_relation_persisted_total{relation_type="CHUNK_NEXT_SIBLING"} 255
+graph_edges_by_relation_persisted_total{relation_type="PRODUCES"} 144
+graph_edges_by_relation_persisted_total{relation_type="BLOCK_PRODUCED_CHUNK"} 765
+graph_edges_by_relation_persisted_total{relation_type="CONSTRAINS"} 189
+graph_edges_by_relation_persisted_total{relation_type="DOCUMENT_CONTAINS_BLOCK"} 44
+graph_edges_by_relation_persisted_total{relation_type="CHUNK_PREVIOUS_SIBLING"} 255
+graph_edges_by_relation_persisted_total{relation_type="CHUNK_SEMANTIC_SIMILAR"} 1713
+graph_edges_by_relation_persisted_total{relation_type="CHUNK_HAS_PARENT"} 510
+graph_edges_by_relation_persisted_total{relation_type="CHUNK_PRODUCED_BY_BLOCK"} 765
+graph_edges_by_relation_persisted_total{relation_type="EXPLAINS"} 1080
+graph_edges_by_relation_persisted_total{relation_type="BLOCK_CONTAINS_BLOCK"} 211
+graph_edges_by_relation_persisted_total{relation_type="REQUIRES"} 45
+graph_edges_by_relation_persisted_total{relation_type="PROTECTED_BY"} 171
+graph_edges_by_relation_persisted_total{relation_type="PUBLISHES_TO"} 315
+graph_edges_by_relation_persisted_total{relation_type="CONSTRAINED_BY"} 540
+graph_edges_by_relation_persisted_total{relation_type="RELATED_TO"} 612
+
+# TYPE qdrant_request_error_total counter
+qdrant_request_error_total{operation="search_sparse",status="network"} 2
+
+# TYPE astravector_qdrant_scroll_requests_total counter
+astravector_qdrant_scroll_requests_total 186
+
+# TYPE graph_mmr_embedding_identity_missing_total counter
+graph_mmr_embedding_identity_missing_total 833884
+
+# TYPE index_ttl_cleanup_qdrant_points_deleted_total counter
+index_ttl_cleanup_qdrant_points_deleted_total 0
+
+# TYPE graph_mmr_candidates_truncated_by_total counter
+graph_mmr_candidates_truncated_by_total 6792
+
+# TYPE access_zone_registry_db_recheck_total counter
+access_zone_registry_db_recheck_total{mode="uuid"} 4922
+access_zone_registry_db_recheck_total{mode="code"} 5067
+
+# TYPE access_zone_registry_cache_hit_total counter
+access_zone_registry_cache_hit_total 12753
+
+# TYPE graph_semantic_edges_skipped_by_limit_total counter
+graph_semantic_edges_skipped_by_limit_total 0
+
+# TYPE vector_outbox_binding_version_mismatch_total counter
+vector_outbox_binding_version_mismatch_total{operation="DELETE_POINT"} 0
+
+# TYPE graph_merge_final_candidates_total counter
+graph_merge_final_candidates_total 47728
+
+# TYPE graph_mmr_group_direct_candidates_total counter
+graph_mmr_group_direct_candidates_total 418721
+
+# TYPE index_ttl_cleanup_qdrant_points_already_absent_total counter
+index_ttl_cleanup_qdrant_points_already_absent_total 1
+
+# TYPE graph_semantic_parallel_enabled_total counter
+graph_semantic_parallel_enabled_total{enabled="false"} 44
+
+# TYPE embedding_document_submit_many_total counter
+embedding_document_submit_many_total 44
+
+# TYPE index_ttl_cleanup_documents_deleted_total counter
+index_ttl_cleanup_documents_deleted_total 1
+
+# TYPE graph_semantic_topk_heap_used_total counter
+graph_semantic_topk_heap_used_total 765
+
+# TYPE graph_mmr_token_fallback_total counter
+graph_mmr_token_fallback_total 2518956
+
+# TYPE access_zone_registry_resolve_total counter
+access_zone_registry_resolve_total{mode="uuid",source="cache"} 1576
+access_zone_registry_resolve_total{mode="uuid",source="cache_rechecked"} 4922
+access_zone_registry_resolve_total{mode="ingestion_uuid",source="db_strict"} 44
+access_zone_registry_resolve_total{mode="code",source="cache"} 1528
+access_zone_registry_resolve_total{mode="code",source="cache_rechecked"} 5067
+access_zone_registry_resolve_total{mode="ingestion_code",source="db_strict"} 88
+
+# TYPE embedding_document_chunks_completed_total counter
+embedding_document_chunks_completed_total 765
+
+# TYPE graph_candidate_identity_original_selected_total counter
+graph_candidate_identity_original_selected_total 30177
+
+# TYPE graph_merge_deduplicated_total counter
+graph_merge_deduplicated_total 18161
+
+# TYPE graph_mmr_enrichment_candidates_total counter
+graph_mmr_enrichment_candidates_total 436134
+
+# TYPE graph_mmr_selected_total counter
+graph_mmr_selected_total 47802
+
+# TYPE graph_expansion_requests_total counter
+graph_expansion_requests_total 6030
+
+# TYPE vector_outbox_stale_event_skipped_total counter
+vector_outbox_stale_event_skipped_total{operation="DELETE_POINT"} 12
+
+# TYPE graph_mmr_embedding_fetch_timeout_total counter
+graph_mmr_embedding_fetch_timeout_total 16
+
+# TYPE graph_expansion_candidates_by_relation_total counter
+graph_expansion_candidates_by_relation_total{relation_type="OBSERVED_BY"} 3
+graph_expansion_candidates_by_relation_total{relation_type="CHUNK_NEXT_SIBLING"} 33
+graph_expansion_candidates_by_relation_total{relation_type="REPAIRED_BY"} 8290
+graph_expansion_candidates_by_relation_total{relation_type="CHUNK_SEMANTIC_SIMILAR"} 10502
+graph_expansion_candidates_by_relation_total{relation_type="PUBLISHES_TO"} 4
+graph_expansion_candidates_by_relation_total{relation_type="RELATED_TO"} 1525
+graph_expansion_candidates_by_relation_total{relation_type="PRODUCES"} 6
+graph_expansion_candidates_by_relation_total{relation_type="CHUNK_PREVIOUS_SIBLING"} 780
+graph_expansion_candidates_by_relation_total{relation_type="CONSTRAINS"} 3
+graph_expansion_candidates_by_relation_total{relation_type="CHUNK_HAS_PARENT"} 2287
+graph_expansion_candidates_by_relation_total{relation_type="CONSTRAINED_BY"} 2178
+graph_expansion_candidates_by_relation_total{relation_type="EXPLAINS"} 4566
+
+# TYPE graph_expansion_seed_chunks_total counter
+graph_expansion_seed_chunks_total 96480
+
+# TYPE graph_mmr_token_pair_comparisons_total counter
+graph_mmr_token_pair_comparisons_total 2519800
+
+# TYPE graph_semantic_edges_created_total counter
+graph_semantic_edges_created_total 1713
+
+# TYPE graph_mmr_embedding_fetch_by_point_total counter
+graph_mmr_embedding_fetch_by_point_total 151319
+
+# TYPE astravector_postgres_purged_total counter
+astravector_postgres_purged_total 0
+
+# TYPE source_chunk_metadata_only_total counter
+source_chunk_metadata_only_total 44
+
+# TYPE index_ttl_cleanup_batches_total counter
+index_ttl_cleanup_batches_total 7
+
+# TYPE ingestion_staging_cleanup_deleted_blocks_total counter
+ingestion_staging_cleanup_deleted_blocks_total 0
+
+# TYPE retrieved_contexts_by_source_total counter
+retrieved_contexts_by_source_total{source="LEXICAL_PARENT_BACKFILL"} 31192
+retrieved_contexts_by_source_total{source="GRAPH_EXPANDED"} 17255
+retrieved_contexts_by_source_total{source="VECTOR_DIRECT"} 20641
+
+# TYPE graph_merge_graph_candidates_total counter
+graph_merge_graph_candidates_total 30152
+
+# TYPE graph_merge_direct_candidates_total counter
+graph_merge_direct_candidates_total 419179
+
+# TYPE retrieve_context_final_visibility_recheck_total counter
+retrieve_context_final_visibility_recheck_total 6085
+
+# TYPE hybrid_fusion_applied_total counter
+hybrid_fusion_applied_total{method="RRF"} 6102
+
+# TYPE graph_mmr_group_graph_selected_total counter
+graph_mmr_group_graph_selected_total 11227
+
+# TYPE graph_mmr_group_graph_candidates_total counter
+graph_mmr_group_graph_candidates_total 11991
+
+# TYPE graph_mmr_dense_pair_comparisons_total counter
+graph_mmr_dense_pair_comparisons_total 0
+
+# TYPE graph_mmr_group_direct_selected_total counter
+graph_mmr_group_direct_selected_total 36144
+
+# TYPE ingestion_finalizing_stale_failed_total counter
+ingestion_finalizing_stale_failed_total 0
+
+# TYPE retrieval_no_answer_post_mmr_triggered_total counter
+retrieval_no_answer_post_mmr_triggered_total 14
+
+# TYPE access_zone_registry_db_fallback_total counter
+access_zone_registry_db_fallback_total{mode="uuid"} 4966
+access_zone_registry_db_fallback_total{mode="code"} 5155
+
+# TYPE graph_semantic_edges_skipped_by_score_total counter
+graph_semantic_edges_skipped_by_score_total 15120
+
+# TYPE graph_merge_candidates_by_relation_total counter
+graph_merge_candidates_by_relation_total{relation_type="PRODUCES"} 6
+graph_merge_candidates_by_relation_total{relation_type="EXPLAINS"} 4560
+graph_merge_candidates_by_relation_total{relation_type="CONSTRAINED_BY"} 2178
+graph_merge_candidates_by_relation_total{relation_type="CHUNK_NEXT_SIBLING"} 33
+graph_merge_candidates_by_relation_total{relation_type="PUBLISHES_TO"} 4
+graph_merge_candidates_by_relation_total{relation_type="CHUNK_PREVIOUS_SIBLING"} 778
+graph_merge_candidates_by_relation_total{relation_type="CHUNK_HAS_PARENT"} 2285
+graph_merge_candidates_by_relation_total{relation_type="RELATED_TO"} 1525
+graph_merge_candidates_by_relation_total{relation_type="CONSTRAINS"} 3
+graph_merge_candidates_by_relation_total{relation_type="CHUNK_SEMANTIC_SIMILAR"} 10492
+graph_merge_candidates_by_relation_total{relation_type="OBSERVED_BY"} 3
+graph_merge_candidates_by_relation_total{relation_type="REPAIRED_BY"} 8285
+
+# TYPE graph_mmr_full_candidates_total counter
+graph_mmr_full_candidates_total 449749
+
+# TYPE graph_mmr_embedding_cache_miss_total counter
+graph_mmr_embedding_cache_miss_total 151319
+
+# TYPE graph_mmr_embedding_fetch_slow_total counter
+graph_mmr_embedding_fetch_slow_total 19
+
+# TYPE graph_mmr_enrichment_candidates_skipped_total counter
+graph_mmr_enrichment_candidates_skipped_total 13615
+
+# TYPE graph_mmr_enabled_total counter
+graph_mmr_enabled_total 6105
+
+# TYPE graph_mmr_embedding_fetch_missing_total counter
+graph_mmr_embedding_fetch_missing_total 151251
+
+# TYPE inference_retry_attempts_total counter
+inference_retry_attempts_total{operation="encode_batch"} 60
+
+# TYPE qdrant_payload_index_create_total counter
+qdrant_payload_index_create_total{field="chunking_profile_version",result="ok"} 765
+qdrant_payload_index_create_total{field="document_id",result="ok"} 765
+qdrant_payload_index_create_total{field="qdrant_point_id",result="ok"} 765
+qdrant_payload_index_create_total{field="quality_run_id",result="ok"} 765
+qdrant_payload_index_create_total{field="chunk_granularity",result="ok"} 765
+qdrant_payload_index_create_total{field="model_version",result="ok"} 765
+qdrant_payload_index_create_total{field="quarantined",result="ok"} 765
+qdrant_payload_index_create_total{field="access_zone_id",result="ok"} 765
+qdrant_payload_index_create_total{field="document_version",result="ok"} 765
+qdrant_payload_index_create_total{field="lifecycle_status",result="ok"} 765
+qdrant_payload_index_create_total{field="binding_id",result="ok"} 765
+qdrant_payload_index_create_total{field="dense_version",result="ok"} 765
+qdrant_payload_index_create_total{field="access_level",result="ok"} 765
+qdrant_payload_index_create_total{field="tokenizer_version",result="ok"} 765
+qdrant_payload_index_create_total{field="expires_at_epoch",result="ok"} 765
+qdrant_payload_index_create_total{field="sparse_version",result="ok"} 765
+
+# TYPE graph_mmr_embedding_fetch_skipped_all_present_total counter
+graph_mmr_embedding_fetch_skipped_all_present_total 6
+
+# TYPE graph_expansion_candidates_total counter
+graph_expansion_candidates_total 30192
+
+# TYPE graph_mmr_candidates_truncated_total counter
+graph_mmr_candidates_truncated_total 751
+
+# TYPE access_zone_registry_cache_miss_total counter
+access_zone_registry_cache_miss_total 340
+
+# TYPE ingestion_cleanup_finalizing_skipped_total counter
+ingestion_cleanup_finalizing_skipped_total 8
+
+# TYPE graph_rebuild_total counter
+graph_rebuild_total 44
+
+# TYPE ingestion_staging_bytes_total gauge
+ingestion_staging_bytes_total 0
+
+# TYPE astravector_qdrant_outbox_claimed gauge
+astravector_qdrant_outbox_claimed 0
+
+# TYPE graph_mmr_group_graph_lambda_current gauge
+graph_mmr_group_graph_lambda_current 0.6000000238418579
+
+# TYPE index_ttl_backlog_documents gauge
+index_ttl_backlog_documents 1
+
+# TYPE astravector_queue_depth gauge
+astravector_queue_depth{queue="document"} 0
+astravector_queue_depth{queue="query"} 0
+
+# TYPE mmr_fetch_concurrent_active gauge
+mmr_fetch_concurrent_active 2
+
+# TYPE index_ttl_backlog_documents_total gauge
+index_ttl_backlog_documents_total 0
+
+# TYPE retention_last_cache_entries_deleted gauge
+retention_last_cache_entries_deleted 0
+
+# TYPE qdrant_search_concurrent_active gauge
+qdrant_search_concurrent_active 2
+
+# TYPE graph_expansion_concurrent_active gauge
+graph_expansion_concurrent_active 2
+
+# TYPE astravector_qdrant_scroll_concurrent_inflight gauge
+astravector_qdrant_scroll_concurrent_inflight 0
+
+# TYPE embedding_document_max_in_flight_current gauge
+embedding_document_max_in_flight_current 32
+
+# TYPE ingestion_staging_rows_total gauge
+ingestion_staging_rows_total 0
+
+# TYPE index_ttl_oldest_expired_age_seconds gauge
+index_ttl_oldest_expired_age_seconds 0
+
+# TYPE qdrant_search_permits_available gauge
+qdrant_search_permits_available 254
+
+# TYPE retrieval_concurrent_active gauge
+retrieval_concurrent_active 4
+
+# TYPE index_ttl_delete_permanently_failed_documents gauge
+index_ttl_delete_permanently_failed_documents 0
+
+# TYPE index_ttl_claimed_documents gauge
+index_ttl_claimed_documents 1
+
+# TYPE retrieve_context_final_token_count gauge
+retrieve_context_final_token_count 368
+
+# TYPE astravector_expired_bindings gauge
+astravector_expired_bindings 12
+
+# TYPE config_dangerous_override_enabled gauge
+config_dangerous_override_enabled 0
+
+# TYPE astravector_adaptive_mode gauge
+astravector_adaptive_mode{mode="DRY_RUN"} 1
+
+# TYPE graph_mmr_group_direct_lambda_current gauge
+graph_mmr_group_direct_lambda_current 0.800000011920929
+
+# TYPE ingestion_cleanup_result_rows_retained_total gauge
+ingestion_cleanup_result_rows_retained_total 0
+
+# TYPE inference_retry_delay_ms summary
+inference_retry_delay_ms{operation="encode_batch",quantile="0"} 0
+inference_retry_delay_ms{operation="encode_batch",quantile="0.5"} 0
+inference_retry_delay_ms{operation="encode_batch",quantile="0.9"} 0
+inference_retry_delay_ms{operation="encode_batch",quantile="0.95"} 0
+inference_retry_delay_ms{operation="encode_batch",quantile="0.99"} 0
+inference_retry_delay_ms{operation="encode_batch",quantile="0.999"} 0
+inference_retry_delay_ms{operation="encode_batch",quantile="1"} 0
+inference_retry_delay_ms_sum{operation="encode_batch"} 7020
+inference_retry_delay_ms_count{operation="encode_batch"} 60
+
+# TYPE astravector_batch_size summary
+astravector_batch_size{queue="document",quantile="0"} 0
+astravector_batch_size{queue="document",quantile="0.5"} 0
+astravector_batch_size{queue="document",quantile="0.9"} 0
+astravector_batch_size{queue="document",quantile="0.95"} 0
+astravector_batch_size{queue="document",quantile="0.99"} 0
+astravector_batch_size{queue="document",quantile="0.999"} 0
+astravector_batch_size{queue="document",quantile="1"} 0
+astravector_batch_size_sum{queue="document"} 765
+astravector_batch_size_count{queue="document"} 69
+astravector_batch_size{queue="query",quantile="0"} 1
+astravector_batch_size{queue="query",quantile="0.5"} 0.9998999999999999
+astravector_batch_size{queue="query",quantile="0.9"} 0.9998999999999999
+astravector_batch_size{queue="query",quantile="0.95"} 0.9998999999999999
+astravector_batch_size{queue="query",quantile="0.99"} 0.9998999999999999
+astravector_batch_size{queue="query",quantile="0.999"} 0.9998999999999999
+astravector_batch_size{queue="query",quantile="1"} 1
+astravector_batch_size_sum{queue="query"} 6580
+astravector_batch_size_count{queue="query"} 5491
+
+# TYPE graph_mmr_embedding_fetch_duration_ms summary
+graph_mmr_embedding_fetch_duration_ms{quantile="0"} 35
+graph_mmr_embedding_fetch_duration_ms{quantile="0.5"} 34.99831812806673
+graph_mmr_embedding_fetch_duration_ms{quantile="0.9"} 34.99831812806673
+graph_mmr_embedding_fetch_duration_ms{quantile="0.95"} 34.99831812806673
+graph_mmr_embedding_fetch_duration_ms{quantile="0.99"} 34.99831812806673
+graph_mmr_embedding_fetch_duration_ms{quantile="0.999"} 34.99831812806673
+graph_mmr_embedding_fetch_duration_ms{quantile="1"} 36
+graph_mmr_embedding_fetch_duration_ms_sum 251455
+graph_mmr_embedding_fetch_duration_ms_count 6101
+
+# TYPE access_zone_registry_reload_duration_ms summary
+access_zone_registry_reload_duration_ms{quantile="0"} 3
+access_zone_registry_reload_duration_ms{quantile="0.5"} 3.000263141522573
+access_zone_registry_reload_duration_ms{quantile="0.9"} 3.000263141522573
+access_zone_registry_reload_duration_ms{quantile="0.95"} 3.000263141522573
+access_zone_registry_reload_duration_ms{quantile="0.99"} 3.000263141522573
+access_zone_registry_reload_duration_ms{quantile="0.999"} 3.000263141522573
+access_zone_registry_reload_duration_ms{quantile="1"} 3
+access_zone_registry_reload_duration_ms_sum 2756
+access_zone_registry_reload_duration_ms_count 340
+
+# TYPE graph_mmr_duration_ms summary
+graph_mmr_duration_ms{quantile="0"} 0
+graph_mmr_duration_ms{quantile="0.5"} 0
+graph_mmr_duration_ms{quantile="0.9"} 0
+graph_mmr_duration_ms{quantile="0.95"} 0
+graph_mmr_duration_ms{quantile="0.99"} 0
+graph_mmr_duration_ms{quantile="0.999"} 0
+graph_mmr_duration_ms{quantile="1"} 0
+graph_mmr_duration_ms_sum 3055
+graph_mmr_duration_ms_count 6105
+
+# TYPE embedding_document_submit_many_duration_ms summary
+embedding_document_submit_many_duration_ms{quantile="0"} 0
+embedding_document_submit_many_duration_ms{quantile="0.5"} 0
+embedding_document_submit_many_duration_ms{quantile="0.9"} 0
+embedding_document_submit_many_duration_ms{quantile="0.95"} 0
+embedding_document_submit_many_duration_ms{quantile="0.99"} 0
+embedding_document_submit_many_duration_ms{quantile="0.999"} 0
+embedding_document_submit_many_duration_ms{quantile="1"} 0
+embedding_document_submit_many_duration_ms_sum 40458
+embedding_document_submit_many_duration_ms_count 44
+
+# TYPE astravector_qdrant_sync_duration_seconds summary
+astravector_qdrant_sync_duration_seconds{quantile="0"} 0.002122459
+astravector_qdrant_sync_duration_seconds{quantile="0.5"} 0.0024148936621405156
+astravector_qdrant_sync_duration_seconds{quantile="0.9"} 0.0057918702706598255
+astravector_qdrant_sync_duration_seconds{quantile="0.95"} 0.01071725713747622
+astravector_qdrant_sync_duration_seconds{quantile="0.99"} 0.01071725713747622
+astravector_qdrant_sync_duration_seconds{quantile="0.999"} 0.01071725713747622
+astravector_qdrant_sync_duration_seconds{quantile="1"} 0.072030791
+astravector_qdrant_sync_duration_seconds_sum 26.210051473999975
+astravector_qdrant_sync_duration_seconds_count 777
+
+# TYPE index_ttl_cleanup_duration_ms summary
+index_ttl_cleanup_duration_ms{quantile="0"} 225
+index_ttl_cleanup_duration_ms{quantile="0.5"} 224.99991244109768
+index_ttl_cleanup_duration_ms{quantile="0.9"} 224.99991244109768
+index_ttl_cleanup_duration_ms{quantile="0.95"} 224.99991244109768
+index_ttl_cleanup_duration_ms{quantile="0.99"} 224.99991244109768
+index_ttl_cleanup_duration_ms{quantile="0.999"} 224.99991244109768
+index_ttl_cleanup_duration_ms{quantile="1"} 225
+index_ttl_cleanup_duration_ms_sum 1106
+index_ttl_cleanup_duration_ms_count 7
+
+# TYPE astravector_qdrant_scroll_latency_seconds summary
+astravector_qdrant_scroll_latency_seconds{quantile="0"} 0.002624708
+astravector_qdrant_scroll_latency_seconds{quantile="0.5"} 0.002624932690953035
+astravector_qdrant_scroll_latency_seconds{quantile="0.9"} 0.002624932690953035
+astravector_qdrant_scroll_latency_seconds{quantile="0.95"} 0.002624932690953035
+astravector_qdrant_scroll_latency_seconds{quantile="0.99"} 0.002624932690953035
+astravector_qdrant_scroll_latency_seconds{quantile="0.999"} 0.002624932690953035
+astravector_qdrant_scroll_latency_seconds{quantile="1"} 0.002624708
+astravector_qdrant_scroll_latency_seconds_sum 0.2783777489999999
+astravector_qdrant_scroll_latency_seconds_count 186
+
+# TYPE access_zone_search_zones_count summary
+access_zone_search_zones_count{quantile="0"} 1
+access_zone_search_zones_count{quantile="0.5"} 0.9998999999999999
+access_zone_search_zones_count{quantile="0.9"} 0.9998999999999999
+access_zone_search_zones_count{quantile="0.95"} 0.9998999999999999
+access_zone_search_zones_count{quantile="0.99"} 0.9998999999999999
+access_zone_search_zones_count{quantile="0.999"} 0.9998999999999999
+access_zone_search_zones_count{quantile="1"} 1
+access_zone_search_zones_count_sum 6595
+access_zone_search_zones_count_count 6595
+
+# TYPE graph_expansion_duration_ms summary
+graph_expansion_duration_ms{quantile="0"} 8
+graph_expansion_duration_ms{quantile="0.5"} 9.999149133010329
+graph_expansion_duration_ms{quantile="0.9"} 14.000597451292164
+graph_expansion_duration_ms{quantile="0.95"} 14.000597451292164
+graph_expansion_duration_ms{quantile="0.99"} 14.000597451292164
+graph_expansion_duration_ms{quantile="0.999"} 14.000597451292164
+graph_expansion_duration_ms{quantile="1"} 21
+graph_expansion_duration_ms_sum 94434
+graph_expansion_duration_ms_count 6030
+
+# TYPE astravector_qdrant_scroll_points_total summary
+astravector_qdrant_scroll_points_total{quantile="0"} 0
+astravector_qdrant_scroll_points_total{quantile="0.5"} 0
+astravector_qdrant_scroll_points_total{quantile="0.9"} 0
+astravector_qdrant_scroll_points_total{quantile="0.95"} 0
+astravector_qdrant_scroll_points_total{quantile="0.99"} 0
+astravector_qdrant_scroll_points_total{quantile="0.999"} 0
+astravector_qdrant_scroll_points_total{quantile="1"} 0
+astravector_qdrant_scroll_points_total_sum 2129
+astravector_qdrant_scroll_points_total_count 186
+
+# TYPE astravector_inference_duration_seconds summary
+astravector_inference_duration_seconds{quantile="0"} 0.059545917
+astravector_inference_duration_seconds{quantile="0.5"} 0.07006723388290004
+astravector_inference_duration_seconds{quantile="0.9"} 0.1412957579223896
+astravector_inference_duration_seconds{quantile="0.95"} 0.1412957579223896
+astravector_inference_duration_seconds{quantile="0.99"} 0.1412957579223896
+astravector_inference_duration_seconds{quantile="0.999"} 0.1412957579223896
+astravector_inference_duration_seconds{quantile="1"} 0.175116542
+astravector_inference_duration_seconds_sum 569.675347593001
+astravector_inference_duration_seconds_count 5558
+
+# TYPE graph_edges_batch_insert_duration_ms summary
+graph_edges_batch_insert_duration_ms{quantile="0"} 0
+graph_edges_batch_insert_duration_ms{quantile="0.5"} 0
+graph_edges_batch_insert_duration_ms{quantile="0.9"} 0
+graph_edges_batch_insert_duration_ms{quantile="0.95"} 0
+graph_edges_batch_insert_duration_ms{quantile="0.99"} 0
+graph_edges_batch_insert_duration_ms{quantile="0.999"} 0
+graph_edges_batch_insert_duration_ms{quantile="1"} 0
+graph_edges_batch_insert_duration_ms_sum 596
+graph_edges_batch_insert_duration_ms_count 82
+
+# TYPE ingestion_staging_cleanup_duration_ms summary
+ingestion_staging_cleanup_duration_ms{quantile="0"} 26
+ingestion_staging_cleanup_duration_ms{quantile="0.5"} 26.000090163966476
+ingestion_staging_cleanup_duration_ms{quantile="0.9"} 26.000090163966476
+ingestion_staging_cleanup_duration_ms{quantile="0.95"} 26.000090163966476
+ingestion_staging_cleanup_duration_ms{quantile="0.99"} 26.000090163966476
+ingestion_staging_cleanup_duration_ms{quantile="0.999"} 26.000090163966476
+ingestion_staging_cleanup_duration_ms{quantile="1"} 26
+ingestion_staging_cleanup_duration_ms_sum 605
+ingestion_staging_cleanup_duration_ms_count 8
+
+# TYPE graph_semantic_build_duration_ms summary
+graph_semantic_build_duration_ms{quantile="0"} 0
+graph_semantic_build_duration_ms{quantile="0.5"} 0
+graph_semantic_build_duration_ms{quantile="0.9"} 0
+graph_semantic_build_duration_ms{quantile="0.95"} 0
+graph_semantic_build_duration_ms{quantile="0.99"} 0
+graph_semantic_build_duration_ms{quantile="0.999"} 0
+graph_semantic_build_duration_ms{quantile="1"} 0
+graph_semantic_build_duration_ms_sum 8
+graph_semantic_build_duration_ms_count 44
+
+# TYPE astravector_qdrant_scroll_pages_total summary
+astravector_qdrant_scroll_pages_total{quantile="0"} 1
+astravector_qdrant_scroll_pages_total{quantile="0.5"} 0.9998999999999999
+astravector_qdrant_scroll_pages_total{quantile="0.9"} 0.9998999999999999
+astravector_qdrant_scroll_pages_total{quantile="0.95"} 0.9998999999999999
+astravector_qdrant_scroll_pages_total{quantile="0.99"} 0.9998999999999999
+astravector_qdrant_scroll_pages_total{quantile="0.999"} 0.9998999999999999
+astravector_qdrant_scroll_pages_total{quantile="1"} 1
+astravector_qdrant_scroll_pages_total_sum 186
+astravector_qdrant_scroll_pages_total_count 186
+
+# TYPE qdrant_request_duration_ms summary
+qdrant_request_duration_ms{operation="collection_exists",quantile="0"} 0
+qdrant_request_duration_ms{operation="collection_exists",quantile="0.5"} 1.9999056357269998
+qdrant_request_duration_ms{operation="collection_exists",quantile="0.9"} 4.000022554068023
+qdrant_request_duration_ms{operation="collection_exists",quantile="0.95"} 4.000022554068023
+qdrant_request_duration_ms{operation="collection_exists",quantile="0.99"} 4.000022554068023
+qdrant_request_duration_ms{operation="collection_exists",quantile="0.999"} 4.000022554068023
+qdrant_request_duration_ms{operation="collection_exists",quantile="1"} 5
+qdrant_request_duration_ms_sum{operation="collection_exists"} 2145
+qdrant_request_duration_ms_count{operation="collection_exists"} 795
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="0"} 1
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="0.5"} 0.9998999999999999
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="0.9"} 0.9998999999999999
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="0.95"} 0.9998999999999999
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="0.99"} 0.9998999999999999
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="0.999"} 0.9998999999999999
+qdrant_request_duration_ms{operation="point_ids_by_document_scroll",quantile="1"} 1
+qdrant_request_duration_ms_sum{operation="point_ids_by_document_scroll"} 61
+qdrant_request_duration_ms_count{operation="point_ids_by_document_scroll"} 186
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="0"} 0
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="0.5"} 0
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="0.9"} 0
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="0.95"} 0
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="0.99"} 0
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="0.999"} 0
+qdrant_request_duration_ms{operation="ensure_collection_get",quantile="1"} 0
+qdrant_request_duration_ms_sum{operation="ensure_collection_get"} 52
+qdrant_request_duration_ms_count{operation="ensure_collection_get"} 765
+qdrant_request_duration_ms{operation="upsert",quantile="0"} 0
+qdrant_request_duration_ms{operation="upsert",quantile="0.5"} 0
+qdrant_request_duration_ms{operation="upsert",quantile="0.9"} 0
+qdrant_request_duration_ms{operation="upsert",quantile="0.95"} 0
+qdrant_request_duration_ms{operation="upsert",quantile="0.99"} 0
+qdrant_request_duration_ms{operation="upsert",quantile="0.999"} 0
+qdrant_request_duration_ms{operation="upsert",quantile="1"} 0
+qdrant_request_duration_ms_sum{operation="upsert"} 1097
+qdrant_request_duration_ms_count{operation="upsert"} 765
+qdrant_request_duration_ms{operation="validate_collection",quantile="0"} 0
+qdrant_request_duration_ms{operation="validate_collection",quantile="0.5"} 0
+qdrant_request_duration_ms{operation="validate_collection",quantile="0.9"} 0
+qdrant_request_duration_ms{operation="validate_collection",quantile="0.95"} 0
+qdrant_request_duration_ms{operation="validate_collection",quantile="0.99"} 0
+qdrant_request_duration_ms{operation="validate_collection",quantile="0.999"} 0
+qdrant_request_duration_ms{operation="validate_collection",quantile="1"} 0
+qdrant_request_duration_ms_sum{operation="validate_collection"} 27
+qdrant_request_duration_ms_count{operation="validate_collection"} 765
+qdrant_request_duration_ms{operation="search_sparse",quantile="0"} 4
+qdrant_request_duration_ms{operation="search_sparse",quantile="0.5"} 4.000022554068023
+qdrant_request_duration_ms{operation="search_sparse",quantile="0.9"} 11.999920242205052
+qdrant_request_duration_ms{operation="search_sparse",quantile="0.95"} 11.999920242205052
+qdrant_request_duration_ms{operation="search_sparse",quantile="0.99"} 11.999920242205052
+qdrant_request_duration_ms{operation="search_sparse",quantile="0.999"} 11.999920242205052
+qdrant_request_duration_ms{operation="search_sparse",quantile="1"} 18
+qdrant_request_duration_ms_sum{operation="search_sparse"} 95251
+qdrant_request_duration_ms_count{operation="search_sparse"} 6116
+qdrant_request_duration_ms{operation="search_dense",quantile="0"} 5
+qdrant_request_duration_ms{operation="search_dense",quantile="0.5"} 6.999928967377545
+qdrant_request_duration_ms{operation="search_dense",quantile="0.9"} 14.000597451292164
+qdrant_request_duration_ms{operation="search_dense",quantile="0.95"} 14.000597451292164
+qdrant_request_duration_ms{operation="search_dense",quantile="0.99"} 14.000597451292164
+qdrant_request_duration_ms{operation="search_dense",quantile="0.999"} 14.000597451292164
+qdrant_request_duration_ms{operation="search_dense",quantile="1"} 26
+qdrant_request_duration_ms_sum{operation="search_dense"} 109288
+qdrant_request_duration_ms_count{operation="search_dense"} 6112
+
+# TYPE graph_merge_duration_ms summary
+graph_merge_duration_ms{quantile="0"} 37
+graph_merge_duration_ms{quantile="0.5"} 36.999337498439296
+graph_merge_duration_ms{quantile="0.9"} 36.999337498439296
+graph_merge_duration_ms{quantile="0.95"} 36.999337498439296
+graph_merge_duration_ms{quantile="0.99"} 36.999337498439296
+graph_merge_duration_ms{quantile="0.999"} 36.999337498439296
+graph_merge_duration_ms{quantile="1"} 39
+graph_merge_duration_ms_sum 267610
+graph_merge_duration_ms_count 6105
+

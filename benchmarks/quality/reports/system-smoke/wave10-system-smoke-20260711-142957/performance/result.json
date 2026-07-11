@@ -1,0 +1,13 @@
+{
+  "retrieve_p50_ms": 452,
+  "retrieve_p95_ms": 616,
+  "graph_query_end_to_end_p50_ms": 524,
+  "graph_query_end_to_end_p95_ms": 646,
+  "graph_query_end_to_end_p99_ms": 646,
+  "graph_lookup_latency_available": false,
+  "graph_timeout_count": 0,
+  "profile_duration_seconds": 155,
+  "retrieve_p95_threshold_ms": 5000,
+  "graph_query_p95_threshold_ms": 5000,
+  "pass": true
+}

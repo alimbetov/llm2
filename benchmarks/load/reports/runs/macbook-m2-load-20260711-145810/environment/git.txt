@@ -1,0 +1,22 @@
+timestamp=2026-07-11T14:58:10+05:00
+pwd=/Users/ruslanalimbetov/Documents/llm2/astravector
+branch=main
+head=12823b322ae7a368d82a53e5a4d90fe7c7550bdd
+origin_main=12823b322ae7a368d82a53e5a4d90fe7c7550bdd
+ M benchmarks/quality/reports/rag-analysis-bank-system-smoke-report.json
+ M benchmarks/quality/reports/rag-analysis-bank-system-smoke-report.md
+ M benchmarks/quality/reports/runtime-candidates.jsonl
+ M benchmarks/quality/reports/runtime-failures.jsonl
+ M benchmarks/quality/reports/runtime-quality-report.json
+ M benchmarks/quality/reports/runtime-quality-report.md
+ M build.rs
+ M scripts/quality-system-smoke.sh
+?? benchmarks/load/
+?? benchmarks/quality/reports/system-smoke/wave10-system-smoke-20260711-142957/
+?? migrations/0038_v007_fix477_graph_reverse_lookup_index.sql
+?? scripts/macbook-model-backed-load.sh
+12823b3 wave12
+7b28753 wave11
+33e8ee6 wave10
+9b5e688 wave09
+c2920f9 wave08

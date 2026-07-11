@@ -1,7 +1,8 @@
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
 
-pub fn install(addr: SocketAddr) -> anyhow::Result<PrometheusHandle> {
+pub fn install(addr: SocketAddr) -> anyhow::Result<()> {
     let builder = PrometheusBuilder::new().with_http_listener(addr);
-    Ok(builder.install_recorder()?)
+    builder.install()?;
+    Ok(())
 }

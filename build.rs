@@ -8,5 +8,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(out_dir.join("astravector_descriptor.bin"))
         .compile_protos(&["proto/astravector_embedding.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/astravector_embedding.proto");
+    println!("cargo:rerun-if-changed=migrations");
     Ok(())
 }

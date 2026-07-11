@@ -1,0 +1,1 @@
+env ASTRAVECTOR_DB_URL=postgres://astravector:astravector@127.0.0.1:55432/astravector make migrate 

@@ -1,0 +1,75 @@
+# TYPE ingestion_staging_cleanup_deleted_sessions_total counter
+ingestion_staging_cleanup_deleted_sessions_total 0
+
+# TYPE ingestion_staging_cleanup_deleted_blocks_total counter
+ingestion_staging_cleanup_deleted_blocks_total 0
+
+# TYPE ingestion_chunked_session_expired_total counter
+ingestion_chunked_session_expired_total 0
+
+# TYPE ingestion_cleanup_finalizing_skipped_total counter
+ingestion_cleanup_finalizing_skipped_total 1
+
+# TYPE ingestion_cleanup_active_expired_total counter
+ingestion_cleanup_active_expired_total 0
+
+# TYPE index_ttl_worker_started_total counter
+index_ttl_worker_started_total 1
+
+# TYPE qdrant_retry_non_retryable_total counter
+qdrant_retry_non_retryable_total{operation="collection_exists"} 2
+
+# TYPE astravector_adaptive_dry_run_decisions_total counter
+astravector_adaptive_dry_run_decisions_total{parameter="outbox.poll_interval_ms",action="increase"} 2
+
+# TYPE ingestion_finalizing_stale_failed_total counter
+ingestion_finalizing_stale_failed_total 0
+
+# TYPE astravector_postgres_purged_total counter
+astravector_postgres_purged_total 0
+
+# TYPE retention_deleted_total counter
+retention_deleted_total{table="embedding_requests"} 0
+retention_deleted_total{table="embedding_cache_entries"} 0
+
+# TYPE ingestion_cleanup_finalizing_stale_total counter
+ingestion_cleanup_finalizing_stale_total 0
+
+# TYPE retry_non_retryable_total counter
+retry_non_retryable_total{operation="collection_exists"} 2
+
+# TYPE astravector_adaptive_mode gauge
+astravector_adaptive_mode{mode="DRY_RUN"} 1
+
+# TYPE ingestion_cleanup_result_rows_retained_total gauge
+ingestion_cleanup_result_rows_retained_total 0
+
+# TYPE ingestion_staging_bytes_total gauge
+ingestion_staging_bytes_total 0
+
+# TYPE config_dangerous_override_enabled gauge
+config_dangerous_override_enabled 0
+
+# TYPE astravector_qdrant_outbox_claimed gauge
+astravector_qdrant_outbox_claimed 0
+
+# TYPE retention_last_cache_entries_deleted gauge
+retention_last_cache_entries_deleted 0
+
+# TYPE astravector_expired_bindings gauge
+astravector_expired_bindings 0
+
+# TYPE ingestion_staging_rows_total gauge
+ingestion_staging_rows_total 0
+
+# TYPE ingestion_staging_cleanup_duration_ms summary
+ingestion_staging_cleanup_duration_ms{quantile="0"} 27
+ingestion_staging_cleanup_duration_ms{quantile="0.5"} 27.001704833335125
+ingestion_staging_cleanup_duration_ms{quantile="0.9"} 27.001704833335125
+ingestion_staging_cleanup_duration_ms{quantile="0.95"} 27.001704833335125
+ingestion_staging_cleanup_duration_ms{quantile="0.99"} 27.001704833335125
+ingestion_staging_cleanup_duration_ms{quantile="0.999"} 27.001704833335125
+ingestion_staging_cleanup_duration_ms{quantile="1"} 27
+ingestion_staging_cleanup_duration_ms_sum 27
+ingestion_staging_cleanup_duration_ms_count 1
+

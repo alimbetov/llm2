@@ -1,0 +1,9 @@
+./proto/astravector_embedding.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx-operators.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx-operators.in.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx-operators-ml.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx-data.in.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx-data.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx.in.proto
+./.venv-onnx/lib/python3.14/site-packages/onnx/onnx-ml.proto

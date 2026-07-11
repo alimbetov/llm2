@@ -1,0 +1,220 @@
+{
+  "schema_version": "2.0",
+  "load_run_id": "macbook-m2-load-20260711-151409",
+  "git_sha": "12823b322ae7a368d82a53e5a4d90fe7c7550bdd",
+  "git_dirty": true,
+  "machine": {
+    "chip": "Apple M2",
+    "cpu_cores": 8,
+    "memory_bytes": 17179869184,
+    "macos_version": "ProductName:\t\tmacOS\nProductVersion:\t\t15.6\nBuildVersion:\t\t24G84",
+    "power_connected": true
+  },
+  "tools": {
+    "ghz": "0.121.0",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)"
+  },
+  "runtime": {
+    "binary_sha256": "4b307bad84620394cc56f563d199f0e3610d2c9edece5c44f3d509e39e5ff40b",
+    "model_sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
+    "tokenizer_sha256": "21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08",
+    "model_backed": true,
+    "release_build": true,
+    "runtime_pid": 34044
+  },
+  "existing_concurrency_smoke": {
+    "concurrency": 50,
+    "engine": "FixedSmokeEngine",
+    "exit_code": 0,
+    "p95_ms": null,
+    "p95_reason": "test asserts the limit but does not emit the measured value",
+    "verdict": "PASS"
+  },
+  "pre_load_quality": {
+    "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+    "verdict": "PASS",
+    "queries_total": 97,
+    "queries_passed": 97,
+    "queries_failed": 0,
+    "graph_expected_hits": 13,
+    "graph_expected_total": 13,
+    "graph_timeout_count": 0,
+    "graph_db_error_count": 0,
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0,
+    "qdrant_missing_points": 0,
+    "outbox_dead_letter_count": 0
+  },
+  "baseline": [
+    {
+      "requested_rps": 2,
+      "achieved_rps": 1.9900215171657933,
+      "duration_seconds": 301.0017705,
+      "count": 599,
+      "success_rate": 1.0,
+      "error_rate": 0.0,
+      "p50_ms": 267.075917,
+      "p90_ms": 279.849,
+      "p95_ms": 288.658083,
+      "p99_ms": 317.220458,
+      "errors": {},
+      "status_codes": {
+        "OK": 599
+      }
+    },
+    {
+      "requested_rps": 5,
+      "achieved_rps": 4.996636791642046,
+      "duration_seconds": 300.001793708,
+      "count": 1499,
+      "success_rate": 0.9973315543695798,
+      "error_rate": 0.00266844563042028,
+      "p50_ms": 558.360542,
+      "p90_ms": 1001.943875,
+      "p95_ms": 1087.563333,
+      "p99_ms": 1208.5785,
+      "errors": {
+        "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:61316->127.0.0.1:50051: use of closed network connection": 4
+      },
+      "status_codes": {
+        "OK": 1495,
+        "Unavailable": 4
+      }
+    },
+    {
+      "requested_rps": 10,
+      "achieved_rps": 7.063172926722023,
+      "duration_seconds": 300.006813083,
+      "count": 2119,
+      "success_rate": 0.7753657385559226,
+      "error_rate": 0.2246342614440774,
+      "p50_ms": 1306.67325,
+      "p90_ms": 2115.552333,
+      "p95_ms": 2265.314542,
+      "p99_ms": 2603.373541,
+      "errors": {
+        "rpc error: code = DeadlineExceeded desc = batch deadline": 8,
+        "rpc error: code = DeadlineExceeded desc = expired before inference": 11,
+        "rpc error: code = DeadlineExceeded desc = inference deadline": 134,
+        "rpc error: code = DeadlineExceeded desc = scheduler deadline": 313,
+        "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:61567->127.0.0.1:50051: use of closed network connection": 10
+      },
+      "status_codes": {
+        "DeadlineExceeded": 466,
+        "OK": 1643,
+        "Unavailable": 10
+      }
+    }
+  ],
+  "capacity": {
+    "stable_rps": 6,
+    "saturation_rps": null,
+    "failure_rps": 8,
+    "stop_reason": "ACCEPTANCE_THRESHOLD"
+  },
+  "soak": {
+    "requested_rps": 3,
+    "achieved_rps": 2.9994431767673344,
+    "duration_seconds": 3600.334916709,
+    "count": 10799,
+    "success_rate": 1.0,
+    "error_rate": 0.0,
+    "p50_ms": 238.149125,
+    "p90_ms": 258.087875,
+    "p95_ms": 309.621958,
+    "p99_ms": 934.617958,
+    "errors": {},
+    "status_codes": {
+      "OK": 10799
+    },
+    "samples": 486,
+    "rss_start_mb": 1368.546875,
+    "rss_end_mb": 1268.234375,
+    "rss_max_mb": 1368.546875,
+    "rss_growth_mb": -100.3125,
+    "rss_growth_percent": -7.329854887140785,
+    "rss_slope_mb_per_hour": -34.49486533191608,
+    "requested_duration_seconds": 3600,
+    "wall_duration_seconds": 4118.0,
+    "runtime_pid_before": 34044,
+    "runtime_pid_after": 34044,
+    "swap_start_mb": 3574.25,
+    "swap_end_mb": 3334.88,
+    "exit_code": 0,
+    "verdict": "PASS"
+  },
+  "spike": {
+    "requested_rps": 12,
+    "achieved_rps": 10.400072367170221,
+    "duration_seconds": 29.99979125,
+    "count": 312,
+    "success_rate": 0.9615384615384616,
+    "error_rate": 0.038461538461538464,
+    "p50_ms": 1107.048083,
+    "p90_ms": 1555.448542,
+    "p95_ms": 2074.13875,
+    "p99_ms": 2299.826958,
+    "errors": {
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:65007->127.0.0.1:50051: use of closed network connection": 12
+    },
+    "status_codes": {
+      "OK": 300,
+      "Unavailable": 12
+    },
+    "runtime_survived": true,
+    "exit_code": 0,
+    "verdict": "SURVIVED"
+  },
+  "recovery": {
+    "requested_rps": 3,
+    "achieved_rps": 2.993326794536721,
+    "duration_seconds": 300.334731791,
+    "count": 899,
+    "success_rate": 0.9766407119021134,
+    "error_rate": 0.02335928809788654,
+    "p50_ms": 258.501833,
+    "p90_ms": 1087.45375,
+    "p95_ms": 1716.383625,
+    "p99_ms": 4992.678375,
+    "errors": {
+      "rpc error: code = DeadlineExceeded desc = context deadline exceeded": 9,
+      "rpc error: code = DeadlineExceeded desc = inference deadline": 3,
+      "rpc error: code = DeadlineExceeded desc = scheduler deadline": 6,
+      "rpc error: code = Unavailable desc = QDRANT_SEARCH_UNAVAILABLE: dense and sparse search unavailable": 1,
+      "rpc error: code = Unavailable desc = postgres: error returned from database: canceling statement due to statement timeout": 2
+    },
+    "status_codes": {
+      "DeadlineExceeded": 18,
+      "OK": 878,
+      "Unavailable": 3
+    },
+    "recovered": false,
+    "verdict": "FAIL"
+  },
+  "post_load_quality": {
+    "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
+    "verdict": "PASS",
+    "queries_total": 97,
+    "queries_passed": 97,
+    "queries_failed": 0,
+    "graph_expected_hits": 13,
+    "graph_expected_total": 13,
+    "graph_timeout_count": 0,
+    "graph_db_error_count": 0,
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0,
+    "qdrant_missing_points": 0,
+    "outbox_dead_letter_count": 0
+  },
+  "evidence": {
+    "all_json_valid": true,
+    "invalid_json": [],
+    "checksums_verified": true,
+    "simulation_detected": false,
+    "incomplete_processes": []
+  },
+  "overall_verdict": "FAIL",
+  "failure_reasons": [
+    "RECOVERY_SLO_FAILED"
+  ]
+}

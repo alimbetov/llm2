@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     checksum::verify(&cfg.model.path, &cfg.model.checksum, prod).await?;
     checksum::verify(&cfg.tokenizer.path, &cfg.tokenizer.checksum, prod).await?;
     let metrics_addr: SocketAddr = format!("{}:{}", cfg.metrics.host, cfg.metrics.port).parse()?;
-    let _recorder = metrics::install(metrics_addr)?;
+    metrics::install(metrics_addr)?;
     if cfg.limits.allow_dangerous_limit_override {
         ::metrics::gauge!("config_dangerous_override_enabled").set(1.0);
         warn!("dangerous limit override is enabled");

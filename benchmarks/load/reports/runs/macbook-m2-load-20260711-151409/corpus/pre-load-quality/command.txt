@@ -1,0 +1,1 @@
+env ASTRAVECTOR_QUALITY_RUN_ID=macbook-m2-load-20260711-151409-pre-load-quality make quality-runtime-full-capability-quick-remote 
