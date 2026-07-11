@@ -7,16 +7,16 @@
       "RESTRICTED": 1
     },
     "postgres_distribution": {
-      "1": 64800,
-      "2": 30033,
+      "1": 64155,
+      "2": 29754,
       "3": 0,
-      "4": 4617
+      "4": 4566
     },
     "qdrant_distribution": {
-      "1": 16659,
-      "2": 7747,
+      "1": 16648,
+      "2": 7756,
       "3": 0,
-      "4": 1194
+      "4": 1196
     },
     "reason": null,
     "status": "PASS"
@@ -48,9 +48,9 @@
     },
     "graph_rag": {
       "blocked": 0,
-      "failed": 2,
-      "passed": 5,
-      "recall_at_5": 0.7142857142857143,
+      "failed": 0,
+      "passed": 7,
+      "recall_at_5": 1.0,
       "skipped": 0,
       "total": 7
     },
@@ -74,9 +74,9 @@
   "by_mode": {
     "graph": {
       "blocked": 0,
-      "failed": 2,
-      "passed": 7,
-      "recall_at_5": 0.7777777777777778,
+      "failed": 0,
+      "passed": 9,
+      "recall_at_5": 1.0,
       "skipped": 0,
       "total": 9
     },
@@ -98,8 +98,6 @@
     }
   },
   "by_reason": {
-    "GRAPH_EXPANSION_TIMEOUT": 2,
-    "MISSING_REQUIRED_SOURCE": 2,
     "PRE_MMR_WEAK_CANDIDATE_FILTERED": 3
   },
   "capabilities": {
@@ -120,13 +118,10 @@
   },
   "data_isolation_mode": "quality_run_id_namespace",
   "embeddings": {
-    "dense_embeddings_count": 99510,
-    "sparse_embeddings_count": 97950
+    "dense_embeddings_count": 98535,
+    "sparse_embeddings_count": 96975
   },
-  "failures": [
-    "rag-bank-seed-001: missing retrieval source `GRAPH_EXPANDED`",
-    "rag-bank-seed-002: missing retrieval source `GRAPH_EXPANDED`"
-  ],
+  "failures": [],
   "forced_caller_access_level": null,
   "graph": {
     "aliased_relation_edges_count": 0,
@@ -135,13 +130,13 @@
       "cycle_detected": false,
       "duplicate_suppressed_count": 0,
       "max_hop_depth": 1,
-      "visited_count": 21
+      "visited_count": 28
     },
     "graph_db_error_count": 0,
     "graph_duplicate_suppressed_count": 0,
-    "graph_edges_available_count": 588622,
-    "graph_expanded_contexts_count": 21,
-    "graph_expansion_used_count": 21,
+    "graph_edges_available_count": 582914,
+    "graph_expanded_contexts_count": 28,
+    "graph_expansion_used_count": 28,
     "graph_expected_related_hit_rate": 1.0,
     "graph_expected_related_hits": 7,
     "graph_expected_related_total": 7,
@@ -151,8 +146,8 @@
       "false_positive_expanded": 0,
       "graph_fp_rate": 0.0,
       "sample_size_warning": true,
-      "total_expanded": 21,
-      "true_positive_expanded": 21
+      "total_expanded": 28,
+      "true_positive_expanded": 28
     },
     "graph_fp_rate": 0.0,
     "graph_impact": {
@@ -176,9 +171,9 @@
       "p50_ms": null,
       "p95_ms": null,
       "p99_ms": null,
-      "timeout_count": 2,
+      "timeout_count": 0,
       "timeout_ms": 500,
-      "timeout_rate": 0.16666666666666666
+      "timeout_rate": 0.0
     },
     "graph_statistical_tests": {
       "false_positive": {
@@ -196,7 +191,7 @@
       "sample_size": 7,
       "sample_size_warning": true
     },
-    "graph_timeout_count": 2,
+    "graph_timeout_count": 0,
     "relations_ingested_count": 108,
     "relations_loaded_count": 12,
     "relations_persisted_by_type": {
@@ -234,7 +229,7 @@
   },
   "ingestion": {
     "access_zones_auto_created_count": 3,
-    "documents_indexed_count": 6129,
+    "documents_indexed_count": 6069,
     "documents_registered_count": 8,
     "fixtures_ingested_count": 8
   },
@@ -266,8 +261,8 @@
     "sparse_only_require_technical_token": true
   },
   "outbox": {
-    "outbox_completed_count": 99570,
-    "outbox_created_count": 99570,
+    "outbox_completed_count": 98595,
+    "outbox_created_count": 98595,
     "outbox_dead_letter_count": 0,
     "outbox_staleness_p95_ms": 0
   },
@@ -284,35 +279,35 @@
   "qdrant": {
     "collections_count": 1,
     "payload_verified": true,
-    "points_count": 99498,
+    "points_count": 98523,
     "qdrant_missing_points": 0
   },
-  "quality_run_id": "wave10-system-smoke-20260711-101714-isolation-b",
+  "quality_run_id": "wave10-system-smoke-20260711-101714-cycle-3-rag-bank",
   "retrieval": {
     "access_level_violation_count": 0,
     "access_zone_conflict_accuracy": 1.0,
     "cross_zone_leakage_count": 0,
-    "expected_block_hit_rate": 0.8333333333333334,
-    "expected_document_hit_rate": 0.8333333333333334,
+    "expected_block_hit_rate": 1.0,
+    "expected_document_hit_rate": 1.0,
     "graph_expected_related_hit_rate": 1.0,
     "hard_negative_false_positive_rate": 0.0,
     "mmr_expected_aspect_coverage": 0.0,
     "mrr": 0.0,
     "queries_blocked": 0,
-    "queries_failed": 2,
-    "queries_passed": 10,
+    "queries_failed": 0,
+    "queries_passed": 12,
     "queries_skipped": 0,
     "queries_total": 12,
-    "recall_at_5": 0.8333333333333334,
+    "recall_at_5": 1.0,
     "retrieve_context_p95_ms": 0
   },
   "retrieval_diagnostics": {
     "likely_failure_stage": "UNKNOWN",
-    "qdrant_points_available": 99498,
+    "qdrant_points_available": 98523,
     "queries_with_empty_contexts": 1,
     "queries_with_retrieve_errors": 0
   },
-  "runtime_execution": "MODEL_BACKED_E2E_FAILED",
+  "runtime_execution": "MODEL_BACKED_E2E_CONFIRMED",
   "runtime_mode": "ingest-and-retrieve",
   "schema_version": "1.0",
   "skipped_reason": null,
@@ -326,11 +321,11 @@
     "qdrant_sparse_points_with_vectors": 252,
     "qdrant_sparse_vectors_in_sample": 252,
     "sparse_available": true,
-    "sparse_embeddings_count": 97950,
+    "sparse_embeddings_count": 96975,
     "sparse_mode": "LEXICAL_BASELINE_TECHNICAL",
     "special_token_count": 12,
     "technical_sparse_index_strategy": "stable_hash_sha256_u32",
     "technical_token_count": 15
   },
-  "verdict": "FAIL"
+  "verdict": "PASS"
 }
