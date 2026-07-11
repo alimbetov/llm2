@@ -1,4 +1,8 @@
 /target/
+/benchmarks/load/reports/runs/
+/benchmarks/quality/reports/system-smoke/wave10-system-smoke-*/
+/astravector-evidence/
+__pycache__/
 .env
 .env.*
 !.env.example

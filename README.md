@@ -4,7 +4,7 @@
 
 ## Текущий статус
 
-`GRAPH_RAG_READY`
+`RUNTIME_READY + SYSTEM_SMOKE_PASS + RECOVERY_FIX_IMPLEMENTED`
 
 Локальный runtime поднимается, `grpcurl -plaintext 127.0.0.1:50051 list` отвечает, а model-backed confidence gate проходит в ingest-and-retrieve режиме:
 
@@ -15,6 +15,7 @@
 - runtime ready: `true`
 - production candidate: `false`
 - production ready: `false`
+- recovery proof: `PENDING` until three clean load-gate v3 runs pass
 
 `production_pass=true` в runtime confidence report означает, что confidence gate пройден. Это не означает `PRODUCTION_CANDIDATE`. Актуальная сводка: [docs/ASTRAVECTOR_READINESS_REPORT.md](docs/ASTRAVECTOR_READINESS_REPORT.md).
 
@@ -60,6 +61,16 @@ make quality-runtime-confidence-remote
 - Load/Backpressure/soak: не закрыт.
 - Recovery, backup/restore, rollback: не закрыт.
 - Security hardening beyond access zones: не закрыт.
+
+## fix478 local recovery gate
+
+The MacBook M2 profile is a local hardware-specific gate, not a production capacity claim. Raw evidence is written outside the repository to `ASTRAVECTOR_EVIDENCE_ROOT` (default `../astravector-evidence`). A dirty worktree is rejected before evidence creation.
+
+```bash
+make production-recovery-gate-m2
+```
+
+Until three consecutive clean runs pass with identical source, binary, config, model and tokenizer identities, the official status remains `RECOVERY_PROOF_PENDING` and `NOT_PRODUCTION_READY`.
 
 ## fix462 production-candidate validation
 

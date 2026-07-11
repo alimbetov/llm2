@@ -4,8 +4,21 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 LOAD_RUN_ID="${LOAD_RUN_ID:-macbook-m2-load-$(date +%Y%m%d-%H%M%S)}"
-EVIDENCE_DIR="$ROOT_DIR/benchmarks/load/reports/runs/$LOAD_RUN_ID"
-REPORTS_DIR="$ROOT_DIR/benchmarks/load/reports"
+if [[ -n "$(git status --porcelain)" ]]; then
+  printf 'OVERALL_VERDICT=BLOCKED\nFAILURE_REASON=DIRTY_GIT_AT_START\n' >&2
+  exit 2
+fi
+SOURCE_GIT_SHA="$(git rev-parse HEAD)"
+SOURCE_BRANCH="$(git branch --show-current)"
+SOURCE_ORIGIN_MAIN_SHA="$(git rev-parse origin/main)"
+EXPECTED_RELEASE_SHA="${ASTRAVECTOR_EXPECTED_RELEASE_SHA:-$SOURCE_ORIGIN_MAIN_SHA}"
+if [[ "$SOURCE_GIT_SHA" != "$EXPECTED_RELEASE_SHA" ]]; then
+  printf 'OVERALL_VERDICT=BLOCKED\nFAILURE_REASON=RELEASE_SHA_MISMATCH\nEXPECTED_RELEASE_SHA=%s\nACTUAL_RELEASE_SHA=%s\n' \
+    "$EXPECTED_RELEASE_SHA" "$SOURCE_GIT_SHA" >&2
+  exit 2
+fi
+EVIDENCE_ROOT="${ASTRAVECTOR_EVIDENCE_ROOT:-$ROOT_DIR/../astravector-evidence}"
+EVIDENCE_DIR="$EVIDENCE_ROOT/$LOAD_RUN_ID"
 MODEL_PATH="${ASTRAVECTOR_MODEL_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/model.onnx}"
 TOKENIZER_PATH="${ASTRAVECTOR_TOKENIZER_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/tokenizer.json}"
 DB_URL="${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@127.0.0.1:55432/astravector}"
@@ -16,12 +29,20 @@ RESOURCE_PID=""
 METRICS_PID=""
 OVERALL_VERDICT="INCOMPLETE"
 FAILURE_REASONS=()
+RECOVERY_P95_SLO_MS="${RECOVERY_P95_SLO_MS:-1000}"
 
 mkdir -p "$EVIDENCE_DIR"/{environment,static,infrastructure,runtime,corpus,contract,warmup,baseline,step,soak,spike,recovery,post-load-quality,system,metrics}
+mkdir -p "$EVIDENCE_DIR/environment/quality-reports-before"
+for report in runtime-quality-report.json runtime-quality-report.md runtime-candidates.jsonl runtime-failures.jsonl; do
+  [[ -f "benchmarks/quality/reports/$report" ]] && cp "benchmarks/quality/reports/$report" "$EVIDENCE_DIR/environment/quality-reports-before/$report"
+done
 
 finish_owned_processes() {
   for pid in "$RESOURCE_PID" "$METRICS_PID" "$RUNTIME_PID"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  done
+  for report in runtime-quality-report.json runtime-quality-report.md runtime-candidates.jsonl runtime-failures.jsonl; do
+    [[ -f "$EVIDENCE_DIR/environment/quality-reports-before/$report" ]] && cp "$EVIDENCE_DIR/environment/quality-reports-before/$report" "benchmarks/quality/reports/$report"
   done
 }
 trap finish_owned_processes EXIT INT TERM
@@ -66,6 +87,15 @@ quality_passes() {
     .retrieval.access_level_violation_count == 0 and .qdrant.qdrant_missing_points == 0 and
     .outbox.outbox_dead_letter_count == 0
   ' "$1" >/dev/null
+}
+
+integrity_snapshot() {
+  local destination="$1"
+  psql "$DB_URL" -At -F $'\t' -f smoke-tests/v004/sql/data-integrity-audit-v004.sql > "$destination.tsv" || return 1
+  jq -Rn '
+    [inputs | split("\t") | {(.[0]): (.[1] | tonumber)}] | add as $checks |
+    {checks:$checks,total_violations:([$checks[]] | add)}
+  ' < "$destination.tsv" > "$destination.json"
 }
 
 latency_ms() {
@@ -119,17 +149,16 @@ start_samplers() {
 
 write_report() {
   local report="$EVIDENCE_DIR/astravector-macbook-load-report.json"
-  local git_sha git_dirty model_sha tokenizer_sha binary_sha
+  local git_sha model_sha tokenizer_sha binary_sha
   git_sha="$(git rev-parse HEAD 2>/dev/null || true)"
-  git_dirty=false; [[ -n "$(git status --short 2>/dev/null)" ]] && git_dirty=true
   model_sha="$(shasum -a 256 "$MODEL_PATH" 2>/dev/null | awk '{print $1}')"
   tokenizer_sha="$(shasum -a 256 "$TOKENIZER_PATH" 2>/dev/null | awk '{print $1}')"
   binary_sha="$(shasum -a 256 target/release/astravector-runtime 2>/dev/null | awk '{print $1}')"
   local reasons; reasons="$(printf '%s\n' "${FAILURE_REASONS[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')"
-  jq -n --arg id "$LOAD_RUN_ID" --arg sha "$git_sha" --argjson dirty "$git_dirty" \
+  jq -n --arg id "$LOAD_RUN_ID" --arg sha "$git_sha" \
     --arg verdict "$OVERALL_VERDICT" --arg model "$model_sha" --arg tokenizer "$tokenizer_sha" \
     --arg binary "$binary_sha" --argjson reasons "$reasons" \
-    '{schema_version:"2.0",load_run_id:$id,git_sha:$sha,git_dirty:$dirty,machine:{chip:"Apple M2",cpu_cores:8,memory_bytes:17179869184},tools:{ghz:"0.121.0"},runtime:{binary_sha256:($binary|select(length>0)//null),model_sha256:($model|select(length>0)//null),tokenizer_sha256:($tokenizer|select(length>0)//null),model_backed:true,release_build:true},overall_verdict:$verdict,failure_reasons:$reasons,evidence:{simulation_detected:false,incomplete_processes:[]}}' > "$report"
+    '{schema_version:"3.0",report_schema_version:"3.0",load_run_id:$id,source:{git_sha:$sha,git_clean_at_start:true},machine:{chip:"Apple M2",cpu_cores:8,memory_bytes:17179869184},tools:{ghz:"0.121.0"},runtime:{binary_sha256:($binary|select(length>0)//null),model_sha256:($model|select(length>0)//null),tokenizer_sha256:($tokenizer|select(length>0)//null),model_backed:true,release_build:true},overall_verdict:$verdict,failure_reasons:$reasons,evidence:{simulation_detected:false,incomplete_processes:[]}}' > "$report"
   cat > "$EVIDENCE_DIR/astravector-macbook-load-report.md" <<EOF
 # AstraVector MacBook M2 Load Report
 
@@ -146,16 +175,6 @@ Run: \`$LOAD_RUN_ID\`. Machine-readable stage evidence is stored beside this rep
 All components and the load generator ran on the same MacBook. The result is a single-host local capacity benchmark and is not equivalent to Kubernetes or production-server capacity.
 EOF
 }
-
-# Invalidate prior top-level simulated reports without deleting them.
-mkdir -p "$REPORTS_DIR/invalid-simulated"
-find "$REPORTS_DIR" -maxdepth 1 -type f \( -name 'baseline-*.json' -o -name 'step-load.json' -o -name 'soak-60m.json' -o -name 'spike.json' -o -name 'post-spike-recovery.json' -o -name 'astravector-macbook-load-report.json' -o -name 'astravector-macbook-load-report.md' \) -exec mv {} "$REPORTS_DIR/invalid-simulated/" \;
-cat > "$REPORTS_DIR/invalid-simulated/INVALIDATION.md" <<'EOF'
-The previous load report is invalid because the soak, spike,
-memory-growth and post-load quality results were simulated or
-reported without completed process evidence. These values must
-not be used as performance or production-readiness proof.
-EOF
 
 {
   echo "timestamp=$(date -Iseconds)"; echo "pwd=$PWD"; echo "branch=$(git branch --show-current)"; echo "head=$(git rev-parse HEAD)"; echo "origin_main=$(git rev-parse origin/main)"; git status --short; git log -5 --oneline
@@ -184,19 +203,38 @@ record "$EVIDENCE_DIR/static/concurrency-smoke" cargo test --features integratio
 docker compose config --services > "$EVIDENCE_DIR/infrastructure/docker-compose-config.txt" 2>&1
 docker compose up -d postgres qdrant > "$EVIDENCE_DIR/infrastructure/docker-compose-up.log" 2>&1 || block BLOCKED_BY_INFRASTRUCTURE
 docker compose ps > "$EVIDENCE_DIR/infrastructure/docker-compose-ps.txt"
-docker compose exec -T postgres pg_isready -U astravector -d astravector > "$EVIDENCE_DIR/infrastructure/postgres-ready.txt" || block BLOCKED_BY_INFRASTRUCTURE
-curl -fsS http://127.0.0.1:6333/readyz > "$EVIDENCE_DIR/infrastructure/qdrant-ready.txt" || block BLOCKED_BY_INFRASTRUCTURE
+postgres_ready=false
+qdrant_ready=false
+for _ in {1..60}; do
+  if docker compose exec -T postgres pg_isready -U astravector -d astravector > "$EVIDENCE_DIR/infrastructure/postgres-ready.txt" 2>&1; then
+    postgres_ready=true
+    break
+  fi
+  sleep 2
+done
+[[ "$postgres_ready" == true ]] || block BLOCKED_BY_INFRASTRUCTURE
+for _ in {1..60}; do
+  if curl -fsS http://127.0.0.1:6333/readyz > "$EVIDENCE_DIR/infrastructure/qdrant-ready.txt" 2>&1; then
+    qdrant_ready=true
+    break
+  fi
+  sleep 2
+done
+[[ "$qdrant_ready" == true ]] || block BLOCKED_BY_INFRASTRUCTURE
 docker inspect astravector-postgres-1 > "$EVIDENCE_DIR/infrastructure/docker-inspect-postgres.json"
 docker inspect astravector-qdrant-1 > "$EVIDENCE_DIR/infrastructure/docker-inspect-qdrant.json"
 record "$EVIDENCE_DIR/infrastructure/migrate" env ASTRAVECTOR_DB_URL="$DB_URL" make migrate || block BLOCKED_BY_MIGRATION
+psql "$DB_URL" -Atc 'select max(version) from _sqlx_migrations where success=true' > "$EVIDENCE_DIR/runtime/migration-head.txt"
 
 [[ -f "$MODEL_PATH" && -f "$TOKENIZER_PATH" ]] || block MODEL_FILES_NOT_FOUND
 shasum -a 256 "$MODEL_PATH" "$TOKENIZER_PATH" > "$EVIDENCE_DIR/runtime/model-tokenizer.sha256"
+cat config/application.yaml config/application-load-m2.yaml | shasum -a 256 > "$EVIDENCE_DIR/runtime/config.sha256"
 record "$EVIDENCE_DIR/runtime/release-build" cargo build --release --bin astravector-runtime || block BLOCKED_BY_RELEASE_BUILD
 shasum -a 256 target/release/astravector-runtime > "$EVIDENCE_DIR/runtime/binary.sha256"
 if lsof -nP -iTCP:50051 -sTCP:LISTEN > "$EVIDENCE_DIR/runtime/port-before.txt" 2>&1; then block BLOCKED_BY_EXISTING_RUNTIME; fi
 
-ASTRAVECTOR_DB_URL="$DB_URL" ASTRAVECTOR_MODEL_PATH="$MODEL_PATH" ASTRAVECTOR_TOKENIZER_PATH="$TOKENIZER_PATH" \
+ASTRAVECTOR_PROFILE=load-m2 ASTRAVECTOR_DB_URL="$DB_URL" ASTRAVECTOR_QDRANT_URL=http://127.0.0.1:6333 \
+ASTRAVECTOR_MODEL_PATH="$MODEL_PATH" ASTRAVECTOR_TOKENIZER_PATH="$TOKENIZER_PATH" \
 ASTRAVECTOR_GRAPH_MERGE_STRATEGY=GRAPH_AS_CONTEXT_APPEND ASTRAVECTOR_GRAPH_MAX_SEED_CHUNKS=16 \
 ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT=5 ASTRAVECTOR_GRAPH_EXPANSION_RESULT_LIMIT=12 ASTRAVECTOR_GRAPH_TIMEOUT_MS=500 \
 ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true target/release/astravector-runtime > "$EVIDENCE_DIR/runtime/runtime.log" 2>&1 &
@@ -209,6 +247,7 @@ copy_quality_reports "$EVIDENCE_DIR/corpus/global-reports-before"
 record "$EVIDENCE_DIR/corpus/pre-load-quality" env ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-pre-load-quality" make quality-runtime-full-capability-quick-remote || block BLOCKED_BY_PRE_LOAD_QUALITY
 copy_quality_reports "$EVIDENCE_DIR/corpus/pre-load-quality"
 quality_passes "$EVIDENCE_DIR/corpus/pre-load-quality/runtime-quality-report.json" || block BLOCKED_BY_PRE_LOAD_QUALITY
+integrity_snapshot "$EVIDENCE_DIR/corpus/pre-load-integrity" || block BLOCKED_BY_PRE_LOAD_INTEGRITY
 
 grpcurl -plaintext 127.0.0.1:50051 describe > "$EVIDENCE_DIR/contract/grpc-describe.txt"
 find . -type f -name '*.proto' -print > "$EVIDENCE_DIR/contract/proto-files.txt"
@@ -241,7 +280,7 @@ for rps in 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30; do
   sleep 60
 done
 (( stable_rps > 0 )) || block NO_STABLE_RPS
-soak_rps=$(( stable_rps * 65 / 100 )); (( soak_rps < 1 )) && soak_rps=1
+soak_rps=$(( (stable_rps * 65 + 99) / 100 )); (( soak_rps < 1 )) && soak_rps=1
 jq -n --argjson stable "$stable_rps" --argjson saturation "$saturation_rps" --argjson failure "$failure_rps" --arg reason "$stop_reason" --argjson soak "$soak_rps" '{stable_rps:$stable,saturation_rps:$saturation,failure_rps:$failure,stop_reason:$reason,soak_rps:$soak}' > "$EVIDENCE_DIR/soak/selection.json"
 
 ps -p "$RUNTIME_PID" -o pid=,rss=,etime= > "$EVIDENCE_DIR/soak/runtime-before.txt"
@@ -254,11 +293,37 @@ sleep 120
 spike_rps=$(( stable_rps * 2 )); (( spike_rps > 50 )) && spike_rps=50
 spike_concurrency="$spike_rps"; (( spike_concurrency < 10 )) && spike_concurrency=10; (( spike_concurrency > 64 )) && spike_concurrency=64
 ghz_run "$EVIDENCE_DIR/spike" "$spike_rps" "$spike_concurrency" 30s || FAILURE_REASONS+=(SPIKE_NONZERO)
-ghz_run "$EVIDENCE_DIR/recovery" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 5m || FAILURE_REASONS+=(RECOVERY_FAILED)
+consecutive_healthy=0
+recovery_achieved=false
+for window in 1 2 3 4 5 6; do
+  dir="$EVIDENCE_DIR/recovery/window-$(printf '%03d' "$window")"
+  if ! ghz_run "$dir" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 10s; then
+    consecutive_healthy=0
+    continue
+  fi
+  sr="$(success_rate "$dir/result.json")"; er="$(error_rate "$dir/result.json")"; p95="$(latency_ms "$dir/result.json" 95)"
+  deadline_rate="$(jq -r '((.statusCodeDistribution.DeadlineExceeded // 0) / (.count | if . == 0 then 1 else . end))' "$dir/result.json")"
+  unavailable_rate="$(jq -r '((.statusCodeDistribution.Unavailable // 0) / (.count | if . == 0 then 1 else . end))' "$dir/result.json")"
+  healthy=false
+  if awk "BEGIN {exit !($sr >= 0.99 && $er < 0.01 && $p95 <= $RECOVERY_P95_SLO_MS && $deadline_rate <= 0.005 && $unavailable_rate <= 0.005)}"; then
+    healthy=true; consecutive_healthy=$((consecutive_healthy + 1))
+  else
+    consecutive_healthy=0
+  fi
+  jq -n --argjson success "$sr" --argjson error "$er" --argjson p95 "$p95" \
+    --argjson deadline "$deadline_rate" --argjson unavailable "$unavailable_rate" --argjson healthy "$healthy" \
+    '{success_rate:$success,error_rate:$error,p95_ms:$p95,deadline_exceeded_rate:$deadline,unavailable_rate:$unavailable,healthy:$healthy}' > "$dir/health.json"
+  if (( consecutive_healthy >= 3 )); then recovery_achieved=true; break; fi
+done
+[[ "$recovery_achieved" == true ]] || FAILURE_REASONS+=(RECOVERY_TTR_FAILED)
+curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-before.prom" || FAILURE_REASONS+=(RECOVERY_METRICS_FAILED)
+ghz_run "$EVIDENCE_DIR/recovery/stabilized" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 5m || FAILURE_REASONS+=(RECOVERY_STABILIZED_FAILED)
+curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-after.prom" || FAILURE_REASONS+=(RECOVERY_METRICS_FAILED)
 
 record "$EVIDENCE_DIR/post-load-quality/run" env ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-post-load-quality" make quality-runtime-full-capability-quick-remote || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
 copy_quality_reports "$EVIDENCE_DIR/post-load-quality"
 quality_passes "$EVIDENCE_DIR/post-load-quality/runtime-quality-report.json" || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
+integrity_snapshot "$EVIDENCE_DIR/post-load-quality/post-load-integrity" || FAILURE_REASONS+=(POST_LOAD_INTEGRITY_FAILED)
 
 kill "$RESOURCE_PID" "$METRICS_PID" 2>/dev/null || true; wait "$RESOURCE_PID" "$METRICS_PID" 2>/dev/null || true; RESOURCE_PID=""; METRICS_PID=""
-python3 "$ROOT_DIR/scripts/finalize_macbook_load_report.py" "$EVIDENCE_DIR"
+python3 "$ROOT_DIR/scripts/finalize_macbook_load_report.py" "$EVIDENCE_DIR" "$SOURCE_GIT_SHA" "$SOURCE_BRANCH" "$SOURCE_ORIGIN_MAIN_SHA" "$EXPECTED_RELEASE_SHA" "$RECOVERY_P95_SLO_MS"

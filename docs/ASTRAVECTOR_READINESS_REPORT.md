@@ -2,7 +2,7 @@
 
 Date: 2026-07-08
 
-Final status: `GRAPH_RAG_READY`
+Final status: `RUNTIME_READY + SYSTEM_SMOKE_PASS + RECOVERY_FIX_IMPLEMENTED + RECOVERY_PROOF_PENDING`
 
 This report is based on the live local runtime in `/Users/ruslanalimbetov/Documents/llm2/astravector`. Static checks, skipped profiles, and stale generated reports are not counted as runtime proof.
 
@@ -106,6 +106,12 @@ Distractor fixture labels are used for evaluation and reporting only. Production
 5. Review and stage the large untracked readiness/fixture file set intentionally.
 
 Generated machine-readable evidence:
+
+## fix478 Recovery Status
+
+Admission control, bounded query queue age, minimum inference budget, deadline-skew batch isolation, query/document retry separation, and observable Graph/MMR degradation are implemented. The local load gate now uses schema `3.0`, external raw evidence, clean-source preconditions, ceil-based soak load, recovery windows, and explicit time-to-recovery.
+
+This implementation is not recovery proof. The status may advance to `LOCAL_LOAD_GATE_PASS + RECOVERY_SLO_PASS` only after three consecutive clean model-backed runs pass with identical release identities. It does not imply `PRODUCTION_READY`.
 
 - `benchmarks/quality/reports/runtime-confidence-report.json`
 - `benchmarks/quality/reports/final-readiness-report.json`

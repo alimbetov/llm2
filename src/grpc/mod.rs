@@ -44,6 +44,17 @@ use tonic::{
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+struct AdmissionPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    scope: &'static str,
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        gauge!("astravector_admission_in_flight", "scope" => self.scope).decrement(1.0);
+    }
+}
+
 #[derive(Clone)]
 pub struct AstraVectorV004ControlService {
     cfg: Arc<AppConfig>,
@@ -91,15 +102,28 @@ impl AstraVectorV004ControlService {
         semaphore: Arc<Semaphore>,
         timeout_ms: u64,
         metric_scope: &'static str,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
-        tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), semaphore.acquire_owned())
+    ) -> Result<AdmissionPermit, Status> {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms.max(1)),
+            semaphore.acquire_owned(),
+        )
             .await
             .map_err(|_| {
                 counter!("backpressure_acquire_timeout_total", "scope" => metric_scope).increment(1);
                 counter!("retrieval_rejected_total", "scope" => metric_scope, "reason" => "acquire_timeout").increment(1);
-                Status::resource_exhausted(format!("{metric_scope} concurrency limit exceeded"))
+                counter!("astravector_admission_rejected_total", "scope" => metric_scope, "reason" => "admission_timeout").increment(1);
+                Status::resource_exhausted(format!("{metric_scope}_admission_timeout"))
             })?
-            .map_err(|_| Status::unavailable(format!("{metric_scope} semaphore closed")))
+            .map_err(|_| Status::unavailable(format!("{metric_scope} semaphore closed")));
+        histogram!("astravector_admission_wait_seconds", "scope" => metric_scope)
+            .record(started.elapsed().as_secs_f64());
+        let permit = result?;
+        gauge!("astravector_admission_in_flight", "scope" => metric_scope).increment(1.0);
+        Ok(AdmissionPermit {
+            _permit: permit,
+            scope: metric_scope,
+        })
     }
 
     #[allow(clippy::result_large_err)]
@@ -1247,11 +1271,23 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             )
             .await;
             if maybe_graph_permit.is_err() {
+                if !self
+                    .cfg
+                    .graph_rag
+                    .retrieval
+                    .allow_partial_dense_sparse_fallback
+                {
+                    return Err(Status::resource_exhausted(
+                        "graph_expansion_admission_timeout",
+                    ));
+                }
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "GRAPH_EXPANSION_BACKPRESSURE".into(),
                     message: "Graph expansion skipped because concurrency limit is exceeded".into(),
                 });
                 counter!("graph_expansion_rejected_total", "reason" => "backpressure").increment(1);
+                counter!("astravector_degraded_path_total", "component" => "graph", "reason" => "admission_timeout").increment(1);
+                tracing::warn!(correlation_id=%r.correlation_id, reason="admission_timeout", "GRAPH_PATH_DEGRADED_TO_DIRECT_RETRIEVAL");
             }
             if let Ok(_graph_permit) = maybe_graph_permit {
                 gauge!("graph_expansion_concurrent_active").set(
@@ -1583,7 +1619,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             )
             .await
         } else {
+            if !self
+                .cfg
+                .graph_rag
+                .retrieval
+                .allow_partial_dense_sparse_fallback
+            {
+                return Err(Status::resource_exhausted("mmr_fetch_admission_timeout"));
+            }
             counter!("mmr_fetch_rejected_total", "reason" => "backpressure").increment(1);
+            counter!("astravector_degraded_path_total", "component" => "mmr", "reason" => "admission_timeout").increment(1);
+            tracing::warn!(correlation_id=%r.correlation_id, reason="admission_timeout", "MMR_PATH_DEGRADED_TO_TOKEN_FALLBACK");
             warnings.push(pb::DiagnosticWarningV005 {
                 code: "MMR_FETCH_BACKPRESSURE".into(),
                 message: "MMR embedding fetch skipped because concurrency limit is exceeded".into(),
@@ -3961,12 +4007,25 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
         request: Request<pb::RetrieveContextRequest>,
     ) -> Result<Response<pb::RetrieveContextResponse>, Status> {
         let metadata = request.metadata().clone();
+        let admission_correlation_id = request
+            .get_ref()
+            .context
+            .as_ref()
+            .map(|context| context.correlation_id.as_str())
+            .unwrap_or("");
         let _retrieve_permit = Self::acquire_backpressure_permit(
             self.retrieve_context_semaphore.clone(),
             self.cfg.limits.backpressure_acquire_timeout_ms,
             "retrieve_context",
         )
-        .await?;
+        .await
+        .inspect_err(|_status| {
+            tracing::warn!(
+                correlation_id = admission_correlation_id,
+                reason = "retrieve_context_admission_timeout",
+                "RETRIEVE_CONTEXT_ADMISSION_REJECTED"
+            );
+        })?;
         gauge!("retrieval_concurrent_active").set(
             (self
                 .cfg

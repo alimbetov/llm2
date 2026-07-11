@@ -1,0 +1,14 @@
+# MacBook M2 local load-gate profile. These values are not production capacity claims.
+batching:
+  query:
+    queue_capacity: ${ASTRAVECTOR_QUERY_QUEUE_CAPACITY:-32}
+    max_queue_age_ms: ${ASTRAVECTOR_QUERY_MAX_QUEUE_AGE_MS:-250}
+    min_inference_budget_ms: ${ASTRAVECTOR_QUERY_MIN_INFERENCE_BUDGET_MS:-250}
+    max_deadline_skew_ms: ${ASTRAVECTOR_QUERY_MAX_DEADLINE_SKEW_MS:-250}
+
+limits:
+  max_concurrent_retrieve_context: ${ASTRAVECTOR_MAX_CONCURRENT_RETRIEVE_CONTEXT:-8}
+  max_concurrent_qdrant_search: ${ASTRAVECTOR_MAX_CONCURRENT_QDRANT_SEARCH:-16}
+  max_concurrent_graph_expansion: ${ASTRAVECTOR_MAX_CONCURRENT_GRAPH_EXPANSION:-4}
+  max_concurrent_mmr_fetch: ${ASTRAVECTOR_MAX_CONCURRENT_MMR_FETCH:-8}
+  backpressure_acquire_timeout_ms: ${ASTRAVECTOR_BACKPRESSURE_ACQUIRE_TIMEOUT_MS:-20}

@@ -93,8 +93,22 @@ cache:
     processing_poll_max_interval_ms: 500
 
 batching:
-  query: { max_wait_ms: 3, max_items: 16, max_padded_tokens: 4096, queue_capacity: 2000 }
-  document: { max_wait_ms: 10, max_items: 16, max_padded_tokens: 8192, queue_capacity: 10000 }
+  query:
+    max_wait_ms: 3
+    max_items: 16
+    max_padded_tokens: 4096
+    queue_capacity: ${ASTRAVECTOR_QUERY_QUEUE_CAPACITY:-2000}
+    max_queue_age_ms: ${ASTRAVECTOR_QUERY_MAX_QUEUE_AGE_MS:-0}
+    min_inference_budget_ms: ${ASTRAVECTOR_QUERY_MIN_INFERENCE_BUDGET_MS:-0}
+    max_deadline_skew_ms: ${ASTRAVECTOR_QUERY_MAX_DEADLINE_SKEW_MS:-0}
+  document:
+    max_wait_ms: 10
+    max_items: 16
+    max_padded_tokens: 8192
+    queue_capacity: 10000
+    max_queue_age_ms: 0
+    min_inference_budget_ms: 0
+    max_deadline_skew_ms: 0
   buckets: [64, 128, 256, 512]
 
 scheduler:
@@ -401,14 +415,26 @@ embedding:
 
 resilience:
   inference_retry:
-    enabled: ${ASTRAVECTOR_INFERENCE_RETRY_ENABLED:-true}
-    max_attempts: ${ASTRAVECTOR_INFERENCE_RETRY_MAX_ATTEMPTS:-3}
-    base_delay_ms: ${ASTRAVECTOR_INFERENCE_RETRY_BASE_DELAY_MS:-100}
-    max_delay_ms: ${ASTRAVECTOR_INFERENCE_RETRY_MAX_DELAY_MS:-1000}
-    jitter_enabled: ${ASTRAVECTOR_INFERENCE_RETRY_JITTER_ENABLED:-true}
-    retry_on_statuses: []
-    retry_on_timeout: ${ASTRAVECTOR_INFERENCE_RETRY_ON_TIMEOUT:-true}
-    retry_on_unavailable: ${ASTRAVECTOR_INFERENCE_RETRY_ON_UNAVAILABLE:-true}
+    query:
+      enabled: true
+      max_attempts: 2
+      base_delay_ms: 50
+      max_delay_ms: 100
+      jitter_enabled: true
+      retry_on_statuses: []
+      retry_on_timeout: false
+      retry_on_unavailable: true
+      min_remaining_budget_ms: 350
+    document:
+      enabled: true
+      max_attempts: 3
+      base_delay_ms: 100
+      max_delay_ms: 1000
+      jitter_enabled: true
+      retry_on_statuses: []
+      retry_on_timeout: true
+      retry_on_unavailable: true
+      min_remaining_budget_ms: 1000
   qdrant_retry:
     enabled: ${ASTRAVECTOR_QDRANT_RETRY_ENABLED:-true}
     max_attempts: ${ASTRAVECTOR_QDRANT_RETRY_MAX_ATTEMPTS:-3}

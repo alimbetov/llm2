@@ -855,9 +855,24 @@ impl Default for EmbeddingRuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ResilienceConfig {
     #[serde(default)]
-    pub inference_retry: RetryPolicyConfig,
+    pub inference_retry: InferenceRetryConfig,
     #[serde(default)]
     pub qdrant_retry: RetryPolicyConfig,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct InferenceRetryConfig {
+    #[serde(default = "default_query_retry_policy")]
+    pub query: RetryPolicyConfig,
+    #[serde(default = "default_document_retry_policy")]
+    pub document: RetryPolicyConfig,
+}
+impl Default for InferenceRetryConfig {
+    fn default() -> Self {
+        Self {
+            query: default_query_retry_policy(),
+            document: default_document_retry_policy(),
+        }
+    }
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetryPolicyConfig {
@@ -877,6 +892,8 @@ pub struct RetryPolicyConfig {
     pub retry_on_timeout: bool,
     #[serde(default = "default_true")]
     pub retry_on_unavailable: bool,
+    #[serde(default = "default_retry_min_remaining_budget_ms")]
+    pub min_remaining_budget_ms: u64,
 }
 impl Default for RetryPolicyConfig {
     fn default() -> Self {
@@ -889,8 +906,35 @@ impl Default for RetryPolicyConfig {
             retry_on_statuses: vec![429, 502, 503, 504],
             retry_on_timeout: true,
             retry_on_unavailable: true,
+            min_remaining_budget_ms: default_retry_min_remaining_budget_ms(),
         }
     }
+}
+
+fn default_query_retry_policy() -> RetryPolicyConfig {
+    RetryPolicyConfig {
+        max_attempts: 2,
+        base_delay_ms: 50,
+        max_delay_ms: 100,
+        retry_on_timeout: false,
+        min_remaining_budget_ms: 350,
+        ..RetryPolicyConfig::default()
+    }
+}
+
+fn default_document_retry_policy() -> RetryPolicyConfig {
+    RetryPolicyConfig {
+        max_attempts: 3,
+        base_delay_ms: 100,
+        max_delay_ms: 1000,
+        retry_on_timeout: true,
+        min_remaining_budget_ms: 1000,
+        ..RetryPolicyConfig::default()
+    }
+}
+
+fn default_retry_min_remaining_budget_ms() -> u64 {
+    350
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1368,6 +1412,12 @@ pub struct BatchProfile {
     pub max_items: usize,
     pub max_padded_tokens: usize,
     pub queue_capacity: usize,
+    #[serde(default)]
+    pub max_queue_age_ms: u64,
+    #[serde(default)]
+    pub min_inference_budget_ms: u64,
+    #[serde(default)]
+    pub max_deadline_skew_ms: u64,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
@@ -1927,13 +1977,16 @@ impl AppConfig {
             "qdrant retry max_delay must be >= base_delay"
         );
         anyhow::ensure!(
-            self.resilience.inference_retry.max_attempts >= 1,
-            "resilience.inference_retry.max_attempts must be >= 1"
+            self.resilience.inference_retry.query.max_attempts >= 1
+                && self.resilience.inference_retry.document.max_attempts >= 1,
+            "inference retry max_attempts must be >= 1"
         );
         anyhow::ensure!(
-            self.resilience.inference_retry.max_delay_ms
-                >= self.resilience.inference_retry.base_delay_ms,
-            "inference retry max_delay must be >= base_delay"
+            self.resilience.inference_retry.query.max_delay_ms
+                >= self.resilience.inference_retry.query.base_delay_ms
+                && self.resilience.inference_retry.document.max_delay_ms
+                    >= self.resilience.inference_retry.document.base_delay_ms,
+            "inference retry max_delay must be >= base_delay for each workload"
         );
         anyhow::ensure!(
             self.rag_context.max_context_tokens > self.rag_context.reserved_answer_tokens,

@@ -10,11 +10,11 @@
 
 ## Short Summary
 
-Текущий статус: `SECURE_RAG_CORE_CANDIDATE + CONSISTENCY_PASS`.
+Текущий статус: `RUNTIME_READY + SYSTEM_SMOKE_PASS + RECOVERY_FIX_IMPLEMENTED + RECOVERY_PROOF_PENDING`.
 
 ## Current Status
 
-`AstraVector_v004 = SECURE_RAG_CORE_CANDIDATE + CONSISTENCY_PASS`
+`AstraVector_v004 = RUNTIME_READY + SYSTEM_SMOKE_PASS + RECOVERY_FIX_IMPLEMENTED + RECOVERY_PROOF_PENDING`
 
 ## What This Status Means
 
@@ -34,6 +34,7 @@ Secure RAG core работает, а consistency under controlled failures до�
 ## What This Status Does Not Mean
 
 - Не production-ready.
+- Local recovery gate требует 3/3 clean schema-v3 runs с одинаковой release identity.
 - Не `RELIABILITY_CANDIDATE`.
 - Не `LEGAL_RAG_QUALITY_CANDIDATE`.
 - Не доказана BM25/Sparse/Hybrid retrieval quality.

@@ -65,3 +65,21 @@ This file is part of the fix462 production-candidate gate. Alert expressions mus
 ## Validation requirement
 
 Before declaring `PRODUCTION CANDIDATE`, run observability checks that scrape `/metrics` and verify fix462 counters are visible after the corresponding test scenario.
+
+## Overload and recovery
+
+- **Retrieve admission rejects sustained**
+  - Expr: `rate(astravector_admission_rejected_total{scope="retrieve_context"}[5m]) > 0`
+  - Runbook: compare admitted RPS with hardware-specific stable capacity; do not increase queue capacity.
+- **Query queue age rejects**
+  - Expr: `rate(astravector_queue_rejected_total{queue="query",reason="age_exceeded"}[5m]) > 0`
+  - Runbook: inspect inference latency and admission limits.
+- **Insufficient inference budget**
+  - Expr: `rate(astravector_deadline_rejected_total{stage="inference_queue",reason="insufficient_budget"}[5m]) > 0`
+  - Runbook: check caller deadlines and queue wait; do not increase global timeout.
+- **Retry amplification risk**
+  - Expr: `rate(astravector_retry_attempts_total{workload="query"}[5m]) > rate(astravector_retry_success_total{workload="query"}[5m]) * 2`
+  - Runbook: verify retries have sufficient remaining budget.
+- **Optional retrieval degradation**
+  - Expr: `rate(astravector_degraded_path_total[5m]) > 0`
+  - Runbook: distinguish Graph/MMR permit pressure from mandatory retrieval failure.
