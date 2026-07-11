@@ -1,0 +1,12 @@
+{
+  "retrieve_p50_ms": 499,
+  "retrieve_p95_ms": 878,
+  "graph_lookup_upper_bound_p50_ms": 861,
+  "graph_lookup_upper_bound_p95_ms": 959,
+  "graph_lookup_upper_bound_p99_ms": 959,
+  "graph_timeout_count": 0,
+  "profile_duration_seconds": 181,
+  "retrieve_threshold_ms": 5000,
+  "graph_timeout_threshold_ms": 500,
+  "pass": false
+}

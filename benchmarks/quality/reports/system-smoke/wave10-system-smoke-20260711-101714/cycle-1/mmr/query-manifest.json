@@ -1,0 +1,31 @@
+{
+  "profile": "mmr",
+  "expected_query_ids": [
+    "mmr-001",
+    "mmr-002",
+    "mmr-003",
+    "mmr-004",
+    "mmr-extra-001",
+    "mmr-extra-002",
+    "mmr-extra-003",
+    "mmr-extra-004",
+    "mmr-extra-005",
+    "mmr-extra-006"
+  ],
+  "actual_query_ids": [
+    "mmr-001",
+    "mmr-002",
+    "mmr-003",
+    "mmr-004",
+    "mmr-extra-001",
+    "mmr-extra-002",
+    "mmr-extra-003",
+    "mmr-extra-004",
+    "mmr-extra-005",
+    "mmr-extra-006"
+  ],
+  "missing_query_ids": [],
+  "unexpected_query_ids": [],
+  "duplicate_query_ids": [],
+  "coverage_pass": true
+}

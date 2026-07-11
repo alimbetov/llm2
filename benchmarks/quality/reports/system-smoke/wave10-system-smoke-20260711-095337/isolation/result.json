@@ -1,0 +1,9 @@
+{
+  "run_a": "wave10-system-smoke-20260711-095337-isolation-a",
+  "run_b": "wave10-system-smoke-20260711-095337-isolation-b",
+  "cross_run_postgres_leakage_count": 0,
+  "cross_run_qdrant_leakage_count": 0,
+  "cross_run_graph_leakage_count": 0,
+  "cross_run_final_context_leakage_count": 0,
+  "confirmed": true
+}

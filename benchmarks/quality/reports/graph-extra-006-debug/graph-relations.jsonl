@@ -1,0 +1,2 @@
+{"stage":"GRAPH_RELATION_LOOKUP","from_block_id":"ttl-001","to_block_id":"ttl-002","relation_type":"CONSTRAINED_BY","relation_score":0.85,"hop_distance":1,"quality_run_id":"wave10-1-graph-extra-006-004"}
+{"stage":"GRAPH_RELATION_LOOKUP","from_block_id":"tech-ttl-clean-002","to_block_id":"tech-recon-run-004","relation_type":"CONSTRAINED_BY","relation_score":0.88,"hop_distance":1,"quality_run_id":"wave10-1-graph-extra-006-004"}

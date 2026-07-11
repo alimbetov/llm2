@@ -1,0 +1,17 @@
+{
+  "profile": "graph",
+  "expected_query_ids": [
+    "graph-001",
+    "graph-003",
+    "graph-extra-007"
+  ],
+  "actual_query_ids": [
+    "graph-001",
+    "graph-003",
+    "graph-extra-007"
+  ],
+  "missing_query_ids": [],
+  "unexpected_query_ids": [],
+  "duplicate_query_ids": [],
+  "coverage_pass": true
+}

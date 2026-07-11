@@ -1181,6 +1181,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_candidates_by_relation: HashMap<String, usize> = HashMap::new();
         let mut graph_seed_candidates = Vec::new();
         let mut graph_seed_preview_by_key = HashMap::new();
+        let mut graph_seed_source_block_by_key = HashMap::new();
         seed_scores.clear();
         for result in &direct_results {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
@@ -1195,7 +1196,18 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 .as_ref()
                 .map(|scores| scores.final_score.max(scores.fusion_score))
                 .unwrap_or(0.5);
-            graph_seed_candidates.push((key, seed_score));
+            let matched_terms = matched_term_count(result, query);
+            let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+            let strong_lexical_evidence = matched_terms >= 2
+                && matched_discriminating_terms >= 1
+                && matched_terms.saturating_mul(2) >= query_term_count(query);
+            graph_seed_candidates.push(GraphSeedCandidate {
+                key,
+                score: seed_score,
+                matched_terms,
+                matched_discriminating_terms,
+                strong_lexical_evidence,
+            });
             seed_scores.entry(key).or_insert(seed_score);
             let source_block_id = result
                 .citation
@@ -1203,6 +1215,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 .and_then(|citation| citation.metadata.get("source_block_id"))
                 .cloned()
                 .unwrap_or_default();
+            graph_seed_source_block_by_key.insert(key, source_block_id.clone());
             graph_seed_preview_by_key.entry(key).or_insert_with(|| {
                 format!(
                     "{}:{}:{:.3}:{}",
@@ -1214,20 +1227,16 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             });
         }
         let mut seen_graph_seed_keys = HashSet::new();
-        graph_seed_candidates.retain(|(key, _)| seen_graph_seed_keys.insert(*key));
-        graph_seed_candidates.sort_by(|(_, left_score), (_, right_score)| {
-            right_score
-                .partial_cmp(left_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        graph_seed_candidates.retain(|candidate| seen_graph_seed_keys.insert(candidate.key));
+        graph_seed_candidates.sort_by(compare_graph_seed_candidates);
         let graph_seed_keys = graph_seed_candidates
             .iter()
-            .map(|(key, _)| *key)
+            .map(|candidate| candidate.key)
             .collect::<Vec<_>>();
         let graph_seed_preview = graph_seed_candidates
             .iter()
             .take(12)
-            .filter_map(|(key, _)| graph_seed_preview_by_key.get(key).cloned())
+            .filter_map(|candidate| graph_seed_preview_by_key.get(&candidate.key).cloned())
             .collect::<Vec<_>>()
             .join(",");
         if r.enable_graph_expansion && self.cfg.graph_rag.enabled && !graph_seed_keys.is_empty() {
@@ -1418,6 +1427,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     "graph_seed_chunk_id".into(),
                                     rel.seed_chunk_id.to_string(),
                                 );
+                                if let Some(source_block_id) = graph_seed_source_block_by_key
+                                    .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "graph_seed_source_block_id".into(),
+                                        source_block_id.clone(),
+                                    );
+                                }
                                 citation.metadata.insert(
                                     "graph_relation_type".into(),
                                     rel.relation_type.as_str().into(),
@@ -7950,15 +7967,43 @@ fn select_graph_append_with_group_mmr(
     mmr_allow_graph_candidates: bool,
     max_graph_relations_debug_per_candidate: usize,
 ) -> SearchSelectionResult {
-    let (direct_pool, direct_dedup) =
+    let graph_seed_chunk_ids = graph_results
+        .iter()
+        .filter_map(|result| {
+            result
+                .citation
+                .as_ref()
+                .and_then(|citation| citation.metadata.get("graph_seed_chunk_id"))
+                .cloned()
+        })
+        .collect::<HashSet<_>>();
+    let graph_seed_source_block_ids = graph_results
+        .iter()
+        .filter_map(|result| {
+            result
+                .citation
+                .as_ref()
+                .and_then(|citation| citation.metadata.get("graph_seed_source_block_id"))
+                .cloned()
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    let (mut direct_pool, direct_dedup) =
         dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
     metrics::counter!("graph_mmr_group_direct_candidates_total")
         .increment(direct_pool.len() as u64);
     metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
     metrics::gauge!("graph_mmr_group_graph_lambda_current").set(mmr_lambda_graph as f64);
     let direct_budget = direct_context_limit.min(final_limit);
-    let direct_mmr = apply_mmr_rerank(
-        direct_pool,
+    let (seed_direct_pool, remaining_direct_pool): (Vec<_>, Vec<_>) =
+        direct_pool.drain(..).partition(|result| {
+            graph_seed_chunk_ids.contains(&result.matched_chunk_id)
+                || result_source_block_id(result)
+                    .map(|block_id| graph_seed_source_block_ids.contains(block_id))
+                    .unwrap_or(false)
+        });
+    let seed_direct_mmr = apply_mmr_rerank(
+        seed_direct_pool,
         direct_budget,
         mmr_enabled && mmr_allow_direct_candidates && direct_budget > 0,
         mmr_lambda_direct,
@@ -7966,6 +8011,19 @@ fn select_graph_append_with_group_mmr(
         similarity_source,
         fallback_similarity_source,
     );
+    let remaining_direct_budget = direct_budget.saturating_sub(seed_direct_mmr.results.len());
+    let remaining_direct_mmr = apply_mmr_rerank(
+        remaining_direct_pool,
+        remaining_direct_budget,
+        mmr_enabled && mmr_allow_direct_candidates && remaining_direct_budget > 0,
+        mmr_lambda_direct,
+        mmr_candidate_limit,
+        similarity_source,
+        fallback_similarity_source,
+    );
+    let mut direct_selected = seed_direct_mmr.results.clone();
+    direct_selected.extend(remaining_direct_mmr.results.clone());
+    let direct_mmr = combine_group_mmr(seed_direct_mmr, remaining_direct_mmr, direct_selected);
     let mut selected = direct_mmr.results.clone();
     let mut dedup_count = direct_dedup;
     let selected_by_chunk: HashMap<String, usize> = selected
@@ -8477,6 +8535,37 @@ fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
 
 fn score_of(result: &pb::SearchResultV004) -> f32 {
     result.scores.as_ref().map(|s| s.final_score).unwrap_or(0.0)
+}
+
+#[derive(Debug, Clone)]
+struct GraphSeedCandidate {
+    key: (Uuid, Uuid),
+    score: f32,
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    strong_lexical_evidence: bool,
+}
+
+fn compare_graph_seed_candidates(
+    left: &GraphSeedCandidate,
+    right: &GraphSeedCandidate,
+) -> std::cmp::Ordering {
+    right
+        .strong_lexical_evidence
+        .cmp(&left.strong_lexical_evidence)
+        .then_with(|| {
+            right
+                .matched_discriminating_terms
+                .cmp(&left.matched_discriminating_terms)
+        })
+        .then_with(|| right.matched_terms.cmp(&left.matched_terms))
+        .then_with(|| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| left.key.cmp(&right.key))
 }
 
 fn stable_result_rank(
@@ -10249,6 +10338,92 @@ mod v007_fix1_tests {
             .collect::<Vec<_>>();
             assert_eq!(actual, expected, "candidate rotation {offset}");
         }
+    }
+
+    #[test]
+    fn graph_seed_ranking_preserves_strong_lexical_evidence() {
+        let zone = Uuid::from_u128(1);
+        let weak_high_score = GraphSeedCandidate {
+            key: (zone, Uuid::from_u128(30)),
+            score: 0.95,
+            matched_terms: 1,
+            matched_discriminating_terms: 0,
+            strong_lexical_evidence: false,
+        };
+        let strong_lower_score = GraphSeedCandidate {
+            key: (zone, Uuid::from_u128(20)),
+            score: 0.55,
+            matched_terms: 3,
+            matched_discriminating_terms: 2,
+            strong_lexical_evidence: true,
+        };
+        let strong_stable_tie = GraphSeedCandidate {
+            key: (zone, Uuid::from_u128(10)),
+            score: 0.55,
+            matched_terms: 3,
+            matched_discriminating_terms: 2,
+            strong_lexical_evidence: true,
+        };
+        let mut candidates = [weak_high_score, strong_lower_score, strong_stable_tie];
+
+        candidates.sort_by(compare_graph_seed_candidates);
+
+        assert_eq!(candidates[0].key.1, Uuid::from_u128(10));
+        assert_eq!(candidates[1].key.1, Uuid::from_u128(20));
+        assert_eq!(candidates[2].key.1, Uuid::from_u128(30));
+    }
+
+    #[test]
+    fn graph_append_preserves_direct_seed_provenance_without_mmr() {
+        let mut seed = test_result("seed-parent", "direct relation seed evidence", 0.4);
+        seed.citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "block-2".into());
+        let direct = vec![
+            test_result("high-a", "high score direct evidence", 0.9),
+            test_result("high-b", "second high score direct evidence", 0.8),
+            seed,
+        ];
+        let mut graph = test_result("related", "one-hop related evidence", 0.7);
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_seed_chunk_id".into(), "seed-sub".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_seed_source_block_id".into(), "block-2".into());
+
+        let selected = select_graph_append_with_group_mmr(
+            direct,
+            vec![graph],
+            3,
+            2,
+            1,
+            false,
+            0.75,
+            0.75,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            8,
+        );
+
+        let ids = selected
+            .results
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"seed-parent"));
+        assert!(ids.contains(&"related"));
     }
 
     #[test]

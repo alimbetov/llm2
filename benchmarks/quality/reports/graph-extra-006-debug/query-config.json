@@ -1,0 +1,13 @@
+{
+  "query_id": "graph-extra-006",
+  "quality_run_id": "wave10-1-graph-extra-006-004",
+  "query": "How is legal hold related to orphan point cleanup?",
+  "search_mode": "HYBRID",
+  "graph_enabled": true,
+  "graph_merge_strategy": "GRAPH_AS_CONTEXT_APPEND",
+  "max_seed_chunks": 16,
+  "max_hops": 1,
+  "graph_timeout_ms": 500,
+  "expected_direct_block": "tech-ttl-clean-002",
+  "expected_related_block": "tech-recon-run-004"
+}
