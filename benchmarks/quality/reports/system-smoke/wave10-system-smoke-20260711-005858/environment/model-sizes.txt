@@ -1,2 +1,0 @@
-708K	/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/model.onnx
- 16M	/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/tokenizer.json

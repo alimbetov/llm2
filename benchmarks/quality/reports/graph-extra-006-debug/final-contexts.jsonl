@@ -1,3 +1,0 @@
-{"stage":"FINAL_CONTEXT","final_rank":2,"source_block_id":"tech-ttl-clean-002","retrieval_sources":["VECTOR_DIRECT","LEXICAL_PARENT_BACKFILL"],"quality_run_id":"wave10-1-graph-extra-006-004"}
-{"stage":"FINAL_CONTEXT","final_rank":7,"source_block_id":"ttl-002","retrieval_sources":["GRAPH_EXPANDED"],"quality_run_id":"wave10-1-graph-extra-006-004"}
-{"stage":"FINAL_CONTEXT","final_rank":8,"source_block_id":"tech-recon-run-004","retrieval_sources":["GRAPH_EXPANDED"],"quality_run_id":"wave10-1-graph-extra-006-004"}

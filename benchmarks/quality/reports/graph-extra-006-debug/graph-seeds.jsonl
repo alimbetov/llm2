@@ -1,2 +1,0 @@
-{"stage":"GRAPH_SEED_SELECTION","source_block_id":"ttl-001","matched_chunk_id":"a8bb950d-e971-5c21-8971-ec8be437aac8","seed_rank":null,"quality_run_id":"wave10-1-graph-extra-006-004","drop_reason":null}
-{"stage":"GRAPH_SEED_SELECTION","source_block_id":"tech-ttl-clean-002","matched_chunk_id":"db56f708-e4de-51ac-9a93-237831273d31","seed_rank":null,"quality_run_id":"wave10-1-graph-extra-006-004","drop_reason":null,"selection_reason":"strong lexical evidence retained in bounded seed pool"}

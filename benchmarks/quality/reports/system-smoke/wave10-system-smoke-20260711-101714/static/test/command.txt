@@ -1,1 +1,0 @@
-env -u ASTRAVECTOR_QUALITY_ENDPOINT -u ASTRAVECTOR_QUALITY_RUNTIME_MODE cargo test --all-targets --all-features 

@@ -1,7 +1,0 @@
-astravector.embedding.v1.AstraVectorAdminFacade
-astravector.embedding.v1.AstraVectorIngestionFacade
-astravector.embedding.v1.AstraVectorRetrievalFacade
-astravector.embedding.v1.AstraVectorRuntime
-astravector.embedding.v1.AstraVectorV004Control
-grpc.health.v1.Health
-grpc.reflection.v1.ServerReflection
