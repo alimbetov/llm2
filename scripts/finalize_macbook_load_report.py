@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from stage_failure_registry import read_registry, write_atomic
+from validate_quality_report import quality_gate_passes
 
 
 def read_json(path: Path):
@@ -33,7 +34,8 @@ def load_result(path: Path, requested_rps=None):
         statuses = report.get("status_distribution", {})
         return {
             "requested_rps": requested_rps,
-            "achieved_rps": count / report.get("wall_duration_seconds", 1),
+            "achieved_rps": report.get("achieved_rps"),
+            "achieved_ratio": report.get("achieved_ratio"),
             "duration_seconds": report.get("wall_duration_seconds", 0),
             "count": count,
             "success_rate": report.get("success_rate"),
@@ -45,6 +47,8 @@ def load_result(path: Path, requested_rps=None):
             "errors": {key: value for key, value in statuses.items() if key != "OK"},
             "status_codes": statuses,
             "resource_exhausted_rate": statuses.get("RESOURCE_EXHAUSTED", 0) / count if count else None,
+            "resource_exhausted_p95_ms": report.get("latency_by_status", {}).get("RESOURCE_EXHAUSTED", {}).get("p95_ms"),
+            "resource_exhausted_p99_ms": report.get("latency_by_status", {}).get("RESOURCE_EXHAUSTED", {}).get("p99_ms"),
             "deadline_exceeded_rate": statuses.get("DEADLINE_EXCEEDED", 0) / count if count else None,
             "unavailable_rate": statuses.get("UNAVAILABLE", 0) / count if count else None,
             "positive_empty_count": report.get("positive_empty_count"),
@@ -229,6 +233,9 @@ def main():
     spike_pass = (spike_runtime_unchanged and (spike["deadline_exceeded_rate"] or 0) <= .01 and
                   (spike["unavailable_rate"] or 0) <= .01 and spike_load_shedding_primary and
                   (spike_errors == 0 or (spike["resource_exhausted_rate"] or 0) / spike_errors >= .80) and
+                  spike.get("achieved_ratio", 0) >= .90 and
+                  (spike_errors == 0 or ((spike.get("resource_exhausted_p95_ms") or 0) <= 100 and
+                                         (spike.get("resource_exhausted_p99_ms") or 0) <= 200)) and
                   spike.get("positive_empty_count") == 0 and spike.get("critical_wrong_result_count") == 0)
     consecutive = 0
     recovery_finish = None
@@ -243,7 +250,7 @@ def main():
                        stabilized["p95_ms"] <= recovery_p95_slo_ms and
                        stabilized_admission_rejects == 0 and query_depth_after == 0)
     recovery_pass = time_to_recovery is not None and time_to_recovery <= 60 and stabilized_pass
-    post_pass = post["verdict"] == "PASS" and post["queries_passed"] == 97
+    post_pass = quality_gate_passes(read_json(root / "post-load-quality/runtime-quality-report.json"), 97)
     pre_integrity = read_json(root / "corpus/pre-load-integrity.json")
     post_integrity = read_json(root / "post-load-quality/post-load-integrity.json")
     integrity_regressions = {
@@ -281,6 +288,10 @@ def main():
 
     registry_path = root / "stage-failures.json"
     registry = read_registry(registry_path)
+    for failure in registry["failures"]:
+        code = failure.get("code")
+        if code and code not in failures:
+            failures.append(code)
     existing_codes = {failure.get("code") for failure in registry["failures"]}
     for code in failures:
         if code in existing_codes:
@@ -359,6 +370,7 @@ def main():
         "migration_head": report["runtime"]["migration_head"],
         "corpus_snapshot_sha256": (root / "corpus/corpus-snapshot.sha256").read_text().strip(),
         "query_bank_sha256": (root / "corpus/load-query-bank.sha256").read_text().strip(),
+        "qrels_sha256": (root / "corpus/qrels.sha256").read_text().strip(),
         "machine_identity": hashlib.sha256((root / "environment/mac-hardware.txt").read_bytes()).hexdigest(),
         "rust_version": report["tools"]["rustc"],
         "load_driver_version": "1.0",

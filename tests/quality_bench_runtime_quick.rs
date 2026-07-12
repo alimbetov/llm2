@@ -67,6 +67,7 @@ struct RuntimeStats {
     graph: GraphRuntimeStats,
     no_answer: NoAnswerRuntimeStats,
     safety: SafetyRuntimeStats,
+    ir: IrRuntimeStats,
     query_diagnostics: Vec<Value>,
 }
 
@@ -97,6 +98,58 @@ struct SafetyRuntimeStats {
     citation_text_mismatch_count: usize,
     positive_query_empty_context_count: usize,
     silent_degraded_response_count: usize,
+}
+
+#[derive(Default)]
+struct IrRuntimeStats {
+    positive_queries: usize,
+    precision_at_5_sum: f64,
+    recall_at_5_sum: f64,
+    recall_at_10_sum: f64,
+    recall_at_20_sum: f64,
+    reciprocal_rank_at_10_sum: f64,
+    ndcg_at_10_sum: f64,
+    top1_hits: usize,
+    critical_queries: usize,
+    critical_top1_hits: usize,
+    negative_queries: usize,
+    abstained_queries: usize,
+    correct_abstentions: usize,
+    positive_abstentions: usize,
+}
+impl IrRuntimeStats {
+    fn average(&self, sum: f64) -> f64 {
+        if self.positive_queries == 0 {
+            0.0
+        } else {
+            sum / self.positive_queries as f64
+        }
+    }
+
+    fn no_answer_precision(&self) -> f64 {
+        let all_abstentions = self.correct_abstentions + self.positive_abstentions;
+        if all_abstentions == 0 {
+            1.0
+        } else {
+            self.correct_abstentions as f64 / all_abstentions as f64
+        }
+    }
+
+    fn no_answer_recall(&self) -> f64 {
+        if self.negative_queries == 0 {
+            1.0
+        } else {
+            self.correct_abstentions as f64 / self.negative_queries as f64
+        }
+    }
+
+    fn false_abstention_rate(&self) -> f64 {
+        if self.positive_queries == 0 {
+            0.0
+        } else {
+            self.positive_abstentions as f64 / self.positive_queries as f64
+        }
+    }
 }
 
 struct AccessLevelAudit {
@@ -153,6 +206,17 @@ struct EvalResult {
     citation_text_mismatch_count: usize,
     positive_query_empty_context_count: usize,
     silent_degraded_response_count: usize,
+    ir_applicable: bool,
+    precision_at_5: f64,
+    recall_at_5: f64,
+    recall_at_10: f64,
+    recall_at_20: f64,
+    reciprocal_rank_at_10: f64,
+    ndcg_at_10: f64,
+    top1_relevant: bool,
+    evidence_expected: bool,
+    abstained: bool,
+    critical: bool,
 }
 
 struct CanonicalEvidence {
@@ -499,6 +563,12 @@ fn effective_retrieval_profile(profile_name: &str, query_profile: &str) -> i32 {
 
 fn sha256_hex(input: &str) -> String {
     format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+fn sha256_file(path: PathBuf) -> String {
+    hex::encode(Sha256::digest(fs::read(&path).unwrap_or_else(|error| {
+        panic!("failed to read {}: {error}", path.display())
+    })))
 }
 
 fn quality_run_id() -> Option<String> {
@@ -1726,7 +1796,9 @@ fn retrieval_source_satisfied(retrieval_sources: &str, expected: &str) -> bool {
     if retrieval_sources.contains(expected) {
         return true;
     }
-    expected == "VECTOR_DIRECT" && retrieval_sources.contains("LEXICAL_PARENT_BACKFILL")
+    expected == "VECTOR_DIRECT"
+        && (retrieval_sources.contains("LEXICAL_PARENT_BACKFILL")
+            || retrieval_sources.contains("POSTGRES_FTS"))
 }
 
 fn query_requires_sparse(query: &Value) -> bool {
@@ -1879,7 +1951,13 @@ fn evaluate_query(
 ) -> EvalResult {
     let query_id = query.get("id").and_then(Value::as_str).unwrap_or("query");
     let expected = query.get("expected").expect("query missing expected");
-    let mut result = EvalResult::default();
+    let mut result = EvalResult {
+        critical: query
+            .get("critical")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        ..Default::default()
+    };
     let joined = response
         .contexts
         .iter()
@@ -2032,6 +2110,79 @@ fn evaluate_query(
                     )
                     .is_empty())
         });
+    result.evidence_expected = evidence_expected;
+    result.abstained = response.contexts.is_empty();
+    let relevant_documents = expected_strings_any(
+        expected,
+        &["must_contain_document_ids", "required_document_ids"],
+    )
+    .into_iter()
+    .map(str::to_string)
+    .collect::<HashSet<_>>();
+    let relevant_blocks =
+        expected_strings_any(expected, &["must_contain_block_ids", "required_block_ids"])
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+    if evidence_expected && (!relevant_documents.is_empty() || !relevant_blocks.is_empty()) {
+        result.ir_applicable = true;
+        let total_relevant = if !relevant_documents.is_empty() && !relevant_blocks.is_empty() {
+            relevant_documents.len() * relevant_blocks.len()
+        } else {
+            relevant_documents.len().max(relevant_blocks.len())
+        };
+        let relevance = response
+            .contexts
+            .iter()
+            .map(|context| {
+                let document_match = relevant_documents.is_empty()
+                    || [
+                        Some(context.document_id.as_str()),
+                        context
+                            .metadata
+                            .get("fixture_document_id")
+                            .map(String::as_str),
+                        context
+                            .metadata
+                            .get("original_document_id")
+                            .map(String::as_str),
+                        context
+                            .metadata
+                            .get("external_document_id")
+                            .map(String::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| relevant_documents.contains(value));
+                let block_match = relevant_blocks.is_empty()
+                    || relevant_blocks.contains(context.source_block_id.as_str());
+                document_match && block_match
+            })
+            .collect::<Vec<_>>();
+        let hits_at = |limit: usize| relevance.iter().take(limit).filter(|hit| **hit).count();
+        result.precision_at_5 = hits_at(5) as f64 / 5.0;
+        result.recall_at_5 = hits_at(5) as f64 / total_relevant.max(1) as f64;
+        result.recall_at_10 = hits_at(10) as f64 / total_relevant.max(1) as f64;
+        result.recall_at_20 = hits_at(20) as f64 / total_relevant.max(1) as f64;
+        result.reciprocal_rank_at_10 = relevance
+            .iter()
+            .take(10)
+            .position(|hit| *hit)
+            .map(|rank| 1.0 / (rank + 1) as f64)
+            .unwrap_or(0.0);
+        result.top1_relevant = relevance.first().copied().unwrap_or(false);
+        let dcg = relevance
+            .iter()
+            .take(10)
+            .enumerate()
+            .filter(|(_, hit)| **hit)
+            .map(|(rank, _)| 7.0 / ((rank + 2) as f64).log2())
+            .sum::<f64>();
+        let idcg = (0..total_relevant.min(10))
+            .map(|rank| 7.0 / ((rank + 2) as f64).log2())
+            .sum::<f64>();
+        result.ndcg_at_10 = if idcg == 0.0 { 0.0 } else { dcg / idcg };
+    }
     result.positive_query_empty_context_count =
         usize::from(evidence_expected && response.contexts.is_empty());
     if result.positive_query_empty_context_count > 0 {
@@ -2552,6 +2703,27 @@ async fn retrieve_queries(
                 stats.safety.positive_query_empty_context_count +=
                     eval.positive_query_empty_context_count;
                 stats.safety.silent_degraded_response_count += eval.silent_degraded_response_count;
+                if eval.ir_applicable {
+                    stats.ir.positive_queries += 1;
+                    stats.ir.precision_at_5_sum += eval.precision_at_5;
+                    stats.ir.recall_at_5_sum += eval.recall_at_5;
+                    stats.ir.recall_at_10_sum += eval.recall_at_10;
+                    stats.ir.recall_at_20_sum += eval.recall_at_20;
+                    stats.ir.reciprocal_rank_at_10_sum += eval.reciprocal_rank_at_10;
+                    stats.ir.ndcg_at_10_sum += eval.ndcg_at_10;
+                    stats.ir.top1_hits += usize::from(eval.top1_relevant);
+                    if eval.critical {
+                        stats.ir.critical_queries += 1;
+                        stats.ir.critical_top1_hits += usize::from(eval.top1_relevant);
+                    }
+                }
+                if eval.evidence_expected {
+                    stats.ir.positive_abstentions += usize::from(eval.abstained);
+                } else {
+                    stats.ir.negative_queries += 1;
+                    stats.ir.abstained_queries += usize::from(eval.abstained);
+                    stats.ir.correct_abstentions += usize::from(eval.abstained);
+                }
                 if eval.contexts_count == 0 {
                     stats.queries_with_empty_contexts += 1;
                 }
@@ -2766,6 +2938,8 @@ fn write_report(
     let report = json!({
         "schema_version": "1.0",
         "profile": profile,
+        "holdout_query_bank_sha256": if profile == "holdout" { json!(sha256_file(Path::new(QUALITY_ROOT).join("queries/fix480-holdout.jsonl"))) } else { Value::Null },
+        "qrels_sha256": json!(sha256_file(Path::new(QUALITY_ROOT).join("qrels/qrels.jsonl"))),
         "quality_run_id": quality_run_id(),
         "data_isolation_mode": if quality_run_id().is_some() {
             "quality_run_id_namespace"
@@ -2993,8 +3167,20 @@ fn write_report(
             "queries_failed": stats.retrieve_context_queries_failed,
             "queries_blocked": stats.retrieve_context_queries_blocked,
             "queries_skipped": stats.retrieve_context_queries_skipped,
-            "recall_at_5": recall,
-            "mrr": 0.0,
+            "query_acceptance_rate": recall,
+            "precision_at_5": stats.ir.average(stats.ir.precision_at_5_sum),
+            "recall_at_5": stats.ir.average(stats.ir.recall_at_5_sum),
+            "recall_at_10": stats.ir.average(stats.ir.recall_at_10_sum),
+            "recall_at_20": stats.ir.average(stats.ir.recall_at_20_sum),
+            "mrr_at_10": stats.ir.average(stats.ir.reciprocal_rank_at_10_sum),
+            "ndcg_at_10": stats.ir.average(stats.ir.ndcg_at_10_sum),
+            "top1_accuracy": if stats.ir.positive_queries == 0 { 0.0 } else { stats.ir.top1_hits as f64 / stats.ir.positive_queries as f64 },
+            "critical_query_count": stats.ir.critical_queries,
+            "critical_top1_accuracy": if stats.ir.critical_queries == 0 { Value::Null } else { json!(stats.ir.critical_top1_hits as f64 / stats.ir.critical_queries as f64) },
+            "positive_empty_rate": stats.ir.false_abstention_rate(),
+            "no_answer_precision": stats.ir.no_answer_precision(),
+            "no_answer_recall": stats.ir.no_answer_recall(),
+            "false_abstention_rate": stats.ir.false_abstention_rate(),
             "expected_document_hit_rate": recall,
             "expected_block_hit_rate": recall,
             "hard_negative_false_positive_count": stats.safety.hard_negative_false_positive_count,
@@ -3368,6 +3554,41 @@ async fn quality_bench_runtime_quick() {
     }
     if stats.qdrant_points_count == 0 {
         failures.push("MODEL_BACKED_E2E_NOT_CONFIRMED".into());
+    }
+    if matches!(profile_name.as_str(), "validation" | "holdout") {
+        let precision_at_5 = stats.ir.average(stats.ir.precision_at_5_sum);
+        let recall_at_5 = stats.ir.average(stats.ir.recall_at_5_sum);
+        let recall_at_20 = stats.ir.average(stats.ir.recall_at_20_sum);
+        let mrr_at_10 = stats.ir.average(stats.ir.reciprocal_rank_at_10_sum);
+        let ndcg_at_10 = stats.ir.average(stats.ir.ndcg_at_10_sum);
+        for (passed, code) in [
+            (precision_at_5 >= 0.90, "PRECISION_AT_5_BELOW_THRESHOLD"),
+            (recall_at_5 >= 0.95, "RECALL_AT_5_BELOW_THRESHOLD"),
+            (recall_at_20 >= 0.98, "RECALL_AT_20_BELOW_THRESHOLD"),
+            (mrr_at_10 >= 0.90, "MRR_AT_10_BELOW_THRESHOLD"),
+            (ndcg_at_10 >= 0.90, "NDCG_AT_10_BELOW_THRESHOLD"),
+            (
+                stats.ir.critical_queries > 0
+                    && stats.ir.critical_top1_hits == stats.ir.critical_queries,
+                "CRITICAL_TOP1_ACCURACY_FAILED",
+            ),
+            (
+                stats.ir.no_answer_precision() >= 0.95,
+                "NO_ANSWER_PRECISION_BELOW_THRESHOLD",
+            ),
+            (
+                stats.ir.no_answer_recall() >= 0.95,
+                "NO_ANSWER_RECALL_BELOW_THRESHOLD",
+            ),
+            (
+                stats.ir.false_abstention_rate() <= 0.02,
+                "FALSE_ABSTENTION_RATE_ABOVE_THRESHOLD",
+            ),
+        ] {
+            if !passed {
+                failures.push(code.into());
+            }
+        }
     }
 
     let verdict = if failures.is_empty() { "PASS" } else { "FAIL" };

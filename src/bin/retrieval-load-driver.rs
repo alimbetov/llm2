@@ -259,6 +259,18 @@ async fn execute_request(
         expected,
         &["must_contain_document_ids", "required_document_ids"],
     );
+    let expected_blocks = expected_strings(
+        expected,
+        &[
+            "must_contain_block_ids",
+            "required_block_ids",
+            "expected_source_block_ids",
+        ],
+    );
+    let forbidden_documents = expected_strings(expected, &["forbidden_document_ids"]);
+    let expected_version = expected
+        .get("expected_document_version")
+        .and_then(Value::as_u64);
     let mut request = Request::new(pb::RetrieveContextRequest {
         context: Some(pb::RequestContext {
             correlation_id: format!("load-{request_no}"),
@@ -327,6 +339,21 @@ async fn execute_request(
                         .into_iter()
                         .flatten()
                         .any(|document| expected_documents.iter().any(|expected| expected == document));
+                    let expected_block_match = expected_blocks.is_empty()
+                        || expected_blocks.iter().any(|expected| {
+                            expected == &context.source_block_id
+                                || context
+                                    .metadata
+                                    .get("fixture_source_block_id")
+                                    .is_some_and(|value| value == expected)
+                        });
+                    let forbidden_document = forbidden_documents.iter().any(|forbidden| {
+                        forbidden == &context.document_id
+                            || context
+                                .metadata
+                                .get("fixture_document_id")
+                                .is_some_and(|value| value == forbidden)
+                    });
                     json!({
                         "rank": rank + 1,
                         "access_zone_id": context.access_zone_id,
@@ -337,6 +364,8 @@ async fn execute_request(
                         "citation_complete": citation.is_some_and(|value| !value.document_id.is_empty() && !value.source_uri.is_empty() && !value.matched_chunk_id.is_empty() && !value.source_block_id.is_empty()),
                         "citation_grounded": citation.is_some_and(|value| value.document_id == context.document_id && value.document_version == context.document_version && value.matched_chunk_id == context.matched_chunk_id && value.source_block_id == context.source_block_id),
                         "expected_document_match": expected_document_match,
+                        "expected_block_match": expected_block_match,
+                        "forbidden_document": forbidden_document,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -344,6 +373,23 @@ async fn execute_request(
                 .first()
                 .is_none_or(|context| context["expected_document_match"] == true);
             let positive_empty = evidence_expected(&query) && contexts.is_empty();
+            let missing_expected_document = !expected_documents.is_empty()
+                && !contexts
+                    .iter()
+                    .any(|value| value["expected_document_match"] == true);
+            let missing_expected_block = !expected_blocks.is_empty()
+                && !contexts
+                    .iter()
+                    .any(|value| value["expected_block_match"] == true);
+            let forbidden_document = contexts
+                .iter()
+                .any(|value| value["forbidden_document"] == true);
+            let wrong_version = expected_version.is_some_and(|expected| {
+                contexts.iter().any(|value| {
+                    value["expected_document_match"] == true
+                        && value["document_version"].as_u64() != Some(expected)
+                })
+            });
             let result_fingerprint = fingerprint(&contexts);
             json!({
                 "request_no": request_no,
@@ -362,6 +408,10 @@ async fn execute_request(
                 "result_fingerprint": result_fingerprint,
                 "top1_correct": top1_correct,
                 "positive_empty": positive_empty,
+                "missing_expected_document": missing_expected_document,
+                "missing_expected_block": missing_expected_block,
+                "forbidden_document": forbidden_document,
+                "wrong_version": wrong_version,
                 "critical": critical
             })
         }
@@ -383,6 +433,16 @@ fn percentile(mut values: Vec<f64>, percentile: f64) -> f64 {
     values.sort_by(f64::total_cmp);
     let index = ((values.len() - 1) as f64 * percentile).ceil() as usize;
     values[index]
+}
+
+fn latency_summary(values: Vec<f64>) -> Value {
+    json!({
+        "count": values.len(),
+        "p50_ms": percentile(values.clone(), 0.50),
+        "p95_ms": percentile(values.clone(), 0.95),
+        "p99_ms": percentile(values.clone(), 0.99),
+        "max_ms": values.into_iter().max_by(f64::total_cmp).unwrap_or(0.0),
+    })
 }
 
 fn write_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
@@ -420,8 +480,32 @@ async fn main() -> anyhow::Result<()> {
     let interval = Duration::from_secs_f64(1.0 / args.target_rps as f64);
     let started = Instant::now();
     let mut handles = Vec::with_capacity(request_count);
+    let mut started_requests = 0usize;
     for (request_no, query_index) in sequence.into_iter().enumerate() {
-        let permit = semaphore.clone().acquire_owned().await?;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            started + interval.saturating_mul(request_no as u32),
+        ))
+        .await;
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                results.lock().await.push(json!({
+                    "request_no": request_no + 1,
+                    "query_id": queries[query_index].get("id").and_then(Value::as_str).unwrap_or("query"),
+                    "category": queries[query_index].get("category").and_then(Value::as_str).unwrap_or("general"),
+                    "started_at": chrono::Utc::now().to_rfc3339(),
+                    "latency_ms": 0.0,
+                    "grpc_status": "LOCAL_DROPPED",
+                    "error": "bounded pending request capacity exhausted",
+                    "contexts": [],
+                    "top1_correct": false,
+                    "positive_empty": false,
+                    "critical": queries[query_index].get("critical").and_then(Value::as_bool).unwrap_or(false)
+                }));
+                continue;
+            }
+        };
+        started_requests += 1;
         let client = client.clone();
         let query = queries[query_index].clone();
         let results = results.clone();
@@ -430,10 +514,6 @@ async fn main() -> anyhow::Result<()> {
             results.lock().await.push(result);
             drop(permit);
         }));
-        tokio::time::sleep_until(tokio::time::Instant::from_std(
-            started + interval.saturating_mul((request_no + 1) as u32),
-        ))
-        .await;
     }
     for handle in handles {
         handle.await?;
@@ -474,6 +554,22 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .flat_map(|value| value["contexts"].as_array().into_iter().flatten())
         .filter(|context| context["citation_grounded"] != true)
+        .count();
+    let missing_expected_documents = results
+        .iter()
+        .filter(|value| value["missing_expected_document"] == true)
+        .count();
+    let missing_expected_blocks = results
+        .iter()
+        .filter(|value| value["missing_expected_block"] == true)
+        .count();
+    let forbidden_documents = results
+        .iter()
+        .filter(|value| value["forbidden_document"] == true)
+        .count();
+    let wrong_versions = results
+        .iter()
+        .filter(|value| value["wrong_version"] == true)
         .count();
     let mut stability_compared = 0usize;
     let mut top1_matches_count = 0usize;
@@ -519,6 +615,19 @@ async fn main() -> anyhow::Result<()> {
             .entry(result["grpc_status"].as_str().unwrap_or("UNKNOWN"))
             .or_insert(0usize) += 1;
     }
+    let latency_by_status = statuses
+        .keys()
+        .map(|status| {
+            let values = results
+                .iter()
+                .filter(|value| value["grpc_status"].as_str() == Some(status))
+                .filter_map(|value| value["latency_ms"].as_f64())
+                .collect::<Vec<_>>();
+            ((*status).to_string(), latency_summary(values))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let achieved_rps = started_requests as f64 / args.duration.as_secs_f64().max(f64::EPSILON);
+    let achieved_ratio = achieved_rps / args.target_rps as f64;
     let success_rate = ok as f64 / results.len().max(1) as f64;
     let transport_pass = success_rate >= 0.99;
     let summary = json!({
@@ -533,17 +642,27 @@ async fn main() -> anyhow::Result<()> {
         "requested_duration_seconds": args.duration.as_secs_f64(),
         "wall_duration_seconds": started.elapsed().as_secs_f64(),
         "requests_total": results.len(),
+        "scheduled_requests": request_count,
+        "started_requests": started_requests,
+        "completed_requests": results.len(),
+        "achieved_rps": achieved_rps,
+        "achieved_ratio": achieved_ratio,
         "successful_requests": ok,
         "success_rate": success_rate,
         "error_rate": 1.0 - success_rate,
         "transport_pass": transport_pass,
         "status_distribution": statuses,
+        "latency_by_status": latency_by_status,
         "successful_p95_ms": percentile(latencies.clone(), 0.95),
         "successful_p99_ms": percentile(latencies, 0.99),
         "positive_empty_count": positive_empty,
         "critical_wrong_result_count": critical_wrong,
         "citation_incomplete_count": citation_incomplete,
         "citation_grounding_failure_count": citation_grounding_failures,
+        "missing_expected_document_count": missing_expected_documents,
+        "missing_expected_block_count": missing_expected_blocks,
+        "forbidden_document_count": forbidden_documents,
+        "wrong_version_count": wrong_versions,
         "stability": {
             "comparison_completed": baseline.is_some(),
             "sample_count": stability_compared,
@@ -553,7 +672,7 @@ async fn main() -> anyhow::Result<()> {
             "top5_mean_jaccard": top5_mean_jaccard,
             "pass": stability_pass
         },
-        "verdict": if transport_pass && positive_empty == 0 && critical_wrong == 0 && citation_incomplete == 0 && citation_grounding_failures == 0 && stability_pass { "PASS" } else { "FAIL" }
+        "verdict": if transport_pass && achieved_ratio >= 0.95 && positive_empty == 0 && critical_wrong == 0 && citation_incomplete == 0 && citation_grounding_failures == 0 && missing_expected_documents == 0 && missing_expected_blocks == 0 && forbidden_documents == 0 && wrong_versions == 0 && stability_pass { "PASS" } else { "FAIL" }
     });
     write_atomic(
         &args.summary,
@@ -564,4 +683,26 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("retrieval load correctness gate failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_by_status_counts_each_request_once() {
+        let summary = latency_summary(vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(summary["count"], 4);
+        assert_eq!(summary["max_ms"], 4.0);
+        assert_eq!(summary["p50_ms"], 3.0);
+    }
+
+    #[test]
+    fn achieved_ratio_rejects_underdriven_step() {
+        let requested_rps = 10.0;
+        let started_requests = 80.0;
+        let duration_seconds = 10.0;
+        let achieved_ratio = (started_requests / duration_seconds) / requested_rps;
+        assert!(achieved_ratio < 0.95);
+    }
 }

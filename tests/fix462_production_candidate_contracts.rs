@@ -18,8 +18,12 @@ fn fix462_graph_seed_expansion_is_zone_specific() {
 #[test]
 fn fix462_direct_retrieval_uses_compound_parent_key() {
     let grpc = std::fs::read_to_string("src/grpc/mod.rs").expect("read grpc module");
+    let persistence =
+        std::fs::read_to_string("src/persistence/mod.rs").expect("read persistence module");
     assert!(grpc.contains("Vec<((Uuid, Uuid), QdrantSearchHit)>"));
-    assert!(grpc.contains("HashMap<(Uuid, Uuid), ParentContextRecord>"));
+    assert!(grpc.contains("by_candidate.get(&(*parent_zone_id, matched_id, *parent_id))"));
+    assert!(persistence.contains("fetch_hydrated_search_contexts_multi"));
+    assert!(persistence.contains("WITH ORDINALITY"));
     assert!(grpc.contains("graph_lookup_key = (rel.access_zone_id, rel.chunk_id)"));
 }
 

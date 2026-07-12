@@ -43,6 +43,20 @@ impl OperationBudget {
                     .saturating_add(safety_margin)
     }
 }
+
+pub fn resolve_optional_stage_budget(
+    deadline: Instant,
+    configured_max: Duration,
+    minimum_useful_budget: Duration,
+    response_reserve: Duration,
+) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining <= response_reserve {
+        return None;
+    }
+    let budget = configured_max.min(remaining - response_reserve);
+    (budget >= minimum_useful_budget).then_some(budget)
+}
 #[derive(Debug, Clone)]
 pub struct RequiredPersistCommand {
     pub access_zone_id: Uuid,
@@ -179,5 +193,29 @@ mod operation_budget_tests {
             Duration::from_millis(500),
             Duration::from_millis(50),
         ));
+    }
+
+    #[test]
+    fn optional_stage_budget_preserves_response_reserve() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let budget = resolve_optional_stage_budget(
+            deadline,
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(budget <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn optional_stage_budget_rejects_non_useful_remainder() {
+        assert!(resolve_optional_stage_budget(
+            Instant::now() + Duration::from_millis(120),
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        )
+        .is_none());
     }
 }

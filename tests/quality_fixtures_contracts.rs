@@ -433,3 +433,32 @@ fn enriched_quality_profiles_and_schemas_are_valid_json() {
         );
     }
 }
+
+#[test]
+fn fix480_quality_splits_are_disjoint_and_qrels_are_complete() {
+    let mut all = HashSet::new();
+    let mut counts = Vec::new();
+    for split in ["tuning", "validation", "holdout"] {
+        let queries =
+            read_jsonl(&Path::new(QUALITY_ROOT).join(format!("queries/fix480-{split}.jsonl")));
+        counts.push(queries.len());
+        for query in queries {
+            let id = query["id"].as_str().unwrap().to_string();
+            assert!(
+                all.insert(id),
+                "query appears in more than one fix480 split"
+            );
+        }
+    }
+    assert_eq!(counts.iter().sum::<usize>(), 97);
+    assert!((57..=60).contains(&counts[0]));
+    assert!((18..=21).contains(&counts[1]));
+    assert!((18..=21).contains(&counts[2]));
+    let qrels = read_jsonl(&Path::new(QUALITY_ROOT).join("qrels/qrels.jsonl"));
+    let qrel_ids = qrels
+        .iter()
+        .map(|value| value["query_id"].as_str().unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(qrel_ids.len(), 97);
+    assert!(all.iter().all(|id| qrel_ids.contains(id.as_str())));
+}

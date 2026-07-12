@@ -28,7 +28,6 @@ RUNTIME_PID=""
 RESOURCE_PID=""
 METRICS_PID=""
 OVERALL_VERDICT="INCOMPLETE"
-FAILURE_REASONS=()
 RECOVERY_P95_SLO_MS="${RECOVERY_P95_SLO_MS:-1000}"
 
 mkdir -p "$EVIDENCE_DIR"/{environment,static,infrastructure,runtime,corpus,contract,warmup,baseline,step,soak,spike,recovery,post-load-quality,system,metrics}
@@ -44,7 +43,6 @@ record_failure() {
 assert_source_tree_clean() {
   local stage="$1"
   if [[ -n "$(git status --porcelain)" ]]; then
-    FAILURE_REASONS+=(SOURCE_TREE_MODIFIED_DURING_RUN)
     record_failure "$stage" SOURCE_TREE_MODIFIED_DURING_RUN EVIDENCE_FAILURE
     return 1
   fi
@@ -71,7 +69,6 @@ record() {
 
 block() {
   OVERALL_VERDICT="BLOCKED"
-  FAILURE_REASONS+=("$1")
   record_failure "preflight" "$1" "BLOCKED"
   write_report
   exit 2
@@ -80,16 +77,7 @@ block() {
 json_valid() { jq -e . "$1" >/dev/null 2>&1; }
 
 quality_passes() {
-  jq -e '
-    .runtime_execution == "MODEL_BACKED_E2E_CONFIRMED" and .verdict == "PASS" and
-    .retrieval.queries_total == 97 and .retrieval.queries_passed == 97 and
-    .retrieval.queries_failed == 0 and .retrieval.queries_blocked == 0 and
-    .retrieval.queries_skipped == 0 and .graph.graph_expected_related_hits == 13 and
-    .graph.graph_expected_related_total == 13 and .graph.graph_timeout_count == 0 and
-    .graph.graph_db_error_count == 0 and .retrieval.cross_zone_leakage_count == 0 and
-    .retrieval.access_level_violation_count == 0 and .qdrant.qdrant_missing_points == 0 and
-    .outbox.outbox_dead_letter_count == 0
-  ' "$1" >/dev/null
+  python3 "$ROOT_DIR/scripts/validate_quality_report.py" "$1" --expected-total 97 >/dev/null
 }
 
 integrity_snapshot() {
@@ -130,7 +118,20 @@ retrieval_run() {
   local rc=$?
   date -Iseconds > "$dir/finished-at.txt"
   printf '%s\n' "$rc" > "$dir/exit-code.txt"
+  (( rc == 0 )) || return "$rc"
   json_valid "$dir/result.json"
+}
+
+load_step_passes() {
+  jq -e '
+    .success_rate >= 0.995 and .error_rate <= 0.005 and
+    .successful_p95_ms <= 1000 and .successful_p99_ms <= 1000 and
+    .achieved_ratio >= 0.95 and .positive_empty_count == 0 and
+    .critical_wrong_result_count == 0 and .missing_expected_document_count == 0 and
+    .missing_expected_block_count == 0 and .forbidden_document_count == 0 and
+    .wrong_version_count == 0 and .citation_incomplete_count == 0 and
+    .citation_grounding_failure_count == 0
+  ' "$1" >/dev/null
 }
 
 ghz_run() {
@@ -176,7 +177,7 @@ write_report() {
   model_sha="$(shasum -a 256 "$MODEL_PATH" 2>/dev/null | awk '{print $1}')"
   tokenizer_sha="$(shasum -a 256 "$TOKENIZER_PATH" 2>/dev/null | awk '{print $1}')"
   binary_sha="$(shasum -a 256 target/release/astravector-runtime 2>/dev/null | awk '{print $1}')"
-  local reasons; reasons="$(printf '%s\n' "${FAILURE_REASONS[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')"
+  local reasons; reasons="$(jq '[.failures[].code] | unique' "$FAILURE_REGISTRY")"
   jq -n --arg id "$LOAD_RUN_ID" --arg sha "$git_sha" \
     --arg verdict "$OVERALL_VERDICT" --arg model "$model_sha" --arg tokenizer "$tokenizer_sha" \
     --arg binary "$binary_sha" --argjson reasons "$reasons" \
@@ -281,6 +282,8 @@ python3 "$ROOT_DIR/scripts/build_quality_query_bank.py" \
   --queries-dir "$ROOT_DIR/benchmarks/quality/queries" \
   --output "$EVIDENCE_DIR/corpus/load-query-bank.jsonl" > "$EVIDENCE_DIR/corpus/load-query-bank-manifest.json" \
   || block QUERY_BANK_BUILD_FAILED
+cp "$ROOT_DIR/benchmarks/quality/qrels/qrels.jsonl" "$EVIDENCE_DIR/corpus/qrels.jsonl" || block QRELS_COPY_FAILED
+shasum -a 256 "$EVIDENCE_DIR/corpus/qrels.jsonl" | awk '{print $1}' > "$EVIDENCE_DIR/corpus/qrels.sha256"
 assert_source_tree_clean after-pre-load || block SOURCE_TREE_MODIFIED_DURING_RUN
 
 grpcurl -plaintext 127.0.0.1:50051 describe > "$EVIDENCE_DIR/contract/grpc-describe.txt"
@@ -301,28 +304,32 @@ retrieval_run "$EVIDENCE_DIR/warmup" 1 1 2m || block WARMUP_FAILED
 jq -e '.success_rate == 1 and .positive_empty_count == 0 and .verdict == "PASS"' "$EVIDENCE_DIR/warmup/result.json" >/dev/null || block WARMUP_FAILED
 STABILITY_BASELINE="$EVIDENCE_DIR/warmup/results.jsonl"
 sleep 60
-for spec in '2 2' '5 5' '10 10'; do set -- $spec; retrieval_run "$EVIDENCE_DIR/baseline/$1-rps" "$1" "$2" 5m "$STABILITY_BASELINE" || block BASELINE_FAILED; sleep 60; done
+for spec in '2 2' '5 5' '10 10'; do
+  set -- $spec
+  retrieval_run "$EVIDENCE_DIR/baseline/$1-rps" "$1" "$2" 5m "$STABILITY_BASELINE" || block BASELINE_FAILED
+  load_step_passes "$EVIDENCE_DIR/baseline/$1-rps/result.json" || block BASELINE_ACCEPTANCE_FAILED
+  sleep 60
+done
 
 stable_rps=0; saturation_rps=null; failure_rps=null; stop_reason=""
 for rps in 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30; do
   concurrency="$rps"; (( concurrency < 4 )) && concurrency=4; (( concurrency > 40 )) && concurrency=40
   dir="$EVIDENCE_DIR/step/$(printf '%03d' "$rps")-rps"
   if ! retrieval_run "$dir" "$rps" "$concurrency" 3m "$STABILITY_BASELINE"; then failure_rps="$rps"; stop_reason="CORRECTNESS_OR_TRANSPORT_GATE"; break; fi
-  er="$(error_rate "$dir/result.json")"; sr="$(success_rate "$dir/result.json")"; p95="$(latency_ms "$dir/result.json" 95)"; p99="$(latency_ms "$dir/result.json" 99)"
-  jq -n --argjson requested "$rps" --argjson success "$sr" --argjson error "$er" --argjson p95 "$p95" --argjson p99 "$p99" '{requested_rps:$requested,success_rate:$success,error_rate:$error,p95_ms:$p95,p99_ms:$p99}' > "$dir/metrics.json"
-  if awk "BEGIN {exit !($er > 0.02 || $p95 > 1000)}"; then failure_rps="$rps"; stop_reason="ACCEPTANCE_THRESHOLD"; break; fi
-  if awk "BEGIN {exit !($sr >= 0.99 && $er < 0.01 && $p95 <= 1000)}"; then stable_rps="$rps"; else [[ "$saturation_rps" == null ]] && saturation_rps="$rps"; fi
+  er="$(error_rate "$dir/result.json")"; sr="$(success_rate "$dir/result.json")"; p95="$(latency_ms "$dir/result.json" 95)"; p99="$(latency_ms "$dir/result.json" 99)"; achieved="$(jq -r '.achieved_ratio' "$dir/result.json")"
+  jq -n --argjson requested "$rps" --argjson success "$sr" --argjson error "$er" --argjson p95 "$p95" --argjson p99 "$p99" --argjson achieved "$achieved" '{requested_rps:$requested,success_rate:$success,error_rate:$error,p95_ms:$p95,p99_ms:$p99,achieved_ratio:$achieved}' > "$dir/metrics.json"
+  if load_step_passes "$dir/result.json"; then stable_rps="$rps"; else failure_rps="$rps"; stop_reason="ACCEPTANCE_THRESHOLD"; break; fi
   kill -0 "$RUNTIME_PID" 2>/dev/null || { failure_rps="$rps"; stop_reason="RUNTIME_DIED"; break; }
   sleep 60
 done
 (( stable_rps >= 6 )) || block STABLE_RPS_BELOW_REFERENCE_MINIMUM
-soak_rps=$(( (stable_rps * 65 + 99) / 100 )); (( soak_rps < 1 )) && soak_rps=1
+soak_rps=$(( stable_rps * 65 / 100 )); (( soak_rps < 2 )) && soak_rps=2
 jq -n --argjson stable "$stable_rps" --argjson saturation "$saturation_rps" --argjson failure "$failure_rps" --arg reason "$stop_reason" --argjson soak "$soak_rps" '{stable_rps:$stable,saturation_rps:$saturation,failure_rps:$failure,stop_reason:$reason,soak_rps:$soak}' > "$EVIDENCE_DIR/soak/selection.json"
 
 ps -p "$RUNTIME_PID" -o pid=,rss=,etime= > "$EVIDENCE_DIR/soak/runtime-before.txt"
 sysctl vm.swapusage > "$EVIDENCE_DIR/soak/swap-before.txt"
-retrieval_run "$EVIDENCE_DIR/soak" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 60m "$STABILITY_BASELINE" || { OVERALL_VERDICT=FAIL; FAILURE_REASONS+=(SOAK_FAILED); write_report; exit 1; }
-ps -p "$RUNTIME_PID" -o pid=,rss=,etime= > "$EVIDENCE_DIR/soak/runtime-after.txt" || { OVERALL_VERDICT=FAIL; FAILURE_REASONS+=(RUNTIME_DIED_DURING_SOAK); write_report; exit 1; }
+retrieval_run "$EVIDENCE_DIR/soak" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 60m "$STABILITY_BASELINE" || { OVERALL_VERDICT=FAIL; record_failure soak SOAK_FAILED FAIL; write_report; exit 1; }
+ps -p "$RUNTIME_PID" -o pid=,rss=,etime= > "$EVIDENCE_DIR/soak/runtime-after.txt" || { OVERALL_VERDICT=FAIL; record_failure soak RUNTIME_DIED_DURING_SOAK FAIL; write_report; exit 1; }
 sysctl vm.swapusage > "$EVIDENCE_DIR/soak/swap-after.txt"
 assert_source_tree_clean after-soak || { OVERALL_VERDICT=FAIL; write_report; exit 1; }
 sleep 120
@@ -332,9 +339,9 @@ spike_concurrency="$spike_rps"; (( spike_concurrency < 10 )) && spike_concurrenc
 ps -p "$RUNTIME_PID" -o pid= > "$EVIDENCE_DIR/spike/runtime-pid-before-spike.txt"
 ps -p "$RUNTIME_PID" -o lstart= > "$EVIDENCE_DIR/spike/runtime-start-time-before.txt"
 retrieval_run "$EVIDENCE_DIR/spike" "$spike_rps" "$spike_concurrency" 30s "$STABILITY_BASELINE" || true
-ps -p "$RUNTIME_PID" -o pid= > "$EVIDENCE_DIR/spike/runtime-pid-after-spike.txt" || FAILURE_REASONS+=(RUNTIME_DIED_DURING_SPIKE)
-ps -p "$RUNTIME_PID" -o lstart= > "$EVIDENCE_DIR/spike/runtime-start-time-after.txt" || FAILURE_REASONS+=(RUNTIME_DIED_DURING_SPIKE)
-grpcurl -plaintext 127.0.0.1:50051 grpc.health.v1.Health/Check > "$EVIDENCE_DIR/spike/health-after.json" 2>&1 || FAILURE_REASONS+=(RUNTIME_UNHEALTHY_AFTER_SPIKE)
+ps -p "$RUNTIME_PID" -o pid= > "$EVIDENCE_DIR/spike/runtime-pid-after-spike.txt" || record_failure spike RUNTIME_DIED_DURING_SPIKE FAIL
+ps -p "$RUNTIME_PID" -o lstart= > "$EVIDENCE_DIR/spike/runtime-start-time-after.txt" || record_failure spike RUNTIME_DIED_DURING_SPIKE FAIL
+grpcurl -plaintext 127.0.0.1:50051 grpc.health.v1.Health/Check > "$EVIDENCE_DIR/spike/health-after.json" 2>&1 || record_failure spike RUNTIME_UNHEALTHY_AFTER_SPIKE FAIL
 consecutive_healthy=0
 recovery_achieved=false
 for window in 1 2 3 4 5 6; do
@@ -357,18 +364,18 @@ for window in 1 2 3 4 5 6; do
     '{success_rate:$success,error_rate:$error,p95_ms:$p95,deadline_exceeded_rate:$deadline,unavailable_rate:$unavailable,healthy:$healthy}' > "$dir/health.json"
   if (( consecutive_healthy >= 3 )); then recovery_achieved=true; break; fi
 done
-[[ "$recovery_achieved" == true ]] || FAILURE_REASONS+=(RECOVERY_TTR_FAILED)
-curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-before.prom" || FAILURE_REASONS+=(RECOVERY_METRICS_FAILED)
-retrieval_run "$EVIDENCE_DIR/recovery/stabilized" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 5m "$STABILITY_BASELINE" || FAILURE_REASONS+=(RECOVERY_STABILIZED_FAILED)
-curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-after.prom" || FAILURE_REASONS+=(RECOVERY_METRICS_FAILED)
+[[ "$recovery_achieved" == true ]] || record_failure recovery RECOVERY_TTR_FAILED FAIL
+curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-before.prom" || record_failure recovery RECOVERY_METRICS_FAILED FAIL
+retrieval_run "$EVIDENCE_DIR/recovery/stabilized" "$soak_rps" "$(( soak_rps > 4 ? soak_rps : 4 ))" 5m "$STABILITY_BASELINE" || record_failure recovery RECOVERY_STABILIZED_FAILED FAIL
+curl -fsS http://127.0.0.1:9090/metrics > "$EVIDENCE_DIR/recovery/stabilized-metrics-after.prom" || record_failure recovery RECOVERY_METRICS_FAILED FAIL
 
 record "$EVIDENCE_DIR/post-load-quality/run" env \
   ASTRAVECTOR_QUALITY_OUTPUT_DIR="$EVIDENCE_DIR/post-load-quality" \
   ASTRAVECTOR_QUALITY_RUN_ID="${LOAD_RUN_ID}-post-load-quality" \
-  make quality-runtime-full-capability-quick-remote || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
-quality_passes "$EVIDENCE_DIR/post-load-quality/runtime-quality-report.json" || FAILURE_REASONS+=(POST_LOAD_QUALITY_FAILED)
-integrity_snapshot "$EVIDENCE_DIR/post-load-quality/post-load-integrity" || FAILURE_REASONS+=(POST_LOAD_INTEGRITY_FAILED)
-assert_source_tree_clean after-post-load || FAILURE_REASONS+=(SOURCE_TREE_MODIFIED_DURING_RUN)
+  make quality-runtime-full-capability-quick-remote || record_failure post-load-quality POST_LOAD_QUALITY_FAILED FAIL
+quality_passes "$EVIDENCE_DIR/post-load-quality/runtime-quality-report.json" || record_failure post-load-quality POST_LOAD_QUALITY_FAILED FAIL
+integrity_snapshot "$EVIDENCE_DIR/post-load-quality/post-load-integrity" || record_failure post-load-integrity POST_LOAD_INTEGRITY_FAILED FAIL
+assert_source_tree_clean after-post-load || record_failure post-load SOURCE_TREE_MODIFIED_DURING_RUN EVIDENCE_FAILURE
 
 kill "$RESOURCE_PID" "$METRICS_PID" 2>/dev/null || true; wait "$RESOURCE_PID" "$METRICS_PID" 2>/dev/null || true; RESOURCE_PID=""; METRICS_PID=""
 python3 "$ROOT_DIR/scripts/finalize_macbook_load_report.py" "$EVIDENCE_DIR" "$SOURCE_GIT_SHA" "$SOURCE_BRANCH" "$SOURCE_ORIGIN_MAIN_SHA" "$EXPECTED_RELEASE_SHA" "$RECOVERY_P95_SLO_MS"

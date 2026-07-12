@@ -17,10 +17,12 @@ use crate::{
         astra_vector_runtime_server::AstraVectorRuntime,
         astra_vector_v004_control_server::AstraVectorV004Control,
     },
-    persistence::{ChunkContentRecord, ClaimResult, ParentContextRecord, Repository},
+    persistence::{
+        ChunkContentRecord, ChunkTraceRecord, ClaimResult, ParentContextRecord, Repository,
+    },
     provider::SelectedProvider,
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
-    reliability::{OperationBudget, WorkloadKind},
+    reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
     sparse::{SparseTechnicalEncoder, SparseTokenClass},
 };
@@ -816,14 +818,15 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let budget = qdrant_budget.clone();
             async move {
                 if !wants_dense {
-                    return Ok::<Option<Vec<QdrantSearchHit>>, Status>(None);
+                    return Ok::<Option<(Vec<QdrantSearchHit>, u64)>, Status>(None);
                 }
                 let Some(dense) = dense_vector.as_deref() else {
                     return Err(Status::failed_precondition(
                         "query dense embedding unavailable",
                     ));
                 };
-                qdrant
+                let branch_started = Instant::now();
+                let hits = qdrant
                     .search_dense_with_budget(
                         dense,
                         &dense_access_zone_ids,
@@ -833,8 +836,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         Some(&budget),
                     )
                     .await
-                    .map(Some)
-                    .map_err(Status::from)
+                    .map_err(Status::from)?;
+                Ok(Some((hits, branch_started.elapsed().as_millis() as u64)))
             }
         };
         let sparse_future = {
@@ -843,8 +846,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let budget = qdrant_budget.clone();
             async move {
                 if !wants_sparse {
-                    return Ok::<Option<Vec<QdrantSearchHit>>, Status>(None);
+                    return Ok::<Option<(Vec<QdrantSearchHit>, u64)>, Status>(None);
                 }
+                let branch_started = Instant::now();
                 match (sparse_indices.as_deref(), sparse_values.as_deref()) {
                     (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
                         qdrant
@@ -858,34 +862,37 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 Some(&budget),
                             )
                             .await
-                            .map(Some)
+                            .map(|hits| Some((hits, branch_started.elapsed().as_millis() as u64)))
                             .map_err(Status::from)
                     }
                     _ if sparse_required => Err(Status::failed_precondition(
                         "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
                     )),
-                    _ => Ok(Some(Vec::new())),
+                    _ => Ok(Some((
+                        Vec::new(),
+                        branch_started.elapsed().as_millis() as u64,
+                    ))),
                 }
             }
         };
         let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
         let mut dense_failed = false;
         let mut sparse_failed = false;
-        let mut dense_hits = match dense_result {
-            Ok(Some(hits)) => hits,
-            Ok(None) => Vec::new(),
+        let (mut dense_hits, dense_search_ms) = match dense_result {
+            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(None) => (Vec::new(), 0),
             Err(e) => {
                 dense_failed = true;
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "DENSE_SEARCH_FAILED".into(),
                     message: format!("Dense Qdrant search failed: {}", e.message()),
                 });
-                Vec::new()
+                (Vec::new(), 0)
             }
         };
-        let mut sparse_hits = match sparse_result {
-            Ok(Some(hits)) => hits,
-            Ok(None) => Vec::new(),
+        let (mut sparse_hits, sparse_search_ms) = match sparse_result {
+            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(None) => (Vec::new(), 0),
             Err(e) if sparse_required => return Err(e),
             Err(e) => {
                 sparse_failed = true;
@@ -893,7 +900,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     code: "SPARSE_SEARCH_FAILED".into(),
                     message: format!("Sparse Qdrant search failed: {}", e.message()),
                 });
-                Vec::new()
+                (Vec::new(), 0)
             }
         };
         dense_hits.sort_by(stable_qdrant_hit_rank);
@@ -905,6 +912,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             && sparse_branch_executed;
         let dense_branch_candidate_count = dense_hits.len() as u32;
         let sparse_branch_candidate_count = sparse_hits.len() as u32;
+        let sparse_top_score = sparse_hits.first().map(|hit| hit.score).unwrap_or(0.0);
+        let fusion_started = Instant::now();
         let hits = match search_mode {
             pb::SearchModeV005::Dense => {
                 if dense_hits.is_empty() && dense_failed {
@@ -962,6 +971,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
             }
         };
+        let fusion_ms = fusion_started.elapsed().as_millis() as u64;
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
         let fusion_candidate_count = hits.len() as u32;
         tracing::debug!(
@@ -1023,12 +1033,21 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 break;
             }
         }
-        let parent_ids: Vec<Uuid> = groups.iter().map(|((_, id), _)| *id).collect();
+        let hydration_keys = groups
+            .iter()
+            .filter_map(|((zone, parent_id), hit)| {
+                hit.payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .map(|matched_id| (*zone, matched_id, *parent_id))
+            })
+            .collect::<Vec<_>>();
         tracing::debug!(
             correlation_id = %r.correlation_id,
             raw_hits_count = hits.len(),
             parent_group_count = groups.len(),
-            parent_ids_count = parent_ids.len(),
+            parent_ids_count = hydration_keys.len(),
             "SEARCH_PARENT_GROUPS_READY"
         );
         let parent_fetch_started = std::time::Instant::now();
@@ -1047,51 +1066,36 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         })?;
         histogram!("astravector_deadline_remaining_seconds", "stage" => "postgres_parent_fetch")
             .record(remaining_ms as f64 / 1000.0);
-        let parents = self
+        let hydrated = self
             .repo()?
-            .fetch_parent_contexts_multi_with_timeout(
-                &access_zone_ids,
-                &parent_ids,
+            .fetch_hydrated_search_contexts_multi(
+                &hydration_keys,
                 caller_access_level as i16,
                 statement_timeout_ms,
             )
             .await
             .map_err(Status::from)?;
         let parent_fetch_ms = parent_fetch_started.elapsed().as_millis() as u64;
-        let fetched_parent_count = parents.len();
-        let by_parent: std::collections::HashMap<(Uuid, Uuid), ParentContextRecord> = parents
+        histogram!("astravector_parent_hydration_duration_seconds")
+            .record(parent_fetch_ms as f64 / 1000.0);
+        counter!("astravector_parent_hydration_candidates_total")
+            .increment(hydration_keys.len() as u64);
+        counter!("astravector_parent_hydration_missing_total")
+            .increment(hydration_keys.len().saturating_sub(hydrated.len()) as u64);
+        let fetched_parent_count = hydrated.len();
+        let by_candidate = hydrated
             .into_iter()
-            .map(|p| ((p.access_zone_id, p.id), p))
-            .collect();
-        let matched_chunk_keys: Vec<(Uuid, Uuid)> = groups
-            .iter()
-            .filter_map(|((zone, _), hit)| {
-                hit.payload
-                    .get("chunk_id")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|v| Uuid::parse_str(v).ok())
-                    .map(|chunk_id| (*zone, chunk_id))
+            .map(|context| {
+                (
+                    (
+                        context.access_zone_id,
+                        context.matched_chunk_id,
+                        context.parent_chunk_id,
+                    ),
+                    context,
+                )
             })
-            .collect();
-        let matched_chunk_ids: Vec<Uuid> = matched_chunk_keys.iter().map(|(_, id)| *id).collect();
-        let matched_texts = self
-            .repo()?
-            .fetch_chunk_texts_by_ids_multi(
-                &access_zone_ids,
-                &matched_chunk_ids,
-                caller_access_level as i16,
-            )
-            .await
-            .map_err(Status::from)?;
-        let matched_traces = self
-            .repo()?
-            .fetch_chunk_traces_by_ids_multi(
-                &access_zone_ids,
-                &matched_chunk_ids,
-                caller_access_level as i16,
-            )
-            .await
-            .map_err(Status::from)?;
+            .collect::<HashMap<_, _>>();
         let mut direct_results = Vec::new();
         let mut graph_results = Vec::new();
         let mut seed_scores: HashMap<(Uuid, Uuid), f32> = HashMap::new();
@@ -1109,26 +1113,41 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             if direct_results.len() >= candidate_limit as usize {
                 break;
             }
-            let Some(parent) = by_parent.get(&(*parent_zone_id, *parent_id)) else {
+            let Some(matched_id) = hit
+                .payload
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
                 continue;
             };
-            let hit_access_zone_id = *parent_zone_id;
-            let matched_text = hit
-                .payload
-                .get("chunk_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|v| Uuid::parse_str(v).ok())
-                .and_then(|id| matched_texts.get(&(hit_access_zone_id, id)).cloned())
-                .unwrap_or_else(|| parent.content.clone());
-            let matched_id = hit
-                .payload
-                .get("chunk_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|v| Uuid::parse_str(v).ok());
-            let trace = matched_id
-                .as_ref()
-                .and_then(|id| matched_traces.get(&(hit_access_zone_id, *id)));
-            let mut direct = search_result_from_hit(parent, hit, matched_text, trace);
+            let Some(context) = by_candidate.get(&(*parent_zone_id, matched_id, *parent_id)) else {
+                continue;
+            };
+            let parent = ParentContextRecord {
+                access_zone_id: context.access_zone_id,
+                id: context.parent_chunk_id,
+                document_id: context.document_id,
+                document_version: context.document_version,
+                root_chunk_id: context.root_chunk_id,
+                source_chunk_id: context.source_chunk_id,
+                access_level: context.access_level,
+                content: context.parent_text.clone(),
+                content_hash: context.parent_content_hash.clone(),
+                token_count: context.parent_token_count,
+                sequence_no: context.parent_sequence_no,
+                source_block_id: context.source_block_id.clone(),
+                metadata: context.parent_metadata.clone(),
+            };
+            let trace = ChunkTraceRecord {
+                id: context.matched_chunk_id,
+                source_block_id: context.source_block_id.clone(),
+                source_location: context.source_location.clone(),
+                source_links: context.source_links.clone(),
+                metadata: context.metadata.clone(),
+            };
+            let mut direct =
+                search_result_from_hit(&parent, hit, context.matched_text.clone(), Some(&trace));
             if let Some(citation) = direct.citation.as_mut() {
                 citation
                     .metadata
@@ -1147,127 +1166,163 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             direct_results.push(direct);
         }
         let quality_run_id_filter = search_quality_run_id_filter(&r.filters);
-        if matches!(
-            search_mode,
-            pb::SearchModeV005::Sparse | pb::SearchModeV005::Hybrid
-        ) {
-            let lexical_candidates = self
-                .repo()?
-                .fetch_active_parent_context_candidates_multi(
-                    &access_zone_ids,
-                    caller_access_level as i16,
-                    quality_run_id_filter.as_deref(),
-                    self.cfg
-                        .limits
-                        .search_candidate_limit_max
-                        .max(candidate_limit) as i64,
-                )
-                .await
-                .map_err(Status::from)?;
-            let parents_by_document = lexical_candidates.iter().fold(
-                HashMap::<(Uuid, Uuid), Vec<&ParentContextRecord>>::new(),
-                |mut acc, parent| {
-                    acc.entry((parent.access_zone_id, parent.document_id))
-                        .or_default()
-                        .push(parent);
-                    acc
-                },
-            );
-            let mut direct_result_index_by_key = direct_results
-                .iter()
-                .enumerate()
-                .map(|(idx, result)| (result_identity_key(result), idx))
-                .collect::<HashMap<_, _>>();
-            let query_terms = query_term_count(query);
-            let mut lexical_results = Vec::new();
-            let mut sibling_seed_scores = HashMap::<(Uuid, Uuid), f32>::new();
-            if self.cfg.graph_rag.rerank.mmr_enabled {
-                for result in &direct_results {
-                    let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
-                        continue;
-                    };
-                    let Ok(document_id) = Uuid::parse_str(&result.document_id) else {
-                        continue;
-                    };
-                    sibling_seed_scores
-                        .entry((access_zone_id, document_id))
-                        .and_modify(|existing| *existing = existing.max(score_of(result)))
-                        .or_insert_with(|| score_of(result));
-                }
-            }
-            for parent in &lexical_candidates {
-                let lexical = search_result_from_lexical_parent(parent, query);
-                let score = lexical
-                    .scores
-                    .as_ref()
-                    .map(|scores| scores.final_score)
-                    .unwrap_or(0.0);
-                let exact_phrase_match = score >= 0.999;
-                let matched_terms = matched_term_count(&lexical, query);
-                let matched_discriminating_terms =
-                    matched_discriminating_term_count(&lexical, query);
-                let leading_discriminating_match =
-                    leading_discriminating_query_term_matches(&lexical, query);
-                let strong_coverage =
-                    query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
-                let strict_lexical_evidence = exact_phrase_match
-                    || (matched_terms >= 2
-                        && matched_discriminating_terms >= 1
-                        && leading_discriminating_match
-                        && strong_coverage);
-                let document_overview_seed = self.cfg.graph_rag.rerank.mmr_enabled
-                    && parent.source_block_id.as_deref() == Some("doc-root")
-                    && matched_terms >= 2
-                    && matched_discriminating_terms >= 1;
-                if !(strict_lexical_evidence || document_overview_seed) {
-                    continue;
-                }
-                let document_key = (parent.access_zone_id, parent.document_id);
-                sibling_seed_scores
-                    .entry(document_key)
-                    .and_modify(|existing| *existing = existing.max(score))
-                    .or_insert(score);
-                lexical_results.push((
-                    lexical,
-                    score,
-                    matched_discriminating_terms,
-                    matched_terms,
-                    leading_discriminating_match,
-                ));
-            }
-            if self.cfg.graph_rag.rerank.mmr_enabled {
-                for (document_key, seed_score) in sibling_seed_scores {
-                    let Some(parents) = parents_by_document.get(&document_key) else {
-                        continue;
-                    };
-                    for parent in parents {
-                        if parent.source_block_id.as_deref() == Some("doc-root") {
+        let mut lexical_search_ms = 0_u64;
+        let mut lexical_candidate_count = 0_u32;
+        if self.cfg.search.lexical.enabled
+            && matches!(
+                search_mode,
+                pb::SearchModeV005::Sparse | pb::SearchModeV005::Hybrid
+            )
+        {
+            let lexical_remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            if lexical_remaining_ms < self.cfg.search.lexical.min_remaining_budget_ms {
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "LEXICAL_SKIPPED_INSUFFICIENT_BUDGET".into(),
+                    message:
+                        "indexed lexical retrieval skipped because request budget is insufficient"
+                            .into(),
+                });
+                counter!("astravector_optional_stage_skipped_total", "stage" => "lexical", "reason" => "insufficient_budget").increment(1);
+            } else {
+                let lexical_started = Instant::now();
+                let lexical_limit = self
+                    .cfg
+                    .search
+                    .lexical
+                    .candidate_limit
+                    .min(self.cfg.search.lexical.max_candidate_limit)
+                    .min(self.cfg.limits.search_candidate_limit_max)
+                    .max(candidate_limit) as i64;
+                let lexical_timeout_ms = self
+                    .cfg
+                    .search
+                    .lexical
+                    .statement_timeout_ms
+                    .min(lexical_remaining_ms);
+                let lexical_candidates = self
+                    .repo()?
+                    .search_active_parent_contexts_lexical_multi(
+                        &access_zone_ids,
+                        caller_access_level as i16,
+                        query,
+                        quality_run_id_filter.as_deref(),
+                        lexical_limit,
+                        lexical_timeout_ms,
+                    )
+                    .await
+                    .map_err(Status::from)?;
+                lexical_search_ms = lexical_started.elapsed().as_millis() as u64;
+                lexical_candidate_count = lexical_candidates.len() as u32;
+                metrics::histogram!("astravector_lexical_search_duration_seconds")
+                    .record(lexical_started.elapsed().as_secs_f64());
+                counter!("astravector_lexical_search_total", "backend" => "POSTGRES_FTS")
+                    .increment(1);
+                counter!("astravector_lexical_candidates_total")
+                    .increment(lexical_candidates.len() as u64);
+                let parents_by_document = lexical_candidates.iter().fold(
+                    HashMap::<(Uuid, Uuid), Vec<&ParentContextRecord>>::new(),
+                    |mut acc, candidate| {
+                        let parent = &candidate.parent;
+                        acc.entry((parent.access_zone_id, parent.document_id))
+                            .or_default()
+                            .push(parent);
+                        acc
+                    },
+                );
+                let mut direct_result_index_by_key = direct_results
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, result)| (result_identity_key(result), idx))
+                    .collect::<HashMap<_, _>>();
+                let query_terms = query_term_count(query);
+                let mut lexical_results = Vec::new();
+                let mut sibling_seed_scores = HashMap::<(Uuid, Uuid), f32>::new();
+                if self.cfg.graph_rag.rerank.mmr_enabled {
+                    for result in &direct_results {
+                        let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
                             continue;
-                        }
-                        let mut lexical = search_result_from_lexical_parent(parent, query);
-                        let sibling_score =
-                            (seed_score * 0.8 + sibling_sequence_bonus(parent)).clamp(0.12, 1.0);
-                        if let Some(scores) = lexical.scores.as_mut() {
-                            scores.sparse_score = scores.sparse_score.max(sibling_score);
-                            scores.fusion_score = scores.fusion_score.max(sibling_score);
-                            scores.final_score = scores.final_score.max(sibling_score);
-                        }
-                        let matched_terms = matched_term_count(&lexical, query);
-                        let matched_discriminating_terms =
-                            matched_discriminating_term_count(&lexical, query);
-                        let leading_discriminating_match =
-                            leading_discriminating_query_term_matches(&lexical, query);
-                        lexical_results.push((
-                            lexical,
-                            sibling_score,
-                            matched_discriminating_terms,
-                            matched_terms,
-                            leading_discriminating_match,
-                        ));
+                        };
+                        let Ok(document_id) = Uuid::parse_str(&result.document_id) else {
+                            continue;
+                        };
+                        sibling_seed_scores
+                            .entry((access_zone_id, document_id))
+                            .and_modify(|existing| *existing = existing.max(score_of(result)))
+                            .or_insert_with(|| score_of(result));
                     }
                 }
-            }
-            lexical_results.sort_by(
+                for candidate in &lexical_candidates {
+                    let parent = &candidate.parent;
+                    let lexical = search_result_from_lexical_parent(parent, query);
+                    let score = candidate.lexical_score;
+                    let exact_phrase_match = candidate.exact_match;
+                    let matched_terms = matched_term_count(&lexical, query);
+                    let matched_discriminating_terms =
+                        matched_discriminating_term_count(&lexical, query);
+                    let leading_discriminating_match =
+                        leading_discriminating_query_term_matches(&lexical, query);
+                    let strong_coverage =
+                        query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
+                    let strict_lexical_evidence = exact_phrase_match
+                        || (matched_terms >= 2
+                            && matched_discriminating_terms >= 1
+                            && leading_discriminating_match
+                            && strong_coverage);
+                    let document_overview_seed = self.cfg.graph_rag.rerank.mmr_enabled
+                        && parent.source_block_id.as_deref() == Some("doc-root")
+                        && matched_terms >= 2
+                        && matched_discriminating_terms >= 1;
+                    if !(strict_lexical_evidence || document_overview_seed) {
+                        continue;
+                    }
+                    let document_key = (parent.access_zone_id, parent.document_id);
+                    sibling_seed_scores
+                        .entry(document_key)
+                        .and_modify(|existing| *existing = existing.max(score))
+                        .or_insert(score);
+                    lexical_results.push((
+                        lexical,
+                        score,
+                        matched_discriminating_terms,
+                        matched_terms,
+                        leading_discriminating_match,
+                    ));
+                }
+                if self.cfg.graph_rag.rerank.mmr_enabled {
+                    for (document_key, seed_score) in sibling_seed_scores {
+                        let Some(parents) = parents_by_document.get(&document_key) else {
+                            continue;
+                        };
+                        for parent in parents {
+                            if parent.source_block_id.as_deref() == Some("doc-root") {
+                                continue;
+                            }
+                            let mut lexical = search_result_from_lexical_parent(parent, query);
+                            let sibling_score = (seed_score * 0.8 + sibling_sequence_bonus(parent))
+                                .clamp(0.12, 1.0);
+                            if let Some(scores) = lexical.scores.as_mut() {
+                                scores.sparse_score = scores.sparse_score.max(sibling_score);
+                                scores.fusion_score = scores.fusion_score.max(sibling_score);
+                                scores.final_score = scores.final_score.max(sibling_score);
+                            }
+                            let matched_terms = matched_term_count(&lexical, query);
+                            let matched_discriminating_terms =
+                                matched_discriminating_term_count(&lexical, query);
+                            let leading_discriminating_match =
+                                leading_discriminating_query_term_matches(&lexical, query);
+                            lexical_results.push((
+                                lexical,
+                                sibling_score,
+                                matched_discriminating_terms,
+                                matched_terms,
+                                leading_discriminating_match,
+                            ));
+                        }
+                    }
+                }
+                lexical_results.sort_by(
                 |(_, left_score, left_discriminating, left_terms, left_leading),
                  (_, right_score, right_discriminating, right_terms, right_leading)| {
                     right_score
@@ -1278,17 +1333,41 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         .then_with(|| right_leading.cmp(left_leading))
                 },
             );
-            let lexical_take_limit = (candidate_limit as usize)
-                .saturating_mul(3)
-                .max(candidate_limit as usize)
-                .min(self.cfg.limits.search_candidate_limit_max as usize);
-            for (lexical, _, _, _, _) in lexical_results.into_iter().take(lexical_take_limit) {
-                let key = result_identity_key(&lexical);
-                if let Some(idx) = direct_result_index_by_key.get(&key).copied() {
-                    merge_lexical_backfill_candidate(&mut direct_results[idx], &lexical);
-                } else {
-                    direct_result_index_by_key.insert(key, direct_results.len());
-                    direct_results.push(lexical);
+                let lexical_take_limit = (candidate_limit as usize)
+                    .saturating_mul(3)
+                    .max(candidate_limit as usize)
+                    .min(self.cfg.limits.search_candidate_limit_max as usize);
+                for (rank, (mut lexical, lexical_score, _, _, _)) in lexical_results
+                    .into_iter()
+                    .take(lexical_take_limit)
+                    .enumerate()
+                {
+                    apply_indexed_lexical_rank_score(
+                        &mut lexical,
+                        lexical_score,
+                        rank + 1,
+                        self.cfg.search.lexical.lexical_weight,
+                        self.cfg.search.rrf_k,
+                    );
+                    let key = result_identity_key(&lexical);
+                    if let Some(idx) = direct_result_index_by_key.get(&key).copied() {
+                        merge_lexical_backfill_candidate(&mut direct_results[idx], &lexical);
+                    } else {
+                        direct_result_index_by_key.insert(key, direct_results.len());
+                        direct_results.push(lexical);
+                    }
+                }
+                if sparse_branch_candidate_count
+                    < self.cfg.search.lexical.run_when_sparse_candidates_below as u32
+                    || sparse_top_score < self.cfg.search.lexical.run_when_sparse_top_score_below
+                {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LEXICAL_FALLBACK_USED".into(),
+                        message:
+                            "indexed lexical retrieval supplemented a weak sparse candidate set"
+                                .into(),
+                    });
+                    counter!("astravector_lexical_fallback_total").increment(1);
                 }
             }
         }
@@ -1310,6 +1389,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let preserve_partial_evidence_for_mmr = self.cfg.graph_rag.rerank.mmr_enabled;
         let skip_pre_mmr_no_answer_for_graph =
             r.enable_graph_expansion && self.cfg.graph_rag.enabled;
+        let pre_mmr_no_answer_started = Instant::now();
         if !skip_pre_mmr_no_answer_for_graph {
             no_answer_stats.pre_mmr_filtered_count = apply_pre_mmr_no_answer_filter(
                 &mut direct_results,
@@ -1332,6 +1412,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 ),
             });
         }
+        let pre_mmr_no_answer_ms = pre_mmr_no_answer_started.elapsed().as_millis() as u64;
         let mut graph_expansion_duration_ms = 0_u64;
         let mut graph_candidates_by_relation: HashMap<String, usize> = HashMap::new();
         let mut graph_seed_candidates = Vec::new();
@@ -1342,15 +1423,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
                 continue;
             };
-            let Ok(matched_chunk_id) = Uuid::parse_str(&result.matched_chunk_id) else {
+            let Some(seed_chunk_id) = graph_seed_chunk_id(result) else {
                 continue;
             };
-            let key = (access_zone_id, matched_chunk_id);
-            let seed_score = result
-                .scores
-                .as_ref()
-                .map(|scores| scores.final_score.max(scores.fusion_score))
-                .unwrap_or(0.5);
+            let key = (access_zone_id, seed_chunk_id);
+            let seed_score = graph_seed_score(result);
             let matched_terms = matched_term_count(result, query);
             let matched_discriminating_terms = matched_discriminating_term_count(result, query);
             let strong_lexical_evidence = matched_terms >= 2
@@ -1374,7 +1451,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             graph_seed_preview_by_key.entry(key).or_insert_with(|| {
                 format!(
                     "{}:{}:{:.3}:{}",
-                    matched_chunk_id,
+                    seed_chunk_id,
                     source_block_id,
                     seed_score,
                     extraction_retrieval_sources(result).join("+")
@@ -1394,7 +1471,33 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .filter_map(|candidate| graph_seed_preview_by_key.get(&candidate.key).cloned())
             .collect::<Vec<_>>()
             .join(",");
-        if r.enable_graph_expansion && self.cfg.graph_rag.enabled && !graph_seed_keys.is_empty() {
+        let remaining_budget_before_graph_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        let graph_stage_budget = resolve_optional_stage_budget(
+            deadline,
+            Duration::from_millis(self.cfg.graph_rag.retrieval.timeout_ms),
+            Duration::from_millis(self.cfg.graph_rag.retrieval.min_useful_budget_ms),
+            Duration::from_millis(self.cfg.graph_rag.retrieval.response_reserve_ms),
+        );
+        let graph_timeout = graph_stage_budget.unwrap_or_default();
+        if r.enable_graph_expansion
+            && self.cfg.graph_rag.enabled
+            && !graph_seed_keys.is_empty()
+            && graph_stage_budget.is_none()
+        {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "GRAPH_SKIPPED_INSUFFICIENT_BUDGET".into(),
+                message: "Graph expansion skipped to preserve the response deadline reserve".into(),
+            });
+            counter!("astravector_degraded_path_total", "component" => "graph", "reason" => "insufficient_budget").increment(1);
+            counter!("astravector_optional_stage_skipped_total", "stage" => "graph", "reason" => "insufficient_budget").increment(1);
+        }
+        if r.enable_graph_expansion
+            && self.cfg.graph_rag.enabled
+            && !graph_seed_keys.is_empty()
+            && graph_stage_budget.is_some()
+        {
             let maybe_graph_permit = Self::acquire_backpressure_permit(
                 self.graph_expansion_semaphore.clone(),
                 self.cfg.limits.backpressure_acquire_timeout_ms,
@@ -1430,7 +1533,6 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         as f64,
                 );
                 let graph_expansion_started = std::time::Instant::now();
-                let graph_timeout = Duration::from_millis(self.cfg.graph_rag.retrieval.timeout_ms);
                 let max_related = if r.graph_max_related_contexts == 0 {
                     self.cfg
                         .graph_rag
@@ -1725,13 +1827,38 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .rerank
             .mmr_candidate_limit
             .max(final_limit);
-        let maybe_mmr_permit = Self::acquire_backpressure_permit(
+        let remaining_budget_before_mmr_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        let mmr_stage_budget = resolve_optional_stage_budget(
+            deadline,
+            Duration::from_millis(self.cfg.graph_rag.rerank.embedding_fetch_timeout_ms),
+            Duration::from_millis(
+                self.cfg
+                    .graph_rag
+                    .rerank
+                    .embedding_fetch_min_useful_budget_ms,
+            ),
+            Duration::from_millis(self.cfg.graph_rag.rerank.response_reserve_ms),
+        );
+        let mmr_fetch_timeout = mmr_stage_budget.unwrap_or_default();
+        let embedding_fetch_stats = if mmr_stage_budget.is_none() {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "MMR_EMBEDDING_FETCH_SKIPPED_INSUFFICIENT_BUDGET".into(),
+                message:
+                    "MMR embedding hydration skipped to preserve the response deadline reserve"
+                        .into(),
+            });
+            counter!("astravector_degraded_path_total", "component" => "mmr", "reason" => "insufficient_budget").increment(1);
+            counter!("astravector_optional_stage_skipped_total", "stage" => "mmr_embedding_fetch", "reason" => "insufficient_budget").increment(1);
+            MmrEmbeddingFetchStats::skipped()
+        } else if let Ok(_mmr_permit) = Self::acquire_backpressure_permit(
             self.mmr_fetch_semaphore.clone(),
             self.cfg.limits.backpressure_acquire_timeout_ms,
             "mmr_fetch",
         )
-        .await;
-        let embedding_fetch_stats = if let Ok(_mmr_permit) = maybe_mmr_permit {
+        .await
+        {
             gauge!("mmr_fetch_concurrent_active").set(
                 (self
                     .cfg
@@ -1747,6 +1874,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 &mut graph_results,
                 &self.cfg,
                 embedding_fetch_limit,
+                mmr_fetch_timeout,
             )
             .await
         } else {
@@ -1808,6 +1936,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let final_graph_evidence_present =
             r.enable_graph_expansion && has_graph_expanded_evidence(&results);
+        let post_mmr_no_answer_started = Instant::now();
         if !final_graph_evidence_present
             && final_no_answer_should_trigger(
                 &results,
@@ -1830,10 +1959,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             });
             results.clear();
         }
+        let post_mmr_no_answer_ms = post_mmr_no_answer_started.elapsed().as_millis() as u64;
         let token_budget_before =
             estimate_results_tokens(&results, self.cfg.rag_context.chars_per_token);
+        let token_budget_started = Instant::now();
         let (dropped_chunk_ids, token_budget_warning_codes, dropped_chunk_count) =
             apply_token_budget_truncation(&mut results, &self.cfg);
+        let token_budget_ms = token_budget_started.elapsed().as_millis() as u64;
         for code in &token_budget_warning_codes {
             warnings.push(pb::DiagnosticWarningV005 {
                 code: code.clone(),
@@ -1846,6 +1978,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             counter!("rag_context_token_budget_applied_total").increment(1);
             counter!("rag_context_chunks_dropped_total").increment(dropped_chunk_count as u64);
         }
+        let visibility_recheck_started = Instant::now();
         let final_visibility_ids = results
             .iter()
             .filter_map(|r| Uuid::parse_str(&r.matched_chunk_id).ok())
@@ -1883,6 +2016,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 });
             }
         }
+        let visibility_recheck_ms = visibility_recheck_started.elapsed().as_millis() as u64;
         strip_internal_embedding_metadata(&mut results);
         let final_results_count = results.len();
         counter!("retrieved_contexts_total").increment(final_results_count as u64);
@@ -1937,7 +2071,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 parent_fetch_ms,
                 total_ms: started.elapsed().as_millis() as u64,
                 candidate_count: hits.len() as u32,
-                parent_group_count: by_parent.len() as u32,
+                parent_group_count: fetched_parent_count as u32,
                 direct_candidates_count: direct_count as u32,
                 graph_candidates_count: graph_count as u32,
                 merged_candidates_count: selection_result.merged_count as u32,
@@ -2009,6 +2143,24 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 dense_branch_candidate_count,
                 sparse_branch_candidate_count,
                 fusion_candidate_count,
+                dense_search_ms,
+                sparse_search_ms,
+                lexical_search_ms,
+                fusion_ms,
+                postgres_hydration_ms: parent_fetch_ms,
+                pre_mmr_no_answer_ms,
+                graph_ms: graph_expansion_duration_ms,
+                mmr_embedding_fetch_ms: embedding_fetch_stats.duration_ms,
+                mmr_selection_ms: mmr_result.duration_ms,
+                post_mmr_no_answer_ms,
+                token_budget_ms,
+                visibility_recheck_ms,
+                lexical_candidate_count,
+                fused_candidate_count: fusion_candidate_count,
+                hydrated_candidate_count: fetched_parent_count as u32,
+                final_candidate_count: final_results_count as u32,
+                remaining_budget_before_graph_ms,
+                remaining_budget_before_mmr_ms,
             }),
             warnings,
         }))
@@ -2830,6 +2982,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 dense_branch_candidate_count: dense_hits.len() as u32,
                 sparse_branch_candidate_count: sparse_hits.len() as u32,
                 fusion_candidate_count: fused.len() as u32,
+                ..Default::default()
             }),
         }))
     }
@@ -7415,6 +7568,7 @@ async fn enrich_dense_embeddings_for_mmr(
     graph_results: &mut [pb::SearchResultV004],
     cfg: &AppConfig,
     enrichment_limit: usize,
+    fetch_timeout: Duration,
 ) -> MmrEmbeddingFetchStats {
     let started = std::time::Instant::now();
     let mut stats = MmrEmbeddingFetchStats::default();
@@ -7511,12 +7665,7 @@ async fn enrich_dense_embeddings_for_mmr(
                 &point_ids_to_fetch,
                 &cfg.graph_rag.rerank.embedding_dense_representation_name,
             );
-            match tokio::time::timeout(
-                Duration::from_millis(cfg.graph_rag.rerank.embedding_fetch_timeout_ms),
-                fetch,
-            )
-            .await
-            {
+            match tokio::time::timeout(fetch_timeout, fetch).await {
                 Ok(Ok(fetched)) => {
                     stats.found += fetched.len();
                     metrics::counter!("graph_mmr_embedding_fetch_found_total")
@@ -7569,12 +7718,7 @@ async fn enrich_dense_embeddings_for_mmr(
                 &cfg.graph_rag.rerank.embedding_dense_representation_name,
                 Some(cfg.dense.version.as_str()),
             );
-            match tokio::time::timeout(
-                Duration::from_millis(cfg.graph_rag.rerank.embedding_fetch_timeout_ms),
-                fetch,
-            )
-            .await
-            {
+            match tokio::time::timeout(fetch_timeout, fetch).await {
                 Ok(Ok(fetched)) => {
                     stats.found += fetched.len();
                     metrics::counter!("graph_mmr_embedding_fetch_found_total")
@@ -8620,26 +8764,16 @@ fn merge_lexical_backfill_candidate(
     primary: &mut pb::SearchResultV004,
     lexical: &pb::SearchResultV004,
 ) {
-    let primary_score = score_of(primary);
-    let lexical_score = score_of(lexical);
     merge_secondary_metadata(primary, lexical);
     match (primary.scores.as_mut(), lexical.scores.as_ref()) {
         (Some(primary_scores), Some(lexical_scores)) => {
-            primary_scores.sparse_score =
-                primary_scores.sparse_score.max(lexical_scores.sparse_score);
-            primary_scores.fusion_score =
-                primary_scores.fusion_score.max(lexical_scores.fusion_score);
-            primary_scores.final_score = primary_scores.final_score.max(lexical_scores.final_score);
+            primary_scores.fusion_score += lexical_scores.fusion_score;
+            primary_scores.final_score = primary_scores.fusion_score;
         }
         (None, Some(lexical_scores)) => {
             primary.scores = Some(*lexical_scores);
         }
         _ => {}
-    }
-    if lexical_score > primary_score {
-        primary.matched_text = lexical.matched_text.clone();
-        primary.parent_text = lexical.parent_text.clone();
-        primary.matched_granularity = lexical.matched_granularity;
     }
     if let (Some(primary_citation), Some(lexical_citation)) =
         (primary.citation.as_mut(), lexical.citation.as_ref())
@@ -8654,6 +8788,33 @@ fn merge_lexical_backfill_candidate(
                 }
             }
         }
+    }
+}
+
+fn apply_indexed_lexical_rank_score(
+    result: &mut pb::SearchResultV004,
+    lexical_score: f32,
+    lexical_rank: usize,
+    lexical_weight: f32,
+    rrf_k: f32,
+) {
+    let contribution = lexical_weight.max(0.0) / (rrf_k.max(1.0) + lexical_rank as f32);
+    if let Some(scores) = result.scores.as_mut() {
+        scores.dense_score = 0.0;
+        scores.sparse_score = 0.0;
+        scores.fusion_score = contribution;
+        scores.final_score = contribution;
+    }
+    if let Some(citation) = result.citation.as_mut() {
+        citation
+            .metadata
+            .insert("lexical_rank".into(), lexical_rank.to_string());
+        citation
+            .metadata
+            .insert("lexical_score".into(), lexical_score.to_string());
+        citation
+            .metadata
+            .insert("lexical_backend".into(), "POSTGRES_FTS".into());
     }
 }
 
@@ -8777,6 +8938,27 @@ fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
 
 fn score_of(result: &pb::SearchResultV004) -> f32 {
     result.scores.as_ref().map(|s| s.final_score).unwrap_or(0.0)
+}
+
+fn graph_seed_chunk_id(result: &pb::SearchResultV004) -> Option<Uuid> {
+    Uuid::parse_str(&result.parent_chunk_id)
+        .ok()
+        .or_else(|| Uuid::parse_str(&result.matched_chunk_id).ok())
+}
+
+fn graph_seed_score(result: &pb::SearchResultV004) -> f32 {
+    result
+        .scores
+        .as_ref()
+        .map(|scores| {
+            let branch_score = scores.dense_score.max(scores.sparse_score);
+            if branch_score.is_finite() && branch_score > 0.0 {
+                branch_score.clamp(0.0, 1.0)
+            } else {
+                scores.final_score.max(scores.fusion_score).clamp(0.0, 1.0)
+            }
+        })
+        .unwrap_or(0.5)
 }
 
 #[derive(Debug, Clone)]
@@ -9932,11 +10114,8 @@ fn search_result_from_lexical_parent(
                 .collect()
         })
         .unwrap_or_default();
-    metadata.insert("retrieval_source".into(), "LEXICAL_PARENT_BACKFILL".into());
-    metadata.insert(
-        "retrieval_sources".into(),
-        "[\"LEXICAL_PARENT_BACKFILL\"]".into(),
-    );
+    metadata.insert("retrieval_source".into(), "POSTGRES_FTS".into());
+    metadata.insert("retrieval_sources".into(), "[\"POSTGRES_FTS\"]".into());
     metadata.insert("chunk_granularity".into(), "PARENT".into());
     metadata.insert("representation_type".into(), "ORIGINAL".into());
     metadata.insert("sequence_no".into(), parent.sequence_no.to_string());
@@ -10569,6 +10748,43 @@ mod v007_fix1_tests {
     }
 
     #[test]
+    fn graph_seed_prefers_parent_chunk_identity() {
+        let parent = Uuid::from_u128(10);
+        let matched_subchunk = Uuid::from_u128(20);
+        let result = pb::SearchResultV004 {
+            parent_chunk_id: parent.to_string(),
+            matched_chunk_id: matched_subchunk.to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(graph_seed_chunk_id(&result), Some(parent));
+
+        let result_without_parent = pb::SearchResultV004 {
+            matched_chunk_id: matched_subchunk.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            graph_seed_chunk_id(&result_without_parent),
+            Some(matched_subchunk)
+        );
+    }
+
+    #[test]
+    fn graph_seed_score_uses_branch_relevance_instead_of_rrf_scale() {
+        let result = pb::SearchResultV004 {
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: 0.72,
+                sparse_score: 0.31,
+                fusion_score: 0.016,
+                final_score: 0.016,
+            }),
+            ..Default::default()
+        };
+
+        assert!((graph_seed_score(&result) - 0.72).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn graph_append_preserves_direct_seed_provenance_without_mmr() {
         let mut seed = test_result("seed-parent", "direct relation seed evidence", 0.4);
         seed.citation
@@ -10654,7 +10870,7 @@ mod v007_fix1_tests {
     }
 
     #[test]
-    fn lexical_backfill_upgrades_duplicate_vector_candidate() {
+    fn lexical_rrf_fusion_is_deterministic() {
         let mut direct = test_result(
             "recon-001",
             "Qdrant drift is repaired by reconciliation.",
@@ -10683,11 +10899,13 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("retrieval_source".into(), "LEXICAL_PARENT_BACKFILL".into());
-        lexical.citation.as_mut().unwrap().metadata.insert(
-            "retrieval_sources".into(),
-            "[\"LEXICAL_PARENT_BACKFILL\"]".into(),
-        );
+            .insert("retrieval_source".into(), "POSTGRES_FTS".into());
+        lexical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"POSTGRES_FTS\"]".into());
         lexical
             .citation
             .as_mut()
@@ -10695,14 +10913,19 @@ mod v007_fix1_tests {
             .metadata
             .insert("source_block_id".into(), "recon-001".into());
 
+        apply_indexed_lexical_rank_score(&mut lexical, 42.0, 1, 0.2, 60.0);
+        let lexical_contribution = lexical.scores.as_ref().unwrap().fusion_score;
+        let direct_fusion = direct.scores.as_ref().unwrap().fusion_score;
         merge_lexical_backfill_candidate(&mut direct, &lexical);
 
-        assert_eq!(direct.scores.as_ref().unwrap().final_score, 1.0);
+        assert_eq!(
+            direct.scores.as_ref().unwrap().final_score,
+            direct_fusion + lexical_contribution
+        );
+        assert_ne!(direct.scores.as_ref().unwrap().final_score, 42.0);
         let sources = extraction_retrieval_sources(&direct);
         assert!(sources.iter().any(|source| source == "VECTOR_DIRECT"));
-        assert!(sources
-            .iter()
-            .any(|source| source == "LEXICAL_PARENT_BACKFILL"));
+        assert!(sources.iter().any(|source| source == "POSTGRES_FTS"));
         assert_eq!(
             direct
                 .citation

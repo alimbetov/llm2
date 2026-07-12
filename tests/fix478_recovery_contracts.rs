@@ -60,9 +60,10 @@ fn load_gate_blocks_dirty_tree_before_evidence_creation() {
 }
 
 #[test]
-fn recovery_gate_uses_ceil_windows_and_ttr() {
+fn recovery_gate_uses_fix480_floor_soak_and_ttr() {
     let script = read("scripts/macbook-model-backed-load.sh");
-    assert!(script.contains("(stable_rps * 65 + 99) / 100"));
+    assert!(script.contains("stable_rps * 65 / 100"));
+    assert!(script.contains("soak_rps < 2"));
     assert!(script.contains("window-$(printf '%03d'"));
     assert!(script.contains("consecutive_healthy >= 3"));
     let report = read("scripts/finalize_macbook_load_report.py");

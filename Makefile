@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -189,6 +189,27 @@ quality-runtime-full-capability-quick-remote:
 	ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
 	cargo test --test quality_bench_runtime_quick -- --nocapture
 
+quality-runtime-tuning-remote:
+	ASTRAVECTOR_QUALITY_ENDPOINT=$${ASTRAVECTOR_QUALITY_ENDPOINT:-http://localhost:50051} \
+	ASTRAVECTOR_QUALITY_RUN_ID=$${ASTRAVECTOR_QUALITY_RUN_ID:-fix480-tuning-$$(date +%Y%m%d-%H%M%S)} \
+	ASTRAVECTOR_QUALITY_PROFILE=tuning ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
+	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true \
+	cargo test --test quality_bench_runtime_quick -- --nocapture
+
+quality-runtime-validation-remote:
+	ASTRAVECTOR_QUALITY_ENDPOINT=$${ASTRAVECTOR_QUALITY_ENDPOINT:-http://localhost:50051} \
+	ASTRAVECTOR_QUALITY_RUN_ID=$${ASTRAVECTOR_QUALITY_RUN_ID:-fix480-validation-$$(date +%Y%m%d-%H%M%S)} \
+	ASTRAVECTOR_QUALITY_PROFILE=validation ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
+	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true \
+	cargo test --test quality_bench_runtime_quick -- --nocapture
+
+quality-runtime-holdout-remote:
+	ASTRAVECTOR_QUALITY_ENDPOINT=$${ASTRAVECTOR_QUALITY_ENDPOINT:-http://localhost:50051} \
+	ASTRAVECTOR_QUALITY_RUN_ID=$${ASTRAVECTOR_QUALITY_RUN_ID:-fix480-holdout-$$(date +%Y%m%d-%H%M%S)} \
+	ASTRAVECTOR_QUALITY_PROFILE=holdout ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
+	ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true \
+	cargo test --test quality_bench_runtime_quick -- --nocapture
+
 quality-system-smoke-remote:
 	./scripts/quality-system-smoke.sh $${SYSTEM_SMOKE_ARGS:---external-runtime}
 
@@ -225,6 +246,15 @@ production-recovery-gate-m2:
 
 production-recovery-gate-m2-repeatability:
 	./scripts/run_fix478_repeatability_gate.sh
+
+production-search-gate-m2:
+	ASTRAVECTOR_PROFILE=search-production-candidate LOAD_RUN_ID=$${LOAD_RUN_ID:-fix480-$$(git rev-parse --short=7 HEAD)-run-1} ./scripts/macbook-model-backed-load.sh
+
+production-search-gate-m2-repeatability:
+	./scripts/run_fix480_repeatability_gate.sh
+
+verify-fix480: fmt clippy check test sqlx-prepare test-e2e quality-fixtures-enriched
+	cargo test --features integration-tests --test lexical_retrieval_integration -- --nocapture
 
 verify-fix467: fmt clippy check test quality-fixtures quality-quick
 

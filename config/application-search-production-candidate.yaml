@@ -1,0 +1,20 @@
+grpc:
+  deadlines:
+    query_ms: 1000
+
+batching:
+  query:
+    max_wait_ms: 3
+    max_items: 16
+    max_padded_tokens: 4096
+    queue_capacity: 64
+    max_queue_age_ms: 200
+    min_inference_budget_ms: 300
+    max_deadline_skew_ms: 200
+
+limits:
+  max_concurrent_retrieve_context: 16
+  max_concurrent_qdrant_search: 24
+  max_concurrent_graph_expansion: 4
+  max_concurrent_mmr_fetch: 8
+  backpressure_acquire_timeout_ms: 20

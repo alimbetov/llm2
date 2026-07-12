@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0",
+  "name": "tuning",
+  "description": "fix480 threshold-development split; never used as release evidence alone",
+  "corpora": ["synthetic-mini", "access-zone-mini", "graph-rag-mini", "mmr-diversity-mini", "technical-mini", "sparse-technical-mini", "distractor-mini", "legal-mini", "long-doc-mini"],
+  "queries": ["fix480-tuning"],
+  "thresholds": {"recall_at_5": 0.95, "recall_at_20": 0.98, "mrr_at_10": 0.90, "ndcg_at_10": 0.90, "precision_at_5": 0.90, "graph_expected_related_hit_rate": 1.0, "cross_zone_leakage_count": 0, "access_level_violation_count": 0, "hard_negative_false_positive_rate": 0.0, "p95_retrieve_context_ms": 1000, "outbox_dead_letter_count": 0, "qdrant_missing_points": 0}
+}

@@ -402,6 +402,10 @@ pub struct GraphRagRetrievalConfig {
     #[serde(default = "default_max_graph_relations_debug_per_candidate")]
     pub max_graph_relations_debug_per_candidate: usize,
     pub timeout_ms: u64,
+    #[serde(default = "default_graph_min_useful_budget_ms")]
+    pub min_useful_budget_ms: u64,
+    #[serde(default = "default_graph_response_reserve_ms")]
+    pub response_reserve_ms: u64,
     pub allow_partial_dense_sparse_fallback: bool,
     pub allowed_relations: Vec<String>,
 }
@@ -474,6 +478,10 @@ pub struct GraphRagRerankConfig {
     pub embedding_fetch_enabled: bool,
     #[serde(default = "default_embedding_fetch_timeout_ms")]
     pub embedding_fetch_timeout_ms: u64,
+    #[serde(default = "default_mmr_embedding_min_useful_budget_ms")]
+    pub embedding_fetch_min_useful_budget_ms: u64,
+    #[serde(default = "default_mmr_response_reserve_ms")]
+    pub response_reserve_ms: u64,
     #[serde(default = "default_embedding_fetch_warn_threshold_ms")]
     pub embedding_fetch_warn_threshold_ms: u64,
     #[serde(default)]
@@ -519,6 +527,8 @@ impl Default for GraphRagRerankConfig {
             mmr_allow_direct_candidates: true,
             embedding_fetch_enabled: true,
             embedding_fetch_timeout_ms: default_embedding_fetch_timeout_ms(),
+            embedding_fetch_min_useful_budget_ms: default_mmr_embedding_min_useful_budget_ms(),
+            response_reserve_ms: default_mmr_response_reserve_ms(),
             embedding_fetch_warn_threshold_ms: default_embedding_fetch_warn_threshold_ms(),
             embedding_fetch_min_candidates: 0,
             embedding_fetch_identity_mode: default_embedding_fetch_identity_mode(),
@@ -630,8 +640,20 @@ fn default_mmr_lambda_graph() -> f32 {
 fn default_mmr_candidate_limit() -> usize {
     80
 }
+fn default_graph_min_useful_budget_ms() -> u64 {
+    80
+}
+fn default_graph_response_reserve_ms() -> u64 {
+    100
+}
 fn default_embedding_fetch_timeout_ms() -> u64 {
     250
+}
+fn default_mmr_embedding_min_useful_budget_ms() -> u64 {
+    50
+}
+fn default_mmr_response_reserve_ms() -> u64 {
+    75
 }
 fn default_embedding_fetch_warn_threshold_ms() -> u64 {
     250
@@ -1133,6 +1155,33 @@ fn default_hybrid_dense_weight() -> f32 {
 fn default_hybrid_sparse_weight() -> f32 {
     0.4
 }
+fn default_lexical_backend() -> String {
+    "POSTGRES_FTS".into()
+}
+fn default_lexical_candidate_limit() -> u32 {
+    50
+}
+fn default_lexical_max_candidate_limit() -> u32 {
+    100
+}
+fn default_lexical_min_remaining_budget_ms() -> u64 {
+    150
+}
+fn default_lexical_statement_timeout_ms() -> u64 {
+    150
+}
+fn default_lexical_trigram_min_similarity() -> f32 {
+    0.70
+}
+fn default_lexical_sparse_candidate_floor() -> usize {
+    10
+}
+fn default_lexical_sparse_score_floor() -> f32 {
+    0.10
+}
+fn default_lexical_weight() -> f32 {
+    0.20
+}
 fn default_no_answer_enabled() -> bool {
     true
 }
@@ -1538,6 +1587,23 @@ impl AppConfig {
         active_profile()
     }
     pub fn validate(&self) -> Result<()> {
+        if Self::active_profile_name() == "search-production-candidate" {
+            anyhow::ensure!(
+                self.batching.query.queue_capacity <= 256
+                    && self.batching.query.max_queue_age_ms > 0,
+                "INVALID_QUERY_QUEUE_CONFIGURATION"
+            );
+            anyhow::ensure!(
+                self.batching.query.min_inference_budget_ms > 0
+                    && self.batching.query.max_deadline_skew_ms > 0
+                    && self.grpc.deadlines.query_ms > self.batching.query.min_inference_budget_ms,
+                "INVALID_QUERY_BUDGET_CONFIGURATION"
+            );
+            anyhow::ensure!(
+                self.limits.backpressure_acquire_timeout_ms < self.grpc.deadlines.query_ms,
+                "INVALID_BACKPRESSURE_CONFIGURATION"
+            );
+        }
         if self.security.enabled
             && self.security.trust_forwarded_identity_headers
             && self.security.gateway_trust_token.trim().is_empty()
@@ -1626,6 +1692,11 @@ impl AppConfig {
         anyhow::ensure!(
             self.graph_rag.retrieval.timeout_ms > 0,
             "graph_rag.retrieval.timeout_ms must be positive"
+        );
+        anyhow::ensure!(
+            self.graph_rag.retrieval.min_useful_budget_ms > 0
+                && self.graph_rag.retrieval.response_reserve_ms > 0,
+            "graph_rag retrieval stage budgets must be positive"
         );
         let mut allowed_graph_relations = std::collections::HashSet::new();
         for relation in &self.graph_rag.retrieval.allowed_relations {
@@ -1739,6 +1810,11 @@ impl AppConfig {
             "graph_rag.rerank.embedding_fetch_timeout_ms must be positive"
         );
         anyhow::ensure!(
+            self.graph_rag.rerank.embedding_fetch_min_useful_budget_ms > 0
+                && self.graph_rag.rerank.response_reserve_ms > 0,
+            "graph_rag rerank stage budgets must be positive"
+        );
+        anyhow::ensure!(
             self.graph_rag.rerank.embedding_fetch_warn_threshold_ms > 0,
             "graph_rag.rerank.embedding_fetch_warn_threshold_ms must be positive"
         );
@@ -1804,6 +1880,28 @@ impl AppConfig {
             "hybrid fusion weights must have positive sum"
         );
         anyhow::ensure!(self.search.rrf_k > 0.0, "search.rrf_k must be positive");
+        anyhow::ensure!(
+            self.search.lexical.backend == "POSTGRES_FTS",
+            "search.lexical.backend must be POSTGRES_FTS"
+        );
+        anyhow::ensure!(
+            self.search.lexical.candidate_limit > 0
+                && self.search.lexical.candidate_limit <= self.search.lexical.max_candidate_limit,
+            "search.lexical candidate limits are invalid"
+        );
+        anyhow::ensure!(
+            self.search.lexical.min_remaining_budget_ms > 0
+                && self.search.lexical.statement_timeout_ms > 0,
+            "search.lexical budgets must be positive"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.search.lexical.trigram_min_similarity),
+            "search.lexical.trigram_min_similarity must be within [0,1]"
+        );
+        anyhow::ensure!(
+            self.search.lexical.lexical_weight >= 0.0,
+            "search.lexical.lexical_weight must be >= 0"
+        );
         anyhow::ensure!(
             self.search.no_answer.min_dense_score >= 0.0,
             "search.no_answer.min_dense_score must be >= 0.0"
@@ -2290,7 +2388,54 @@ pub struct SearchConfig {
     #[serde(default = "default_hybrid_sparse_weight")]
     pub hybrid_sparse_weight: f32,
     #[serde(default)]
+    pub lexical: LexicalSearchConfig,
+    #[serde(default)]
     pub no_answer: NoAnswerConfig,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct LexicalSearchConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_lexical_backend")]
+    pub backend: String,
+    #[serde(default = "default_lexical_candidate_limit")]
+    pub candidate_limit: u32,
+    #[serde(default = "default_lexical_max_candidate_limit")]
+    pub max_candidate_limit: u32,
+    #[serde(default = "default_lexical_min_remaining_budget_ms")]
+    pub min_remaining_budget_ms: u64,
+    #[serde(default = "default_lexical_statement_timeout_ms")]
+    pub statement_timeout_ms: u64,
+    #[serde(default = "default_true")]
+    pub exact_technical_enabled: bool,
+    #[serde(default)]
+    pub trigram_enabled: bool,
+    #[serde(default = "default_lexical_trigram_min_similarity")]
+    pub trigram_min_similarity: f32,
+    #[serde(default = "default_lexical_sparse_candidate_floor")]
+    pub run_when_sparse_candidates_below: usize,
+    #[serde(default = "default_lexical_sparse_score_floor")]
+    pub run_when_sparse_top_score_below: f32,
+    #[serde(default = "default_lexical_weight")]
+    pub lexical_weight: f32,
+}
+impl Default for LexicalSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: default_lexical_backend(),
+            candidate_limit: default_lexical_candidate_limit(),
+            max_candidate_limit: default_lexical_max_candidate_limit(),
+            min_remaining_budget_ms: default_lexical_min_remaining_budget_ms(),
+            statement_timeout_ms: default_lexical_statement_timeout_ms(),
+            exact_technical_enabled: true,
+            trigram_enabled: false,
+            trigram_min_similarity: default_lexical_trigram_min_similarity(),
+            run_when_sparse_candidates_below: default_lexical_sparse_candidate_floor(),
+            run_when_sparse_top_score_below: default_lexical_sparse_score_floor(),
+            lexical_weight: default_lexical_weight(),
+        }
+    }
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct NoAnswerConfig {

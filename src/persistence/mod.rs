@@ -124,6 +124,35 @@ pub struct ParentContextRecord {
     pub metadata: serde_json::Value,
 }
 #[derive(Debug, Clone)]
+pub struct LexicalParentCandidate {
+    pub parent: ParentContextRecord,
+    pub lexical_score: f32,
+    pub exact_match: bool,
+    pub matched_terms: u32,
+    pub matched_technical_terms: u32,
+}
+#[derive(Debug, Clone)]
+pub struct HydratedSearchContext {
+    pub access_zone_id: Uuid,
+    pub matched_chunk_id: Uuid,
+    pub parent_chunk_id: Uuid,
+    pub document_id: Uuid,
+    pub document_version: i64,
+    pub root_chunk_id: Uuid,
+    pub source_chunk_id: Uuid,
+    pub matched_text: String,
+    pub parent_text: String,
+    pub parent_content_hash: String,
+    pub parent_token_count: i32,
+    pub parent_sequence_no: i32,
+    pub access_level: i16,
+    pub source_block_id: Option<String>,
+    pub source_location: serde_json::Value,
+    pub source_links: serde_json::Value,
+    pub metadata: serde_json::Value,
+    pub parent_metadata: serde_json::Value,
+}
+#[derive(Debug, Clone)]
 pub struct ChunkTraceRecord {
     pub id: Uuid,
     pub source_block_id: Option<String>,
@@ -2660,6 +2689,193 @@ WHERE c.access_zone_id=ANY($1::uuid[])
             .collect())
     }
 
+    pub async fn fetch_hydrated_search_contexts_multi(
+        &self,
+        candidates: &[(Uuid, Uuid, Uuid)],
+        caller_access_level: i16,
+        statement_timeout_ms: u64,
+    ) -> Result<Vec<HydratedSearchContext>, AstraError> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        if statement_timeout_ms == 0 {
+            return Err(AstraError::DeadlineExceeded(
+                "insufficient_postgres_hydration_budget".into(),
+            ));
+        }
+        let zones = candidates.iter().map(|value| value.0).collect::<Vec<_>>();
+        let matched = candidates.iter().map(|value| value.1).collect::<Vec<_>>();
+        let parents = candidates.iter().map(|value| value.2).collect::<Vec<_>>();
+        let mut tx = self.pool.begin().await.map_err(postgres_error)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{statement_timeout_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+        let rows = sqlx::query(
+            r#"WITH candidate_keys AS (
+  SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[])
+    WITH ORDINALITY AS keys(access_zone_id, matched_chunk_id, parent_chunk_id, rank)
+)
+SELECT keys.rank, p.access_zone_id, m.id AS matched_chunk_id, p.id AS parent_chunk_id,
+       p.document_id, p.document_version, p.root_chunk_id, p.source_chunk_id,
+       m.content AS matched_text, p.content AS parent_text,
+       p.content_hash AS parent_content_hash, p.actual_token_count AS parent_token_count,
+       p.sequence_no AS parent_sequence_no, p.access_level,
+       COALESCE(m.source_block_id,p.source_block_id) AS source_block_id,
+       COALESCE(m.source_location,'{}'::jsonb) AS source_location,
+       COALESCE(m.source_links,'[]'::jsonb) AS source_links,
+       m.metadata, p.metadata AS parent_metadata
+FROM candidate_keys keys
+JOIN astravector.content_chunks_v004 m
+  ON m.access_zone_id=keys.access_zone_id AND m.id=keys.matched_chunk_id
+JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=keys.access_zone_id AND p.id=keys.parent_chunk_id
+JOIN astravector.document_versions d
+  ON d.access_zone_id=p.access_zone_id
+ AND d.document_id=p.document_id
+ AND d.document_version=p.document_version
+WHERE m.document_id=p.document_id
+  AND m.document_version=p.document_version
+  AND p.granularity='PARENT'
+  AND p.representation_type='ORIGINAL'
+  AND m.access_level <= $4 AND p.access_level <= $4
+  AND m.lifecycle_status='ACTIVE' AND p.lifecycle_status='ACTIVE'
+  AND m.deleted_at IS NULL AND p.deleted_at IS NULL
+  AND (m.expires_at IS NULL OR m.expires_at > now())
+  AND (p.expires_at IS NULL OR p.expires_at > now())
+  AND d.status='ACTIVE' AND d.lifecycle_status='ACTIVE'
+  AND d.delete_operation_id IS NULL
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+ORDER BY keys.rank"#,
+        )
+        .bind(zones)
+        .bind(matched)
+        .bind(parents)
+        .bind(caller_access_level)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| HydratedSearchContext {
+                access_zone_id: r.get("access_zone_id"),
+                matched_chunk_id: r.get("matched_chunk_id"),
+                parent_chunk_id: r.get("parent_chunk_id"),
+                document_id: r.get("document_id"),
+                document_version: r.get("document_version"),
+                root_chunk_id: r.get("root_chunk_id"),
+                source_chunk_id: r.get("source_chunk_id"),
+                matched_text: r.get("matched_text"),
+                parent_text: r.get("parent_text"),
+                parent_content_hash: r.get("parent_content_hash"),
+                parent_token_count: r.get("parent_token_count"),
+                parent_sequence_no: r.get("parent_sequence_no"),
+                access_level: r.get("access_level"),
+                source_block_id: r.try_get("source_block_id").ok(),
+                source_location: r.get("source_location"),
+                source_links: r.get("source_links"),
+                metadata: r.get("metadata"),
+                parent_metadata: r.get("parent_metadata"),
+            })
+            .collect())
+    }
+
+    pub async fn search_active_parent_contexts_lexical_multi(
+        &self,
+        access_zone_ids: &[Uuid],
+        caller_access_level: i16,
+        query: &str,
+        quality_run_id: Option<&str>,
+        limit: i64,
+        statement_timeout_ms: u64,
+    ) -> Result<Vec<LexicalParentCandidate>, AstraError> {
+        if access_zone_ids.is_empty() || limit <= 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        if statement_timeout_ms == 0 {
+            return Err(AstraError::DeadlineExceeded(
+                "insufficient_postgres_lexical_budget".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(postgres_error)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{statement_timeout_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+        let rows = sqlx::query(
+            r#"WITH query_input AS (
+  SELECT to_tsquery(
+    'simple',
+    array_to_string(tsvector_to_array(to_tsvector('simple', $3)), ' | ')
+  ) AS query
+)
+SELECT c.access_zone_id,c.id,c.document_id,c.document_version,c.root_chunk_id,
+       c.source_chunk_id,c.access_level,c.content,c.content_hash,c.actual_token_count,
+       c.sequence_no,c.source_block_id,c.metadata,
+       ts_rank_cd(c.search_vector_simple, query_input.query)::real AS lexical_score,
+       (position(lower($3) in lower(c.content)) > 0) AS exact_match,
+       numnode(query_input.query)::bigint AS matched_terms
+FROM astravector.content_chunks_v004 c
+JOIN astravector.document_versions d
+  ON d.access_zone_id=c.access_zone_id
+ AND d.document_id=c.document_id
+ AND d.document_version=c.document_version
+CROSS JOIN query_input
+WHERE c.access_zone_id=ANY($1::uuid[])
+  AND c.access_level <= $2
+  AND c.granularity='PARENT'
+  AND c.representation_type='ORIGINAL'
+  AND c.lifecycle_status='ACTIVE'
+  AND c.deleted_at IS NULL
+  AND (c.expires_at IS NULL OR c.expires_at > now())
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND d.delete_operation_id IS NULL
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND ($4::text IS NULL OR c.metadata->>'quality_run_id'=$4)
+  AND c.search_vector_simple @@ query_input.query
+ORDER BY lexical_score DESC,c.access_zone_id ASC,c.document_id ASC,c.id ASC
+LIMIT $5"#,
+        )
+        .bind(access_zone_ids)
+        .bind(caller_access_level)
+        .bind(query.trim())
+        .bind(quality_run_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| LexicalParentCandidate {
+                lexical_score: r.get("lexical_score"),
+                exact_match: r.get("exact_match"),
+                matched_terms: r.get::<i64, _>("matched_terms").max(0) as u32,
+                matched_technical_terms: 0,
+                parent: ParentContextRecord {
+                    access_zone_id: r.get("access_zone_id"),
+                    id: r.get("id"),
+                    document_id: r.get("document_id"),
+                    document_version: r.get("document_version"),
+                    root_chunk_id: r.get("root_chunk_id"),
+                    source_chunk_id: r.get("source_chunk_id"),
+                    access_level: r.get("access_level"),
+                    content: r.get("content"),
+                    content_hash: r.get("content_hash"),
+                    token_count: r.get("actual_token_count"),
+                    sequence_no: r.get("sequence_no"),
+                    source_block_id: r.try_get("source_block_id").ok(),
+                    metadata: r.get("metadata"),
+                },
+            })
+            .collect())
+    }
+
+    #[deprecated(note = "offline diagnostics only; online retrieval uses indexed lexical search")]
     pub async fn fetch_active_parent_context_candidates_multi(
         &self,
         access_zone_ids: &[Uuid],
