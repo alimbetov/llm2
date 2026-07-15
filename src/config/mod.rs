@@ -2146,6 +2146,70 @@ impl AppConfig {
             self.access_zone_codes.special_max_ttl_days == 3650,
             "special max-retention TTL must be 3650 days"
         );
+        let qp = &self.search.query_processing;
+        let query_max = self.tokenization.query.max_length;
+        anyhow::ensure!(
+            qp.absolute_max_tokens > query_max,
+            "search.query_processing.absolute_max_tokens must exceed tokenization.query.max_length"
+        );
+        anyhow::ensure!(
+            qp.segment_target_tokens > 0,
+            "search.query_processing.segment_target_tokens must be positive"
+        );
+        anyhow::ensure!(
+            qp.segment_target_tokens <= qp.segment_max_tokens,
+            "search.query_processing.segment_target_tokens must not exceed segment_max_tokens"
+        );
+        anyhow::ensure!(
+            qp.segment_max_tokens <= query_max,
+            "search.query_processing.segment_max_tokens must not exceed query max_length"
+        );
+        anyhow::ensure!(
+            qp.segment_overlap_tokens < qp.segment_target_tokens,
+            "search.query_processing.segment_overlap_tokens must be smaller than segment_target_tokens"
+        );
+        anyhow::ensure!(
+            qp.max_segments >= 2,
+            "search.query_processing.max_segments must be at least 2"
+        );
+        anyhow::ensure!(
+            qp.max_segments <= self.batching.query.max_items,
+            "search.query_processing.max_segments must not exceed batching.query.max_items"
+        );
+        anyhow::ensure!(
+            qp.max_parallel_segments > 0 && qp.max_parallel_segments <= qp.max_segments,
+            "search.query_processing.max_parallel_segments must be between 1 and max_segments"
+        );
+        anyhow::ensure!(
+            qp.per_segment_candidate_limit > 0,
+            "search.query_processing.per_segment_candidate_limit must be positive"
+        );
+        anyhow::ensure!(
+            qp.global_candidate_limit >= qp.per_segment_candidate_limit,
+            "search.query_processing.global_candidate_limit must be >= per_segment_candidate_limit"
+        );
+        anyhow::ensure!(
+            qp.global_candidate_limit <= self.limits.search_candidate_limit_max,
+            "search.query_processing.global_candidate_limit exceeds system search candidate limit"
+        );
+        anyhow::ensure!(
+            qp.segment_rrf_k.is_finite() && qp.segment_rrf_k >= 1.0,
+            "search.query_processing.segment_rrf_k must be finite and >= 1"
+        );
+        for (name, value) in [
+            ("question_segment_weight", qp.question_segment_weight),
+            ("technical_segment_weight", qp.technical_segment_weight),
+            ("context_segment_weight", qp.context_segment_weight),
+        ] {
+            anyhow::ensure!(
+                value.is_finite() && value > 0.0,
+                "search.query_processing.{name} must be finite and positive"
+            );
+        }
+        anyhow::ensure!(
+            qp.long_query_deadline_ms >= self.grpc.deadlines.query_ms,
+            "search.query_processing.long_query_deadline_ms must be >= normal query deadline"
+        );
 
         anyhow::ensure!(
             self.ingestion.max_blocks_per_document > 0,
@@ -2428,6 +2492,8 @@ pub struct SearchConfig {
     pub candidate_limit: u32,
     pub parent_limit: u32,
     pub rrf_k: f32,
+    #[serde(default)]
+    pub query_processing: QueryProcessingConfig,
     #[serde(default = "default_hybrid_fusion_method")]
     pub hybrid_fusion_method: String,
     #[serde(default = "default_hybrid_dense_weight")]
@@ -2442,6 +2508,102 @@ pub struct SearchConfig {
     pub ranking_trace: RankingTraceConfig,
     #[serde(default)]
     pub no_answer: NoAnswerConfig,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueryProcessingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_long_query_absolute_max_tokens")]
+    pub absolute_max_tokens: usize,
+    #[serde(default = "default_long_query_absolute_max_bytes")]
+    pub absolute_max_bytes: usize,
+    #[serde(default = "default_query_segment_target_tokens")]
+    pub segment_target_tokens: usize,
+    #[serde(default = "default_query_segment_max_tokens")]
+    pub segment_max_tokens: usize,
+    #[serde(default = "default_query_segment_overlap_tokens")]
+    pub segment_overlap_tokens: usize,
+    #[serde(default = "default_query_max_segments")]
+    pub max_segments: usize,
+    #[serde(default = "default_query_max_parallel_segments")]
+    pub max_parallel_segments: usize,
+    #[serde(default = "default_query_per_segment_candidate_limit")]
+    pub per_segment_candidate_limit: u32,
+    #[serde(default = "default_query_global_candidate_limit")]
+    pub global_candidate_limit: u32,
+    #[serde(default = "default_query_segment_rrf_k")]
+    pub segment_rrf_k: f32,
+    #[serde(default = "default_question_segment_weight")]
+    pub question_segment_weight: f32,
+    #[serde(default = "default_technical_segment_weight")]
+    pub technical_segment_weight: f32,
+    #[serde(default = "default_context_segment_weight")]
+    pub context_segment_weight: f32,
+    #[serde(default = "default_long_query_deadline_ms")]
+    pub long_query_deadline_ms: u64,
+}
+impl Default for QueryProcessingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            absolute_max_tokens: default_long_query_absolute_max_tokens(),
+            absolute_max_bytes: default_long_query_absolute_max_bytes(),
+            segment_target_tokens: default_query_segment_target_tokens(),
+            segment_max_tokens: default_query_segment_max_tokens(),
+            segment_overlap_tokens: default_query_segment_overlap_tokens(),
+            max_segments: default_query_max_segments(),
+            max_parallel_segments: default_query_max_parallel_segments(),
+            per_segment_candidate_limit: default_query_per_segment_candidate_limit(),
+            global_candidate_limit: default_query_global_candidate_limit(),
+            segment_rrf_k: default_query_segment_rrf_k(),
+            question_segment_weight: default_question_segment_weight(),
+            technical_segment_weight: default_technical_segment_weight(),
+            context_segment_weight: default_context_segment_weight(),
+            long_query_deadline_ms: default_long_query_deadline_ms(),
+        }
+    }
+}
+fn default_long_query_absolute_max_tokens() -> usize {
+    1024
+}
+fn default_long_query_absolute_max_bytes() -> usize {
+    65_536
+}
+fn default_query_segment_target_tokens() -> usize {
+    180
+}
+fn default_query_segment_max_tokens() -> usize {
+    220
+}
+fn default_query_segment_overlap_tokens() -> usize {
+    24
+}
+fn default_query_max_segments() -> usize {
+    6
+}
+fn default_query_max_parallel_segments() -> usize {
+    3
+}
+fn default_query_per_segment_candidate_limit() -> u32 {
+    20
+}
+fn default_query_global_candidate_limit() -> u32 {
+    100
+}
+fn default_query_segment_rrf_k() -> f32 {
+    60.0
+}
+fn default_question_segment_weight() -> f32 {
+    1.0
+}
+fn default_technical_segment_weight() -> f32 {
+    1.0
+}
+fn default_context_segment_weight() -> f32 {
+    0.5
+}
+fn default_long_query_deadline_ms() -> u64 {
+    3_000
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct FusionSearchConfig {
