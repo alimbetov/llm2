@@ -249,6 +249,28 @@ Read `by_category` and `by_mode` to see whether failures are concentrated in lex
 
 `ACCESS_LEVEL_FIXTURE_MAPPING_MISMATCH` means the runner detected fixture access levels that do not match indexed PostgreSQL/Qdrant payload levels. For diagnostics only, `ASTRAVECTOR_QUALITY_FORCE_CALLER_ACCESS_LEVEL=RESTRICTED` can confirm that contexts reappear when the caller is allowed to see restricted data. Reports generated with this override include `forced_caller_access_level` and must not be treated as production quality PASS.
 
+## Fix481 Evaluation Contract
+
+Validation and holdout use `Hit@5` as the primary single-evidence gate. `Precision@5`
+remains diagnostic unless a multi-evidence query has at least five relevant items and
+all top-5 candidates are judged. MRR@10 and nDCG@10 consume graded adjudicated qrels.
+
+The candidate pool is the union of independent dense, sparse, PostgreSQL FTS,
+hybrid, and hybrid-with-GraphRAG executions at depth 20. The blind file contains
+query text and candidate text, but no rank, retrieval source, document ID, or block
+ID. The identity map is joined only by the finalizer after every candidate has a
+relevance value from 0 through 3.
+
+`EVALUATION_DATA_INCOMPLETE` is a validation failure, not a retrieval miss. It is
+emitted when the manifest is missing, the pool has fewer than four sources, a trace
+is truncated, a candidate is unjudged, or adjudicated qrels fail their checksum.
+Prepared templates use `AWAITING_BLIND_JUDGMENT` and can never satisfy the gate.
+
+```bash
+FIX481_REPORT_DIR=target/fix481-evidence/<run-id>/validation make fix481-prepare-judgments
+make fix481-finalize-judgments
+```
+
 ## Remaining Carryover
 
-The runner still keeps implementation in one test file for low integration risk. Future improvements are a shared `tests/support/quality_runtime` module, richer MRR/rank metrics, latency percentiles from all queries, and an optional harness that starts a disposable runtime automatically.
+The runner still keeps implementation in one test file for low integration risk. Future improvements are a shared `tests/support/quality_runtime` module, latency percentiles from all queries, and an optional harness that starts a disposable runtime automatically.

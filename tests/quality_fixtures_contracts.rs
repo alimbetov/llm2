@@ -435,7 +435,7 @@ fn enriched_quality_profiles_and_schemas_are_valid_json() {
 }
 
 #[test]
-fn fix480_quality_splits_are_disjoint_and_qrels_are_complete() {
+fn fix480_quality_splits_are_disjoint_and_have_structural_qrel_coverage() {
     let mut all = HashSet::new();
     let mut counts = Vec::new();
     for split in ["tuning", "validation", "holdout"] {
@@ -461,4 +461,38 @@ fn fix480_quality_splits_are_disjoint_and_qrels_are_complete() {
         .collect::<HashSet<_>>();
     assert_eq!(qrel_ids.len(), 97);
     assert!(all.iter().all(|id| qrel_ids.contains(id.as_str())));
+}
+
+#[test]
+fn fix481_validation_pool_distinguishes_prepared_from_adjudicated_qrels() {
+    let root = Path::new(QUALITY_ROOT).join("judgments");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(root.join("manifests/validation.json"))
+            .expect("fix481 validation judgment manifest"),
+    )
+    .expect("valid fix481 judgment manifest JSON");
+    assert_eq!(manifest["requested_pool_depth"], 20);
+    assert!(manifest["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|query| query["pool_source_count"].as_u64().unwrap_or(0) >= 4));
+
+    let complete = manifest["qrels_complete"].as_bool().unwrap_or(false);
+    let adjudicated = root.join("adjudicated/validation.jsonl");
+    if complete {
+        assert_eq!(manifest["status"], "ADJUDICATED");
+        let rows = read_jsonl(&adjudicated);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| {
+            row["judgment_status"] == "ADJUDICATED"
+                && row["relevance"].as_u64().is_some_and(|value| value <= 3)
+        }));
+    } else {
+        assert_eq!(manifest["status"], "AWAITING_BLIND_JUDGMENT");
+        assert!(!adjudicated.exists());
+        assert!(manifest["unjudged_candidates_total"]
+            .as_u64()
+            .is_some_and(|value| value > 0));
+    }
 }

@@ -654,6 +654,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
     ) -> Result<Response<pb::SearchResponseV004>, Status> {
         let started = std::time::Instant::now();
         let r = request.into_inner();
+        let mut ranking_trace = RankingTraceCollector::new(
+            r.include_debug && self.cfg.search.ranking_trace.enabled,
+            self.cfg.search.ranking_trace.max_candidates,
+            self.cfg.search.ranking_trace.max_stages_per_candidate,
+        );
         let query = r.query.trim();
         if query.is_empty() {
             return Err(Status::invalid_argument("query must not be empty"));
@@ -1255,7 +1260,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
                 for candidate in &lexical_candidates {
                     let parent = &candidate.parent;
-                    let lexical = search_result_from_lexical_parent(parent, query);
+                    let mut lexical = search_result_from_lexical_parent(parent, query);
                     let score = candidate.lexical_score;
                     let exact_phrase_match = candidate.exact_match;
                     let matched_terms = matched_term_count(&lexical, query);
@@ -1276,6 +1281,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         && matched_discriminating_terms >= 1;
                     if !(strict_lexical_evidence || document_overview_seed) {
                         continue;
+                    }
+                    if strict_lexical_evidence {
+                        if let Some(citation) = lexical.citation.as_mut() {
+                            citation
+                                .metadata
+                                .insert("strong_lexical_evidence".into(), "true".into());
+                        }
                     }
                     let document_key = (parent.access_zone_id, parent.document_id);
                     sibling_seed_scores
@@ -1337,6 +1349,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .saturating_mul(3)
                     .max(candidate_limit as usize)
                     .min(self.cfg.limits.search_candidate_limit_max as usize);
+                let mut protected_lexical_count = 0usize;
+                let lexical_reservation_limit =
+                    self.cfg.search.fusion.min_strong_lexical_candidates.max(3);
                 for (rank, (mut lexical, lexical_score, _, _, _)) in lexical_results
                     .into_iter()
                     .take(lexical_take_limit)
@@ -1349,6 +1364,20 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         self.cfg.search.lexical.lexical_weight,
                         self.cfg.search.rrf_k,
                     );
+                    if rank < lexical_reservation_limit
+                        && is_strong_lexical_candidate(&lexical)
+                        && protected_lexical_count < lexical_reservation_limit
+                    {
+                        mark_ranking_protection(
+                            &mut lexical,
+                            RankingProtection {
+                                preserve_primary_direct: true,
+                                preserve_strong_lexical: true,
+                                preserve_unique_source_block: true,
+                            },
+                        );
+                        protected_lexical_count += 1;
+                    }
                     let key = result_identity_key(&lexical);
                     if let Some(idx) = direct_result_index_by_key.get(&key).copied() {
                         merge_lexical_backfill_candidate(&mut direct_results[idx], &lexical);
@@ -1379,6 +1408,87 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "SEARCH_PARENT_FETCH_DONE"
         );
         drop_root_container_results_when_document_has_evidence(&mut direct_results);
+        for result in &mut direct_results {
+            if let Some(citation) = result.citation.as_mut() {
+                citation
+                    .metadata
+                    .insert("evidence_provenance".into(), "PRIMARY_DIRECT".into());
+            }
+        }
+        let lexical_reservation_limit = self.cfg.search.fusion.min_strong_lexical_candidates.max(3);
+        for (fusion_rank, result) in direct_results.iter_mut().enumerate() {
+            let lexical_rank = result
+                .citation
+                .as_ref()
+                .and_then(|citation| citation.metadata.get("lexical_rank"))
+                .and_then(|rank| rank.parse::<usize>().ok());
+            if is_strong_lexical_candidate(result)
+                && (fusion_rank < lexical_reservation_limit
+                    || lexical_rank.is_some_and(|rank| rank <= lexical_reservation_limit))
+            {
+                mark_ranking_protection(
+                    result,
+                    RankingProtection {
+                        preserve_primary_direct: true,
+                        preserve_strong_lexical: true,
+                        preserve_unique_source_block: result_source_block_id(result).is_some(),
+                    },
+                );
+            }
+        }
+        let dense_trace = if ranking_trace.enabled {
+            {
+                direct_results
+                    .iter()
+                    .filter(|result| {
+                        result
+                            .scores
+                            .as_ref()
+                            .is_some_and(|scores| scores.dense_score > 0.0)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        ranking_trace.observe(pb::RankingStageV005::DenseRetrieval, &dense_trace);
+        let sparse_trace = if ranking_trace.enabled {
+            {
+                direct_results
+                    .iter()
+                    .filter(|result| {
+                        result
+                            .scores
+                            .as_ref()
+                            .is_some_and(|scores| scores.sparse_score > 0.0)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        ranking_trace.observe(pb::RankingStageV005::SparseRetrieval, &sparse_trace);
+        let lexical_trace = if ranking_trace.enabled {
+            {
+                direct_results
+                    .iter()
+                    .filter(|result| {
+                        extraction_retrieval_sources(result)
+                            .iter()
+                            .any(|source| source == "POSTGRES_FTS")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        ranking_trace.observe(pb::RankingStageV005::LexicalRetrieval, &lexical_trace);
+        ranking_trace.observe(pb::RankingStageV005::FusionAdmission, &direct_results);
+        ranking_trace.observe(pb::RankingStageV005::PostFusionDedup, &direct_results);
+        ranking_trace.observe(pb::RankingStageV005::PostgresHydration, &direct_results);
         let mut no_answer_stats = NoAnswerFilterStats::default();
         let no_answer_debug = no_answer_debug_enabled(r.include_debug, &self.cfg.search.no_answer);
         let query_technical_tokens = if self.cfg.search.no_answer.enabled {
@@ -1390,6 +1500,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let skip_pre_mmr_no_answer_for_graph =
             r.enable_graph_expansion && self.cfg.graph_rag.enabled;
         let pre_mmr_no_answer_started = Instant::now();
+        let pre_mmr_before = if ranking_trace.enabled {
+            direct_results.clone()
+        } else {
+            Vec::new()
+        };
         if !skip_pre_mmr_no_answer_for_graph {
             no_answer_stats.pre_mmr_filtered_count = apply_pre_mmr_no_answer_filter(
                 &mut direct_results,
@@ -1401,6 +1516,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 preserve_partial_evidence_for_mmr,
             );
         }
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::PreMmrNoAnswer,
+            &pre_mmr_before,
+            &direct_results,
+            pb::CandidateDropReasonV005::NoAnswerFiltered,
+            "pre-MMR no-answer policy",
+        );
         if no_answer_stats.pre_mmr_filtered_count > 0 {
             counter!("retrieval_no_answer_pre_mmr_filtered_total")
                 .increment(no_answer_stats.pre_mmr_filtered_count as u64);
@@ -1471,6 +1593,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .filter_map(|candidate| graph_seed_preview_by_key.get(&candidate.key).cloned())
             .collect::<Vec<_>>()
             .join(",");
+        let graph_seed_trace = if ranking_trace.enabled {
+            {
+                direct_results
+                    .iter()
+                    .filter(|result| {
+                        graph_seed_chunk_id(result)
+                            .zip(Uuid::parse_str(&result.access_zone_id).ok())
+                            .is_some_and(|(chunk, zone)| graph_seed_keys.contains(&(zone, chunk)))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        ranking_trace.observe(pb::RankingStageV005::GraphSeed, &graph_seed_trace);
         let remaining_budget_before_graph_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis() as u64;
@@ -1742,6 +1880,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     "retrieval_sources".into(),
                                     "[\"GRAPH_EXPANDED\"]".into(),
                                 );
+                                citation
+                                    .metadata
+                                    .insert("evidence_provenance".into(), "GRAPH_EXPANDED".into());
                                 citation.metadata.insert(
                                     "graph_merge_strategy".into(),
                                     self.cfg.graph_rag.retrieval.graph_merge_strategy.clone(),
@@ -1813,6 +1954,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 "GRAPH_EXPANSION_COMPLETED"
             );
         }
+        ranking_trace.observe(pb::RankingStageV005::GraphExpansion, &graph_results);
         let merge_started = std::time::Instant::now();
         let direct_count = direct_results.len();
         let graph_count = graph_results.len();
@@ -1907,13 +2049,47 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             } else {
                 None
             };
+        for result in direct_results
+            .iter_mut()
+            .take(self.cfg.graph_rag.retrieval.min_direct_contexts)
+        {
+            mark_ranking_protection(
+                result,
+                RankingProtection {
+                    preserve_primary_direct: true,
+                    preserve_strong_lexical: is_strong_lexical_candidate(result),
+                    preserve_unique_source_block: result_source_block_id(result).is_some(),
+                },
+            );
+        }
+        let max_graph_contexts = ((final_limit as f32)
+            * self.cfg.graph_rag.retrieval.max_graph_fraction)
+            .floor() as usize;
+        let mut mmr_input_trace = if ranking_trace.enabled {
+            direct_results.clone()
+        } else {
+            Vec::new()
+        };
+        if ranking_trace.enabled {
+            mmr_input_trace.extend(graph_results.iter().cloned());
+        }
+        ranking_trace.observe(pb::RankingStageV005::GraphMerge, &mmr_input_trace);
+        ranking_trace.observe(pb::RankingStageV005::MmrInput, &mmr_input_trace);
         let selection_result = select_results_with_strategy_aware_mmr(
             direct_results,
             graph_results,
             final_limit,
             &self.cfg.graph_rag.retrieval.graph_merge_strategy,
-            self.cfg.graph_rag.retrieval.direct_context_limit,
-            self.cfg.graph_rag.retrieval.graph_context_append_limit,
+            self.cfg
+                .graph_rag
+                .retrieval
+                .direct_context_limit
+                .max(self.cfg.graph_rag.retrieval.min_direct_contexts),
+            self.cfg
+                .graph_rag
+                .retrieval
+                .graph_context_append_limit
+                .min(max_graph_contexts),
             self.cfg.graph_rag.rerank.mmr_enabled,
             self.cfg.graph_rag.rerank.mmr_lambda,
             self.cfg.graph_rag.rerank.mmr_lambda_direct,
@@ -1931,12 +2107,24 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let merge_duration_ms = merge_started.elapsed().as_millis() as u64;
         let mmr_result = selection_result.mmr.clone();
         let mut results = selection_result.results;
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::MmrSelected,
+            &mmr_input_trace,
+            &results,
+            pb::CandidateDropReasonV005::MmrLimit,
+            "MMR selection or context limit",
+        );
         if let Some(candidates) = broad_coverage_candidates.as_deref() {
             reinforce_broad_coverage_results(&mut results, candidates, final_limit);
         }
         let final_graph_evidence_present =
             r.enable_graph_expansion && has_graph_expanded_evidence(&results);
         let post_mmr_no_answer_started = Instant::now();
+        let post_mmr_before = if ranking_trace.enabled {
+            results.clone()
+        } else {
+            Vec::new()
+        };
         if !final_graph_evidence_present
             && final_no_answer_should_trigger(
                 &results,
@@ -1959,12 +2147,31 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             });
             results.clear();
         }
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::PostMmrNoAnswer,
+            &post_mmr_before,
+            &results,
+            pb::CandidateDropReasonV005::NoAnswerFiltered,
+            "post-MMR no-answer policy",
+        );
         let post_mmr_no_answer_ms = post_mmr_no_answer_started.elapsed().as_millis() as u64;
         let token_budget_before =
             estimate_results_tokens(&results, self.cfg.rag_context.chars_per_token);
         let token_budget_started = Instant::now();
+        let token_budget_input = if ranking_trace.enabled {
+            results.clone()
+        } else {
+            Vec::new()
+        };
         let (dropped_chunk_ids, token_budget_warning_codes, dropped_chunk_count) =
-            apply_token_budget_truncation(&mut results, &self.cfg);
+            apply_token_budget_truncation(&mut results, &self.cfg.rag_context);
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::TokenBudget,
+            &token_budget_input,
+            &results,
+            pb::CandidateDropReasonV005::TokenBudgetDrop,
+            "context token budget",
+        );
         let token_budget_ms = token_budget_started.elapsed().as_millis() as u64;
         for code in &token_budget_warning_codes {
             warnings.push(pb::DiagnosticWarningV005 {
@@ -1979,6 +2186,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             counter!("rag_context_chunks_dropped_total").increment(dropped_chunk_count as u64);
         }
         let visibility_recheck_started = Instant::now();
+        let visibility_input = if ranking_trace.enabled {
+            results.clone()
+        } else {
+            Vec::new()
+        };
         let final_visibility_ids = results
             .iter()
             .filter_map(|r| Uuid::parse_str(&r.matched_chunk_id).ok())
@@ -2016,8 +2228,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 });
             }
         }
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::VisibilityRecheck,
+            &visibility_input,
+            &results,
+            pb::CandidateDropReasonV005::VisibilityRejected,
+            "final PostgreSQL visibility recheck",
+        );
         let visibility_recheck_ms = visibility_recheck_started.elapsed().as_millis() as u64;
         strip_internal_embedding_metadata(&mut results);
+        ranking_trace.observe(pb::RankingStageV005::FinalSelection, &results);
+        let ranking_trace = ranking_trace.finish();
         let final_results_count = results.len();
         counter!("retrieved_contexts_total").increment(final_results_count as u64);
         if final_results_count == 0 {
@@ -2161,6 +2382,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 final_candidate_count: final_results_count as u32,
                 remaining_budget_before_graph_ms,
                 remaining_budget_before_mmr_ms,
+                ranking_trace: Some(ranking_trace),
             }),
             warnings,
         }))
@@ -4464,6 +4686,7 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
             }),
             contexts,
             warnings: search.warnings,
+            diagnostics: Some(diagnostics),
         }))
     }
 
@@ -7852,18 +8075,17 @@ fn estimate_text_tokens(text: &str, chars_per_token: usize) -> usize {
 
 fn apply_token_budget_truncation(
     results: &mut Vec<pb::SearchResultV004>,
-    cfg: &AppConfig,
+    cfg: &crate::config::RagContextConfig,
 ) -> (Vec<String>, Vec<String>, u32) {
-    if !cfg.rag_context.token_budget_enabled {
+    if !cfg.token_budget_enabled {
         return (Vec::new(), Vec::new(), 0);
     }
     let available = cfg
-        .rag_context
         .max_context_tokens
-        .saturating_sub(cfg.rag_context.reserved_answer_tokens);
-    let effective_available = available.saturating_mul(
-        100usize.saturating_sub(cfg.rag_context.tokenizer_safety_margin_percent.min(80)),
-    ) / 100;
+        .saturating_sub(cfg.reserved_answer_tokens);
+    let effective_available = available
+        .saturating_mul(100usize.saturating_sub(cfg.tokenizer_safety_margin_percent.min(80)))
+        / 100;
     if effective_available == 0 {
         let dropped = results
             .iter()
@@ -7874,14 +8096,14 @@ fn apply_token_budget_truncation(
         return (dropped, Vec::new(), count);
     }
     let mut dropped = Vec::new();
-    let chars_per_token = cfg.rag_context.chars_per_token.max(1);
+    let chars_per_token = cfg.chars_per_token.max(1);
     let mut huge_to_drop = Vec::new();
     for (idx, result) in results.iter_mut().enumerate() {
         let tokens = estimate_text_tokens(&result.matched_text, chars_per_token)
             + estimate_text_tokens(&result.parent_text, chars_per_token);
         if tokens > effective_available {
-            match cfg.rag_context.huge_chunk_strategy.as_str() {
-                "TRUNCATE_ONE_HUGE_CHUNK" if cfg.rag_context.allow_chunk_text_truncation => {
+            match cfg.huge_chunk_strategy.as_str() {
+                "TRUNCATE_ONE_HUGE_CHUNK" if cfg.allow_chunk_text_truncation => {
                     let max_chars = effective_available.saturating_mul(chars_per_token).max(1);
                     result.matched_text = result.matched_text.chars().take(max_chars).collect();
                     counter!("rag_context_huge_chunk_truncated_total").increment(1);
@@ -7897,6 +8119,26 @@ fn apply_token_budget_truncation(
         let removed = results.remove(idx);
         dropped.push(removed.matched_chunk_id);
     }
+    let graph_token_limit =
+        (effective_available as f32 * cfg.max_graph_token_fraction).floor() as usize;
+    while estimate_graph_results_tokens(results, chars_per_token) > graph_token_limit {
+        let Some(idx) = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| is_graph_expanded_result(result))
+            .min_by(|(_, left), (_, right)| {
+                token_truncation_score(left, &cfg.truncation_strategy)
+                    .partial_cmp(&token_truncation_score(right, &cfg.truncation_strategy))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+        else {
+            break;
+        };
+        let removed = results.remove(idx);
+        dropped.push(removed.matched_chunk_id);
+        counter!("rag_context_graph_quota_dropped_total").increment(1);
+    }
     while estimate_results_tokens(results, chars_per_token) > effective_available
         && !results.is_empty()
     {
@@ -7904,14 +8146,18 @@ fn apply_token_budget_truncation(
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                let sa = token_truncation_score(a, &cfg.rag_context.truncation_strategy);
-                let sb = token_truncation_score(b, &cfg.rag_context.truncation_strategy);
+                let protection_order = is_ranking_protected(a).cmp(&is_ranking_protected(b));
+                if protection_order != std::cmp::Ordering::Equal {
+                    return protection_order;
+                }
+                let sa = token_truncation_score(a, &cfg.truncation_strategy);
+                let sb = token_truncation_score(b, &cfg.truncation_strategy);
                 sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(idx, _)| idx)
             .unwrap_or(results.len() - 1);
-        if cfg.rag_context.truncation_strategy == "TRUNCATE_LAST_CHUNK"
-            && cfg.rag_context.allow_chunk_text_truncation
+        if cfg.truncation_strategy == "TRUNCATE_LAST_CHUNK"
+            && cfg.allow_chunk_text_truncation
             && !results.is_empty()
         {
             let prefix_tokens = estimate_results_tokens(
@@ -7940,6 +8186,26 @@ fn apply_token_budget_truncation(
         counter!("rag_context_dropped_chunk_ids_truncated_total").increment(1);
     }
     (dropped, warnings, dropped_count)
+}
+
+fn is_graph_expanded_result(result: &pb::SearchResultV004) -> bool {
+    extraction_retrieval_sources(result)
+        .iter()
+        .any(|source| source == "GRAPH_EXPANDED")
+}
+
+fn estimate_graph_results_tokens(
+    results: &[pb::SearchResultV004],
+    chars_per_token: usize,
+) -> usize {
+    results
+        .iter()
+        .filter(|result| is_graph_expanded_result(result))
+        .map(|result| {
+            estimate_text_tokens(&result.matched_text, chars_per_token)
+                + estimate_text_tokens(&result.parent_text, chars_per_token)
+        })
+        .sum()
 }
 
 fn token_truncation_score(result: &pb::SearchResultV004, strategy: &str) -> f32 {
@@ -8381,13 +8647,23 @@ fn select_graph_append_with_group_mmr(
     metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
     metrics::gauge!("graph_mmr_group_graph_lambda_current").set(mmr_lambda_graph as f64);
     let direct_budget = direct_context_limit.min(final_limit);
-    let (seed_direct_pool, remaining_direct_pool): (Vec<_>, Vec<_>) =
+    let (mut seed_direct_pool, remaining_direct_pool): (Vec<_>, Vec<_>) =
         direct_pool.drain(..).partition(|result| {
             graph_seed_chunk_ids.contains(&result.matched_chunk_id)
                 || result_source_block_id(result)
                     .map(|block_id| graph_seed_source_block_ids.contains(block_id))
                     .unwrap_or(false)
         });
+    for seed in &mut seed_direct_pool {
+        mark_ranking_protection(
+            seed,
+            RankingProtection {
+                preserve_primary_direct: true,
+                preserve_strong_lexical: is_strong_lexical_candidate(seed),
+                preserve_unique_source_block: result_source_block_id(seed).is_some(),
+            },
+        );
+    }
     let seed_direct_mmr = apply_mmr_rerank(
         seed_direct_pool,
         direct_budget,
@@ -8469,6 +8745,7 @@ pub fn apply_mmr_rerank(
     let requested_similarity_source = similarity_source.to_string();
     if !enabled {
         candidates.sort_by(stable_result_rank);
+        reserve_protected_candidates_in_prefix(&mut candidates, final_limit);
         candidates.truncate(final_limit);
         let selected_count = candidates.len();
         return SearchMmrResult {
@@ -8488,12 +8765,18 @@ pub fn apply_mmr_rerank(
     let input_count = candidates.len();
     candidates.sort_by(stable_result_rank);
     let truncate_limit = candidate_limit.max(final_limit);
+    reserve_protected_candidates_in_prefix(&mut candidates, truncate_limit);
     if candidates.len() > truncate_limit {
         metrics::counter!("graph_mmr_candidates_truncated_total").increment(1);
         metrics::counter!("graph_mmr_candidates_truncated_by_total")
             .increment((candidates.len() - truncate_limit) as u64);
     }
     candidates.truncate(truncate_limit);
+    let protected_candidates = candidates
+        .iter()
+        .filter(|candidate| is_ranking_protected(candidate))
+        .cloned()
+        .collect::<Vec<_>>();
 
     let mut prepared: Vec<MmrPreparedCandidate> = candidates
         .into_iter()
@@ -8599,7 +8882,8 @@ pub fn apply_mmr_rerank(
     if effective_source == "MIXED" {
         metrics::counter!("graph_mmr_mixed_similarity_sessions_total").increment(1);
     }
-    let results = selected.into_iter().map(|c| c.result).collect::<Vec<_>>();
+    let mut results = selected.into_iter().map(|c| c.result).collect::<Vec<_>>();
+    preserve_protected_candidates_in_selection(&mut results, &protected_candidates, final_limit);
     let selected_count = results.len();
     SearchMmrResult {
         results,
@@ -8612,6 +8896,59 @@ pub fn apply_mmr_rerank(
         token_fallback_count,
         dense_pair_comparisons,
         token_pair_comparisons,
+    }
+}
+
+fn reserve_protected_candidates_in_prefix(
+    candidates: &mut [pb::SearchResultV004],
+    prefix_limit: usize,
+) {
+    if prefix_limit == 0 || candidates.len() <= prefix_limit {
+        return;
+    }
+    let mut replacement_slots = (0..prefix_limit)
+        .rev()
+        .filter(|idx| !is_ranking_protected(&candidates[*idx]))
+        .collect::<Vec<_>>();
+    let protected_after_prefix = (prefix_limit..candidates.len())
+        .filter(|idx| is_ranking_protected(&candidates[*idx]))
+        .collect::<Vec<_>>();
+    for protected_idx in protected_after_prefix {
+        let Some(slot) = replacement_slots.pop() else {
+            break;
+        };
+        candidates.swap(slot, protected_idx);
+    }
+}
+
+fn preserve_protected_candidates_in_selection(
+    selected: &mut Vec<pb::SearchResultV004>,
+    protected: &[pb::SearchResultV004],
+    final_limit: usize,
+) {
+    if final_limit == 0 {
+        return;
+    }
+    for (protected_rank, candidate) in protected.iter().enumerate() {
+        let key = result_identity_key(candidate);
+        if selected
+            .iter()
+            .any(|existing| result_identity_key(existing) == key)
+        {
+            continue;
+        }
+        if selected.len() < final_limit {
+            selected.push(candidate.clone());
+            continue;
+        }
+        if let Some(idx) = selected
+            .iter()
+            .rposition(|existing| !is_ranking_protected(existing))
+        {
+            selected.remove(idx);
+            let insertion = protected_rank.min(selected.len());
+            selected.insert(insertion, candidate.clone());
+        }
     }
 }
 
@@ -8778,7 +9115,16 @@ fn merge_lexical_backfill_candidate(
     if let (Some(primary_citation), Some(lexical_citation)) =
         (primary.citation.as_mut(), lexical.citation.as_ref())
     {
-        for key in ["source_block_id", "section_path", "heading"] {
+        for key in [
+            "source_block_id",
+            "section_path",
+            "heading",
+            "lexical_rank",
+            "lexical_score",
+            "lexical_backend",
+            "strong_lexical_evidence",
+            "ranking_protection",
+        ] {
             if let Some(value) = lexical_citation.metadata.get(key) {
                 if !value.trim().is_empty() {
                     primary_citation
@@ -8938,6 +9284,213 @@ fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
 
 fn score_of(result: &pb::SearchResultV004) -> f32 {
     result.scores.as_ref().map(|s| s.final_score).unwrap_or(0.0)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RankingProtection {
+    preserve_primary_direct: bool,
+    preserve_strong_lexical: bool,
+    preserve_unique_source_block: bool,
+}
+
+struct RankingTraceCollector {
+    enabled: bool,
+    max_candidates: usize,
+    max_stages: usize,
+    order: Vec<String>,
+    candidates: HashMap<String, pb::RankingCandidateTraceV005>,
+    total_seen: usize,
+    truncated: bool,
+}
+
+impl RankingTraceCollector {
+    fn new(enabled: bool, max_candidates: usize, max_stages: usize) -> Self {
+        Self {
+            enabled,
+            max_candidates: max_candidates.max(1),
+            max_stages: max_stages.max(1),
+            order: Vec::new(),
+            candidates: HashMap::new(),
+            total_seen: 0,
+            truncated: false,
+        }
+    }
+
+    fn observe(&mut self, stage: pb::RankingStageV005, results: &[pb::SearchResultV004]) {
+        if !self.enabled {
+            return;
+        }
+        for (rank, result) in results.iter().enumerate() {
+            self.observe_one(stage, result, rank + 1, true, None, "");
+        }
+    }
+
+    fn mark_removed(
+        &mut self,
+        stage: pb::RankingStageV005,
+        before: &[pb::SearchResultV004],
+        after: &[pb::SearchResultV004],
+        reason: pb::CandidateDropReasonV005,
+        detail: &str,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let retained = after
+            .iter()
+            .map(result_identity_key)
+            .collect::<HashSet<_>>();
+        for (rank, result) in before.iter().enumerate() {
+            self.observe_one(
+                stage,
+                result,
+                rank + 1,
+                retained.contains(&result_identity_key(result)),
+                (!retained.contains(&result_identity_key(result))).then_some(reason),
+                detail,
+            );
+        }
+    }
+
+    fn observe_one(
+        &mut self,
+        stage: pb::RankingStageV005,
+        result: &pb::SearchResultV004,
+        rank: usize,
+        present: bool,
+        drop_reason: Option<pb::CandidateDropReasonV005>,
+        detail: &str,
+    ) {
+        let key = result_identity_key(result);
+        if !self.candidates.contains_key(&key) {
+            self.total_seen += 1;
+            if self.candidates.len() >= self.max_candidates {
+                self.truncated = true;
+                return;
+            }
+            let citation = result.citation.as_ref();
+            let source_block_id = citation
+                .and_then(|c| c.metadata.get("source_block_id"))
+                .cloned()
+                .unwrap_or_default();
+            let sources = extraction_retrieval_sources(result);
+            self.order.push(key.clone());
+            self.candidates.insert(
+                key.clone(),
+                pb::RankingCandidateTraceV005 {
+                    identity: Some(pb::RankingCandidateIdentityV005 {
+                        access_zone_id: result.access_zone_id.clone(),
+                        document_id: result.document_id.clone(),
+                        document_version: result.document_version,
+                        matched_chunk_id: result.matched_chunk_id.clone(),
+                        parent_chunk_id: result.parent_chunk_id.clone(),
+                        source_block_id,
+                    }),
+                    stages: Vec::new(),
+                    primary_direct: sources.iter().any(|s| s != "GRAPH_EXPANDED"),
+                    graph_expanded: sources.iter().any(|s| s == "GRAPH_EXPANDED"),
+                    exact_technical_match: citation
+                        .and_then(|c| c.metadata.get("exact_technical_match"))
+                        .is_some_and(|v| v == "true"),
+                    strong_lexical_evidence: is_strong_lexical_candidate(result),
+                    ranking_protected: is_ranking_protected(result),
+                },
+            );
+        }
+        let Some(candidate) = self.candidates.get_mut(&key) else {
+            return;
+        };
+        if candidate.stages.len() >= self.max_stages {
+            self.truncated = true;
+            return;
+        }
+        let scores = result.scores.as_ref().cloned().unwrap_or_default();
+        let citation = result.citation.as_ref();
+        let metadata_float = |name: &str| {
+            citation
+                .and_then(|c| c.metadata.get(name))
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or_default()
+        };
+        let effective_rank = if stage == pb::RankingStageV005::LexicalRetrieval {
+            citation
+                .and_then(|c| c.metadata.get("lexical_rank"))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(rank)
+        } else {
+            rank
+        };
+        candidate.stages.push(pb::RankingStageTraceV005 {
+            stage: stage as i32,
+            present,
+            rank: effective_rank as u32,
+            dense_score: scores.dense_score,
+            sparse_score: scores.sparse_score,
+            lexical_score: metadata_float("lexical_score"),
+            fusion_score: scores.fusion_score,
+            graph_score: metadata_float("graph_score"),
+            mmr_relevance: scores.final_score,
+            mmr_redundancy: metadata_float("mmr_max_similarity_to_selected"),
+            final_score: scores.final_score,
+            retrieval_sources: extraction_retrieval_sources(result),
+            drop_reason: drop_reason.unwrap_or(pb::CandidateDropReasonV005::DropReasonUnspecified)
+                as i32,
+            reason: detail.to_string(),
+        });
+    }
+
+    fn finish(self) -> pb::RankingTraceV005 {
+        let candidates = self
+            .order
+            .into_iter()
+            .filter_map(|key| self.candidates.get(&key).cloned())
+            .collect();
+        pb::RankingTraceV005 {
+            candidates,
+            truncated: self.truncated,
+            total_candidates_seen: self.total_seen as u32,
+        }
+    }
+}
+
+fn mark_ranking_protection(result: &mut pb::SearchResultV004, protection: RankingProtection) {
+    let Some(citation) = result.citation.as_mut() else {
+        return;
+    };
+    let encoded = [
+        protection
+            .preserve_primary_direct
+            .then_some("PRIMARY_DIRECT"),
+        protection
+            .preserve_strong_lexical
+            .then_some("STRONG_LEXICAL"),
+        protection
+            .preserve_unique_source_block
+            .then_some("UNIQUE_SOURCE_BLOCK"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(",");
+    citation
+        .metadata
+        .insert("ranking_protection".into(), encoded);
+}
+
+fn is_ranking_protected(result: &pb::SearchResultV004) -> bool {
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("ranking_protection"))
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn is_strong_lexical_candidate(result: &pb::SearchResultV004) -> bool {
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("strong_lexical_evidence"))
+        .is_some_and(|value| value == "true")
 }
 
 fn graph_seed_chunk_id(result: &pb::SearchResultV004) -> Option<Uuid> {
@@ -10626,6 +11179,97 @@ mod v007_fix1_tests {
     }
 
     #[test]
+    fn ranking_protection_does_not_bypass_no_answer() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut protected = test_result(
+            "protected-weak",
+            "Summer membership includes access to a heated swimming pool.",
+            0.01,
+        );
+        protected
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("ranking_protection".into(), "PRIMARY_DIRECT".into());
+        let mut candidates = vec![protected];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            "How is the upstream connection pool repaired after HTTP 502 failures?",
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn ranking_protection_does_not_bypass_hard_token_budget() {
+        let cfg = crate::config::RagContextConfig {
+            token_budget_enabled: true,
+            max_context_tokens: 20,
+            reserved_answer_tokens: 0,
+            tokenizer_safety_margin_percent: 0,
+            chars_per_token: 1,
+            huge_chunk_strategy: "DROP_HUGE_CHUNK".into(),
+            ..Default::default()
+        };
+        let mut protected = test_result("protected-huge", &"x".repeat(100), 0.9);
+        protected
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("ranking_protection".into(), "PRIMARY_DIRECT".into());
+        let mut results = vec![protected];
+
+        let (dropped, _, count) = apply_token_budget_truncation(&mut results, &cfg);
+
+        assert!(results.is_empty());
+        assert_eq!(dropped, vec!["protected-huge"]);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn graph_token_fraction_is_enforced() {
+        let cfg = crate::config::RagContextConfig {
+            token_budget_enabled: true,
+            max_context_tokens: 200,
+            reserved_answer_tokens: 0,
+            tokenizer_safety_margin_percent: 0,
+            chars_per_token: 1,
+            max_graph_token_fraction: 0.25,
+            ..Default::default()
+        };
+        let direct = test_result("direct", "primary", 0.8);
+        let mut graph = test_result("graph", &"g".repeat(80), 0.9);
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        let mut results = vec![direct, graph];
+
+        apply_token_budget_truncation(&mut results, &cfg);
+
+        assert!(results
+            .iter()
+            .any(|result| result.matched_chunk_id == "direct"));
+        assert!(!results
+            .iter()
+            .any(|result| result.matched_chunk_id == "graph"));
+    }
+
+    #[test]
     fn mmr_disabled_keeps_score_order() {
         let candidates = vec![
             test_result("a", "alpha credit repayment", 0.7),
@@ -10785,6 +11429,46 @@ mod v007_fix1_tests {
     }
 
     #[test]
+    fn ranking_trace_records_first_drop_reason_without_document_text() {
+        let retained = test_result("retained", "confidential retained text", 0.8);
+        let dropped = test_result("dropped", "confidential dropped text", 0.7);
+        let mut collector = RankingTraceCollector::new(true, 10, 10);
+        collector.observe(
+            pb::RankingStageV005::FusionAdmission,
+            &[retained.clone(), dropped.clone()],
+        );
+        collector.mark_removed(
+            pb::RankingStageV005::MmrSelected,
+            &[retained.clone(), dropped],
+            &[retained],
+            pb::CandidateDropReasonV005::MmrLimit,
+            "MMR selection limit",
+        );
+
+        let trace = collector.finish();
+        let dropped_trace = trace
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.matched_chunk_id == "dropped")
+            })
+            .expect("dropped candidate trace");
+        let loss = dropped_trace.stages.last().expect("drop stage");
+        assert!(!loss.present);
+        assert_eq!(
+            loss.drop_reason,
+            pb::CandidateDropReasonV005::MmrLimit as i32
+        );
+        assert!(dropped_trace
+            .identity
+            .as_ref()
+            .is_some_and(|identity| !identity.source_block_id.contains("confidential")));
+    }
+
+    #[test]
     fn graph_append_preserves_direct_seed_provenance_without_mmr() {
         let mut seed = test_result("seed-parent", "direct relation seed evidence", 0.4);
         seed.citation
@@ -10914,6 +11598,20 @@ mod v007_fix1_tests {
             .insert("source_block_id".into(), "recon-001".into());
 
         apply_indexed_lexical_rank_score(&mut lexical, 42.0, 1, 0.2, 60.0);
+        lexical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("strong_lexical_evidence".into(), "true".into());
+        mark_ranking_protection(
+            &mut lexical,
+            RankingProtection {
+                preserve_primary_direct: true,
+                preserve_strong_lexical: true,
+                preserve_unique_source_block: true,
+            },
+        );
         let lexical_contribution = lexical.scores.as_ref().unwrap().fusion_score;
         let direct_fusion = direct.scores.as_ref().unwrap().fusion_score;
         merge_lexical_backfill_candidate(&mut direct, &lexical);
@@ -10936,6 +11634,9 @@ mod v007_fix1_tests {
                 .map(String::as_str),
             Some("recon-001")
         );
+        let metadata = &direct.citation.as_ref().unwrap().metadata;
+        assert_eq!(metadata.get("lexical_rank").map(String::as_str), Some("1"));
+        assert!(metadata.contains_key("ranking_protection"));
     }
 
     fn block(

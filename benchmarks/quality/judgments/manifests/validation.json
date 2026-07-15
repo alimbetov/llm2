@@ -1,0 +1,389 @@
+{
+  "blind_judgments_sha256": "37ff805c3290c9f6fc13a30d1c96f7fcb3d1cc894d8ded66c7d5a9e0fc5df23d",
+  "candidate_pool_sha256": "a3aff031ab2ee8a5f704548a720bba2e776cab481b34d8a0e4ac8d5782e7c9d3",
+  "identity_map_sha256": "9b23186578d81e4495692df028ecd1d6ee9250b8da2f8febf1cd5f5edbe9c0af",
+  "judged_candidates_total": 0,
+  "minimum_pool_source_count": 4,
+  "profile": "validation",
+  "profile_sha256": "ed44a3eca59677864272b7e7716c2c0d1bc45dc2069c5b924a7036d2f5a406d8",
+  "qrels_complete": false,
+  "queries": [
+    {
+      "candidate_count": 3,
+      "pool_source_count": 4,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "access-004",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 3,
+        "hybrid": 3,
+        "postgres_fts": 1,
+        "sparse": 2
+      }
+    },
+    {
+      "candidate_count": 9,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "access-005",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 9,
+        "hybrid": 9,
+        "hybrid_graph": 9,
+        "postgres_fts": 3,
+        "sparse": 6
+      }
+    },
+    {
+      "candidate_count": 31,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "access-012",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 5,
+        "sparse": 17
+      }
+    },
+    {
+      "candidate_count": 25,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "dense-003",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 18,
+        "hybrid_graph": 12,
+        "postgres_fts": 19,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 34,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "distractor-003",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 19,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 10,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 31,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "distractor-negative-001",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 16,
+        "hybrid": 20,
+        "hybrid_graph": 8,
+        "postgres_fts": 19,
+        "sparse": 19
+      }
+    },
+    {
+      "candidate_count": 28,
+      "pool_source_count": 4,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "distractor-negative-003",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 20,
+        "postgres_fts": 19,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 33,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "graph-extra-006",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 17,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 14,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 45,
+      "pool_source_count": 4,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "negative-002",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 14,
+        "hybrid": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 29,
+      "pool_source_count": 4,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "negative-004",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 14,
+        "hybrid": 18,
+        "postgres_fts": 17,
+        "sparse": 19
+      }
+    },
+    {
+      "candidate_count": 33,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "sparse-tech-003",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 1,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 20,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "sparse-tech-004",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 5,
+        "hybrid_graph": 5,
+        "postgres_fts": 4,
+        "sparse": 5
+      }
+    },
+    {
+      "candidate_count": 27,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-002",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 21,
+        "hybrid_graph": 10,
+        "postgres_fts": 19,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 31,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-003",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 17,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 16,
+        "sparse": 19
+      }
+    },
+    {
+      "candidate_count": 27,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-012",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 17,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 13,
+        "sparse": 19
+      }
+    },
+    {
+      "candidate_count": 36,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-014",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 19,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 13,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 31,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-graph-001",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 18,
+        "hybrid": 21,
+        "hybrid_graph": 10,
+        "postgres_fts": 17,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 29,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-graph-003",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 17,
+        "hybrid": 20,
+        "hybrid_graph": 10,
+        "postgres_fts": 14,
+        "sparse": 20
+      }
+    },
+    {
+      "candidate_count": 31,
+      "pool_source_count": 5,
+      "pool_sources": [
+        "dense",
+        "hybrid",
+        "hybrid_graph",
+        "postgres_fts",
+        "sparse"
+      ],
+      "query_id": "technical-negative-001",
+      "requested_pool_depth": 20,
+      "source_candidate_counts": {
+        "dense": 16,
+        "hybrid": 20,
+        "hybrid_graph": 8,
+        "postgres_fts": 19,
+        "sparse": 19
+      }
+    }
+  ],
+  "queries_total": 19,
+  "requested_pool_depth": 20,
+  "schema_version": 1,
+  "status": "AWAITING_BLIND_JUDGMENT",
+  "unjudged_candidates_total": 533
+}

@@ -33,6 +33,88 @@ fn quality_report_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("target/quality-reports"))
 }
 
+fn export_fix481_ranking_trace(query_id: &str, response: &pb::RetrieveContextResponse) {
+    const TARGETS: &[&str] = &[
+        "technical-012",
+        "graph-extra-006",
+        "technical-graph-001",
+        "technical-graph-003",
+    ];
+    let export_all = env::var("ASTRAVECTOR_FIX481_EXPORT_ALL_TRACES")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if !export_all && !TARGETS.contains(&query_id) {
+        return;
+    }
+    let Ok(root) = env::var("ASTRAVECTOR_FIX481_EVIDENCE_DIR") else {
+        return;
+    };
+    let Some(trace) = response
+        .diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.ranking_trace.as_ref())
+    else {
+        return;
+    };
+    let candidates = trace
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let identity = candidate.identity.as_ref().map(|identity| json!({
+                "access_zone_id": identity.access_zone_id,
+                "document_id": identity.document_id,
+                "document_version": identity.document_version,
+                "matched_chunk_id": identity.matched_chunk_id,
+                "parent_chunk_id": identity.parent_chunk_id,
+                "source_block_id": identity.source_block_id,
+            }));
+            let stages = candidate.stages.iter().map(|stage| json!({
+                "stage": pb::RankingStageV005::try_from(stage.stage).map(|v| v.as_str_name()).unwrap_or("RANKING_STAGE_UNSPECIFIED"),
+                "present": stage.present,
+                "rank": stage.rank,
+                "dense_score": stage.dense_score,
+                "sparse_score": stage.sparse_score,
+                "lexical_score": stage.lexical_score,
+                "fusion_score": stage.fusion_score,
+                "graph_score": stage.graph_score,
+                "mmr_relevance": stage.mmr_relevance,
+                "mmr_redundancy": stage.mmr_redundancy,
+                "final_score": stage.final_score,
+                "retrieval_sources": stage.retrieval_sources,
+                "drop_reason": pb::CandidateDropReasonV005::try_from(stage.drop_reason).map(|v| v.as_str_name()).unwrap_or("DROP_REASON_UNSPECIFIED"),
+                "reason": stage.reason,
+            })).collect::<Vec<_>>();
+            json!({
+                "identity": identity,
+                "stages": stages,
+                "primary_direct": candidate.primary_direct,
+                "graph_expanded": candidate.graph_expanded,
+                "exact_technical_match": candidate.exact_technical_match,
+                "strong_lexical_evidence": candidate.strong_lexical_evidence,
+                "ranking_protected": candidate.ranking_protected,
+            })
+        })
+        .collect::<Vec<_>>();
+    let output = env::var("ASTRAVECTOR_FIX481_POOL_SOURCE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|source| PathBuf::from(&root).join("ranking-traces").join(source))
+        .unwrap_or_else(|| PathBuf::from(root).join("ranking-traces"));
+    fs::create_dir_all(&output).expect("create fix481 ranking trace directory");
+    fs::write(
+        output.join(format!("{query_id}.json")),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "query_id": query_id,
+            "truncated": trace.truncated,
+            "total_candidates_seen": trace.total_candidates_seen,
+            "candidates": candidates,
+        }))
+        .expect("serialize ranking trace"),
+    )
+    .expect("write fix481 ranking trace");
+}
+
 #[derive(Default)]
 struct RuntimeStats {
     fixtures_ingested_count: usize,
@@ -68,7 +150,134 @@ struct RuntimeStats {
     no_answer: NoAnswerRuntimeStats,
     safety: SafetyRuntimeStats,
     ir: IrRuntimeStats,
+    evaluation: EvaluationContract,
     query_diagnostics: Vec<Value>,
+}
+
+#[derive(Default)]
+struct EvaluationContract {
+    status: String,
+    reason: Option<String>,
+    qrels_complete: bool,
+    judged_candidates_total: usize,
+    unjudged_candidates_total: usize,
+    unjudged_at_5: usize,
+    unjudged_at_10: usize,
+    pool_depth: usize,
+    pool_source_count: usize,
+    queries_with_complete_qrels: usize,
+    queries_with_incomplete_qrels: usize,
+    judgments: HashMap<String, HashMap<String, u8>>,
+}
+
+fn load_evaluation_contract(profile: &str, query_count: usize) -> EvaluationContract {
+    let root = Path::new(QUALITY_ROOT).join("judgments");
+    let manifest_path = root.join("manifests").join(format!("{profile}.json"));
+    let qrels_path = root.join("adjudicated").join(format!("{profile}.jsonl"));
+    let incomplete = |reason: &str| EvaluationContract {
+        status: "INCOMPLETE".into(),
+        reason: Some(reason.into()),
+        queries_with_incomplete_qrels: query_count,
+        ..Default::default()
+    };
+    let Ok(manifest_bytes) = fs::read(&manifest_path) else {
+        return incomplete("JUDGMENT_MANIFEST_NOT_FOUND");
+    };
+    let Ok(manifest) = serde_json::from_slice::<Value>(&manifest_bytes) else {
+        return incomplete("JUDGMENT_MANIFEST_INVALID");
+    };
+    let pool_depth = manifest
+        .get("requested_pool_depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let pool_source_count = manifest
+        .get("queries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|query| query.get("pool_source_count").and_then(Value::as_u64))
+        .min()
+        .unwrap_or(0) as usize;
+    let judged_candidates_total = manifest
+        .get("judged_candidates_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let unjudged_candidates_total = manifest
+        .get("unjudged_candidates_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let incomplete_manifest = |reason: &str| EvaluationContract {
+        status: "INCOMPLETE".into(),
+        reason: Some(reason.into()),
+        judged_candidates_total,
+        unjudged_candidates_total,
+        pool_depth,
+        pool_source_count,
+        queries_with_incomplete_qrels: query_count,
+        ..Default::default()
+    };
+    if manifest.get("status").and_then(Value::as_str) != Some("ADJUDICATED")
+        || manifest.get("qrels_complete").and_then(Value::as_bool) != Some(true)
+    {
+        return incomplete_manifest("BLIND_JUDGMENT_NOT_ADJUDICATED");
+    }
+    if pool_depth < 20 || pool_source_count < 4 {
+        return incomplete_manifest("QRELS_POOL_INCOMPLETE");
+    }
+    let expected_sha = manifest
+        .get("adjudicated_qrels_sha256")
+        .and_then(Value::as_str);
+    let Ok(qrels_bytes) = fs::read(&qrels_path) else {
+        return incomplete_manifest("ADJUDICATED_QRELS_NOT_FOUND");
+    };
+    let actual_sha = hex::encode(Sha256::digest(&qrels_bytes));
+    if expected_sha != Some(actual_sha.as_str()) {
+        return incomplete_manifest("ADJUDICATED_QRELS_HASH_MISMATCH");
+    }
+    let mut judgments: HashMap<String, HashMap<String, u8>> = HashMap::new();
+    let mut rows = 0usize;
+    for line in String::from_utf8_lossy(&qrels_bytes).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            return incomplete_manifest("ADJUDICATED_QRELS_INVALID");
+        };
+        let (Some(query_id), Some(block_id), Some(relevance)) = (
+            row.get("query_id").and_then(Value::as_str),
+            row.get("source_block_id").and_then(Value::as_str),
+            row.get("relevance").and_then(Value::as_u64),
+        ) else {
+            return incomplete_manifest("ADJUDICATED_QRELS_INVALID");
+        };
+        if relevance > 3
+            || row.get("judgment_status").and_then(Value::as_str) != Some("ADJUDICATED")
+        {
+            return incomplete_manifest("ADJUDICATED_QRELS_INVALID");
+        }
+        judgments
+            .entry(query_id.into())
+            .or_default()
+            .insert(block_id.into(), relevance as u8);
+        rows += 1;
+    }
+    let expected_rows = manifest
+        .get("judged_candidates_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    if rows == 0 || rows != expected_rows {
+        return incomplete_manifest("ADJUDICATED_QRELS_COUNT_MISMATCH");
+    }
+    EvaluationContract {
+        status: "COMPLETE".into(),
+        qrels_complete: true,
+        judged_candidates_total: rows,
+        pool_depth,
+        pool_source_count,
+        queries_with_complete_qrels: query_count,
+        judgments,
+        ..Default::default()
+    }
 }
 
 #[derive(Default)]
@@ -103,6 +312,7 @@ struct SafetyRuntimeStats {
 #[derive(Default)]
 struct IrRuntimeStats {
     positive_queries: usize,
+    hit_at_5_sum: f64,
     precision_at_5_sum: f64,
     recall_at_5_sum: f64,
     recall_at_10_sum: f64,
@@ -207,6 +417,7 @@ struct EvalResult {
     positive_query_empty_context_count: usize,
     silent_degraded_response_count: usize,
     ir_applicable: bool,
+    hit_at_5: f64,
     precision_at_5: f64,
     recall_at_5: f64,
     recall_at_10: f64,
@@ -217,6 +428,8 @@ struct EvalResult {
     evidence_expected: bool,
     abstained: bool,
     critical: bool,
+    unjudged_at_5: usize,
+    unjudged_at_10: usize,
 }
 
 struct CanonicalEvidence {
@@ -554,6 +767,14 @@ fn retrieval_profile(value: &str) -> i32 {
 }
 
 fn effective_retrieval_profile(profile_name: &str, query_profile: &str) -> i32 {
+    if let Ok(source) = env::var("ASTRAVECTOR_FIX481_POOL_SOURCE") {
+        return match source.as_str() {
+            "dense" => pb::RetrievalProfile::Semantic as i32,
+            "sparse" | "postgres_fts" => pb::RetrievalProfile::LexicalStrict as i32,
+            "hybrid" | "hybrid_graph" => retrieval_profile(query_profile),
+            _ => panic!("unsupported ASTRAVECTOR_FIX481_POOL_SOURCE={source}"),
+        };
+    }
     match profile_name {
         "dense-only-quick" => pb::RetrievalProfile::Semantic as i32,
         "sparse-quick" => pb::RetrievalProfile::LexicalStrict as i32,
@@ -1948,6 +2169,7 @@ fn evaluate_query(
     elapsed_ms: u128,
     effective_caller_access_level: &str,
     canonical_evidence: &HashMap<String, CanonicalEvidence>,
+    adjudicated: Option<&HashMap<String, u8>>,
 ) -> EvalResult {
     let query_id = query.get("id").and_then(Value::as_str).unwrap_or("query");
     let expected = query.get("expected").expect("query missing expected");
@@ -2126,15 +2348,22 @@ fn evaluate_query(
             .collect::<HashSet<_>>();
     if evidence_expected && (!relevant_documents.is_empty() || !relevant_blocks.is_empty()) {
         result.ir_applicable = true;
-        let total_relevant = if !relevant_documents.is_empty() && !relevant_blocks.is_empty() {
-            relevant_documents.len() * relevant_blocks.len()
-        } else {
-            relevant_documents.len().max(relevant_blocks.len())
-        };
-        let relevance = response
+        let expected_total_relevant =
+            if !relevant_documents.is_empty() && !relevant_blocks.is_empty() {
+                relevant_documents.len() * relevant_blocks.len()
+            } else {
+                relevant_documents.len().max(relevant_blocks.len())
+            };
+        let graded_relevance = response
             .contexts
             .iter()
             .map(|context| {
+                if let Some(judgments) = adjudicated {
+                    return judgments
+                        .get(context.source_block_id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                }
                 let document_match = relevant_documents.is_empty()
                     || [
                         Some(context.document_id.as_str()),
@@ -2156,11 +2385,41 @@ fn evaluate_query(
                     .any(|value| relevant_documents.contains(value));
                 let block_match = relevant_blocks.is_empty()
                     || relevant_blocks.contains(context.source_block_id.as_str());
-                document_match && block_match
+                u8::from(document_match && block_match) * 3
             })
+            .collect::<Vec<_>>();
+        if let Some(judgments) = adjudicated {
+            result.unjudged_at_5 = response
+                .contexts
+                .iter()
+                .take(5)
+                .filter(|context| !judgments.contains_key(context.source_block_id.as_str()))
+                .count();
+            result.unjudged_at_10 = response
+                .contexts
+                .iter()
+                .take(10)
+                .filter(|context| !judgments.contains_key(context.source_block_id.as_str()))
+                .count();
+        } else {
+            result.unjudged_at_5 = response.contexts.len().min(5);
+            result.unjudged_at_10 = response.contexts.len().min(10);
+        }
+        let total_relevant = adjudicated
+            .map(|judgments| {
+                judgments
+                    .values()
+                    .filter(|relevance| **relevance > 0)
+                    .count()
+            })
+            .unwrap_or(expected_total_relevant);
+        let relevance = graded_relevance
+            .iter()
+            .map(|relevance| *relevance > 0)
             .collect::<Vec<_>>();
         let hits_at = |limit: usize| relevance.iter().take(limit).filter(|hit| **hit).count();
         result.precision_at_5 = hits_at(5) as f64 / 5.0;
+        result.hit_at_5 = f64::from(hits_at(5) > 0);
         result.recall_at_5 = hits_at(5) as f64 / total_relevant.max(1) as f64;
         result.recall_at_10 = hits_at(10) as f64 / total_relevant.max(1) as f64;
         result.recall_at_20 = hits_at(20) as f64 / total_relevant.max(1) as f64;
@@ -2171,15 +2430,31 @@ fn evaluate_query(
             .map(|rank| 1.0 / (rank + 1) as f64)
             .unwrap_or(0.0);
         result.top1_relevant = relevance.first().copied().unwrap_or(false);
-        let dcg = relevance
+        let dcg = graded_relevance
             .iter()
             .take(10)
             .enumerate()
-            .filter(|(_, hit)| **hit)
-            .map(|(rank, _)| 7.0 / ((rank + 2) as f64).log2())
+            .map(|(rank, relevance)| {
+                (2f64.powi(*relevance as i32) - 1.0) / ((rank + 2) as f64).log2()
+            })
             .sum::<f64>();
-        let idcg = (0..total_relevant.min(10))
-            .map(|rank| 7.0 / ((rank + 2) as f64).log2())
+        let mut ideal = adjudicated
+            .map(|judgments| {
+                judgments
+                    .values()
+                    .copied()
+                    .filter(|relevance| *relevance > 0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![3; total_relevant]);
+        ideal.sort_unstable_by(|left, right| right.cmp(left));
+        let idcg = ideal
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(rank, relevance)| {
+                (2f64.powi(*relevance as i32) - 1.0) / ((rank + 2) as f64).log2()
+            })
             .sum::<f64>();
         result.ndcg_at_10 = if idcg == 0.0 { 0.0 } else { dcg / idcg };
     }
@@ -2505,6 +2780,7 @@ async fn retrieve_queries(
     capabilities: &Capabilities,
     profile_name: &str,
     canonical_evidence: &HashMap<String, CanonicalEvidence>,
+    evaluation: &mut EvaluationContract,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     let mut client = match AstraVectorRetrievalFacadeClient::connect(endpoint.to_string()).await {
@@ -2642,10 +2918,14 @@ async fn retrieve_queries(
                 .unwrap_or(10) as u32,
             filters,
             response_detail: pb::ResponseDetail::Debug as i32,
-            enable_graph_expansion: context
-                .get("enable_graph_expansion")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            enable_graph_expansion: match env::var("ASTRAVECTOR_FIX481_POOL_SOURCE").as_deref() {
+                Ok("hybrid_graph") => true,
+                Ok("dense" | "sparse" | "postgres_fts" | "hybrid") => false,
+                _ => context
+                    .get("enable_graph_expansion")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
             graph_max_hops: 1,
             graph_max_related_contexts: env_u32("ASTRAVECTOR_GRAPH_MAX_RELATED_CHUNKS", 5),
         });
@@ -2654,6 +2934,7 @@ async fn retrieve_queries(
         match client.retrieve_context(req).await {
             Ok(response) => {
                 let response = response.into_inner();
+                export_fix481_ranking_trace(query_id, &response);
                 for warning in &response.warnings {
                     match warning.code.as_str() {
                         "PRE_MMR_WEAK_CANDIDATE_FILTERED" => {
@@ -2687,6 +2968,7 @@ async fn retrieve_queries(
                     before.elapsed().as_millis(),
                     effective_access_level,
                     canonical_evidence,
+                    evaluation.judgments.get(query_id),
                 );
                 stats.safety.comparisons += 1;
                 stats.safety.returned_contexts_compared += eval.contexts_count;
@@ -2704,8 +2986,11 @@ async fn retrieve_queries(
                     eval.positive_query_empty_context_count;
                 stats.safety.silent_degraded_response_count += eval.silent_degraded_response_count;
                 if eval.ir_applicable {
+                    evaluation.unjudged_at_5 += eval.unjudged_at_5;
+                    evaluation.unjudged_at_10 += eval.unjudged_at_10;
                     stats.ir.positive_queries += 1;
                     stats.ir.precision_at_5_sum += eval.precision_at_5;
+                    stats.ir.hit_at_5_sum += eval.hit_at_5;
                     stats.ir.recall_at_5_sum += eval.recall_at_5;
                     stats.ir.recall_at_10_sum += eval.recall_at_10;
                     stats.ir.recall_at_20_sum += eval.recall_at_20;
@@ -3161,6 +3446,22 @@ fn write_report(
             "dense_embeddings_count": stats.dense_embeddings_count,
             "sparse_embeddings_count": stats.sparse_embeddings_count
         },
+        "evaluation_contract": {
+            "status": stats.evaluation.status,
+            "reason": stats.evaluation.reason,
+            "qrels_complete": stats.evaluation.qrels_complete,
+            "judged_candidates_total": stats.evaluation.judged_candidates_total,
+            "unjudged_candidates_total": stats.evaluation.unjudged_candidates_total,
+            "unjudged_at_5": stats.evaluation.unjudged_at_5,
+            "unjudged_at_10": stats.evaluation.unjudged_at_10,
+            "pool_depth": stats.evaluation.pool_depth,
+            "pool_source_count": stats.evaluation.pool_source_count,
+            "queries_with_complete_qrels": stats.evaluation.queries_with_complete_qrels,
+            "queries_with_incomplete_qrels": stats.evaluation.queries_with_incomplete_qrels,
+            "precision_at_5_mode": "DIAGNOSTIC",
+            "eligible_precision_queries": 0,
+            "ineligible_precision_queries": stats.ir.positive_queries
+        },
         "retrieval": {
             "queries_total": stats.retrieve_context_queries_total,
             "queries_passed": stats.retrieve_context_queries_passed,
@@ -3169,6 +3470,10 @@ fn write_report(
             "queries_skipped": stats.retrieve_context_queries_skipped,
             "query_acceptance_rate": recall,
             "precision_at_5": stats.ir.average(stats.ir.precision_at_5_sum),
+            "hit_at_5": stats.ir.average(stats.ir.hit_at_5_sum),
+            "precision_at_5_mode": "DIAGNOSTIC",
+            "unjudged_at_5": stats.evaluation.unjudged_at_5,
+            "qrels_complete": stats.evaluation.qrels_complete,
             "recall_at_5": stats.ir.average(stats.ir.recall_at_5_sum),
             "recall_at_10": stats.ir.average(stats.ir.recall_at_10_sum),
             "recall_at_20": stats.ir.average(stats.ir.recall_at_20_sum),
@@ -3401,6 +3706,14 @@ async fn quality_bench_runtime_quick() {
     let documents = load_documents(&profile);
     let relations = load_relations(&profile);
     let queries = load_queries(&profile);
+    let mut evaluation = if matches!(profile_name.as_str(), "validation" | "holdout") {
+        load_evaluation_contract(&profile_name, queries.len())
+    } else {
+        EvaluationContract {
+            status: "NOT_APPLICABLE".into(),
+            ..Default::default()
+        }
+    };
     stats.graph.relations_loaded_count = relations.len() as u64;
     let mut failures = Vec::new();
     let mut unsupported_relation_types = relations
@@ -3491,9 +3804,11 @@ async fn quality_bench_runtime_quick() {
             &capabilities,
             &profile_name,
             &canonical_evidence,
+            &mut evaluation,
         )
         .await,
     );
+    stats.evaluation = evaluation;
     for (count, code) in [
         (
             stats.safety.hard_negative_false_positive_count,
@@ -3556,37 +3871,42 @@ async fn quality_bench_runtime_quick() {
         failures.push("MODEL_BACKED_E2E_NOT_CONFIRMED".into());
     }
     if matches!(profile_name.as_str(), "validation" | "holdout") {
-        let precision_at_5 = stats.ir.average(stats.ir.precision_at_5_sum);
-        let recall_at_5 = stats.ir.average(stats.ir.recall_at_5_sum);
-        let recall_at_20 = stats.ir.average(stats.ir.recall_at_20_sum);
-        let mrr_at_10 = stats.ir.average(stats.ir.reciprocal_rank_at_10_sum);
-        let ndcg_at_10 = stats.ir.average(stats.ir.ndcg_at_10_sum);
-        for (passed, code) in [
-            (precision_at_5 >= 0.90, "PRECISION_AT_5_BELOW_THRESHOLD"),
-            (recall_at_5 >= 0.95, "RECALL_AT_5_BELOW_THRESHOLD"),
-            (recall_at_20 >= 0.98, "RECALL_AT_20_BELOW_THRESHOLD"),
-            (mrr_at_10 >= 0.90, "MRR_AT_10_BELOW_THRESHOLD"),
-            (ndcg_at_10 >= 0.90, "NDCG_AT_10_BELOW_THRESHOLD"),
-            (
-                stats.ir.critical_queries > 0
-                    && stats.ir.critical_top1_hits == stats.ir.critical_queries,
-                "CRITICAL_TOP1_ACCURACY_FAILED",
-            ),
-            (
-                stats.ir.no_answer_precision() >= 0.95,
-                "NO_ANSWER_PRECISION_BELOW_THRESHOLD",
-            ),
-            (
-                stats.ir.no_answer_recall() >= 0.95,
-                "NO_ANSWER_RECALL_BELOW_THRESHOLD",
-            ),
-            (
-                stats.ir.false_abstention_rate() <= 0.02,
-                "FALSE_ABSTENTION_RATE_ABOVE_THRESHOLD",
-            ),
-        ] {
-            if !passed {
-                failures.push(code.into());
+        if !stats.evaluation.qrels_complete || stats.evaluation.unjudged_at_5 > 0 {
+            failures.push("EVALUATION_DATA_INCOMPLETE".into());
+        }
+        if stats.evaluation.qrels_complete && stats.evaluation.unjudged_at_5 == 0 {
+            let hit_at_5 = stats.ir.average(stats.ir.hit_at_5_sum);
+            let recall_at_5 = stats.ir.average(stats.ir.recall_at_5_sum);
+            let recall_at_20 = stats.ir.average(stats.ir.recall_at_20_sum);
+            let mrr_at_10 = stats.ir.average(stats.ir.reciprocal_rank_at_10_sum);
+            let ndcg_at_10 = stats.ir.average(stats.ir.ndcg_at_10_sum);
+            for (passed, code) in [
+                (hit_at_5 >= 0.95, "HIT_AT_5_BELOW_THRESHOLD"),
+                (recall_at_5 >= 0.95, "RECALL_AT_5_BELOW_THRESHOLD"),
+                (recall_at_20 >= 0.98, "RECALL_AT_20_BELOW_THRESHOLD"),
+                (mrr_at_10 >= 0.90, "MRR_AT_10_BELOW_THRESHOLD"),
+                (ndcg_at_10 >= 0.90, "NDCG_AT_10_BELOW_THRESHOLD"),
+                (
+                    stats.ir.critical_queries > 0
+                        && stats.ir.critical_top1_hits == stats.ir.critical_queries,
+                    "CRITICAL_TOP1_ACCURACY_FAILED",
+                ),
+                (
+                    stats.ir.no_answer_precision() >= 0.95,
+                    "NO_ANSWER_PRECISION_BELOW_THRESHOLD",
+                ),
+                (
+                    stats.ir.no_answer_recall() >= 0.95,
+                    "NO_ANSWER_RECALL_BELOW_THRESHOLD",
+                ),
+                (
+                    stats.ir.false_abstention_rate() <= 0.02,
+                    "FALSE_ABSTENTION_RATE_ABOVE_THRESHOLD",
+                ),
+            ] {
+                if !passed {
+                    failures.push(code.into());
+                }
             }
         }
     }
@@ -3654,7 +3974,7 @@ mod truthfulness_tests {
     }
 
     fn evaluate(query: &Value, response: &pb::RetrieveContextResponse) -> EvalResult {
-        evaluate_query(query, response, 1, "PUBLIC", &HashMap::new())
+        evaluate_query(query, response, 1, "PUBLIC", &HashMap::new(), None)
     }
 
     #[test]
@@ -3684,6 +4004,36 @@ mod truthfulness_tests {
         assert_eq!(
             evaluate(&query(), &response).access_level_violation_count,
             1
+        );
+    }
+
+    #[test]
+    fn adjudicated_qrels_drive_graded_metrics_and_unjudged_counts() {
+        let mut query = query();
+        query["expected"]["must_contain_block_ids"] = json!(["block-1"]);
+        let mut supporting = context("1700", "PUBLIC");
+        supporting.source_block_id = "block-2".into();
+        supporting.citation.as_mut().unwrap().source_block_id = "block-2".into();
+        let response = pb::RetrieveContextResponse {
+            contexts: vec![supporting, context("1700", "PUBLIC")],
+            ..Default::default()
+        };
+        let judgments = HashMap::from([("block-1".into(), 3), ("block-2".into(), 2)]);
+        let result = evaluate_query(
+            &query,
+            &response,
+            1,
+            "PUBLIC",
+            &HashMap::new(),
+            Some(&judgments),
+        );
+
+        assert_eq!(result.unjudged_at_5, 0);
+        assert_eq!(result.hit_at_5, 1.0);
+        assert_eq!(result.reciprocal_rank_at_10, 1.0);
+        assert!(
+            result.ndcg_at_10 < 1.0,
+            "grade-3 evidence should rank first"
         );
     }
 

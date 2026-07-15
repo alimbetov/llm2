@@ -176,6 +176,13 @@ search:
   hybrid_fusion_method: ${ASTRAVECTOR_HYBRID_FUSION_METHOD:-RRF}
   hybrid_dense_weight: ${ASTRAVECTOR_HYBRID_DENSE_WEIGHT:-0.6}
   hybrid_sparse_weight: ${ASTRAVECTOR_HYBRID_SPARSE_WEIGHT:-0.4}
+  fusion:
+    min_strong_lexical_candidates: ${ASTRAVECTOR_FUSION_MIN_STRONG_LEXICAL_CANDIDATES:-1}
+  ranking_trace:
+    enabled: ${ASTRAVECTOR_RANKING_TRACE_ENABLED:-false}
+    max_candidates: ${ASTRAVECTOR_RANKING_TRACE_MAX_CANDIDATES:-100}
+    max_stages_per_candidate: ${ASTRAVECTOR_RANKING_TRACE_MAX_STAGES:-32}
+    include_text_preview: false
   lexical:
     enabled: ${ASTRAVECTOR_LEXICAL_SEARCH_ENABLED:-true}
     backend: ${ASTRAVECTOR_LEXICAL_SEARCH_BACKEND:-POSTGRES_FTS}
@@ -250,6 +257,8 @@ graph_rag:
     graph_merge_strategy: ${ASTRAVECTOR_GRAPH_MERGE_STRATEGY:-SCORE_THEN_TRUNCATE}
     direct_context_limit: ${ASTRAVECTOR_GRAPH_DIRECT_CONTEXT_LIMIT:-6}
     graph_context_append_limit: ${ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT:-2}
+    min_direct_contexts: ${ASTRAVECTOR_GRAPH_MIN_DIRECT_CONTEXTS:-1}
+    max_graph_fraction: ${ASTRAVECTOR_GRAPH_MAX_GRAPH_FRACTION:-0.50}
     timeout_ms: ${ASTRAVECTOR_GRAPH_TIMEOUT_MS:-500}
     min_useful_budget_ms: ${ASTRAVECTOR_GRAPH_MIN_USEFUL_BUDGET_MS:-80}
     response_reserve_ms: ${ASTRAVECTOR_GRAPH_RESPONSE_RESERVE_MS:-100}
@@ -496,6 +505,8 @@ rag_context:
   truncation_strategy: ${ASTRAVECTOR_RAG_TRUNCATION_STRATEGY:-DROP_LOWEST_MMR_SCORE_CHUNKS}
   huge_chunk_strategy: ${ASTRAVECTOR_RAG_HUGE_CHUNK_STRATEGY:-DROP_ONE_HUGE_CHUNK}
   allow_chunk_text_truncation: ${ASTRAVECTOR_RAG_ALLOW_CHUNK_TEXT_TRUNCATION:-false}
+  min_direct_token_fraction: ${ASTRAVECTOR_RAG_MIN_DIRECT_TOKEN_FRACTION:-0.50}
+  max_graph_token_fraction: ${ASTRAVECTOR_RAG_MAX_GRAPH_TOKEN_FRACTION:-0.40}
 
 limits:
   source_text_max_bytes: ${ASTRAVECTOR_INGESTION_SINGLE_REQUEST_MAX_BYTES:-2097152}

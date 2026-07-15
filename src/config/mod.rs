@@ -399,6 +399,10 @@ pub struct GraphRagRetrievalConfig {
     pub direct_context_limit: usize,
     #[serde(default = "default_graph_context_append_limit")]
     pub graph_context_append_limit: usize,
+    #[serde(default = "default_min_direct_contexts")]
+    pub min_direct_contexts: usize,
+    #[serde(default = "default_max_graph_fraction")]
+    pub max_graph_fraction: f32,
     #[serde(default = "default_max_graph_relations_debug_per_candidate")]
     pub max_graph_relations_debug_per_candidate: usize,
     pub timeout_ms: u64,
@@ -600,6 +604,12 @@ fn default_direct_context_limit() -> usize {
 }
 fn default_graph_context_append_limit() -> usize {
     2
+}
+fn default_min_direct_contexts() -> usize {
+    1
+}
+fn default_max_graph_fraction() -> f32 {
+    0.50
 }
 fn default_max_graph_relations_debug_per_candidate() -> usize {
     5
@@ -1036,6 +1046,10 @@ pub struct RagContextConfig {
     pub huge_chunk_strategy: String,
     #[serde(default)]
     pub allow_chunk_text_truncation: bool,
+    #[serde(default = "default_min_direct_token_fraction")]
+    pub min_direct_token_fraction: f32,
+    #[serde(default = "default_max_graph_token_fraction")]
+    pub max_graph_token_fraction: f32,
 }
 impl Default for RagContextConfig {
     fn default() -> Self {
@@ -1049,6 +1063,8 @@ impl Default for RagContextConfig {
             truncation_strategy: default_truncation_strategy(),
             huge_chunk_strategy: default_huge_chunk_strategy(),
             allow_chunk_text_truncation: false,
+            min_direct_token_fraction: default_min_direct_token_fraction(),
+            max_graph_token_fraction: default_max_graph_token_fraction(),
         }
     }
 }
@@ -1313,6 +1329,12 @@ fn default_max_context_tokens() -> usize {
 }
 fn default_reserved_answer_tokens() -> usize {
     1000
+}
+fn default_min_direct_token_fraction() -> f32 {
+    0.50
+}
+fn default_max_graph_token_fraction() -> f32 {
+    0.40
 }
 fn default_rag_tokenizer() -> String {
     "APPROX_CHARS".into()
@@ -1730,6 +1752,31 @@ impl AppConfig {
         anyhow::ensure!(
             self.graph_rag.retrieval.final_context_limit > 0,
             "graph_rag.retrieval.final_context_limit must be positive"
+        );
+        anyhow::ensure!(
+            self.graph_rag.retrieval.min_direct_contexts
+                <= self.graph_rag.retrieval.final_context_limit,
+            "graph_rag.retrieval.min_direct_contexts must not exceed final_context_limit"
+        );
+        anyhow::ensure!(
+            self.graph_rag.retrieval.max_graph_fraction.is_finite()
+                && (0.0..=1.0).contains(&self.graph_rag.retrieval.max_graph_fraction),
+            "graph_rag.retrieval.max_graph_fraction must be finite and in [0, 1]"
+        );
+        anyhow::ensure!(
+            self.rag_context.min_direct_token_fraction.is_finite()
+                && (0.0..=1.0).contains(&self.rag_context.min_direct_token_fraction),
+            "rag_context.min_direct_token_fraction must be finite and in [0, 1]"
+        );
+        anyhow::ensure!(
+            self.rag_context.max_graph_token_fraction.is_finite()
+                && (0.0..=1.0).contains(&self.rag_context.max_graph_token_fraction),
+            "rag_context.max_graph_token_fraction must be finite and in [0, 1]"
+        );
+        anyhow::ensure!(
+            self.search.ranking_trace.max_candidates > 0
+                && self.search.ranking_trace.max_stages_per_candidate > 0,
+            "search.ranking_trace limits must be positive"
         );
         anyhow::ensure!(
             matches!(
@@ -2390,7 +2437,53 @@ pub struct SearchConfig {
     #[serde(default)]
     pub lexical: LexicalSearchConfig,
     #[serde(default)]
+    pub fusion: FusionSearchConfig,
+    #[serde(default)]
+    pub ranking_trace: RankingTraceConfig,
+    #[serde(default)]
     pub no_answer: NoAnswerConfig,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct FusionSearchConfig {
+    #[serde(default = "default_min_strong_lexical_candidates")]
+    pub min_strong_lexical_candidates: usize,
+}
+impl Default for FusionSearchConfig {
+    fn default() -> Self {
+        Self {
+            min_strong_lexical_candidates: default_min_strong_lexical_candidates(),
+        }
+    }
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct RankingTraceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ranking_trace_max_candidates")]
+    pub max_candidates: usize,
+    #[serde(default = "default_ranking_trace_max_stages")]
+    pub max_stages_per_candidate: usize,
+    #[serde(default)]
+    pub include_text_preview: bool,
+}
+impl Default for RankingTraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_candidates: default_ranking_trace_max_candidates(),
+            max_stages_per_candidate: default_ranking_trace_max_stages(),
+            include_text_preview: false,
+        }
+    }
+}
+fn default_min_strong_lexical_candidates() -> usize {
+    1
+}
+fn default_ranking_trace_max_candidates() -> usize {
+    100
+}
+fn default_ranking_trace_max_stages() -> usize {
+    32
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct LexicalSearchConfig {

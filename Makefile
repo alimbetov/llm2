@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 fix481-prepare-judgments fix481-finalize-judgments quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -255,6 +255,23 @@ production-search-gate-m2-repeatability:
 
 verify-fix480: fmt clippy check test sqlx-prepare test-e2e quality-fixtures-enriched
 	cargo test --features integration-tests --test lexical_retrieval_integration -- --nocapture
+
+verify-fix481:
+	cargo fmt --check
+	cargo check --all-targets --all-features
+	cargo clippy --all-targets --all-features -- -D warnings
+	cargo test --all-targets --all-features
+	cargo sqlx prepare --check -- --all-targets --all-features
+	cargo test --features integration-tests --test lexical_retrieval_integration -- --nocapture
+	cargo test --features integration-tests --test ranking_evidence_preservation -- --nocapture
+	cargo test --features integration-tests --test e2e_testcontainers -- --nocapture
+
+fix481-prepare-judgments:
+	test -n "$${FIX481_REPORT_DIR}" || (echo "FIX481_REPORT_DIR is required" >&2; exit 2)
+	python3 scripts/fix481_judgment_pool.py prepare --profile $${FIX481_PROFILE:-validation} --report-dir "$${FIX481_REPORT_DIR}"
+
+fix481-finalize-judgments:
+	python3 scripts/fix481_judgment_pool.py finalize --profile $${FIX481_PROFILE:-validation}
 
 verify-fix467: fmt clippy check test quality-fixtures quality-quick
 
