@@ -61,6 +61,27 @@ fn query_files() -> Vec<PathBuf> {
     files
 }
 
+fn profile_query_files(profile: &str) -> Vec<PathBuf> {
+    let path = Path::new(QUALITY_ROOT).join(format!("profiles/{profile}.json"));
+    let value: Value = serde_json::from_slice(
+        &fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("invalid JSON in {}: {e}", path.display()));
+    value
+        .get("queries")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{} missing queries array", path.display()))
+        .iter()
+        .map(|name| {
+            Path::new(QUALITY_ROOT).join(format!(
+                "queries/{}.jsonl",
+                name.as_str()
+                    .unwrap_or_else(|| panic!("{} query entry is not a string", path.display()))
+            ))
+        })
+        .collect()
+}
+
 fn document_files() -> Vec<PathBuf> {
     jsonl_files_under(&Path::new(QUALITY_ROOT).join("corpora"), "documents.jsonl")
 }
@@ -495,4 +516,152 @@ fn fix481_validation_pool_distinguishes_prepared_from_adjudicated_qrels() {
             .as_u64()
             .is_some_and(|value| value > 0));
     }
+}
+
+#[test]
+fn fix482_rag_quality_bank_v1_loads_exactly_42_queries() {
+    let files = profile_query_files("rag-quality-bank-v1");
+    let expected_counts = HashMap::from([
+        ("rag-quality-bank-v1-access.jsonl", 8usize),
+        ("rag-quality-bank-v1-semantic.jsonl", 10),
+        ("rag-quality-bank-v1-lexical.jsonl", 4),
+        ("rag-quality-bank-v1-graph.jsonl", 3),
+        ("rag-quality-bank-v1-mmr.jsonl", 3),
+        ("rag-quality-bank-v1-long.jsonl", 4),
+        ("rag-quality-bank-v1-distractor.jsonl", 4),
+        ("rag-quality-bank-v1-negative.jsonl", 6),
+    ]);
+    assert_eq!(files.len(), expected_counts.len());
+
+    let mut total = 0usize;
+    let mut ids = HashSet::new();
+    for file in files {
+        let file_name = file.file_name().and_then(|name| name.to_str()).unwrap();
+        let expected = expected_counts
+            .get(file_name)
+            .unwrap_or_else(|| panic!("unexpected rag-quality-bank-v1 query file {file_name}"));
+        let rows = read_jsonl(&file);
+        assert_eq!(
+            rows.len(),
+            *expected,
+            "{} loaded unexpected query count",
+            file.display()
+        );
+        for row in &rows {
+            assert_eq!(required_str(row, "schema_version", &file), "1.0");
+            assert!(
+                ids.insert(required_str(row, "id", &file).to_string()),
+                "duplicate query id in rag-quality-bank-v1"
+            );
+            assert!(!required_str(row, "question", &file).is_empty());
+        }
+        total += rows.len();
+    }
+
+    assert_eq!(total, 42, "rag-quality-bank-v1 must load 42/42 queries");
+}
+
+#[test]
+fn fix482_rag_quality_bank_v1_queries_reference_existing_fixture_ids() {
+    let index = build_index();
+    let mut positive_queries = 0usize;
+    let mut negative_queries = 0usize;
+
+    for file in profile_query_files("rag-quality-bank-v1") {
+        for query in read_jsonl(&file) {
+            let query_id = required_str(&query, "id", &file);
+            let context = query
+                .get("context")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{query_id} missing context object"));
+            for key in ["access_zone_code", "caller_access_level", "search_mode"] {
+                assert!(
+                    context.get(key).and_then(Value::as_str).is_some(),
+                    "{query_id} missing context.{key}"
+                );
+            }
+            let expected = query
+                .get("expected")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{query_id} missing expected object"));
+            for key in [
+                "must_contain_document_ids",
+                "forbidden_document_ids",
+                "allowed_document_ids",
+            ] {
+                for doc in array_strings(&Value::Object(expected.clone()), key) {
+                    assert!(
+                        index.document_ids.contains(doc),
+                        "{query_id} references missing document {doc} in {key}"
+                    );
+                }
+            }
+            for key in [
+                "must_contain_block_ids",
+                "expected_related_block_ids",
+                "forbidden_block_ids",
+            ] {
+                for block in array_strings(&Value::Object(expected.clone()), key) {
+                    assert!(
+                        index.block_ids.contains(block),
+                        "{query_id} references missing block {block} in {key}"
+                    );
+                }
+            }
+            let hard_negative = expected
+                .get("hard_negative")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if hard_negative {
+                negative_queries += 1;
+                assert_eq!(
+                    expected.get("expected_empty").and_then(Value::as_bool),
+                    Some(true),
+                    "{query_id} hard_negative must be expected_empty"
+                );
+            } else {
+                positive_queries += 1;
+                assert!(
+                    !array_strings(&Value::Object(expected.clone()), "must_contain_block_ids")
+                        .collect::<Vec<_>>()
+                        .is_empty(),
+                    "{query_id} positive query must name at least one expected block"
+                );
+            }
+        }
+    }
+
+    assert_eq!(positive_queries, 36);
+    assert_eq!(negative_queries, 6);
+}
+
+#[test]
+fn fix482_rag_quality_bank_v1_blind_judgment_template_is_pending() {
+    let root = Path::new(QUALITY_ROOT).join("judgments");
+    let manifest_path = root.join("manifests/rag-quality-bank-v1.json");
+    if !manifest_path.exists() {
+        return;
+    }
+
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display())),
+    )
+    .unwrap_or_else(|e| panic!("invalid JSON in {}: {e}", manifest_path.display()));
+    assert_eq!(manifest["profile"], "rag-quality-bank-v1");
+    assert_eq!(manifest["queries_total"], 42);
+    assert_eq!(manifest["status"], "AWAITING_BLIND_JUDGMENT");
+    assert_eq!(manifest["qrels_complete"], false);
+    assert_eq!(manifest["judged_candidates_total"], 0);
+    assert!(manifest["unjudged_candidates_total"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+
+    let blind_path = root.join("blind-judgments/rag-quality-bank-v1.jsonl");
+    let blind_rows = read_jsonl(&blind_path);
+    assert!(!blind_rows.is_empty());
+    assert!(blind_rows.iter().all(|row| row["relevance"].is_null()));
+    assert!(blind_rows.iter().all(|row| row.get("document_id").is_none()
+        && row.get("source_block_id").is_none()
+        && row.get("pool_reasons").is_none()));
 }
