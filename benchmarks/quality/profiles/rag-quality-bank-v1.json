@@ -14,7 +14,14 @@
     "long-doc-mini"
   ],
   "queries": [
-    "rag-quality-bank-v1"
+    "rag-quality-bank-v1-access",
+    "rag-quality-bank-v1-semantic",
+    "rag-quality-bank-v1-lexical",
+    "rag-quality-bank-v1-graph",
+    "rag-quality-bank-v1-mmr",
+    "rag-quality-bank-v1-long",
+    "rag-quality-bank-v1-distractor",
+    "rag-quality-bank-v1-negative"
   ],
   "thresholds": {
     "query_assertion_pass_rate": 1.0,
