@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const QUALITY_ROOT: &str = "benchmarks/quality";
 
@@ -664,4 +665,208 @@ fn fix482_rag_quality_bank_v1_blind_judgment_template_is_pending() {
     assert!(blind_rows.iter().all(|row| row.get("document_id").is_none()
         && row.get("source_block_id").is_none()
         && row.get("pool_reasons").is_none()));
+}
+
+#[test]
+fn candidate_pool_does_not_read_expected_labels() {
+    let root = Path::new(QUALITY_ROOT).join("judgments");
+    let manifest_path = root.join("manifests/rag-quality-bank-v1.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap())
+        .expect("valid rag-quality-bank-v1 manifest");
+    assert_eq!(
+        manifest["candidate_selection"]["uses_expected_labels_for_selection"],
+        false
+    );
+
+    let pool = read_jsonl(&root.join("candidate-pools/rag-quality-bank-v1.jsonl"));
+    assert!(!pool.is_empty());
+    for row in pool {
+        assert!(row.get("pool_reasons").is_none());
+        assert!(row.get("expected").is_none());
+        assert!(row.get("relevance").is_none());
+        assert!(row["pool_sources"].as_array().is_some_and(|sources| {
+            !sources.is_empty()
+                && sources.iter().all(|source| {
+                    source.get("source").and_then(Value::as_str).is_some()
+                        && source.get("rank").and_then(Value::as_u64).is_some()
+                        && source.get("score").and_then(Value::as_f64).is_some()
+                        && source.get("run_id").and_then(Value::as_str).is_some()
+                })
+        }));
+    }
+}
+
+#[test]
+fn candidate_pool_is_independent_of_structural_expectations() {
+    let output = Command::new("python3")
+        .arg("scripts/prepare_fix482_rag_quality_bank_judgments.py")
+        .arg("--self-test")
+        .output()
+        .expect("run fix482 expectation-independence self-test");
+    assert!(
+        output.status.success(),
+        "self-test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("self-test JSON");
+    assert_eq!(
+        report["candidate_pool_is_independent_of_structural_expectations"],
+        true
+    );
+}
+
+#[test]
+fn candidate_pool_contains_at_least_four_sources() {
+    let root = Path::new(QUALITY_ROOT).join("judgments");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.join("manifests/rag-quality-bank-v1.json")).unwrap())
+            .expect("valid rag-quality-bank-v1 manifest");
+    assert_eq!(manifest["minimum_pool_source_count"], 4);
+    for query in manifest["queries"].as_array().unwrap() {
+        assert!(
+            query["pool_source_count"].as_u64().unwrap_or(0) >= 4,
+            "query {} has insufficient pool source count: {}",
+            query["query_id"],
+            query["pool_source_count"]
+        );
+    }
+}
+
+#[test]
+fn candidate_pool_depth_is_at_least_twenty() {
+    let root = Path::new(QUALITY_ROOT).join("judgments");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.join("manifests/rag-quality-bank-v1.json")).unwrap())
+            .expect("valid rag-quality-bank-v1 manifest");
+    assert_eq!(manifest["pool_depth"], 20);
+    for query in manifest["queries"].as_array().unwrap() {
+        let count = query["candidate_count"].as_u64().unwrap_or(0);
+        let exception = query["pool_depth_exception"].as_bool().unwrap_or(false);
+        assert!(
+            count >= 20 || exception,
+            "query {} has candidate_count={} without exception",
+            query["query_id"],
+            count
+        );
+        if exception {
+            assert_eq!(
+                query["reason"],
+                "ACCESS_FILTERED_CORPUS_SMALLER_THAN_POOL_DEPTH"
+            );
+        }
+    }
+}
+
+#[test]
+fn blind_template_hides_identity_rank_and_source() {
+    let blind = read_jsonl(
+        &Path::new(QUALITY_ROOT).join("judgments/blind-judgments/rag-quality-bank-v1.jsonl"),
+    );
+    assert!(!blind.is_empty());
+    for row in blind {
+        for hidden in [
+            "document_id",
+            "document_version",
+            "source_block_id",
+            "access_zone_id",
+            "pool_sources",
+            "source",
+            "rank",
+            "score",
+            "expected",
+            "expected_label",
+        ] {
+            assert!(
+                row.get(hidden).is_none(),
+                "blind row leaks hidden field {hidden}: {row:?}"
+            );
+        }
+        assert!(row["relevance"].is_null());
+    }
+}
+
+#[test]
+fn pool_manifest_contains_runtime_identity() {
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(Path::new(QUALITY_ROOT).join("judgments/manifests/rag-quality-bank-v1.json"))
+            .unwrap(),
+    )
+    .expect("valid rag-quality-bank-v1 manifest");
+    for field in [
+        "git_sha",
+        "runtime_binary_sha256",
+        "effective_config_sha256",
+        "model_sha256",
+        "tokenizer_sha256",
+        "corpus_sha256",
+        "query_bank_sha256",
+        "candidate_pool_sha256",
+        "blind_template_sha256",
+        "identity_map_sha256",
+        "dense_run_id",
+        "dense_result_sha256",
+        "sparse_run_id",
+        "sparse_result_sha256",
+        "postgres_fts_run_id",
+        "postgres_fts_result_sha256",
+        "hybrid_run_id",
+        "hybrid_result_sha256",
+        "hybrid_graph_run_id",
+        "hybrid_graph_result_sha256",
+    ] {
+        let value = manifest[field].as_str().unwrap_or("");
+        assert!(
+            !value.is_empty() && value != "MISSING" && value != "UNKNOWN",
+            "manifest field {field} is incomplete: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn pool_generation_is_deterministic() {
+    let output = Command::new("python3")
+        .arg("scripts/prepare_fix482_rag_quality_bank_judgments.py")
+        .arg("--self-test")
+        .output()
+        .expect("run fix482 deterministic self-test");
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("self-test JSON");
+    assert_eq!(
+        report["original_candidate_pool_total"],
+        report["mutated_candidate_pool_total"]
+    );
+}
+
+#[test]
+fn pool_generation_respects_access_filters() {
+    let pool = read_jsonl(
+        &Path::new(QUALITY_ROOT).join("judgments/candidate-pools/rag-quality-bank-v1.jsonl"),
+    );
+    let queries = profile_query_files("rag-quality-bank-v1")
+        .into_iter()
+        .flat_map(|file| read_jsonl(&file))
+        .map(|query| {
+            let context = query["context"].as_object().unwrap();
+            (
+                query["id"].as_str().unwrap().to_string(),
+                (
+                    context["access_zone_code"].as_str().unwrap().to_string(),
+                    context["caller_access_level"].as_str().unwrap().to_string(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let order = HashMap::from([("PUBLIC", 0u8), ("INTERNAL", 1), ("RESTRICTED", 2)]);
+    for row in pool {
+        let (zone, caller_level) = queries
+            .get(row["query_id"].as_str().unwrap())
+            .expect("candidate query exists");
+        assert_eq!(row["access_zone_id"].as_str().unwrap(), zone);
+        assert!(
+            order[row["access_level"].as_str().unwrap()] <= order[caller_level.as_str()],
+            "candidate violates access filter: {row:?}"
+        );
+        assert_eq!(row["lifecycle_status"], "ACTIVE");
+    }
 }

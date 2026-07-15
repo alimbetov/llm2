@@ -1,397 +1,679 @@
 {
-  "blind_candidates_total": 712,
-  "blind_judgments_sha256": "33a519d6a145f79e891ab8d268d1b8aacb7f4afc9fb075ffb4777e030836fb33",
-  "candidate_pool_sha256": "5c9637ff5b32528c4993b2844939eb91baa8d51e6bc3ba916afc6dd60f1b7faa",
-  "candidate_pool_total": 712,
+  "blind_candidates_total": 1061,
+  "blind_template_sha256": "067b3dccb01f3c3043d719b3c73d0dc7cafd5f78ddc460225241416ccd3790ad",
+  "candidate_pool_sha256": "196832311da646e6de66bcae1b8db1985dd5fe097308721d1576b7146b2a93fd",
+  "candidate_pool_total": 1061,
   "candidate_selection": {
-    "lexical_depth": 12,
-    "minimum_candidates_per_query": 3,
     "runtime_rank_independent": true,
+    "sources": [
+      "dense",
+      "sparse",
+      "postgres_fts",
+      "hybrid",
+      "hybrid_graph"
+    ],
+    "uses_expected_labels_for_selection": false,
     "uses_production_ranking_output": false
   },
-  "identity_map_sha256": "debbf3103ce7a3825c657d06ede12c8a43721f55abf52c405e8b6a1daec31fe1",
+  "corpus_sha256": "fa3ff5fb468229d76a59d40b66d3172e483b311dd3b72e5f3976a67d30b3d748",
+  "dense_result_sha256": "4c1bcb7fc66f2fc8cccde4b4b5a345bcbc4f07a9defddcdf536e50b8e0296e46",
+  "dense_run_id": "fix482-rag-quality-bank-v1-dense",
+  "effective_config_sha256": "d0377e56dbc9296cf07c3ad30fd6cb036e9abd98ac4e49b6f3c056a16b4beea4",
+  "git_sha": "d405a5bb276070be4a42f7eb29fffe6a37d58330",
+  "hybrid_graph_result_sha256": "9197d1ab6e4cef8a521ffb1fd43a17acc3e8851dfb10063e218d569d68869d2b",
+  "hybrid_graph_run_id": "fix482-rag-quality-bank-v1-hybrid_graph",
+  "hybrid_result_sha256": "205e4349b098c3964d9a87c7f76aaa68290593a1c399233583bbb249e690508c",
+  "hybrid_run_id": "fix482-rag-quality-bank-v1-hybrid",
+  "identity_map_sha256": "666d4f640e225e7108011224a9b59c98b051db88387a57d78ddfa8a4133c18eb",
   "judged_candidates_total": 0,
+  "minimum_pool_source_count": 4,
+  "model_sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
+  "pool_depth": 20,
+  "postgres_fts_result_sha256": "0f4f3fe4cf8bde205eda43cc5f22fe38ff093b697d0173d20f51cca91d7a10b3",
+  "postgres_fts_run_id": "fix482-rag-quality-bank-v1-postgres_fts",
   "profile": "rag-quality-bank-v1",
   "qrels_complete": false,
   "queries": [
     {
-      "candidate_count": 12,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 4
+      "available_corpus_blocks": 118,
+      "candidate_count": 21,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
       },
-      "query_id": "rag-v1-access-001"
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-001",
+      "reason": null
     },
     {
-      "candidate_count": 12,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 4
+      "available_corpus_blocks": 9,
+      "candidate_count": 9,
+      "candidate_counts_by_source": {
+        "dense": 9,
+        "hybrid": 9,
+        "hybrid_graph": 9,
+        "postgres_fts": 9,
+        "sparse": 9
       },
-      "query_id": "rag-v1-access-002"
+      "pool_depth_exception": true,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-002",
+      "reason": "ACCESS_FILTERED_CORPUS_SMALLER_THAN_POOL_DEPTH"
     },
     {
-      "candidate_count": 13,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 2
+      "available_corpus_blocks": 3,
+      "candidate_count": 3,
+      "candidate_counts_by_source": {
+        "dense": 3,
+        "hybrid": 3,
+        "hybrid_graph": 3,
+        "postgres_fts": 3,
+        "sparse": 3
       },
-      "query_id": "rag-v1-access-003"
+      "pool_depth_exception": true,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-003",
+      "reason": "ACCESS_FILTERED_CORPUS_SMALLER_THAN_POOL_DEPTH"
     },
     {
-      "candidate_count": 12,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 1
+      "available_corpus_blocks": 9,
+      "candidate_count": 9,
+      "candidate_counts_by_source": {
+        "dense": 9,
+        "hybrid": 9,
+        "hybrid_graph": 9,
+        "postgres_fts": 9,
+        "sparse": 9
       },
-      "query_id": "rag-v1-access-004"
+      "pool_depth_exception": true,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-004",
+      "reason": "ACCESS_FILTERED_CORPUS_SMALLER_THAN_POOL_DEPTH"
     },
     {
-      "candidate_count": 12,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 6
-      },
-      "query_id": "rag-v1-access-005"
-    },
-    {
-      "candidate_count": 13,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 4
-      },
-      "query_id": "rag-v1-access-006"
-    },
-    {
-      "candidate_count": 16,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 6
-      },
-      "query_id": "rag-v1-access-007"
-    },
-    {
-      "candidate_count": 15,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 4
-      },
-      "query_id": "rag-v1-access-008"
-    },
-    {
-      "candidate_count": 16,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-semantic-001"
-    },
-    {
-      "candidate_count": 14,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-semantic-002"
-    },
-    {
-      "candidate_count": 13,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 3
-      },
-      "query_id": "rag-v1-semantic-003"
-    },
-    {
-      "candidate_count": 15,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-semantic-004"
-    },
-    {
-      "candidate_count": 15,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 3
-      },
-      "query_id": "rag-v1-semantic-005"
-    },
-    {
-      "candidate_count": 10,
-      "pool_reason_counts": {
-        "lexical_overlap": 9,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-semantic-006"
-    },
-    {
-      "candidate_count": 16,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-paraphrase-001"
-    },
-    {
-      "candidate_count": 15,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-paraphrase-002"
-    },
-    {
-      "candidate_count": 16,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-paraphrase-003"
-    },
-    {
-      "candidate_count": 25,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 15
-      },
-      "query_id": "rag-v1-paraphrase-004"
-    },
-    {
-      "candidate_count": 19,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 8
-      },
-      "query_id": "rag-v1-lexical-001"
-    },
-    {
-      "candidate_count": 8,
-      "pool_reason_counts": {
-        "lexical_overlap": 1,
-        "must_contain_block": 1,
-        "referenced_document_block": 8
-      },
-      "query_id": "rag-v1-lexical-002"
-    },
-    {
-      "candidate_count": 18,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 8
-      },
-      "query_id": "rag-v1-lexical-003"
-    },
-    {
-      "candidate_count": 18,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 8
-      },
-      "query_id": "rag-v1-lexical-004"
-    },
-    {
-      "candidate_count": 16,
-      "pool_reason_counts": {
-        "expected_related_block": 1,
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-graph-001"
-    },
-    {
-      "candidate_count": 17,
-      "pool_reason_counts": {
-        "expected_related_block": 1,
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-graph-002"
-    },
-    {
-      "candidate_count": 15,
-      "pool_reason_counts": {
-        "expected_related_block": 1,
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-graph-003"
-    },
-    {
-      "candidate_count": 14,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 2,
-        "referenced_document_block": 3
-      },
-      "query_id": "rag-v1-mmr-001"
-    },
-    {
-      "candidate_count": 14,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 3,
-        "referenced_document_block": 3
-      },
-      "query_id": "rag-v1-mmr-002"
-    },
-    {
-      "candidate_count": 17,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 5
-      },
-      "query_id": "rag-v1-mmr-003"
-    },
-    {
-      "candidate_count": 25,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 15
-      },
-      "query_id": "rag-v1-long-001"
-    },
-    {
-      "candidate_count": 26,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 15
-      },
-      "query_id": "rag-v1-long-002"
-    },
-    {
-      "candidate_count": 24,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 15
-      },
-      "query_id": "rag-v1-long-003"
-    },
-    {
-      "candidate_count": 26,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 15
-      },
-      "query_id": "rag-v1-long-004"
-    },
-    {
-      "candidate_count": 18,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 12
-      },
-      "query_id": "rag-v1-distractor-001"
-    },
-    {
-      "candidate_count": 17,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 12
-      },
-      "query_id": "rag-v1-distractor-002"
-    },
-    {
-      "candidate_count": 18,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 8
-      },
-      "query_id": "rag-v1-distractor-003"
-    },
-    {
-      "candidate_count": 19,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "must_contain_block": 1,
-        "referenced_document_block": 8
-      },
-      "query_id": "rag-v1-distractor-004"
-    },
-    {
-      "candidate_count": 24,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "referenced_document_block": 18
-      },
-      "query_id": "rag-v1-negative-001"
-    },
-    {
-      "candidate_count": 12,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "referenced_document_block": 4
-      },
-      "query_id": "rag-v1-negative-002"
-    },
-    {
-      "candidate_count": 29,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "referenced_document_block": 18
-      },
-      "query_id": "rag-v1-negative-003"
-    },
-    {
+      "available_corpus_blocks": 118,
       "candidate_count": 22,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "referenced_document_block": 10
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
       },
-      "query_id": "rag-v1-negative-004"
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-005",
+      "reason": null
     },
     {
-      "candidate_count": 17,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "referenced_document_block": 5
+      "available_corpus_blocks": 118,
+      "candidate_count": 23,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
       },
-      "query_id": "rag-v1-negative-005"
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-006",
+      "reason": null
     },
     {
-      "candidate_count": 19,
-      "pool_reason_counts": {
-        "lexical_overlap": 12,
-        "referenced_document_block": 9
+      "available_corpus_blocks": 118,
+      "candidate_count": 23,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
       },
-      "query_id": "rag-v1-negative-006"
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-007",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 176,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-access-008",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 24,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-semantic-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-semantic-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 26,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-semantic-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 28,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-semantic-004",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 21,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-semantic-005",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 20,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-semantic-006",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-paraphrase-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 176,
+      "candidate_count": 24,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-paraphrase-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 38,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-paraphrase-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 30,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-paraphrase-004",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-lexical-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 20,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-lexical-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-lexical-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 31,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-lexical-004",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 176,
+      "candidate_count": 26,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-graph-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 176,
+      "candidate_count": 28,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-graph-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 176,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-graph-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 27,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-mmr-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 31,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-mmr-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 33,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-mmr-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 25,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-long-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 26,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-long-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 28,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-long-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 39,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-long-004",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 21,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-distractor-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 28,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-distractor-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 24,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-distractor-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 29,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-distractor-004",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 30,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-negative-001",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 23,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-negative-002",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 28,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-negative-003",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 24,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-negative-004",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 23,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-negative-005",
+      "reason": null
+    },
+    {
+      "available_corpus_blocks": 118,
+      "candidate_count": 22,
+      "candidate_counts_by_source": {
+        "dense": 20,
+        "hybrid": 20,
+        "hybrid_graph": 20,
+        "postgres_fts": 20,
+        "sparse": 20
+      },
+      "pool_depth_exception": false,
+      "pool_source_count": 5,
+      "query_id": "rag-v1-negative-006",
+      "reason": null
     }
   ],
   "queries_total": 42,
+  "query_bank_sha256": "8508d2f6429ce21140a1db46521b7140ce07d5a60432b5259685f154aacf5cc4",
+  "retrieval_sources_sha256": "44517221b94ff4122587711b3fb56b386415ee63d0ad43c53781a4497bb4f674",
+  "runtime_binary_sha256": "ab90d97e17594698b2ba92a41fe7eac70ce4efca9785a22d66fe56f4155d506b",
   "schema_version": 1,
+  "sparse_result_sha256": "b58427270d94af2659016c62e08da97e19e0825ef27ebcc4b93fa00927d71ea1",
+  "sparse_run_id": "fix482-rag-quality-bank-v1-sparse",
   "status": "AWAITING_BLIND_JUDGMENT",
-  "unjudged_candidates_total": 712
+  "status_failures": [],
+  "tokenizer_sha256": "21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08",
+  "unjudged_candidates_total": 1061
 }

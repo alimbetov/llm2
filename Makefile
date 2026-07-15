@@ -277,7 +277,7 @@ fix482-structural-validator:
 	python3 scripts/validate_rag_quality_bank_v1.py
 
 fix482-contract-tests:
-	cargo test --test quality_fixtures_contracts fix482_ -- --nocapture
+	cargo test --test quality_fixtures_contracts -- --nocapture
 
 fix482-prepare-judgments: fix482-structural-validator
 	python3 scripts/prepare_fix482_rag_quality_bank_judgments.py
@@ -286,9 +286,10 @@ verify-fix482:
 	cargo fmt --check
 	cargo check --all-targets --all-features
 	cargo clippy --all-targets --all-features -- -D warnings
+	cargo build --bin astravector-runtime
 	python3 scripts/validate_rag_quality_bank_v1.py
-	cargo test --test quality_fixtures_contracts fix482_ -- --nocapture
 	python3 scripts/prepare_fix482_rag_quality_bank_judgments.py
+	cargo test --test quality_fixtures_contracts -- --nocapture
 
 verify-fix467: fmt clippy check test quality-fixtures quality-quick
 
