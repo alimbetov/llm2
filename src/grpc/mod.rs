@@ -22,6 +22,13 @@ use crate::{
     },
     provider::SelectedProvider,
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
+    query_processing::{
+        build_query_plan,
+        coverage::{evaluate_required_coverage, QueryCoverage, QueryEvidenceStatus},
+        diagnostics::QueryPlanDiagnostics,
+        planner::{QueryPlan, QueryPlanningError, QueryTokenCounter},
+        QueryProcessingMode,
+    },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
     sparse::{SparseTechnicalEncoder, SparseTokenClass},
@@ -50,6 +57,78 @@ use uuid::Uuid;
 struct AdmissionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     scope: &'static str,
+}
+
+struct DirectQdrantGeneration {
+    hits: Vec<QdrantSearchHit>,
+    query_embedding_ms: u64,
+    qdrant_search_ms: u64,
+    dense_search_ms: u64,
+    sparse_search_ms: u64,
+    fusion_ms: u64,
+    dense_branch_executed: bool,
+    sparse_branch_executed: bool,
+    fusion_executed: bool,
+    dense_branch_candidate_count: u32,
+    sparse_branch_candidate_count: u32,
+    fusion_candidate_count: u32,
+    sparse_top_score: f32,
+    dense_failed: bool,
+    sparse_failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QdrantHitIdentity {
+    access_zone_id: String,
+    document_id: String,
+    document_version: u64,
+    matched_chunk_id: String,
+    parent_chunk_id: String,
+}
+
+struct SegmentedHitAggregate {
+    hit: QdrantSearchHit,
+    score: f32,
+    best_contribution: f32,
+    matched_segments: BTreeSet<usize>,
+}
+
+struct EngineQueryTokenCounter<'a> {
+    engine: &'a dyn InferenceEngine,
+}
+
+impl QueryTokenCounter for EngineQueryTokenCounter<'_> {
+    fn count_tokens(
+        &self,
+        text: &str,
+        max_length: usize,
+        allow_truncation: bool,
+    ) -> Result<usize, String> {
+        self.engine
+            .count_tokens(text, max_length, allow_truncation)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn query_planning_status(error: QueryPlanningError) -> Status {
+    match error {
+        QueryPlanningError::Empty => Status::invalid_argument("query must not be empty"),
+        QueryPlanningError::ByteLimitExceeded => Status::out_of_range(format!(
+            "LONG_QUERY_BYTE_LIMIT_EXCEEDED: query exceeds configured absolute_max_bytes"
+        )),
+        QueryPlanningError::TokenLimitExceeded => Status::out_of_range(format!(
+            "LONG_QUERY_TOO_LARGE: query exceeds configured absolute_max_tokens"
+        )),
+        QueryPlanningError::LongQueryNotSupported => Status::out_of_range(
+            "LONG_QUERY_NOT_SUPPORTED: query_processing.enabled=false rejects queries above tokenization.query.max_length",
+        ),
+        QueryPlanningError::SegmentationInvariant(message) => Status::internal(format!(
+            "QUERY_SEGMENTATION_INVARIANT_FAILED: {message}"
+        )),
+        QueryPlanningError::Tokenization(message) => {
+            Status::invalid_argument(format!("tokenization failed: {message}"))
+        }
+    }
 }
 
 fn postgres_statement_timeout_ms(
@@ -232,6 +311,580 @@ impl AstraVectorV004ControlService {
         self.qdrant
             .as_ref()
             .ok_or_else(|| Status::unavailable("Qdrant client is not configured"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_direct_qdrant_hits(
+        &self,
+        plan: &QueryPlan,
+        access_zone_ids: &[Uuid],
+        caller_access_level: pb::AccessLevel,
+        candidate_limit: u32,
+        search_mode: pb::SearchModeV005,
+        wants_dense: bool,
+        wants_sparse: bool,
+        sparse_available: bool,
+        sparse_required: bool,
+        version_filters: &QdrantVersionFilters,
+        deadline: Instant,
+        qdrant_budget: &OperationBudget,
+        warnings: &mut Vec<pb::DiagnosticWarningV005>,
+    ) -> Result<DirectQdrantGeneration, Status> {
+        match plan.mode {
+            QueryProcessingMode::Single => {
+                self.generate_single_direct_qdrant_hits(
+                    plan,
+                    access_zone_ids,
+                    caller_access_level,
+                    candidate_limit,
+                    search_mode,
+                    wants_dense,
+                    wants_sparse,
+                    sparse_available,
+                    sparse_required,
+                    version_filters,
+                    deadline,
+                    qdrant_budget,
+                    warnings,
+                )
+                .await
+            }
+            QueryProcessingMode::Segmented => {
+                self.generate_segmented_direct_qdrant_hits(
+                    plan,
+                    access_zone_ids,
+                    caller_access_level,
+                    candidate_limit,
+                    search_mode,
+                    wants_dense,
+                    wants_sparse,
+                    sparse_available,
+                    sparse_required,
+                    version_filters,
+                    deadline,
+                    qdrant_budget,
+                    warnings,
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_single_direct_qdrant_hits(
+        &self,
+        plan: &QueryPlan,
+        access_zone_ids: &[Uuid],
+        caller_access_level: pb::AccessLevel,
+        candidate_limit: u32,
+        search_mode: pb::SearchModeV005,
+        wants_dense: bool,
+        wants_sparse: bool,
+        sparse_available: bool,
+        sparse_required: bool,
+        version_filters: &QdrantVersionFilters,
+        deadline: Instant,
+        qdrant_budget: &OperationBudget,
+        warnings: &mut Vec<pb::DiagnosticWarningV005>,
+    ) -> Result<DirectQdrantGeneration, Status> {
+        let query = plan.original_query.as_str();
+        let emb_started = std::time::Instant::now();
+        let embedding = self
+            .scheduler
+            .submit(
+                QueueKind::Query,
+                InferenceInput {
+                    text: query.to_string(),
+                    max_length: self.cfg.tokenization.query.max_length,
+                    allow_truncation: false,
+                    want_dense: wants_dense,
+                    want_sparse: wants_sparse && sparse_available,
+                    token_count_hint: plan.original_token_count,
+                },
+                deadline,
+                self.shutdown.child_token(),
+            )
+            .await
+            .map_err(Status::from)?;
+        if embedding.truncated {
+            return Err(Status::internal(
+                "UNEXPECTED_QUERY_TRUNCATION: single query embedding was truncated",
+            ));
+        }
+        let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
+        let qdrant_started = std::time::Instant::now();
+        let qdrant = self.qdrant()?.clone();
+        let dense_vector = embedding.dense.clone();
+        let sparse_indices = embedding.sparse_indices.clone();
+        let sparse_values = embedding.sparse_values.clone();
+        let dense_dim = dense_vector.as_ref().map(|v| v.len()).unwrap_or(0);
+        let dense_norm = dense_vector
+            .as_ref()
+            .map(|v| {
+                v.iter()
+                    .map(|x| (*x as f64) * (*x as f64))
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .unwrap_or(0.0);
+        tracing::debug!(
+            query_embedding_ms,
+            dense_dim,
+            dense_norm,
+            sparse_terms = sparse_indices.as_ref().map(|v| v.len()).unwrap_or(0),
+            "SEARCH_QUERY_EMBEDDING_READY"
+        );
+        let dense_access_zone_ids = access_zone_ids.to_vec();
+        let sparse_access_zone_ids = access_zone_ids.to_vec();
+        let dense_future = {
+            let qdrant = qdrant.clone();
+            let version_filters = version_filters.clone();
+            let budget = qdrant_budget.clone();
+            async move {
+                if !wants_dense {
+                    return Ok::<Option<(Vec<QdrantSearchHit>, u64)>, Status>(None);
+                }
+                let Some(dense) = dense_vector.as_deref() else {
+                    return Err(Status::failed_precondition(
+                        "query dense embedding unavailable",
+                    ));
+                };
+                let branch_started = Instant::now();
+                let hits = qdrant
+                    .search_dense_with_budget(
+                        dense,
+                        &dense_access_zone_ids,
+                        caller_access_level as i16,
+                        candidate_limit as usize,
+                        Some(&version_filters),
+                        Some(&budget),
+                    )
+                    .await
+                    .map_err(Status::from)?;
+                Ok(Some((hits, branch_started.elapsed().as_millis() as u64)))
+            }
+        };
+        let sparse_future = {
+            let qdrant = qdrant.clone();
+            let version_filters = version_filters.clone();
+            let budget = qdrant_budget.clone();
+            async move {
+                if !wants_sparse {
+                    return Ok::<Option<(Vec<QdrantSearchHit>, u64)>, Status>(None);
+                }
+                let branch_started = Instant::now();
+                match (sparse_indices.as_deref(), sparse_values.as_deref()) {
+                    (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
+                        qdrant
+                            .search_sparse_with_budget(
+                                indices,
+                                values,
+                                &sparse_access_zone_ids,
+                                caller_access_level as i16,
+                                candidate_limit as usize,
+                                Some(&version_filters),
+                                Some(&budget),
+                            )
+                            .await
+                            .map(|hits| Some((hits, branch_started.elapsed().as_millis() as u64)))
+                            .map_err(Status::from)
+                    }
+                    _ if sparse_required => Err(Status::failed_precondition(
+                        "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
+                    )),
+                    _ => Ok(Some((
+                        Vec::new(),
+                        branch_started.elapsed().as_millis() as u64,
+                    ))),
+                }
+            }
+        };
+        let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
+        let mut dense_failed = false;
+        let mut sparse_failed = false;
+        let (mut dense_hits, dense_search_ms) = match dense_result {
+            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(None) => (Vec::new(), 0),
+            Err(e) => {
+                dense_failed = true;
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "DENSE_SEARCH_FAILED".into(),
+                    message: format!("Dense Qdrant search failed: {}", e.message()),
+                });
+                (Vec::new(), 0)
+            }
+        };
+        let (mut sparse_hits, sparse_search_ms) = match sparse_result {
+            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(None) => (Vec::new(), 0),
+            Err(e) if sparse_required => return Err(e),
+            Err(e) => {
+                sparse_failed = true;
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "SPARSE_SEARCH_FAILED".into(),
+                    message: format!("Sparse Qdrant search failed: {}", e.message()),
+                });
+                (Vec::new(), 0)
+            }
+        };
+        dense_hits.sort_by(stable_qdrant_hit_rank);
+        sparse_hits.sort_by(stable_qdrant_hit_rank);
+        let dense_branch_executed = wants_dense && !dense_failed;
+        let sparse_branch_executed = wants_sparse && !sparse_failed;
+        let fusion_executed = search_mode == pb::SearchModeV005::Hybrid
+            && dense_branch_executed
+            && sparse_branch_executed;
+        let dense_branch_candidate_count = dense_hits.len() as u32;
+        let sparse_branch_candidate_count = sparse_hits.len() as u32;
+        let sparse_top_score = sparse_hits.first().map(|hit| hit.score).unwrap_or(0.0);
+        let fusion_started = Instant::now();
+        let hits = Self::select_branch_hits(
+            dense_hits,
+            sparse_hits,
+            candidate_limit,
+            search_mode,
+            dense_failed,
+            sparse_failed,
+            warnings,
+            &self.cfg,
+        )?;
+        let fusion_ms = fusion_started.elapsed().as_millis() as u64;
+        let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        Ok(DirectQdrantGeneration {
+            fusion_candidate_count: hits.len() as u32,
+            hits,
+            query_embedding_ms,
+            qdrant_search_ms,
+            dense_search_ms,
+            sparse_search_ms,
+            fusion_ms,
+            dense_branch_executed,
+            sparse_branch_executed,
+            fusion_executed,
+            dense_branch_candidate_count,
+            sparse_branch_candidate_count,
+            sparse_top_score,
+            dense_failed,
+            sparse_failed,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_segmented_direct_qdrant_hits(
+        &self,
+        plan: &QueryPlan,
+        access_zone_ids: &[Uuid],
+        caller_access_level: pb::AccessLevel,
+        candidate_limit: u32,
+        search_mode: pb::SearchModeV005,
+        wants_dense: bool,
+        wants_sparse: bool,
+        sparse_available: bool,
+        sparse_required: bool,
+        version_filters: &QdrantVersionFilters,
+        deadline: Instant,
+        qdrant_budget: &OperationBudget,
+        warnings: &mut Vec<pb::DiagnosticWarningV005>,
+    ) -> Result<DirectQdrantGeneration, Status> {
+        warnings.push(pb::DiagnosticWarningV005 {
+            code: "LONG_QUERY_SEGMENTED".into(),
+            message: format!(
+                "query segmented into {} bounded segments",
+                plan.segments.len()
+            ),
+        });
+        let emb_started = std::time::Instant::now();
+        let inputs = plan
+            .segments
+            .iter()
+            .map(|segment| InferenceInput {
+                text: segment.text.clone(),
+                max_length: self.cfg.search.query_processing.segment_max_tokens,
+                allow_truncation: false,
+                want_dense: wants_dense,
+                want_sparse: wants_sparse && sparse_available,
+                token_count_hint: segment.token_count,
+            })
+            .collect::<Vec<_>>();
+        let embeddings = self
+            .scheduler
+            .submit_many(
+                QueueKind::Query,
+                inputs,
+                deadline,
+                self.shutdown.child_token(),
+                SubmitManyOptions {
+                    max_in_flight: self.cfg.search.query_processing.max_parallel_segments,
+                    preserve_order: true,
+                    cancel_on_error: true,
+                },
+            )
+            .await
+            .map_err(Status::from)?;
+        if embeddings.len() != plan.segments.len() {
+            return Err(Status::internal(
+                "QUERY_SEGMENT_EMBEDDING_FAILED: embedding count mismatch",
+            ));
+        }
+        if embeddings.iter().any(|embedding| embedding.truncated) {
+            return Err(Status::internal(
+                "UNEXPECTED_QUERY_TRUNCATION: segmented query embedding was truncated",
+            ));
+        }
+        let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
+        let qdrant_started = std::time::Instant::now();
+        let qdrant = self.qdrant()?.clone();
+        let per_segment_limit = self
+            .cfg
+            .search
+            .query_processing
+            .per_segment_candidate_limit
+            .min(self.cfg.limits.search_candidate_limit_max)
+            .max(1) as usize;
+        let global_limit = candidate_limit
+            .min(self.cfg.search.query_processing.global_candidate_limit)
+            .max(1) as usize;
+        let mut dense_failed = false;
+        let mut sparse_failed = false;
+        let mut dense_search_ms = 0_u64;
+        let mut sparse_search_ms = 0_u64;
+        let mut dense_branch_candidate_count = 0_u32;
+        let mut sparse_branch_candidate_count = 0_u32;
+        let mut sparse_top_score = 0.0_f32;
+        let mut aggregates = HashMap::<QdrantHitIdentity, SegmentedHitAggregate>::new();
+        let fusion_started = Instant::now();
+        for (segment, embedding) in plan.segments.iter().zip(embeddings.iter()) {
+            let mut dense_hits = Vec::new();
+            let mut sparse_hits = Vec::new();
+            if wants_dense {
+                let Some(dense) = embedding.dense.as_deref() else {
+                    return Err(Status::failed_precondition(
+                        "query dense embedding unavailable",
+                    ));
+                };
+                let branch_started = Instant::now();
+                match qdrant
+                    .search_dense_with_budget(
+                        dense,
+                        access_zone_ids,
+                        caller_access_level as i16,
+                        per_segment_limit,
+                        Some(version_filters),
+                        Some(qdrant_budget),
+                    )
+                    .await
+                {
+                    Ok(hits) => {
+                        dense_search_ms += branch_started.elapsed().as_millis() as u64;
+                        dense_branch_candidate_count += hits.len() as u32;
+                        dense_hits = hits;
+                    }
+                    Err(error) => {
+                        dense_failed = true;
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "DENSE_SEARCH_FAILED".into(),
+                            message: format!(
+                                "Dense Qdrant search failed for segment {}: {error}",
+                                segment.index
+                            ),
+                        });
+                    }
+                }
+            }
+            if wants_sparse {
+                let branch_started = Instant::now();
+                match (
+                    embedding.sparse_indices.as_deref(),
+                    embedding.sparse_values.as_deref(),
+                ) {
+                    (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
+                        match qdrant
+                            .search_sparse_with_budget(
+                                indices,
+                                values,
+                                access_zone_ids,
+                                caller_access_level as i16,
+                                per_segment_limit,
+                                Some(version_filters),
+                                Some(qdrant_budget),
+                            )
+                            .await
+                        {
+                            Ok(hits) => {
+                                sparse_search_ms += branch_started.elapsed().as_millis() as u64;
+                                sparse_branch_candidate_count += hits.len() as u32;
+                                sparse_top_score = sparse_top_score
+                                    .max(hits.first().map(|hit| hit.score).unwrap_or(0.0));
+                                sparse_hits = hits;
+                            }
+                            Err(error) if sparse_required => return Err(Status::from(error)),
+                            Err(error) => {
+                                sparse_failed = true;
+                                warnings.push(pb::DiagnosticWarningV005 {
+                                    code: "SPARSE_SEARCH_FAILED".into(),
+                                    message: format!(
+                                        "Sparse Qdrant search failed for segment {}: {error}",
+                                        segment.index
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    _ if sparse_required => {
+                        return Err(Status::failed_precondition(
+                            "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            dense_hits.sort_by(stable_qdrant_hit_rank);
+            sparse_hits.sort_by(stable_qdrant_hit_rank);
+            let segment_hits = Self::select_branch_hits(
+                dense_hits,
+                sparse_hits,
+                per_segment_limit as u32,
+                search_mode,
+                dense_failed,
+                sparse_failed,
+                warnings,
+                &self.cfg,
+            )?;
+            for (rank, hit) in segment_hits.into_iter().enumerate() {
+                let Some(identity) = qdrant_hit_identity(&hit) else {
+                    continue;
+                };
+                let contribution = segment.weight
+                    / (self.cfg.search.query_processing.segment_rrf_k + rank as f32 + 1.0);
+                aggregates
+                    .entry(identity)
+                    .and_modify(|aggregate| {
+                        aggregate.score += contribution;
+                        if contribution > aggregate.best_contribution {
+                            aggregate.best_contribution = contribution;
+                            aggregate.hit = hit.clone();
+                        }
+                        aggregate.matched_segments.insert(segment.index);
+                    })
+                    .or_insert_with(|| {
+                        let mut matched_segments = BTreeSet::new();
+                        matched_segments.insert(segment.index);
+                        SegmentedHitAggregate {
+                            hit,
+                            score: contribution,
+                            best_contribution: contribution,
+                            matched_segments,
+                        }
+                    });
+            }
+        }
+        let mut fused = aggregates.into_values().collect::<Vec<_>>();
+        fused.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.hit.id.cmp(&right.hit.id))
+        });
+        fused.truncate(global_limit);
+        let hits = fused
+            .into_iter()
+            .map(|mut aggregate| {
+                aggregate.hit.score = aggregate.score;
+                aggregate.hit.fusion_score = aggregate.score;
+                annotate_segmented_hit(&mut aggregate.hit, &aggregate.matched_segments);
+                aggregate.hit
+            })
+            .collect::<Vec<_>>();
+        let fusion_ms = fusion_started.elapsed().as_millis() as u64;
+        let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        Ok(DirectQdrantGeneration {
+            fusion_candidate_count: hits.len() as u32,
+            hits,
+            query_embedding_ms,
+            qdrant_search_ms,
+            dense_search_ms,
+            sparse_search_ms,
+            fusion_ms,
+            dense_branch_executed: wants_dense && !dense_failed,
+            sparse_branch_executed: wants_sparse && !sparse_failed,
+            fusion_executed: search_mode == pb::SearchModeV005::Hybrid,
+            dense_branch_candidate_count,
+            sparse_branch_candidate_count,
+            sparse_top_score,
+            dense_failed,
+            sparse_failed,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_branch_hits(
+        dense_hits: Vec<QdrantSearchHit>,
+        sparse_hits: Vec<QdrantSearchHit>,
+        candidate_limit: u32,
+        search_mode: pb::SearchModeV005,
+        dense_failed: bool,
+        sparse_failed: bool,
+        warnings: &mut Vec<pb::DiagnosticWarningV005>,
+        cfg: &AppConfig,
+    ) -> Result<Vec<QdrantSearchHit>, Status> {
+        match search_mode {
+            pb::SearchModeV005::Dense => {
+                if dense_hits.is_empty() && dense_failed {
+                    return Err(Status::unavailable(
+                        "QDRANT_SEARCH_UNAVAILABLE: dense search failed",
+                    ));
+                }
+                Ok(dense_hits)
+            }
+            pb::SearchModeV005::Sparse => {
+                if sparse_hits.is_empty() && sparse_failed {
+                    return Err(Status::unavailable(
+                        "QDRANT_SEARCH_UNAVAILABLE: sparse search failed",
+                    ));
+                }
+                Ok(sparse_hits)
+            }
+            _ => {
+                if dense_hits.is_empty()
+                    && sparse_hits.is_empty()
+                    && (dense_failed || sparse_failed)
+                {
+                    return Err(Status::unavailable(
+                        "QDRANT_SEARCH_UNAVAILABLE: dense and sparse search unavailable",
+                    ));
+                }
+                if !dense_hits.is_empty() && !sparse_hits.is_empty() {
+                    Ok(fuse_qdrant_hits(
+                        dense_hits,
+                        sparse_hits,
+                        candidate_limit as usize,
+                        &cfg.search.hybrid_fusion_method,
+                        cfg.search.hybrid_dense_weight,
+                        cfg.search.hybrid_sparse_weight,
+                        cfg.search.rrf_k,
+                    ))
+                } else if !dense_hits.is_empty() {
+                    if sparse_failed {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "SPARSE_SEARCH_FAILED_FALLBACK_TO_DENSE".into(),
+                            message: "Sparse search failed; returning dense-only retrieval results"
+                                .into(),
+                        });
+                    }
+                    Ok(dense_hits)
+                } else {
+                    if dense_failed {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "DENSE_SEARCH_FAILED_FALLBACK_TO_SPARSE".into(),
+                            message: "Dense search failed; returning sparse-only retrieval results"
+                                .into(),
+                        });
+                    }
+                    Ok(sparse_hits)
+                }
+            }
+        }
     }
 
     fn require_trusted_forwarded_identity_headers(
@@ -646,6 +1299,81 @@ impl AstraVectorV004ControlService {
     }
 }
 
+fn qdrant_hit_identity(hit: &QdrantSearchHit) -> Option<QdrantHitIdentity> {
+    let access_zone_id = payload_string(&hit.payload, "access_zone_id")?;
+    let document_id = payload_string(&hit.payload, "document_id")?;
+    let document_version = payload_u64(&hit.payload, "document_version")?;
+    let matched_chunk_id = payload_string(&hit.payload, "chunk_id")?;
+    let parent_chunk_id =
+        payload_string(&hit.payload, "parent_chunk_id").unwrap_or_else(|| matched_chunk_id.clone());
+    Some(QdrantHitIdentity {
+        access_zone_id,
+        document_id,
+        document_version,
+        matched_chunk_id,
+        parent_chunk_id,
+    })
+}
+
+fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn payload_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+    })
+}
+
+fn annotate_segmented_hit(hit: &mut QdrantSearchHit, matched_segments: &BTreeSet<usize>) {
+    let Some(object) = hit.payload.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "query_processing_mode".into(),
+        serde_json::json!("SEGMENTED"),
+    );
+    object.insert(
+        "query_segment_indices".into(),
+        serde_json::json!(matched_segments.iter().copied().collect::<Vec<_>>()),
+    );
+}
+
+fn result_query_segment_indices(result: &pb::SearchResultV004) -> Vec<usize> {
+    let Some(raw) = result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("query_segment_indices"))
+    else {
+        return Vec::new();
+    };
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(items) = value.as_array() {
+            return items
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|value| value as usize)
+                .collect();
+        }
+        if let Some(index) = value.as_u64() {
+            return vec![index as usize];
+        }
+    }
+    raw.split(',')
+        .filter_map(|part| {
+            part.trim_matches(|ch: char| !ch.is_ascii_digit())
+                .parse::<usize>()
+                .ok()
+        })
+        .collect()
+}
+
 #[tonic::async_trait]
 impl AstraVectorV004Control for AstraVectorV004ControlService {
     async fn search(
@@ -772,213 +1500,78 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 message: "Sparse embedding is unavailable; HYBRID search degraded to DENSE search because embeddingMode is DENSE_SPARSE_IF_AVAILABLE.".into(),
             });
         }
-
-        let emb_started = std::time::Instant::now();
-        let embedding = self
-            .scheduler
-            .submit(
-                QueueKind::Query,
-                InferenceInput {
-                    text: query.to_string(),
-                    max_length: self.cfg.tokenization.query.max_length,
-                    allow_truncation: self.cfg.tokenization.query.truncation_allowed,
-                    want_dense: wants_dense,
-                    want_sparse: wants_sparse && sparse_available,
-                    token_count_hint: 0,
-                },
-                deadline,
-                self.shutdown.child_token(),
-            )
-            .await
-            .map_err(Status::from)?;
-        let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
-        let qdrant_started = std::time::Instant::now();
-        let qdrant = self.qdrant()?.clone();
-        let dense_vector = embedding.dense.clone();
-        let sparse_indices = embedding.sparse_indices.clone();
-        let sparse_values = embedding.sparse_values.clone();
-        let dense_dim = dense_vector.as_ref().map(|v| v.len()).unwrap_or(0);
-        let dense_norm = dense_vector
-            .as_ref()
-            .map(|v| {
-                v.iter()
-                    .map(|x| (*x as f64) * (*x as f64))
-                    .sum::<f64>()
-                    .sqrt()
-            })
-            .unwrap_or(0.0);
-        tracing::debug!(
+        let query_counter = EngineQueryTokenCounter {
+            engine: self.engine.as_ref(),
+        };
+        let query_plan = build_query_plan(
+            query,
+            &query_counter,
+            &self.cfg.search.query_processing,
+            self.cfg.tokenization.query.max_length,
+        )
+        .map_err(query_planning_status)?;
+        let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
+        counter!(
+            "astravector_query_processing_total",
+            "mode" => query_plan_diagnostics.mode_code()
+        )
+        .increment(1);
+        histogram!("astravector_query_original_tokens")
+            .record(query_plan.original_token_count as f64);
+        histogram!("astravector_query_segment_count").record(query_plan.segments.len() as f64);
+        for segment in &query_plan.segments {
+            counter!("astravector_query_segments_total", "segment_kind" => format!("{:?}", segment.kind))
+                .increment(1);
+            histogram!("astravector_query_segment_tokens").record(segment.token_count as f64);
+        }
+        let candidate_limit = if query_plan.mode == QueryProcessingMode::Segmented {
+            candidate_limit
+                .min(self.cfg.search.query_processing.global_candidate_limit)
+                .max(top_k)
+        } else {
+            candidate_limit
+        };
+        tracing::info!(
             correlation_id = %r.correlation_id,
-            query_embedding_ms,
-            dense_dim,
-            dense_norm,
-            sparse_terms = sparse_indices.as_ref().map(|v| v.len()).unwrap_or(0),
-            "SEARCH_QUERY_EMBEDDING_READY"
+            mode = query_plan_diagnostics.mode_code(),
+            original_token_count = query_plan.original_token_count,
+            segment_count = query_plan.segments.len(),
+            "QUERY_PLAN_READY"
         );
-        let dense_access_zone_ids = access_zone_ids.clone();
-        let sparse_access_zone_ids = access_zone_ids.clone();
-        let dense_future = {
-            let qdrant = qdrant.clone();
-            let version_filters = version_filters.clone();
-            let budget = qdrant_budget.clone();
-            async move {
-                if !wants_dense {
-                    return Ok::<Option<(Vec<QdrantSearchHit>, u64)>, Status>(None);
-                }
-                let Some(dense) = dense_vector.as_deref() else {
-                    return Err(Status::failed_precondition(
-                        "query dense embedding unavailable",
-                    ));
-                };
-                let branch_started = Instant::now();
-                let hits = qdrant
-                    .search_dense_with_budget(
-                        dense,
-                        &dense_access_zone_ids,
-                        caller_access_level as i16,
-                        candidate_limit as usize,
-                        Some(&version_filters),
-                        Some(&budget),
-                    )
-                    .await
-                    .map_err(Status::from)?;
-                Ok(Some((hits, branch_started.elapsed().as_millis() as u64)))
-            }
-        };
-        let sparse_future = {
-            let qdrant = qdrant.clone();
-            let version_filters = version_filters.clone();
-            let budget = qdrant_budget.clone();
-            async move {
-                if !wants_sparse {
-                    return Ok::<Option<(Vec<QdrantSearchHit>, u64)>, Status>(None);
-                }
-                let branch_started = Instant::now();
-                match (sparse_indices.as_deref(), sparse_values.as_deref()) {
-                    (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
-                        qdrant
-                            .search_sparse_with_budget(
-                                indices,
-                                values,
-                                &sparse_access_zone_ids,
-                                caller_access_level as i16,
-                                candidate_limit as usize,
-                                Some(&version_filters),
-                                Some(&budget),
-                            )
-                            .await
-                            .map(|hits| Some((hits, branch_started.elapsed().as_millis() as u64)))
-                            .map_err(Status::from)
-                    }
-                    _ if sparse_required => Err(Status::failed_precondition(
-                        "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
-                    )),
-                    _ => Ok(Some((
-                        Vec::new(),
-                        branch_started.elapsed().as_millis() as u64,
-                    ))),
-                }
-            }
-        };
-        let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
-        let mut dense_failed = false;
-        let mut sparse_failed = false;
-        let (mut dense_hits, dense_search_ms) = match dense_result {
-            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
-            Ok(None) => (Vec::new(), 0),
-            Err(e) => {
-                dense_failed = true;
-                warnings.push(pb::DiagnosticWarningV005 {
-                    code: "DENSE_SEARCH_FAILED".into(),
-                    message: format!("Dense Qdrant search failed: {}", e.message()),
-                });
-                (Vec::new(), 0)
-            }
-        };
-        let (mut sparse_hits, sparse_search_ms) = match sparse_result {
-            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
-            Ok(None) => (Vec::new(), 0),
-            Err(e) if sparse_required => return Err(e),
-            Err(e) => {
-                sparse_failed = true;
-                warnings.push(pb::DiagnosticWarningV005 {
-                    code: "SPARSE_SEARCH_FAILED".into(),
-                    message: format!("Sparse Qdrant search failed: {}", e.message()),
-                });
-                (Vec::new(), 0)
-            }
-        };
-        dense_hits.sort_by(stable_qdrant_hit_rank);
-        sparse_hits.sort_by(stable_qdrant_hit_rank);
-        let dense_branch_executed = wants_dense && !dense_failed;
-        let sparse_branch_executed = wants_sparse && !sparse_failed;
-        let fusion_executed = search_mode == pb::SearchModeV005::Hybrid
-            && dense_branch_executed
-            && sparse_branch_executed;
-        let dense_branch_candidate_count = dense_hits.len() as u32;
-        let sparse_branch_candidate_count = sparse_hits.len() as u32;
-        let sparse_top_score = sparse_hits.first().map(|hit| hit.score).unwrap_or(0.0);
-        let fusion_started = Instant::now();
-        let hits = match search_mode {
-            pb::SearchModeV005::Dense => {
-                if dense_hits.is_empty() && dense_failed {
-                    return Err(Status::unavailable(
-                        "QDRANT_SEARCH_UNAVAILABLE: dense search failed",
-                    ));
-                }
-                dense_hits
-            }
-            pb::SearchModeV005::Sparse => {
-                if sparse_hits.is_empty() && sparse_failed {
-                    return Err(Status::unavailable(
-                        "QDRANT_SEARCH_UNAVAILABLE: sparse search failed",
-                    ));
-                }
-                sparse_hits
-            }
-            _ => {
-                if dense_hits.is_empty()
-                    && sparse_hits.is_empty()
-                    && (dense_failed || sparse_failed)
-                {
-                    return Err(Status::unavailable(
-                        "QDRANT_SEARCH_UNAVAILABLE: dense and sparse search unavailable",
-                    ));
-                }
-                if !dense_hits.is_empty() && !sparse_hits.is_empty() {
-                    fuse_qdrant_hits(
-                        dense_hits,
-                        sparse_hits,
-                        candidate_limit as usize,
-                        &self.cfg.search.hybrid_fusion_method,
-                        self.cfg.search.hybrid_dense_weight,
-                        self.cfg.search.hybrid_sparse_weight,
-                        self.cfg.search.rrf_k,
-                    )
-                } else if !dense_hits.is_empty() {
-                    if sparse_failed {
-                        warnings.push(pb::DiagnosticWarningV005 {
-                            code: "SPARSE_SEARCH_FAILED_FALLBACK_TO_DENSE".into(),
-                            message: "Sparse search failed; returning dense-only retrieval results"
-                                .into(),
-                        });
-                    }
-                    dense_hits
-                } else {
-                    if dense_failed {
-                        warnings.push(pb::DiagnosticWarningV005 {
-                            code: "DENSE_SEARCH_FAILED_FALLBACK_TO_SPARSE".into(),
-                            message: "Dense search failed; returning sparse-only retrieval results"
-                                .into(),
-                        });
-                    }
-                    sparse_hits
-                }
-            }
-        };
-        let fusion_ms = fusion_started.elapsed().as_millis() as u64;
-        let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
-        let fusion_candidate_count = hits.len() as u32;
+        let direct_generation = self
+            .generate_direct_qdrant_hits(
+                &query_plan,
+                &access_zone_ids,
+                caller_access_level,
+                candidate_limit,
+                search_mode,
+                wants_dense,
+                wants_sparse,
+                sparse_available,
+                sparse_required,
+                &version_filters,
+                deadline,
+                &qdrant_budget,
+                &mut warnings,
+            )
+            .await?;
+        let DirectQdrantGeneration {
+            hits,
+            query_embedding_ms,
+            qdrant_search_ms,
+            dense_search_ms,
+            sparse_search_ms,
+            fusion_ms,
+            dense_branch_executed,
+            sparse_branch_executed,
+            fusion_executed,
+            dense_branch_candidate_count,
+            sparse_branch_candidate_count,
+            fusion_candidate_count,
+            sparse_top_score,
+            dense_failed,
+            sparse_failed,
+        } = direct_generation;
         tracing::debug!(
             correlation_id = %r.correlation_id,
             search_mode = ?search_mode,
@@ -1206,18 +1799,35 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .lexical
                     .statement_timeout_ms
                     .min(lexical_remaining_ms);
-                let lexical_candidates = self
-                    .repo()?
-                    .search_active_parent_contexts_lexical_multi(
-                        &access_zone_ids,
-                        caller_access_level as i16,
-                        query,
-                        quality_run_id_filter.as_deref(),
-                        lexical_limit,
-                        lexical_timeout_ms,
-                    )
-                    .await
-                    .map_err(Status::from)?;
+                let lexical_segments = query_plan
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.index, segment.text.as_str(), segment.weight))
+                    .collect::<Vec<_>>();
+                let mut lexical_candidates = Vec::new();
+                for (segment_index, segment_text, segment_weight) in lexical_segments {
+                    let segment_candidates = self
+                        .repo()?
+                        .search_active_parent_contexts_lexical_multi(
+                            &access_zone_ids,
+                            caller_access_level as i16,
+                            segment_text,
+                            quality_run_id_filter.as_deref(),
+                            lexical_limit,
+                            lexical_timeout_ms,
+                        )
+                        .await
+                        .map_err(Status::from)?;
+                    counter!("astravector_segment_lexical_search_total").increment(1);
+                    lexical_candidates.extend(segment_candidates.into_iter().map(|candidate| {
+                        (
+                            candidate,
+                            segment_index,
+                            segment_text.to_owned(),
+                            segment_weight,
+                        )
+                    }));
+                }
                 lexical_search_ms = lexical_started.elapsed().as_millis() as u64;
                 lexical_candidate_count = lexical_candidates.len() as u32;
                 metrics::histogram!("astravector_lexical_search_duration_seconds")
@@ -1228,7 +1838,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .increment(lexical_candidates.len() as u64);
                 let parents_by_document = lexical_candidates.iter().fold(
                     HashMap::<(Uuid, Uuid), Vec<&ParentContextRecord>>::new(),
-                    |mut acc, candidate| {
+                    |mut acc, (candidate, _, _, _)| {
                         let parent = &candidate.parent;
                         acc.entry((parent.access_zone_id, parent.document_id))
                             .or_default()
@@ -1241,9 +1851,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .enumerate()
                     .map(|(idx, result)| (result_identity_key(result), idx))
                     .collect::<HashMap<_, _>>();
-                let query_terms = query_term_count(query);
                 let mut lexical_results = Vec::new();
                 let mut sibling_seed_scores = HashMap::<(Uuid, Uuid), f32>::new();
+                let mut sibling_seed_query_by_document = HashMap::<(Uuid, Uuid), String>::new();
+                let mut sibling_seed_segment_by_document = HashMap::<(Uuid, Uuid), usize>::new();
                 if self.cfg.graph_rag.rerank.mmr_enabled {
                     for result in &direct_results {
                         let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
@@ -1258,16 +1869,28 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             .or_insert_with(|| score_of(result));
                     }
                 }
-                for candidate in &lexical_candidates {
+                for (candidate, segment_index, segment_text, segment_weight) in &lexical_candidates
+                {
                     let parent = &candidate.parent;
-                    let mut lexical = search_result_from_lexical_parent(parent, query);
-                    let score = candidate.lexical_score;
+                    let mut lexical = search_result_from_lexical_parent(parent, segment_text);
+                    if let Some(citation) = lexical.citation.as_mut() {
+                        citation.metadata.insert(
+                            "query_processing_mode".into(),
+                            query_plan_diagnostics.mode_code().into(),
+                        );
+                        citation.metadata.insert(
+                            "query_segment_indices".into(),
+                            format!("[{}]", segment_index),
+                        );
+                    }
+                    let score = candidate.lexical_score * *segment_weight;
                     let exact_phrase_match = candidate.exact_match;
-                    let matched_terms = matched_term_count(&lexical, query);
+                    let query_terms = query_term_count(segment_text);
+                    let matched_terms = matched_term_count(&lexical, segment_text);
                     let matched_discriminating_terms =
-                        matched_discriminating_term_count(&lexical, query);
+                        matched_discriminating_term_count(&lexical, segment_text);
                     let leading_discriminating_match =
-                        leading_discriminating_query_term_matches(&lexical, query);
+                        leading_discriminating_query_term_matches(&lexical, segment_text);
                     let strong_coverage =
                         query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
                     let strict_lexical_evidence = exact_phrase_match
@@ -1294,6 +1917,12 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         .entry(document_key)
                         .and_modify(|existing| *existing = existing.max(score))
                         .or_insert(score);
+                    sibling_seed_query_by_document
+                        .entry(document_key)
+                        .or_insert_with(|| segment_text.clone());
+                    sibling_seed_segment_by_document
+                        .entry(document_key)
+                        .or_insert(*segment_index);
                     lexical_results.push((
                         lexical,
                         score,
@@ -1307,11 +1936,30 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         let Some(parents) = parents_by_document.get(&document_key) else {
                             continue;
                         };
+                        let sibling_query = sibling_seed_query_by_document
+                            .get(&document_key)
+                            .map(String::as_str)
+                            .unwrap_or(query);
+                        let sibling_segment_index = sibling_seed_segment_by_document
+                            .get(&document_key)
+                            .copied()
+                            .unwrap_or(0);
                         for parent in parents {
                             if parent.source_block_id.as_deref() == Some("doc-root") {
                                 continue;
                             }
-                            let mut lexical = search_result_from_lexical_parent(parent, query);
+                            let mut lexical =
+                                search_result_from_lexical_parent(parent, sibling_query);
+                            if let Some(citation) = lexical.citation.as_mut() {
+                                citation.metadata.insert(
+                                    "query_processing_mode".into(),
+                                    query_plan_diagnostics.mode_code().into(),
+                                );
+                                citation.metadata.insert(
+                                    "query_segment_indices".into(),
+                                    format!("[{}]", sibling_segment_index),
+                                );
+                            }
                             let sibling_score = (seed_score * 0.8 + sibling_sequence_bonus(parent))
                                 .clamp(0.12, 1.0);
                             if let Some(scores) = lexical.scores.as_mut() {
@@ -1319,11 +1967,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 scores.fusion_score = scores.fusion_score.max(sibling_score);
                                 scores.final_score = scores.final_score.max(sibling_score);
                             }
-                            let matched_terms = matched_term_count(&lexical, query);
+                            let matched_terms = matched_term_count(&lexical, sibling_query);
                             let matched_discriminating_terms =
-                                matched_discriminating_term_count(&lexical, query);
+                                matched_discriminating_term_count(&lexical, sibling_query);
                             let leading_discriminating_match =
-                                leading_discriminating_query_term_matches(&lexical, query);
+                                leading_discriminating_query_term_matches(&lexical, sibling_query);
                             lexical_results.push((
                                 lexical,
                                 sibling_score,
@@ -1400,6 +2048,48 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
             }
         }
+        let query_coverage = if query_plan.mode == QueryProcessingMode::Segmented {
+            let covered_segments = direct_results
+                .iter()
+                .flat_map(result_query_segment_indices)
+                .collect::<HashSet<_>>();
+            let coverage = evaluate_required_coverage(&query_plan.segments, &covered_segments);
+            match coverage.status {
+                QueryEvidenceStatus::Found => {}
+                QueryEvidenceStatus::Degraded => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                        message: format!(
+                            "required segment coverage is {}/{}",
+                            coverage.required_covered, coverage.required_total
+                        ),
+                    });
+                    counter!("astravector_long_query_partial_coverage_total").increment(1);
+                }
+                QueryEvidenceStatus::Insufficient => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                        message:
+                            "no required long-query segments produced admissible direct evidence"
+                                .into(),
+                    });
+                    direct_results.clear();
+                    counter!("astravector_long_query_partial_coverage_total").increment(1);
+                }
+            }
+            coverage
+        } else {
+            QueryCoverage {
+                required_total: 1,
+                required_covered: usize::from(!direct_results.is_empty()),
+                ratio: if direct_results.is_empty() { 0.0 } else { 1.0 },
+                status: if direct_results.is_empty() {
+                    QueryEvidenceStatus::Insufficient
+                } else {
+                    QueryEvidenceStatus::Found
+                },
+            }
+        };
         tracing::debug!(
             correlation_id = %r.correlation_id,
             parent_fetch_ms,
@@ -2383,6 +3073,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 remaining_budget_before_graph_ms,
                 remaining_budget_before_mmr_ms,
                 ranking_trace: Some(ranking_trace),
+                query_processing_mode: query_plan_diagnostics.mode_code().into(),
+                query_original_token_count: query_plan.original_token_count as u32,
+                query_segment_count: query_plan.segments.len() as u32,
+                query_was_truncated: query_plan_diagnostics.query_was_truncated,
+                query_coverage_ratio: query_coverage.ratio,
+                query_required_segments: query_coverage.required_total as u32,
+                query_covered_required_segments: query_coverage.required_covered as u32,
+                query_segment_sha256: query_plan_diagnostics.segment_sha256,
             }),
             warnings,
         }))
@@ -2961,6 +3659,151 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         if wants_sparse && sparse_required && !self.engine.sparse_available() {
             return Err(Status::failed_precondition("SPARSE_UNAVAILABLE: sparse explain requested but loaded ONNX artifact has no sparse output"));
         }
+        let query_counter = EngineQueryTokenCounter {
+            engine: self.engine.as_ref(),
+        };
+        let query_plan = build_query_plan(
+            query,
+            &query_counter,
+            &self.cfg.search.query_processing,
+            self.cfg.tokenization.query.max_length,
+        )
+        .map_err(query_planning_status)?;
+        let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            let qdrant_budget = OperationBudget {
+                deadline,
+                cancellation: self.shutdown.child_token(),
+                workload: WorkloadKind::Query,
+            };
+            let mut warnings = Vec::new();
+            let direct = self
+                .generate_direct_qdrant_hits(
+                    &query_plan,
+                    &[access_zone_id],
+                    caller_access_level,
+                    candidate_limit,
+                    search_mode,
+                    wants_dense,
+                    wants_sparse,
+                    self.engine.sparse_available(),
+                    sparse_required,
+                    &version_filters,
+                    deadline,
+                    &qdrant_budget,
+                    &mut warnings,
+                )
+                .await?;
+            let fusion = direct
+                .hits
+                .iter()
+                .take(top_k as usize)
+                .enumerate()
+                .map(|(rank, hit)| pb::ExplainFusionCandidateV005 {
+                    rank: (rank + 1) as u32,
+                    chunk_id: hit
+                        .payload
+                        .get("chunk_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    dense_rank: hit.dense_rank,
+                    sparse_rank: hit.sparse_rank,
+                    dense_score: hit.dense_score,
+                    sparse_score: hit.sparse_score,
+                    fusion_score: hit.fusion_score,
+                    reason: "SEGMENTED_GLOBAL_RRF".into(),
+                })
+                .collect::<Vec<_>>();
+            let selected_parents = direct
+                .hits
+                .iter()
+                .take(top_k as usize)
+                .filter_map(|hit| {
+                    let parent = hit
+                        .payload
+                        .get("parent_chunk_id")
+                        .or_else(|| hit.payload.get("chunk_id"))?
+                        .as_str()?;
+                    Some(pb::ExplainSelectedParentV005 {
+                        parent_chunk_id: parent.to_string(),
+                        selected_because: "best segmented fused candidate".into(),
+                    })
+                })
+                .collect();
+            return Ok(Response::new(pb::ExplainSearchResponse {
+                query: query.to_string(),
+                query_embedding: None,
+                dense_candidates: direct
+                    .hits
+                    .iter()
+                    .filter(|hit| hit.dense_score > 0.0)
+                    .take(top_k as usize)
+                    .enumerate()
+                    .map(|(rank, hit)| explain_candidate(rank, hit))
+                    .collect(),
+                sparse_candidates: direct
+                    .hits
+                    .iter()
+                    .filter(|hit| hit.sparse_score > 0.0)
+                    .take(top_k as usize)
+                    .enumerate()
+                    .map(|(rank, hit)| explain_candidate(rank, hit))
+                    .collect(),
+                fusion,
+                selected_parents,
+                applied_filters: vec![
+                    pb::AppliedFilterV005 {
+                        key: "access_zone_id".into(),
+                        op: "eq".into(),
+                        value: access_zone_id.to_string(),
+                    },
+                    pb::AppliedFilterV005 {
+                        key: "access_level".into(),
+                        op: "lte".into(),
+                        value: (caller_access_level as i32).to_string(),
+                    },
+                    pb::AppliedFilterV005 {
+                        key: "lifecycle_status".into(),
+                        op: "eq".into(),
+                        value: "ACTIVE".into(),
+                    },
+                ],
+                diagnostics: Some(pb::SearchDiagnosticsV004 {
+                    query_embedding_ms: direct.query_embedding_ms,
+                    qdrant_search_ms: direct.qdrant_search_ms,
+                    total_ms: started.elapsed().as_millis() as u64,
+                    candidate_count: direct.hits.len() as u32,
+                    parent_group_count: direct.hits.len() as u32,
+                    direct_candidates_count: direct.hits.len() as u32,
+                    merged_candidates_count: direct.hits.len() as u32,
+                    final_candidates_count: direct.hits.len() as u32,
+                    dense_branch_executed: direct.dense_branch_executed,
+                    sparse_branch_executed: direct.sparse_branch_executed,
+                    fusion_executed: direct.fusion_executed,
+                    dense_branch_candidate_count: direct.dense_branch_candidate_count,
+                    sparse_branch_candidate_count: direct.sparse_branch_candidate_count,
+                    fusion_candidate_count: direct.fusion_candidate_count,
+                    dense_search_ms: direct.dense_search_ms,
+                    sparse_search_ms: direct.sparse_search_ms,
+                    fusion_ms: direct.fusion_ms,
+                    warning_codes: warnings.into_iter().map(|warning| warning.code).collect(),
+                    query_processing_mode: query_plan_diagnostics.mode_code().into(),
+                    query_original_token_count: query_plan.original_token_count as u32,
+                    query_segment_count: query_plan.segments.len() as u32,
+                    query_was_truncated: false,
+                    query_coverage_ratio: 0.0,
+                    query_required_segments: query_plan
+                        .segments
+                        .iter()
+                        .filter(|segment| segment.required_for_coverage)
+                        .count() as u32,
+                    query_covered_required_segments: 0,
+                    query_segment_sha256: query_plan_diagnostics.segment_sha256,
+                    ..Default::default()
+                }),
+            }));
+        }
         let emb_started = std::time::Instant::now();
         let embedding = self
             .scheduler
@@ -2969,16 +3812,21 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 InferenceInput {
                     text: query.to_string(),
                     max_length: self.cfg.tokenization.query.max_length,
-                    allow_truncation: self.cfg.tokenization.query.truncation_allowed,
+                    allow_truncation: false,
                     want_dense: wants_dense,
                     want_sparse: wants_sparse && self.engine.sparse_available(),
-                    token_count_hint: 0,
+                    token_count_hint: query_plan.original_token_count,
                 },
                 deadline,
                 self.shutdown.child_token(),
             )
             .await
             .map_err(Status::from)?;
+        if embedding.truncated {
+            return Err(Status::internal(
+                "UNEXPECTED_QUERY_TRUNCATION: explain query embedding was truncated",
+            ));
+        }
         let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
         let q_started = std::time::Instant::now();
         let qdrant = self.qdrant()?;
@@ -3204,6 +4052,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 dense_branch_candidate_count: dense_hits.len() as u32,
                 sparse_branch_candidate_count: sparse_hits.len() as u32,
                 fusion_candidate_count: fused.len() as u32,
+                query_processing_mode: query_plan_diagnostics.mode_code().into(),
+                query_original_token_count: query_plan.original_token_count as u32,
+                query_segment_count: query_plan.segments.len() as u32,
+                query_was_truncated: false,
+                query_coverage_ratio: if fused.is_empty() { 0.0 } else { 1.0 },
+                query_required_segments: 1,
+                query_covered_required_segments: u32::from(!fused.is_empty()),
+                query_segment_sha256: query_plan_diagnostics.segment_sha256,
                 ..Default::default()
             }),
         }))
@@ -4646,6 +5502,12 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
                         | "MMR_FETCH_TIMEOUT"
                         | "TOKEN_SIMILARITY_FALLBACK"
                         | "DEADLINE_BUDGET_DEGRADATION"
+                        | "LONG_QUERY_PARTIAL_COVERAGE"
+                        | "LONG_QUERY_CONTEXT_BUDGET_INSUFFICIENT"
+                        | "LONG_QUERY_COVERAGE_EXCEEDS_CONTEXT_LIMIT"
+                        | "LONG_QUERY_COVERAGE_REDUCED_BY_VISIBILITY_RECHECK"
+                        | "QUERY_SEGMENT_SKIPPED_INSUFFICIENT_BUDGET"
+                        | "QUERY_SEGMENT_RETRIEVAL_DEGRADED"
                 )
             })
             .collect::<Vec<_>>();
@@ -10918,6 +11780,8 @@ fn search_result_from_hit(
         "payload_version",
         "chunk_granularity",
         "source_chunk_granularity",
+        "query_processing_mode",
+        "query_segment_indices",
     ] {
         if let Some(value) = hit.payload.get(key) {
             if let Some(s) = value.as_str() {

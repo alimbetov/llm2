@@ -18,6 +18,7 @@ pub mod ingestion_cleanup;
 pub mod metrics;
 pub mod persistence;
 pub mod provider;
+pub mod query_processing;
 pub mod recovery;
 pub mod retention;
 pub mod scheduler;
