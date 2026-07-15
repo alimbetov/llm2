@@ -1,0 +1,397 @@
+{
+  "blind_candidates_total": 712,
+  "blind_judgments_sha256": "33a519d6a145f79e891ab8d268d1b8aacb7f4afc9fb075ffb4777e030836fb33",
+  "candidate_pool_sha256": "5c9637ff5b32528c4993b2844939eb91baa8d51e6bc3ba916afc6dd60f1b7faa",
+  "candidate_pool_total": 712,
+  "candidate_selection": {
+    "lexical_depth": 12,
+    "minimum_candidates_per_query": 3,
+    "runtime_rank_independent": true,
+    "uses_production_ranking_output": false
+  },
+  "identity_map_sha256": "debbf3103ce7a3825c657d06ede12c8a43721f55abf52c405e8b6a1daec31fe1",
+  "judged_candidates_total": 0,
+  "profile": "rag-quality-bank-v1",
+  "qrels_complete": false,
+  "queries": [
+    {
+      "candidate_count": 12,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 4
+      },
+      "query_id": "rag-v1-access-001"
+    },
+    {
+      "candidate_count": 12,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 4
+      },
+      "query_id": "rag-v1-access-002"
+    },
+    {
+      "candidate_count": 13,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 2
+      },
+      "query_id": "rag-v1-access-003"
+    },
+    {
+      "candidate_count": 12,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 1
+      },
+      "query_id": "rag-v1-access-004"
+    },
+    {
+      "candidate_count": 12,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 6
+      },
+      "query_id": "rag-v1-access-005"
+    },
+    {
+      "candidate_count": 13,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 4
+      },
+      "query_id": "rag-v1-access-006"
+    },
+    {
+      "candidate_count": 16,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 6
+      },
+      "query_id": "rag-v1-access-007"
+    },
+    {
+      "candidate_count": 15,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 4
+      },
+      "query_id": "rag-v1-access-008"
+    },
+    {
+      "candidate_count": 16,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-semantic-001"
+    },
+    {
+      "candidate_count": 14,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-semantic-002"
+    },
+    {
+      "candidate_count": 13,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 3
+      },
+      "query_id": "rag-v1-semantic-003"
+    },
+    {
+      "candidate_count": 15,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-semantic-004"
+    },
+    {
+      "candidate_count": 15,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 3
+      },
+      "query_id": "rag-v1-semantic-005"
+    },
+    {
+      "candidate_count": 10,
+      "pool_reason_counts": {
+        "lexical_overlap": 9,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-semantic-006"
+    },
+    {
+      "candidate_count": 16,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-paraphrase-001"
+    },
+    {
+      "candidate_count": 15,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-paraphrase-002"
+    },
+    {
+      "candidate_count": 16,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-paraphrase-003"
+    },
+    {
+      "candidate_count": 25,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 15
+      },
+      "query_id": "rag-v1-paraphrase-004"
+    },
+    {
+      "candidate_count": 19,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 8
+      },
+      "query_id": "rag-v1-lexical-001"
+    },
+    {
+      "candidate_count": 8,
+      "pool_reason_counts": {
+        "lexical_overlap": 1,
+        "must_contain_block": 1,
+        "referenced_document_block": 8
+      },
+      "query_id": "rag-v1-lexical-002"
+    },
+    {
+      "candidate_count": 18,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 8
+      },
+      "query_id": "rag-v1-lexical-003"
+    },
+    {
+      "candidate_count": 18,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 8
+      },
+      "query_id": "rag-v1-lexical-004"
+    },
+    {
+      "candidate_count": 16,
+      "pool_reason_counts": {
+        "expected_related_block": 1,
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-graph-001"
+    },
+    {
+      "candidate_count": 17,
+      "pool_reason_counts": {
+        "expected_related_block": 1,
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-graph-002"
+    },
+    {
+      "candidate_count": 15,
+      "pool_reason_counts": {
+        "expected_related_block": 1,
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-graph-003"
+    },
+    {
+      "candidate_count": 14,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 2,
+        "referenced_document_block": 3
+      },
+      "query_id": "rag-v1-mmr-001"
+    },
+    {
+      "candidate_count": 14,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 3,
+        "referenced_document_block": 3
+      },
+      "query_id": "rag-v1-mmr-002"
+    },
+    {
+      "candidate_count": 17,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-mmr-003"
+    },
+    {
+      "candidate_count": 25,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 15
+      },
+      "query_id": "rag-v1-long-001"
+    },
+    {
+      "candidate_count": 26,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 15
+      },
+      "query_id": "rag-v1-long-002"
+    },
+    {
+      "candidate_count": 24,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 15
+      },
+      "query_id": "rag-v1-long-003"
+    },
+    {
+      "candidate_count": 26,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 15
+      },
+      "query_id": "rag-v1-long-004"
+    },
+    {
+      "candidate_count": 18,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 12
+      },
+      "query_id": "rag-v1-distractor-001"
+    },
+    {
+      "candidate_count": 17,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 12
+      },
+      "query_id": "rag-v1-distractor-002"
+    },
+    {
+      "candidate_count": 18,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 8
+      },
+      "query_id": "rag-v1-distractor-003"
+    },
+    {
+      "candidate_count": 19,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "must_contain_block": 1,
+        "referenced_document_block": 8
+      },
+      "query_id": "rag-v1-distractor-004"
+    },
+    {
+      "candidate_count": 24,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "referenced_document_block": 18
+      },
+      "query_id": "rag-v1-negative-001"
+    },
+    {
+      "candidate_count": 12,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "referenced_document_block": 4
+      },
+      "query_id": "rag-v1-negative-002"
+    },
+    {
+      "candidate_count": 29,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "referenced_document_block": 18
+      },
+      "query_id": "rag-v1-negative-003"
+    },
+    {
+      "candidate_count": 22,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "referenced_document_block": 10
+      },
+      "query_id": "rag-v1-negative-004"
+    },
+    {
+      "candidate_count": 17,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "referenced_document_block": 5
+      },
+      "query_id": "rag-v1-negative-005"
+    },
+    {
+      "candidate_count": 19,
+      "pool_reason_counts": {
+        "lexical_overlap": 12,
+        "referenced_document_block": 9
+      },
+      "query_id": "rag-v1-negative-006"
+    }
+  ],
+  "queries_total": 42,
+  "schema_version": 1,
+  "status": "AWAITING_BLIND_JUDGMENT",
+  "unjudged_candidates_total": 712
+}

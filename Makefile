@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 fix481-prepare-judgments fix481-finalize-judgments quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -272,6 +272,23 @@ fix481-prepare-judgments:
 
 fix481-finalize-judgments:
 	python3 scripts/fix481_judgment_pool.py finalize --profile $${FIX481_PROFILE:-validation}
+
+fix482-structural-validator:
+	python3 scripts/validate_rag_quality_bank_v1.py
+
+fix482-contract-tests:
+	cargo test --test quality_fixtures_contracts fix482_ -- --nocapture
+
+fix482-prepare-judgments: fix482-structural-validator
+	python3 scripts/prepare_fix482_rag_quality_bank_judgments.py
+
+verify-fix482:
+	cargo fmt --check
+	cargo check --all-targets --all-features
+	cargo clippy --all-targets --all-features -- -D warnings
+	python3 scripts/validate_rag_quality_bank_v1.py
+	cargo test --test quality_fixtures_contracts fix482_ -- --nocapture
+	python3 scripts/prepare_fix482_rag_quality_bank_judgments.py
 
 verify-fix467: fmt clippy check test quality-fixtures quality-quick
 
