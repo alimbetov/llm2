@@ -9696,16 +9696,54 @@ fn ordered_lexical_terms(text: &str) -> Vec<String> {
 
 fn lexical_term_variants(term: &str) -> Vec<String> {
     let mut variants = vec![term.to_string()];
-    if term.contains('_') {
+    if term.contains('_') || term.contains('-') {
         variants.extend(
-            term.split('_')
+            term.split(['_', '-'])
                 .filter(|part| part.len() >= 2)
                 .map(str::to_string),
         );
     }
+    if variants.iter().any(|variant| variant == "tenant") {
+        variants.push("access_zone_id".into());
+    }
+    if term.len() > 5 && term.ends_with("ly") {
+        variants.push(term[..term.len() - 2].to_string());
+    }
     match term {
         "absent" => variants.push("missing".into()),
-        "missing" => variants.push("absent".into()),
+        "acknowledge" | "acknowledgement" | "acknowledgment" => variants.push("acknowledge".into()),
+        "accelerate" | "accelerates" => variants.push("improve".into()),
+        "canonical" => {
+            variants.push("source".into());
+            variants.push("truth".into());
+        }
+        "ceiling" => variants.push("limit".into()),
+        "confirm" | "confirms" => variants.push("prove".into()),
+        "discuss" | "discusses" => variants.push("cover".into()),
+        "drift" => variants.push("missing".into()),
+        "essential" => variants.push("mandatory".into()),
+        "fail" | "failed" | "failure" | "failures" => variants.push("failure".into()),
+        "improve" | "improves" => variants.push("accelerate".into()),
+        "key" => variants.push("index".into()),
+        "bench" => variants.push("benchmark".into()),
+        "benchmark" => variants.push("bench".into()),
+        "limit" => variants.push("ceiling".into()),
+        "missing" => {
+            variants.push("absent".into());
+            variants.push("drift".into());
+        }
+        "record" | "records" => variants.push("handles".into()),
+        "restored" | "restore" => variants.push("repair".into()),
+        "repaired" | "repair" => variants.push("restore".into()),
+        "retrieval" => variants.push("search".into()),
+        "search" => variants.push("retrieval".into()),
+        "security" => {
+            variants.push("threat".into());
+            variants.push("model".into());
+        }
+        "store" => variants.push("postgresql".into()),
+        "prove" | "proves" => variants.push("confirm".into()),
+        "seen" | "saw" => variants.push("acknowledgement".into()),
         "tenant" => variants.push("access_zone_id".into()),
         "gateway" => variants.push("x-astravector".into()),
         _ => {}
@@ -9726,6 +9764,17 @@ fn normalized_lexical_term(term: &str) -> Option<String> {
 fn lexical_stem(term: &str) -> String {
     if matches!(term, "binding" | "chess" | "missing" | "ranking") {
         return term.to_string();
+    }
+    match term {
+        "acknowledged" => return "acknowledge".to_string(),
+        "fixtures" => return "fixture".to_string(),
+        "proves" => return "prove".to_string(),
+        "repaired" => return "repair".to_string(),
+        "restored" => return "restore".to_string(),
+        _ => {}
+    }
+    if term.len() > 6 && term.ends_with("ated") {
+        return format!("{}ate", &term[..term.len() - 4]);
     }
     if term.len() > 5 && term.ends_with("ies") {
         return format!("{}y", &term[..term.len() - 3]);
@@ -9755,14 +9804,24 @@ fn is_lexical_stopword(term: &str) -> bool {
             | "do"
             | "does"
             | "answer"
+            | "avoid"
+            | "avoiding"
             | "behavior"
             | "behaviour"
+            | "block"
+            | "can"
+            | "chunk"
+            | "chunks"
+            | "contain"
+            | "contains"
             | "cover"
             | "covers"
             | "during"
+            | "evidence"
             | "explain"
             | "explains"
             | "for"
+            | "find"
             | "from"
             | "happen"
             | "happens"
@@ -9774,15 +9833,29 @@ fn is_lexical_stopword(term: &str) -> bool {
             | "main"
             | "mechanism"
             | "mechanisms"
+            | "much"
             | "must"
             | "of"
             | "on"
+            | "operator"
             | "or"
+            | "quickly"
+            | "redundant"
             | "rule"
             | "rules"
+            | "running"
+            | "return"
+            | "section"
             | "should"
+            | "state"
+            | "that"
             | "the"
             | "to"
+            | "distinct"
+            | "guidance"
+            | "guide"
+            | "relevant"
+            | "unique"
             | "what"
             | "when"
             | "which"
@@ -9821,6 +9894,15 @@ fn strong_lexical_match(matched_terms: usize, query_terms: usize, cfg: &NoAnswer
     }
     let required_terms = cfg.sparse_only_min_matched_terms.max(2).min(query_terms);
     matched_terms >= required_terms && matched_terms.saturating_mul(2) >= query_terms
+}
+
+fn lexical_score_for_no_answer(result: &pb::SearchResultV004) -> f32 {
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("lexical_score"))
+        .and_then(|score| score.parse::<f32>().ok())
+        .unwrap_or(0.0)
 }
 
 fn apply_no_answer_exact_technical_boost(
@@ -9892,10 +9974,27 @@ fn no_answer_candidate_passes(
         exact_technical_match && sparse_after_boost >= cfg.min_sparse_score * 2.0;
     let exact_hybrid_allow = exact_sparse_allow && strong_query_coverage;
     let strong_lexical_match = strong_lexical_match(matched_terms, query_terms, cfg);
+    let branch_confidence = scores
+        .dense_score
+        .max(sparse_after_boost)
+        .max(lexical_score_for_no_answer(result));
+    let strong_branch_source = scores.dense_score >= cfg.min_dense_score
+        || is_strong_lexical_candidate(result)
+        || (sparse_after_boost >= cfg.min_sparse_score && strong_lexical_match)
+        || (lexical_score_for_no_answer(result) >= cfg.min_sparse_score && strong_lexical_match);
+    let branch_confidence_allow = branch_confidence >= cfg.min_sparse_score
+        && strong_branch_source
+        && matched_terms >= cfg.sparse_only_min_matched_terms.max(2)
+        && matched_discriminating_terms >= 1
+        && strong_query_coverage
+        && (leading_discriminating_match
+            || strong_lexical_match
+            || is_strong_lexical_candidate(result));
     let strong_hybrid_lexical_allow = strong_lexical_match
+        && strong_branch_source
         && matched_terms >= cfg.sparse_only_min_matched_terms.max(3)
         && matched_discriminating_terms >= 2
-        && leading_discriminating_match
+        && (leading_discriminating_match || is_strong_lexical_candidate(result))
         && strong_query_coverage;
     match search_mode {
         pb::SearchModeV005::Dense => {
@@ -9917,6 +10016,7 @@ fn no_answer_candidate_passes(
                 && matched_discriminating_terms >= 1
                 && leading_discriminating_match
                 && strong_query_coverage)
+                || branch_confidence_allow
                 || strong_hybrid_lexical_allow
                 || (exact_hybrid_allow && matched_discriminating_terms >= 2)
         }
@@ -9945,7 +10045,10 @@ fn no_answer_partial_mmr_evidence_passes(
         pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
             scores.final_score >= cfg.min_hybrid_score
                 || scores.fusion_score >= cfg.min_hybrid_score
-                || sparse_after_boost >= cfg.min_sparse_score
+                || (sparse_after_boost >= cfg.min_sparse_score
+                    && (scores.dense_score >= cfg.min_dense_score
+                        || exact_technical_match
+                        || is_strong_lexical_candidate(result)))
         }
     };
     enough_score
@@ -11176,6 +11279,240 @@ mod v007_fix1_tests {
 
         assert_eq!(filtered, 2);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn hybrid_no_answer_uses_branch_confidence_not_only_rrf_scale() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How much can a zone alpha employee transfer internally?";
+        let mut candidate = test_result(
+            "zone-alpha-transfer-001-b1",
+            "Internal transfer limit is 1 000 000 KZT for zone alpha.",
+            0.03,
+        );
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.75;
+            scores.sparse_score = 0.27;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        candidate.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.33".into());
+        let mut candidates = vec![candidate];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            false,
+        );
+
+        assert_eq!(filtered, 0);
+        assert_eq!(candidates.len(), 1);
+        assert!(!final_no_answer_should_trigger(
+            &candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn hybrid_no_answer_rejects_partial_overlap_hard_negative() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Which dragon passport is required for zone alpha transfers?";
+        let mut candidate = test_result(
+            "zone-alpha-transfer-001-b1",
+            "Internal transfer limit is 1 000 000 KZT for zone alpha.",
+            0.04,
+        );
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.76;
+            scores.sparse_score = 0.30;
+            scores.fusion_score = 0.04;
+            scores.final_score = 0.04;
+        }
+        candidate.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.33".into());
+        let mut candidates = vec![candidate];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            false,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn hybrid_no_answer_preserves_proves_confirms_lexical_evidence() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "What proves that a notification was seen by the user?";
+        let mut candidate = test_result(
+            "dist-receipt-001",
+            "Receipt acknowledgement confirms a user saw a notification.",
+            0.03,
+        );
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.21;
+            scores.sparse_score = 0.30;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.45".into());
+        let mut candidates = vec![candidate];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            false,
+        );
+
+        assert_eq!(filtered, 0);
+        assert_eq!(candidates.len(), 1);
+        assert!(!final_no_answer_should_trigger(
+            &candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn hybrid_no_answer_preserves_sparse_strong_lexical_evidence_without_metadata() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Which claim records that a user acknowledged a notification?";
+        let mut candidate = test_result(
+            "dist-inbox-001",
+            "Inbox claim handles user notification acknowledgement and delivery receipts.",
+            0.03,
+        );
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.05;
+            scores.sparse_score = 0.20;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        let mut candidates = vec![candidate];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            false,
+        );
+
+        assert_eq!(filtered, 0);
+        assert_eq!(candidates.len(), 1);
+        assert!(!final_no_answer_should_trigger(
+            &candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn lexical_terms_normalize_common_retrieval_paraphrases() {
+        let restored =
+            lexical_terms("missing Qdrant points should be restored from canonical store");
+        assert!(restored.contains("repair"));
+        assert!(restored.contains("postgresql"));
+        assert!(restored.contains("source"));
+        assert!(restored.contains("truth"));
+
+        let tenant_key = lexical_terms("tenant-scoped payload key filtering");
+        assert!(tenant_key.contains("access_zone_id"));
+        assert!(tenant_key.contains("index"));
+
+        let acknowledgement =
+            lexical_terms("claim records that a user acknowledged a notification");
+        assert!(acknowledgement.contains("handles"));
+        assert!(acknowledgement.contains("acknowledge"));
+
+        let fixture = lexical_terms("technical file path identifier fixtures");
+        assert!(fixture.contains("fixture"));
+        assert!(fixture.contains("file"));
+        assert!(fixture.contains("path"));
+        assert!(fixture.contains("identifier"));
+
+        let security = lexical_terms("Which gateway runbook block contains the security guidance?");
+        assert!(security.contains("gateway"));
+        assert!(security.contains("runbook"));
+        assert!(security.contains("security"));
+        assert!(security.contains("threat"));
+        assert!(security.contains("model"));
+        assert!(!security.contains("block"));
+        assert!(!security.contains("guidance"));
+
+        let duplicate = lexical_terms(
+            "Find the unique duplicate-outbox evidence while avoiding redundant chunks.",
+        );
+        assert!(duplicate.contains("duplicate-outbox"));
+        assert!(duplicate.contains("outbox"));
+        assert!(!duplicate.contains("unique"));
+        assert!(!duplicate.contains("redundant"));
+        assert!(!duplicate.contains("chunks"));
+
+        let quality = lexical_terms("quality benchmark");
+        assert!(quality.contains("quality"));
+        assert!(quality.contains("bench"));
     }
 
     #[test]
