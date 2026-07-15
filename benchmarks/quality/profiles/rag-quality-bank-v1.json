@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "name": "rag-quality-bank-v1",
+  "description": "Development RAG quality bank: 42 deterministic model-backed assertions across access, dense, hybrid, sparse, GraphRAG, MMR, long-document, distractor, and no-answer scenarios. Not sealed release evidence.",
+  "corpora": [
+    "synthetic-mini",
+    "access-zone-mini",
+    "graph-rag-mini",
+    "mmr-diversity-mini",
+    "technical-mini",
+    "sparse-technical-mini",
+    "distractor-mini",
+    "legal-mini",
+    "long-doc-mini"
+  ],
+  "queries": [
+    "rag-quality-bank-v1-access",
+    "rag-quality-bank-v1-semantic",
+    "rag-quality-bank-v1-lexical",
+    "rag-quality-bank-v1-graph",
+    "rag-quality-bank-v1-mmr",
+    "rag-quality-bank-v1-long",
+    "rag-quality-bank-v1-distractor",
+    "rag-quality-bank-v1-negative"
+  ],
+  "thresholds": {
+    "query_assertion_pass_rate": 1.0,
+    "hit_at_5": 0.95,
+    "critical_top1_accuracy": 1.0,
+    "hard_negative_false_positive_rate": 0.0,
+    "cross_zone_leakage_count": 0,
+    "access_level_violation_count": 0,
+    "positive_query_empty_context_count": 0,
+    "outbox_dead_letter_count": 0,
+    "qdrant_missing_points": 0,
+    "p95_retrieve_context_ms": 2500
+  }
+}
