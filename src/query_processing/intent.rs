@@ -188,6 +188,9 @@ fn split_intent_sentences(text: &str) -> Vec<IntentSentence<'_>> {
 
 fn classify_intent(text: &str) -> (QueryIntentKind, bool, f32) {
     let lower = text.trim().to_lowercase();
+    if looks_like_technical_evidence(text) {
+        return (QueryIntentKind::TechnicalEvidence, false, 0.65);
+    }
     if text.trim().ends_with('?') {
         return (QueryIntentKind::ExplicitQuestion, true, 1.0);
     }
@@ -197,7 +200,7 @@ fn classify_intent(text: &str) -> (QueryIntentKind, bool, f32) {
     if has_constraint_prefix(&lower) {
         return (QueryIntentKind::Constraint, true, 0.9);
     }
-    if looks_like_technical_evidence(text) || has_technical_identifier(text) {
+    if has_technical_identifier(text) {
         return (QueryIntentKind::TechnicalEvidence, false, 0.65);
     }
     (QueryIntentKind::Context, false, 0.4)
@@ -211,17 +214,28 @@ fn has_imperative_prefix(lower: &str) -> bool {
         "find ",
         "compare ",
         "summarize ",
+        "please explain ",
+        "could you compare ",
+        "could you explain ",
         "объясни ",
         "опиши ",
         "покажи ",
         "найди ",
         "сравни ",
         "проанализируй ",
+        "пожалуйста, объясните ",
+        "пожалуйста, объясни ",
+        "подскажите, почему ",
+        "мне нужно понять ",
+        "можно ли сравнить ",
+        "нужно определить ",
         "түсіндір ",
         "сипатта ",
         "көрсет ",
         "тап ",
         "салыстыр ",
+        "маған түсіндіріңіз ",
+        "маған түсіндір ",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -246,11 +260,14 @@ fn has_constraint_prefix(lower: &str) -> bool {
 
 fn looks_like_technical_evidence(text: &str) -> bool {
     let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
     trimmed.starts_with("```")
-        || trimmed.starts_with("SELECT ")
-        || trimmed.starts_with("INSERT ")
-        || trimmed.starts_with("UPDATE ")
-        || trimmed.starts_with("DELETE ")
+        || lower.starts_with("select ")
+        || lower.starts_with("insert ")
+        || lower.starts_with("update ")
+        || lower.starts_with("delete ")
+        || lower.starts_with("with ") && lower.contains(" select ")
+        || lower.starts_with("must not be null")
         || trimmed.contains("Exception:")
         || trimmed.contains("Exception at ")
         || trimmed.contains("Caused by:")
@@ -330,5 +347,39 @@ mod tests {
         let query = "Why does Sparse miss the document?";
         let units = extract_query_intents_normalized(&normalized(query), &[segment(query)]);
         assert!(units.iter().any(|unit| unit.required));
+    }
+
+    #[test]
+    fn multilingual_polite_requests_are_required() {
+        for query in [
+            "Пожалуйста, объясните порядок активации",
+            "Подскажите, почему версия не активна",
+            "Мне нужно понять правила legal hold",
+            "Можно ли сравнить dense и sparse",
+            "Нужно определить source of truth",
+            "Please explain document activation",
+            "Could you compare dense and sparse",
+            "Маған түсіндіріңіз құжатты белсендіру тәртібін",
+        ] {
+            let units = extract_query_intents_normalized(&normalized(query), &[segment(query)]);
+            assert!(units.iter().any(|unit| unit.required), "query={query}");
+        }
+    }
+
+    #[test]
+    fn technical_sql_and_nullability_logs_precede_constraint_classification() {
+        for query in [
+            "select * from content_chunks_v004",
+            "must not be null: parent_chunk_id",
+            "```sql\nselect * from graph_relations\n```",
+        ] {
+            let units = extract_query_intents_normalized(&normalized(query), &[segment(query)]);
+            assert!(units
+                .iter()
+                .any(|unit| unit.kind == QueryIntentKind::TechnicalEvidence));
+            assert!(!units
+                .iter()
+                .any(|unit| unit.kind == QueryIntentKind::Constraint));
+        }
     }
 }
