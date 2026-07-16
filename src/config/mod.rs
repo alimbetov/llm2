@@ -1186,6 +1186,9 @@ fn default_lexical_min_remaining_budget_ms() -> u64 {
 fn default_lexical_statement_timeout_ms() -> u64 {
     150
 }
+fn default_lexical_response_reserve_ms() -> u64 {
+    75
+}
 fn default_lexical_trigram_min_similarity() -> f32 {
     0.70
 }
@@ -1938,7 +1941,8 @@ impl AppConfig {
         );
         anyhow::ensure!(
             self.search.lexical.min_remaining_budget_ms > 0
-                && self.search.lexical.statement_timeout_ms > 0,
+                && self.search.lexical.statement_timeout_ms > 0
+                && self.search.lexical.response_reserve_ms > 0,
             "search.lexical budgets must be positive"
         );
         anyhow::ensure!(
@@ -2179,6 +2183,11 @@ impl AppConfig {
         anyhow::ensure!(
             qp.max_parallel_segments > 0 && qp.max_parallel_segments <= qp.max_segments,
             "search.query_processing.max_parallel_segments must be between 1 and max_segments"
+        );
+        anyhow::ensure!(
+            qp.max_parallel_lexical_segments > 0
+                && qp.max_parallel_lexical_segments <= qp.max_segments,
+            "search.query_processing.max_parallel_lexical_segments must be between 1 and max_segments"
         );
         anyhow::ensure!(
             qp.per_segment_candidate_limit > 0,
@@ -2527,6 +2536,8 @@ pub struct QueryProcessingConfig {
     pub max_segments: usize,
     #[serde(default = "default_query_max_parallel_segments")]
     pub max_parallel_segments: usize,
+    #[serde(default = "default_query_max_parallel_lexical_segments")]
+    pub max_parallel_lexical_segments: usize,
     #[serde(default = "default_query_per_segment_candidate_limit")]
     pub per_segment_candidate_limit: u32,
     #[serde(default = "default_query_global_candidate_limit")]
@@ -2553,6 +2564,7 @@ impl Default for QueryProcessingConfig {
             segment_overlap_tokens: default_query_segment_overlap_tokens(),
             max_segments: default_query_max_segments(),
             max_parallel_segments: default_query_max_parallel_segments(),
+            max_parallel_lexical_segments: default_query_max_parallel_lexical_segments(),
             per_segment_candidate_limit: default_query_per_segment_candidate_limit(),
             global_candidate_limit: default_query_global_candidate_limit(),
             segment_rrf_k: default_query_segment_rrf_k(),
@@ -2583,6 +2595,9 @@ fn default_query_max_segments() -> usize {
 }
 fn default_query_max_parallel_segments() -> usize {
     3
+}
+fn default_query_max_parallel_lexical_segments() -> usize {
+    2
 }
 fn default_query_per_segment_candidate_limit() -> u32 {
     20
@@ -2661,6 +2676,8 @@ pub struct LexicalSearchConfig {
     pub min_remaining_budget_ms: u64,
     #[serde(default = "default_lexical_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
+    #[serde(default = "default_lexical_response_reserve_ms")]
+    pub response_reserve_ms: u64,
     #[serde(default = "default_true")]
     pub exact_technical_enabled: bool,
     #[serde(default)]
@@ -2683,6 +2700,7 @@ impl Default for LexicalSearchConfig {
             max_candidate_limit: default_lexical_max_candidate_limit(),
             min_remaining_budget_ms: default_lexical_min_remaining_budget_ms(),
             statement_timeout_ms: default_lexical_statement_timeout_ms(),
+            response_reserve_ms: default_lexical_response_reserve_ms(),
             exact_technical_enabled: true,
             trigram_enabled: false,
             trigram_min_similarity: default_lexical_trigram_min_similarity(),

@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -43,6 +43,38 @@ smoke-load:
 
 smoke-load-blocking:
 	cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture
+
+fix483-contracts:
+	cargo test query_processing --lib -- --nocapture
+	cargo test --test query_processing_contracts -- --nocapture
+
+fix483-long-query-quality:
+	ASTRAVECTOR_QUALITY_ENDPOINT=$${ASTRAVECTOR_QUALITY_ENDPOINT:-http://localhost:50051} \
+	ASTRAVECTOR_QUALITY_PROFILE=long-query-v1 \
+	ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
+	cargo test --test quality_bench_runtime_quick -- --nocapture
+
+fix483-short-regression:
+	ASTRAVECTOR_QUALITY_ENDPOINT=$${ASTRAVECTOR_QUALITY_ENDPOINT:-http://localhost:50051} \
+	ASTRAVECTOR_QUALITY_PROFILE=rag-quality-bank-v1 \
+	ASTRAVECTOR_QUALITY_RUNTIME_MODE=ingest-and-retrieve \
+	cargo test --test quality_bench_runtime_quick -- --nocapture
+
+fix483-integration:
+	cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture
+	cargo test --features integration-tests --test lexical_retrieval_integration -- --nocapture
+
+fix483-load-smoke:
+	ASTRA_VECTOR_SMOKE_RETRIEVE_ENDPOINT=$${ASTRAVECTOR_QUALITY_ENDPOINT:-http://127.0.0.1:50051} \
+	ASTRA_VECTOR_SMOKE_CONCURRENCY=50 \
+	cargo test --features integration-tests --test smoke_load_retrieve_context -- --ignored --nocapture
+
+verify-fix483-production:
+	cargo fmt --check
+	cargo check --all-targets --all-features
+	cargo clippy --all-targets --all-features -- -D warnings
+	$(MAKE) fix483-contracts
+	$(MAKE) fix483-integration
 
 verify-fix463: fmt clippy check test sqlx-prepare test-e2e
 

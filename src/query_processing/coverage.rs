@@ -13,6 +13,7 @@ pub struct QueryCoverage {
     pub required_covered: usize,
     pub ratio: f32,
     pub status: QueryEvidenceStatus,
+    pub uncovered_required_segment_indices: Vec<usize>,
 }
 
 pub fn evaluate_required_coverage(
@@ -29,6 +30,11 @@ pub fn evaluate_required_coverage(
         .iter()
         .filter(|idx| covered_segment_indices.contains(idx))
         .count();
+    let uncovered_required_segment_indices = required
+        .iter()
+        .filter(|idx| !covered_segment_indices.contains(idx))
+        .copied()
+        .collect();
     let ratio = if required_total == 0 {
         0.0
     } else {
@@ -44,6 +50,7 @@ pub fn evaluate_required_coverage(
         required_covered,
         ratio,
         status,
+        uncovered_required_segment_indices,
     }
 }
 
@@ -72,6 +79,7 @@ mod tests {
     fn partial_required_coverage_is_degraded() {
         let coverage = evaluate_required_coverage(&segments(), &[1].into_iter().collect());
         assert_eq!(coverage.status, QueryEvidenceStatus::Degraded);
+        assert_eq!(coverage.uncovered_required_segment_indices, vec![2]);
     }
 
     #[test]

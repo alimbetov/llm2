@@ -7,6 +7,9 @@ pub struct GlobalCandidateIdentity {
     pub document_version: u64,
     pub matched_chunk_id: String,
     pub parent_chunk_id: String,
+    pub source_block_id: String,
+    pub representation_type: String,
+    pub qdrant_point_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,8 @@ pub struct GlobalRrfCandidate {
     pub identity: GlobalCandidateIdentity,
     pub score: f32,
     pub best_segment_index: usize,
+    pub best_contribution: f32,
+    pub best_local_rank: usize,
     pub matched_segments: Vec<usize>,
 }
 
@@ -40,10 +45,13 @@ pub fn cross_segment_rrf(
             .entry(candidate.identity.clone())
             .and_modify(|global| {
                 global.score += contribution;
-                if contribution > global.score
-                    || candidate.rank < global.matched_segments.len().max(usize::MAX)
+                if contribution > global.best_contribution
+                    || (contribution == global.best_contribution
+                        && candidate.rank < global.best_local_rank)
                 {
                     global.best_segment_index = candidate.segment_index;
+                    global.best_contribution = contribution;
+                    global.best_local_rank = candidate.rank;
                 }
                 if !global.matched_segments.contains(&candidate.segment_index) {
                     global.matched_segments.push(candidate.segment_index);
@@ -54,6 +62,8 @@ pub fn cross_segment_rrf(
                 identity: candidate.identity,
                 score: contribution,
                 best_segment_index: candidate.segment_index,
+                best_contribution: contribution,
+                best_local_rank: candidate.rank,
                 matched_segments: vec![candidate.segment_index],
             });
     }
@@ -69,8 +79,13 @@ fn compare_global_rrf_candidates(
 ) -> Ordering {
     right
         .score
-        .partial_cmp(&left.score)
-        .unwrap_or(Ordering::Equal)
+        .total_cmp(&left.score)
+        .then_with(|| {
+            right
+                .matched_segments
+                .len()
+                .cmp(&left.matched_segments.len())
+        })
         .then_with(|| {
             left.identity
                 .access_zone_id
@@ -80,7 +95,7 @@ fn compare_global_rrf_candidates(
         .then_with(|| {
             left.identity
                 .document_version
-                .cmp(&right.identity.document_version)
+                .cmp(&left.identity.document_version)
         })
         .then_with(|| {
             left.identity
@@ -91,6 +106,21 @@ fn compare_global_rrf_candidates(
             left.identity
                 .matched_chunk_id
                 .cmp(&right.identity.matched_chunk_id)
+        })
+        .then_with(|| {
+            left.identity
+                .source_block_id
+                .cmp(&right.identity.source_block_id)
+        })
+        .then_with(|| {
+            left.identity
+                .representation_type
+                .cmp(&right.identity.representation_type)
+        })
+        .then_with(|| {
+            left.identity
+                .qdrant_point_id
+                .cmp(&right.identity.qdrant_point_id)
         })
 }
 
@@ -105,6 +135,9 @@ mod tests {
             document_version: 1,
             matched_chunk_id: id.into(),
             parent_chunk_id: id.into(),
+            source_block_id: id.into(),
+            representation_type: "ORIGINAL".into(),
+            qdrant_point_id: Some(id.into()),
         }
     }
 
@@ -189,5 +222,31 @@ mod tests {
             2,
         );
         assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn best_segment_uses_contribution_then_local_rank() {
+        let fused = cross_segment_rrf(
+            [
+                SegmentCandidate {
+                    identity: identity("a"),
+                    segment_index: 4,
+                    rank: 3,
+                    score: 1.0,
+                    segment_weight: 1.0,
+                },
+                SegmentCandidate {
+                    identity: identity("a"),
+                    segment_index: 2,
+                    rank: 1,
+                    score: 1.0,
+                    segment_weight: 1.0,
+                },
+            ],
+            60.0,
+            10,
+        );
+        assert_eq!(fused[0].best_segment_index, 2);
+        assert_eq!(fused[0].best_local_rank, 1);
     }
 }

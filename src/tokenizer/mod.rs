@@ -16,6 +16,13 @@ pub struct TokenizedItem {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenOffset {
+    pub token_index: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
 impl CanonicalTokenizer {
     pub fn load(cfg: &AppConfig) -> Result<Self, AstraError> {
         let tokenizer = Tokenizer::from_file(&cfg.tokenizer.path)
@@ -59,5 +66,24 @@ impl CanonicalTokenizer {
 
     pub fn special_ids(&self) -> &HashSet<u32> {
         self.special_ids.as_ref()
+    }
+
+    pub fn token_offsets(&self, text: &str) -> Result<Vec<TokenOffset>, AstraError> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| AstraError::InvalidArgument(format!("tokenization failed: {e}")))?;
+        Ok(encoding
+            .get_offsets()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, (start, end))| end > start && *end <= text.len())
+            .map(|(token_index, (start_byte, end_byte))| TokenOffset {
+                token_index,
+                start_byte,
+                end_byte,
+            })
+            .collect())
     }
 }

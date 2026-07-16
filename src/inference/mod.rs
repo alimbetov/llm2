@@ -3,7 +3,7 @@ use crate::{
     dense::l2_normalize,
     error::AstraError,
     sparse::{build_lexical_sparse, build_sparse},
-    tokenizer::{CanonicalTokenizer, TokenizedItem},
+    tokenizer::{CanonicalTokenizer, TokenOffset, TokenizedItem},
 };
 use async_trait::async_trait;
 use ndarray::Array2;
@@ -43,6 +43,11 @@ pub trait InferenceEngine: Send + Sync {
         max_length: usize,
         allow_truncation: bool,
     ) -> Result<usize, AstraError>;
+    fn token_offsets(&self, _text: &str) -> Result<Vec<TokenOffset>, AstraError> {
+        Err(AstraError::Unavailable(
+            "canonical token offsets are unavailable".into(),
+        ))
+    }
     async fn self_test(&self) -> Result<(), AstraError>;
 }
 pub struct OnnxBgeM3Engine {
@@ -265,6 +270,9 @@ impl InferenceEngine for OnnxBgeM3Engine {
             .tokenizer
             .encode(text, max_length, allow_truncation)?
             .token_count)
+    }
+    fn token_offsets(&self, text: &str) -> Result<Vec<TokenOffset>, AstraError> {
+        self.tokenizer.token_offsets(text)
     }
     async fn self_test(&self) -> Result<(), AstraError> {
         let r = self

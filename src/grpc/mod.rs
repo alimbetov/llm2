@@ -18,7 +18,8 @@ use crate::{
         astra_vector_v004_control_server::AstraVectorV004Control,
     },
     persistence::{
-        ChunkContentRecord, ChunkTraceRecord, ClaimResult, ParentContextRecord, Repository,
+        ChunkContentRecord, ChunkTraceRecord, ClaimResult, LexicalParentCandidate,
+        ParentContextRecord, Repository,
     },
     provider::SelectedProvider,
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
@@ -26,14 +27,15 @@ use crate::{
         build_query_plan,
         coverage::{evaluate_required_coverage, QueryCoverage, QueryEvidenceStatus},
         diagnostics::QueryPlanDiagnostics,
-        planner::{QueryPlan, QueryPlanningError, QueryTokenCounter},
+        fusion::{cross_segment_rrf, GlobalCandidateIdentity, SegmentCandidate},
+        planner::{QueryPlan, QueryPlanningError, QuerySegment, QueryTokenCounter},
         QueryProcessingMode,
     },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
     sparse::{SparseTechnicalEncoder, SparseTokenClass},
 };
-use futures::future::join_all;
+use futures::{future::join_all, stream, StreamExt};
 use metrics::{counter, gauge, histogram};
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
@@ -59,6 +61,16 @@ struct AdmissionPermit {
     scope: &'static str,
 }
 
+struct LongQueryInFlightGuard {
+    segments: f64,
+}
+
+impl Drop for LongQueryInFlightGuard {
+    fn drop(&mut self) {
+        gauge!("astravector_long_query_segments_in_flight").decrement(self.segments);
+    }
+}
+
 struct DirectQdrantGeneration {
     hits: Vec<QdrantSearchHit>,
     query_embedding_ms: u64,
@@ -77,20 +89,31 @@ struct DirectQdrantGeneration {
     sparse_failed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct QdrantHitIdentity {
-    access_zone_id: String,
-    document_id: String,
-    document_version: u64,
-    matched_chunk_id: String,
-    parent_chunk_id: String,
+struct SegmentQdrantResult {
+    segment_index: usize,
+    segment_weight: f32,
+    hits: Vec<QdrantSearchHit>,
+    dense_executed: bool,
+    sparse_executed: bool,
+    fusion_executed: bool,
+    dense_failed: bool,
+    sparse_failed: bool,
+    dense_candidates: usize,
+    sparse_candidates: usize,
+    dense_ms: u64,
+    sparse_ms: u64,
+    fusion_ms: u64,
+    sparse_top_score: f32,
+    warnings: Vec<pb::DiagnosticWarningV005>,
 }
 
-struct SegmentedHitAggregate {
-    hit: QdrantSearchHit,
-    score: f32,
-    best_contribution: f32,
-    matched_segments: BTreeSet<usize>,
+struct SegmentLexicalResult {
+    segment_index: usize,
+    segment_text: String,
+    segment_weight: f32,
+    candidates: Vec<LexicalParentCandidate>,
+    duration_ms: u64,
+    warnings: Vec<pb::DiagnosticWarningV005>,
 }
 
 struct EngineQueryTokenCounter<'a> {
@@ -108,17 +131,23 @@ impl QueryTokenCounter for EngineQueryTokenCounter<'_> {
             .count_tokens(text, max_length, allow_truncation)
             .map_err(|error| error.to_string())
     }
+
+    fn token_offsets(&self, text: &str) -> Result<Vec<crate::tokenizer::TokenOffset>, String> {
+        self.engine
+            .token_offsets(text)
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn query_planning_status(error: QueryPlanningError) -> Status {
     match error {
         QueryPlanningError::Empty => Status::invalid_argument("query must not be empty"),
-        QueryPlanningError::ByteLimitExceeded => Status::out_of_range(format!(
-            "LONG_QUERY_BYTE_LIMIT_EXCEEDED: query exceeds configured absolute_max_bytes"
-        )),
-        QueryPlanningError::TokenLimitExceeded => Status::out_of_range(format!(
-            "LONG_QUERY_TOO_LARGE: query exceeds configured absolute_max_tokens"
-        )),
+        QueryPlanningError::ByteLimitExceeded => Status::out_of_range(
+            "LONG_QUERY_BYTE_LIMIT_EXCEEDED: query exceeds configured absolute_max_bytes",
+        ),
+        QueryPlanningError::TokenLimitExceeded => Status::out_of_range(
+            "LONG_QUERY_TOO_LARGE: query exceeds configured absolute_max_tokens",
+        ),
         QueryPlanningError::LongQueryNotSupported => Status::out_of_range(
             "LONG_QUERY_NOT_SUPPORTED: query_processing.enabled=false rejects queries above tokenization.query.max_length",
         ),
@@ -320,6 +349,7 @@ impl AstraVectorV004ControlService {
         access_zone_ids: &[Uuid],
         caller_access_level: pb::AccessLevel,
         candidate_limit: u32,
+        top_k: u32,
         search_mode: pb::SearchModeV005,
         wants_dense: bool,
         wants_sparse: bool,
@@ -328,6 +358,7 @@ impl AstraVectorV004ControlService {
         version_filters: &QdrantVersionFilters,
         deadline: Instant,
         qdrant_budget: &OperationBudget,
+        request_cancel: CancellationToken,
         warnings: &mut Vec<pb::DiagnosticWarningV005>,
     ) -> Result<DirectQdrantGeneration, Status> {
         match plan.mode {
@@ -345,6 +376,7 @@ impl AstraVectorV004ControlService {
                     version_filters,
                     deadline,
                     qdrant_budget,
+                    request_cancel,
                     warnings,
                 )
                 .await
@@ -355,6 +387,7 @@ impl AstraVectorV004ControlService {
                     access_zone_ids,
                     caller_access_level,
                     candidate_limit,
+                    top_k,
                     search_mode,
                     wants_dense,
                     wants_sparse,
@@ -363,6 +396,7 @@ impl AstraVectorV004ControlService {
                     version_filters,
                     deadline,
                     qdrant_budget,
+                    request_cancel,
                     warnings,
                 )
                 .await
@@ -385,6 +419,7 @@ impl AstraVectorV004ControlService {
         version_filters: &QdrantVersionFilters,
         deadline: Instant,
         qdrant_budget: &OperationBudget,
+        request_cancel: CancellationToken,
         warnings: &mut Vec<pb::DiagnosticWarningV005>,
     ) -> Result<DirectQdrantGeneration, Status> {
         let query = plan.original_query.as_str();
@@ -402,7 +437,7 @@ impl AstraVectorV004ControlService {
                     token_count_hint: plan.original_token_count,
                 },
                 deadline,
-                self.shutdown.child_token(),
+                request_cancel,
             )
             .await
             .map_err(Status::from)?;
@@ -576,6 +611,7 @@ impl AstraVectorV004ControlService {
         access_zone_ids: &[Uuid],
         caller_access_level: pb::AccessLevel,
         candidate_limit: u32,
+        top_k: u32,
         search_mode: pb::SearchModeV005,
         wants_dense: bool,
         wants_sparse: bool,
@@ -584,6 +620,7 @@ impl AstraVectorV004ControlService {
         version_filters: &QdrantVersionFilters,
         deadline: Instant,
         qdrant_budget: &OperationBudget,
+        request_cancel: CancellationToken,
         warnings: &mut Vec<pb::DiagnosticWarningV005>,
     ) -> Result<DirectQdrantGeneration, Status> {
         warnings.push(pb::DiagnosticWarningV005 {
@@ -612,7 +649,7 @@ impl AstraVectorV004ControlService {
                 QueueKind::Query,
                 inputs,
                 deadline,
-                self.shutdown.child_token(),
+                request_cancel,
                 SubmitManyOptions {
                     max_in_flight: self.cfg.search.query_processing.max_parallel_segments,
                     preserve_order: true,
@@ -633,13 +670,14 @@ impl AstraVectorV004ControlService {
         }
         let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
         let qdrant_started = std::time::Instant::now();
-        let qdrant = self.qdrant()?.clone();
         let per_segment_limit = self
             .cfg
             .search
             .query_processing
             .per_segment_candidate_limit
+            .min(candidate_limit)
             .min(self.cfg.limits.search_candidate_limit_max)
+            .max(top_k.min(candidate_limit))
             .max(1) as usize;
         let global_limit = candidate_limit
             .min(self.cfg.search.query_processing.global_candidate_limit)
@@ -651,152 +689,111 @@ impl AstraVectorV004ControlService {
         let mut dense_branch_candidate_count = 0_u32;
         let mut sparse_branch_candidate_count = 0_u32;
         let mut sparse_top_score = 0.0_f32;
-        let mut aggregates = HashMap::<QdrantHitIdentity, SegmentedHitAggregate>::new();
+        let mut all_dense_executed = wants_dense;
+        let mut all_sparse_executed = wants_sparse;
+        let mut all_fusion_executed = search_mode == pb::SearchModeV005::Hybrid;
+        let mut segment_fusion_ms = 0_u64;
+        let mut segment_candidates = Vec::new();
+        let mut best_hits =
+            HashMap::<GlobalCandidateIdentity, (QdrantSearchHit, f32, usize)>::new();
         let fusion_started = Instant::now();
-        for (segment, embedding) in plan.segments.iter().zip(embeddings.iter()) {
-            let mut dense_hits = Vec::new();
-            let mut sparse_hits = Vec::new();
-            if wants_dense {
-                let Some(dense) = embedding.dense.as_deref() else {
-                    return Err(Status::failed_precondition(
-                        "query dense embedding unavailable",
-                    ));
-                };
-                let branch_started = Instant::now();
-                match qdrant
-                    .search_dense_with_budget(
-                        dense,
+        let segment_inputs = plan
+            .segments
+            .iter()
+            .cloned()
+            .zip(embeddings)
+            .collect::<Vec<_>>();
+        let mut segment_results = stream::iter(segment_inputs)
+            .map(|(segment, embedding)| {
+                let budget = qdrant_budget.clone();
+                async move {
+                    self.retrieve_qdrant_for_segment(
+                        &segment,
+                        &embedding,
                         access_zone_ids,
-                        caller_access_level as i16,
+                        caller_access_level,
                         per_segment_limit,
-                        Some(version_filters),
-                        Some(qdrant_budget),
+                        search_mode,
+                        wants_dense,
+                        wants_sparse,
+                        sparse_required,
+                        version_filters,
+                        &budget,
                     )
                     .await
-                {
-                    Ok(hits) => {
-                        dense_search_ms += branch_started.elapsed().as_millis() as u64;
-                        dense_branch_candidate_count += hits.len() as u32;
-                        dense_hits = hits;
-                    }
-                    Err(error) => {
-                        dense_failed = true;
-                        warnings.push(pb::DiagnosticWarningV005 {
-                            code: "DENSE_SEARCH_FAILED".into(),
-                            message: format!(
-                                "Dense Qdrant search failed for segment {}: {error}",
-                                segment.index
-                            ),
-                        });
-                    }
                 }
-            }
-            if wants_sparse {
-                let branch_started = Instant::now();
-                match (
-                    embedding.sparse_indices.as_deref(),
-                    embedding.sparse_values.as_deref(),
-                ) {
-                    (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => {
-                        match qdrant
-                            .search_sparse_with_budget(
-                                indices,
-                                values,
-                                access_zone_ids,
-                                caller_access_level as i16,
-                                per_segment_limit,
-                                Some(version_filters),
-                                Some(qdrant_budget),
-                            )
-                            .await
-                        {
-                            Ok(hits) => {
-                                sparse_search_ms += branch_started.elapsed().as_millis() as u64;
-                                sparse_branch_candidate_count += hits.len() as u32;
-                                sparse_top_score = sparse_top_score
-                                    .max(hits.first().map(|hit| hit.score).unwrap_or(0.0));
-                                sparse_hits = hits;
-                            }
-                            Err(error) if sparse_required => return Err(Status::from(error)),
-                            Err(error) => {
-                                sparse_failed = true;
-                                warnings.push(pb::DiagnosticWarningV005 {
-                                    code: "SPARSE_SEARCH_FAILED".into(),
-                                    message: format!(
-                                        "Sparse Qdrant search failed for segment {}: {error}",
-                                        segment.index
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    _ if sparse_required => {
-                        return Err(Status::failed_precondition(
-                            "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            dense_hits.sort_by(stable_qdrant_hit_rank);
-            sparse_hits.sort_by(stable_qdrant_hit_rank);
-            let segment_hits = Self::select_branch_hits(
-                dense_hits,
-                sparse_hits,
-                per_segment_limit as u32,
-                search_mode,
-                dense_failed,
-                sparse_failed,
-                warnings,
-                &self.cfg,
-            )?;
-            for (rank, hit) in segment_hits.into_iter().enumerate() {
+            })
+            .buffer_unordered(
+                self.cfg
+                    .search
+                    .query_processing
+                    .max_parallel_segments
+                    .max(1),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, Status>>()?;
+        segment_results.sort_by_key(|result| result.segment_index);
+        for result in segment_results {
+            dense_failed |= result.dense_failed;
+            sparse_failed |= result.sparse_failed;
+            all_dense_executed &= result.dense_executed;
+            all_sparse_executed &= result.sparse_executed;
+            all_fusion_executed &= result.fusion_executed;
+            dense_search_ms += result.dense_ms;
+            sparse_search_ms += result.sparse_ms;
+            segment_fusion_ms += result.fusion_ms;
+            histogram!("astravector_long_query_segment_retrieval_duration_seconds")
+                .record((result.dense_ms + result.sparse_ms + result.fusion_ms) as f64 / 1_000.0);
+            dense_branch_candidate_count += result.dense_candidates as u32;
+            sparse_branch_candidate_count += result.sparse_candidates as u32;
+            sparse_top_score = sparse_top_score.max(result.sparse_top_score);
+            warnings.extend(result.warnings);
+            for (rank, hit) in result.hits.into_iter().enumerate() {
                 let Some(identity) = qdrant_hit_identity(&hit) else {
                     continue;
                 };
-                let contribution = segment.weight
+                let local_rank = rank + 1;
+                let contribution = result.segment_weight
                     / (self.cfg.search.query_processing.segment_rrf_k + rank as f32 + 1.0);
-                aggregates
-                    .entry(identity)
-                    .and_modify(|aggregate| {
-                        aggregate.score += contribution;
-                        if contribution > aggregate.best_contribution {
-                            aggregate.best_contribution = contribution;
-                            aggregate.hit = hit.clone();
+                best_hits
+                    .entry(identity.clone())
+                    .and_modify(|(best_hit, best_contribution, best_local_rank)| {
+                        if contribution > *best_contribution
+                            || (contribution == *best_contribution && local_rank < *best_local_rank)
+                        {
+                            *best_contribution = contribution;
+                            *best_local_rank = local_rank;
+                            *best_hit = hit.clone();
                         }
-                        aggregate.matched_segments.insert(segment.index);
                     })
-                    .or_insert_with(|| {
-                        let mut matched_segments = BTreeSet::new();
-                        matched_segments.insert(segment.index);
-                        SegmentedHitAggregate {
-                            hit,
-                            score: contribution,
-                            best_contribution: contribution,
-                            matched_segments,
-                        }
-                    });
+                    .or_insert_with(|| (hit.clone(), contribution, local_rank));
+                segment_candidates.push(SegmentCandidate {
+                    identity,
+                    segment_index: result.segment_index,
+                    rank: local_rank,
+                    score: hit.score,
+                    segment_weight: result.segment_weight,
+                });
             }
         }
-        let mut fused = aggregates.into_values().collect::<Vec<_>>();
-        fused.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.hit.id.cmp(&right.hit.id))
-        });
-        fused.truncate(global_limit);
+        let fused = cross_segment_rrf(
+            segment_candidates,
+            self.cfg.search.query_processing.segment_rrf_k,
+            global_limit,
+        );
         let hits = fused
             .into_iter()
-            .map(|mut aggregate| {
-                aggregate.hit.score = aggregate.score;
-                aggregate.hit.fusion_score = aggregate.score;
-                annotate_segmented_hit(&mut aggregate.hit, &aggregate.matched_segments);
-                aggregate.hit
+            .filter_map(|candidate| {
+                let (mut hit, _, _) = best_hits.remove(&candidate.identity)?;
+                hit.score = candidate.score;
+                hit.fusion_score = candidate.score;
+                annotate_segmented_hit(&mut hit, &candidate.matched_segments.into_iter().collect());
+                Some(hit)
             })
             .collect::<Vec<_>>();
-        let fusion_ms = fusion_started.elapsed().as_millis() as u64;
+        let fusion_ms = fusion_started.elapsed().as_millis() as u64 + segment_fusion_ms;
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
         Ok(DirectQdrantGeneration {
             fusion_candidate_count: hits.len() as u32,
@@ -806,14 +803,227 @@ impl AstraVectorV004ControlService {
             dense_search_ms,
             sparse_search_ms,
             fusion_ms,
-            dense_branch_executed: wants_dense && !dense_failed,
-            sparse_branch_executed: wants_sparse && !sparse_failed,
-            fusion_executed: search_mode == pb::SearchModeV005::Hybrid,
+            dense_branch_executed: all_dense_executed,
+            sparse_branch_executed: all_sparse_executed,
+            fusion_executed: all_fusion_executed,
             dense_branch_candidate_count,
             sparse_branch_candidate_count,
             sparse_top_score,
             dense_failed,
             sparse_failed,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retrieve_qdrant_for_segment(
+        &self,
+        segment: &QuerySegment,
+        embedding: &EmbeddingResult,
+        access_zone_ids: &[Uuid],
+        caller_access_level: pb::AccessLevel,
+        per_segment_limit: usize,
+        search_mode: pb::SearchModeV005,
+        wants_dense: bool,
+        wants_sparse: bool,
+        sparse_required: bool,
+        version_filters: &QdrantVersionFilters,
+        qdrant_budget: &OperationBudget,
+    ) -> Result<SegmentQdrantResult, Status> {
+        let qdrant = self.qdrant()?.clone();
+        let mut warnings = Vec::new();
+        let dense_started = Instant::now();
+        let dense_result = if wants_dense {
+            let dense = embedding
+                .dense
+                .as_deref()
+                .ok_or_else(|| Status::failed_precondition("query dense embedding unavailable"))?;
+            Some(
+                qdrant
+                    .search_dense_with_budget(
+                        dense,
+                        access_zone_ids,
+                        caller_access_level as i16,
+                        per_segment_limit,
+                        Some(version_filters),
+                        Some(qdrant_budget),
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
+        let dense_ms = if wants_dense {
+            dense_started.elapsed().as_millis() as u64
+        } else {
+            0
+        };
+        let mut dense_failed = false;
+        let mut dense_hits = match dense_result {
+            Some(Ok(hits)) => hits,
+            Some(Err(error)) => {
+                dense_failed = true;
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "DENSE_SEARCH_FAILED".into(),
+                    message: format!(
+                        "Dense Qdrant search failed for segment {}: {error}",
+                        segment.index
+                    ),
+                });
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+
+        let sparse_started = Instant::now();
+        let sparse_result = if wants_sparse {
+            match (
+                embedding.sparse_indices.as_deref(),
+                embedding.sparse_values.as_deref(),
+            ) {
+                (Some(indices), Some(values)) if !indices.is_empty() && !values.is_empty() => Some(
+                    qdrant
+                        .search_sparse_with_budget(
+                            indices,
+                            values,
+                            access_zone_ids,
+                            caller_access_level as i16,
+                            per_segment_limit,
+                            Some(version_filters),
+                            Some(qdrant_budget),
+                        )
+                        .await,
+                ),
+                _ if sparse_required => {
+                    return Err(Status::failed_precondition(
+                        "SPARSE_UNAVAILABLE: query sparse embedding is empty or unavailable",
+                    ));
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let sparse_ms = if wants_sparse {
+            sparse_started.elapsed().as_millis() as u64
+        } else {
+            0
+        };
+        let mut sparse_failed = false;
+        let mut sparse_hits = match sparse_result {
+            Some(Ok(hits)) => hits,
+            Some(Err(error)) if sparse_required => return Err(Status::from(error)),
+            Some(Err(error)) => {
+                sparse_failed = true;
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "SPARSE_SEARCH_FAILED".into(),
+                    message: format!(
+                        "Sparse Qdrant search failed for segment {}: {error}",
+                        segment.index
+                    ),
+                });
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        dense_hits.sort_by(stable_qdrant_hit_rank);
+        sparse_hits.sort_by(stable_qdrant_hit_rank);
+        let dense_candidates = dense_hits.len();
+        let sparse_candidates = sparse_hits.len();
+        let sparse_top_score = sparse_hits.first().map(|hit| hit.score).unwrap_or(0.0);
+        let fusion_started = Instant::now();
+        let hits = Self::select_branch_hits(
+            dense_hits,
+            sparse_hits,
+            per_segment_limit as u32,
+            search_mode,
+            dense_failed,
+            sparse_failed,
+            &mut warnings,
+            &self.cfg,
+        )?;
+        Ok(SegmentQdrantResult {
+            segment_index: segment.index,
+            segment_weight: segment.weight,
+            hits,
+            dense_executed: wants_dense && !dense_failed,
+            sparse_executed: wants_sparse && !sparse_failed,
+            fusion_executed: search_mode == pb::SearchModeV005::Hybrid
+                && wants_dense
+                && wants_sparse
+                && !dense_failed
+                && !sparse_failed,
+            dense_failed,
+            sparse_failed,
+            dense_candidates,
+            sparse_candidates,
+            dense_ms,
+            sparse_ms,
+            fusion_ms: fusion_started.elapsed().as_millis() as u64,
+            sparse_top_score,
+            warnings,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retrieve_lexical_for_segment(
+        &self,
+        segment: &QuerySegment,
+        access_zone_ids: &[Uuid],
+        caller_access_level: pb::AccessLevel,
+        quality_run_id_filter: Option<&str>,
+        lexical_limit: i64,
+        deadline: Instant,
+        request_cancel: CancellationToken,
+    ) -> Result<SegmentLexicalResult, Status> {
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        let usable_ms = remaining_ms.saturating_sub(self.cfg.search.lexical.response_reserve_ms);
+        if usable_ms < self.cfg.search.lexical.min_remaining_budget_ms {
+            return Ok(SegmentLexicalResult {
+                segment_index: segment.index,
+                segment_text: segment.text.clone(),
+                segment_weight: segment.weight,
+                candidates: Vec::new(),
+                duration_ms: 0,
+                warnings: vec![pb::DiagnosticWarningV005 {
+                    code: "QUERY_SEGMENT_FTS_SKIPPED".into(),
+                    message: format!(
+                        "PostgreSQL FTS skipped for segment {} because request budget is insufficient",
+                        segment.index
+                    ),
+                }],
+            });
+        }
+        let statement_timeout_ms = self
+            .cfg
+            .search
+            .lexical
+            .statement_timeout_ms
+            .min(usable_ms)
+            .max(1);
+        let started = Instant::now();
+        let search = self.repo()?.search_active_parent_contexts_lexical_multi(
+            access_zone_ids,
+            caller_access_level as i16,
+            &segment.text,
+            quality_run_id_filter,
+            lexical_limit,
+            statement_timeout_ms,
+        );
+        let candidates = tokio::select! {
+            _ = request_cancel.cancelled() => {
+                return Err(Status::cancelled("query cancelled during PostgreSQL FTS"));
+            }
+            result = search => result.map_err(Status::from)?,
+        };
+        Ok(SegmentLexicalResult {
+            segment_index: segment.index,
+            segment_text: segment.text.clone(),
+            segment_weight: segment.weight,
+            candidates,
+            duration_ms: started.elapsed().as_millis() as u64,
+            warnings: Vec::new(),
         })
     }
 
@@ -1299,19 +1509,23 @@ impl AstraVectorV004ControlService {
     }
 }
 
-fn qdrant_hit_identity(hit: &QdrantSearchHit) -> Option<QdrantHitIdentity> {
+fn qdrant_hit_identity(hit: &QdrantSearchHit) -> Option<GlobalCandidateIdentity> {
     let access_zone_id = payload_string(&hit.payload, "access_zone_id")?;
     let document_id = payload_string(&hit.payload, "document_id")?;
     let document_version = payload_u64(&hit.payload, "document_version")?;
     let matched_chunk_id = payload_string(&hit.payload, "chunk_id")?;
     let parent_chunk_id =
         payload_string(&hit.payload, "parent_chunk_id").unwrap_or_else(|| matched_chunk_id.clone());
-    Some(QdrantHitIdentity {
+    Some(GlobalCandidateIdentity {
         access_zone_id,
         document_id,
         document_version,
         matched_chunk_id,
         parent_chunk_id,
+        source_block_id: payload_string(&hit.payload, "source_block_id").unwrap_or_default(),
+        representation_type: payload_string(&hit.payload, "representation_type")
+            .unwrap_or_else(|| "ORIGINAL".into()),
+        qdrant_point_id: Some(hit.id.to_string()),
     })
 }
 
@@ -1346,10 +1560,18 @@ fn annotate_segmented_hit(hit: &mut QdrantSearchHit, matched_segments: &BTreeSet
 }
 
 fn result_query_segment_indices(result: &pb::SearchResultV004) -> Vec<usize> {
+    result_segment_indices_from_metadata(result, "query_segment_indices")
+}
+
+fn result_passed_query_segment_indices(result: &pb::SearchResultV004) -> Vec<usize> {
+    result_segment_indices_from_metadata(result, "passed_query_segment_indices")
+}
+
+fn result_segment_indices_from_metadata(result: &pb::SearchResultV004, key: &str) -> Vec<usize> {
     let Some(raw) = result
         .citation
         .as_ref()
-        .and_then(|citation| citation.metadata.get("query_segment_indices"))
+        .and_then(|citation| citation.metadata.get(key))
     else {
         return Vec::new();
     };
@@ -1370,6 +1592,200 @@ fn result_query_segment_indices(result: &pb::SearchResultV004) -> Vec<usize> {
             part.trim_matches(|ch: char| !ch.is_ascii_digit())
                 .parse::<usize>()
                 .ok()
+        })
+        .collect()
+}
+
+fn coverage_for_results(plan: &QueryPlan, results: &[pb::SearchResultV004]) -> QueryCoverage {
+    if plan.mode == QueryProcessingMode::Single {
+        let covered = usize::from(!results.is_empty());
+        return QueryCoverage {
+            required_total: 1,
+            required_covered: covered,
+            ratio: covered as f32,
+            status: if covered == 0 {
+                QueryEvidenceStatus::Insufficient
+            } else {
+                QueryEvidenceStatus::Found
+            },
+            uncovered_required_segment_indices: if covered == 0 { vec![0] } else { Vec::new() },
+        };
+    }
+    let covered_segments = results
+        .iter()
+        .flat_map(|result| {
+            let passed = result_passed_query_segment_indices(result);
+            if passed.is_empty() {
+                result_query_segment_indices(result)
+            } else {
+                passed
+            }
+        })
+        .collect::<HashSet<_>>();
+    evaluate_required_coverage(&plan.segments, &covered_segments)
+}
+
+fn reserve_required_segment_coverage(
+    results: &mut [pb::SearchResultV004],
+    plan: &QueryPlan,
+    final_context_limit: usize,
+) -> bool {
+    if plan.mode != QueryProcessingMode::Segmented || final_context_limit == 0 {
+        return false;
+    }
+    let required_segment_indices = plan
+        .segments
+        .iter()
+        .filter(|segment| segment.required_for_coverage)
+        .map(|segment| segment.index)
+        .collect::<Vec<_>>();
+    let exceeds_limit = required_segment_indices.len() > final_context_limit;
+    let mut selected_result_keys = HashSet::new();
+    for segment_index in required_segment_indices
+        .into_iter()
+        .take(final_context_limit)
+    {
+        if results.iter().any(|result| {
+            selected_result_keys.contains(&result_identity_key(result))
+                && result_query_segment_indices(result).contains(&segment_index)
+        }) {
+            continue;
+        }
+        let selected = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| result_query_segment_indices(result).contains(&segment_index))
+            .filter(|(_, result)| !selected_result_keys.contains(&result_identity_key(result)))
+            .max_by(|(_, left), (_, right)| {
+                score_of(left)
+                    .total_cmp(&score_of(right))
+                    .then_with(|| result_identity_key(right).cmp(&result_identity_key(left)))
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = selected {
+            selected_result_keys.insert(result_identity_key(&results[index]));
+            mark_ranking_protection(
+                &mut results[index],
+                RankingProtection {
+                    preserve_required_segment_coverage: true,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    exceeds_limit
+}
+
+fn query_processing_mode_v008(mode: QueryProcessingMode) -> i32 {
+    match mode {
+        QueryProcessingMode::Single => pb::QueryProcessingModeV008::Single as i32,
+        QueryProcessingMode::Segmented => pb::QueryProcessingModeV008::Segmented as i32,
+    }
+}
+
+fn query_segment_diagnostics(
+    plan: &QueryPlan,
+    results: &[pb::SearchResultV004],
+) -> Vec<pb::QuerySegmentDiagnosticV008> {
+    plan.segments
+        .iter()
+        .map(|segment| {
+            let segment_results = results
+                .iter()
+                .filter(|result| {
+                    let passed = result_passed_query_segment_indices(result);
+                    if passed.is_empty() {
+                        result_query_segment_indices(result).contains(&segment.index)
+                    } else {
+                        passed.contains(&segment.index)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let dense_candidates = segment_results
+                .iter()
+                .filter(|result| {
+                    result
+                        .scores
+                        .as_ref()
+                        .is_some_and(|scores| scores.dense_score > 0.0)
+                })
+                .count();
+            let sparse_candidates = segment_results
+                .iter()
+                .filter(|result| {
+                    result
+                        .scores
+                        .as_ref()
+                        .is_some_and(|scores| scores.sparse_score > 0.0)
+                })
+                .count();
+            let lexical_candidates = segment_results
+                .iter()
+                .filter(|result| {
+                    extraction_retrieval_sources(result)
+                        .iter()
+                        .any(|source| source == "POSTGRES_FTS")
+                })
+                .count();
+            pb::QuerySegmentDiagnosticV008 {
+                segment_index: segment.index as u32,
+                token_count: segment.token_count as u32,
+                segment_kind: format!("{:?}", segment.kind).to_uppercase(),
+                weight: segment.weight,
+                required_for_coverage: segment.required_for_coverage,
+                retrieval_executed: true,
+                evidence_found: !segment_results.is_empty(),
+                dense_candidates: dense_candidates as u32,
+                sparse_candidates: sparse_candidates as u32,
+                lexical_candidates: lexical_candidates as u32,
+                final_contexts: segment_results.len() as u32,
+                segment_sha256: segment.sha256.clone(),
+            }
+        })
+        .collect()
+}
+
+fn query_segment_diagnostics_from_hits(
+    plan: &QueryPlan,
+    hits: &[QdrantSearchHit],
+) -> Vec<pb::QuerySegmentDiagnosticV008> {
+    plan.segments
+        .iter()
+        .map(|segment| {
+            let segment_hits = hits
+                .iter()
+                .filter(|hit| {
+                    hit.payload
+                        .get("query_segment_indices")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|indices| {
+                            indices
+                                .iter()
+                                .any(|index| index.as_u64() == Some(segment.index as u64))
+                        })
+                        || plan.mode == QueryProcessingMode::Single
+                })
+                .collect::<Vec<_>>();
+            pb::QuerySegmentDiagnosticV008 {
+                segment_index: segment.index as u32,
+                token_count: segment.token_count as u32,
+                segment_kind: format!("{:?}", segment.kind).to_uppercase(),
+                weight: segment.weight,
+                required_for_coverage: segment.required_for_coverage,
+                retrieval_executed: true,
+                evidence_found: !segment_hits.is_empty(),
+                dense_candidates: segment_hits
+                    .iter()
+                    .filter(|hit| hit.dense_score > 0.0)
+                    .count() as u32,
+                sparse_candidates: segment_hits
+                    .iter()
+                    .filter(|hit| hit.sparse_score > 0.0)
+                    .count() as u32,
+                lexical_candidates: 0,
+                final_contexts: segment_hits.len() as u32,
+                segment_sha256: segment.sha256.clone(),
+            }
         })
         .collect()
 }
@@ -1433,18 +1849,6 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 self.cfg.limits.search_top_k_max
             )));
         }
-        let timeout_ms = if r.timeout_ms == 0 {
-            self.cfg.grpc.deadlines.query_ms
-        } else {
-            r.timeout_ms as u64
-        }
-        .min(self.cfg.grpc.deadlines.query_ms);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let qdrant_budget = OperationBudget {
-            deadline,
-            cancellation: self.shutdown.child_token(),
-            workload: WorkloadKind::Query,
-        };
         let search_mode = Self::resolve_search_mode(r.search_mode, &self.cfg.search.default_mode);
         let version_filters = Self::version_filters_from_search_request(&r);
         tracing::debug!(
@@ -1511,6 +1915,18 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         )
         .map_err(query_planning_status)?;
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
+        let timeout_ms =
+            effective_query_timeout_ms(r.timeout_ms as u64, query_plan.mode, &self.cfg);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let request_cancel = self.shutdown.child_token();
+        let qdrant_budget = OperationBudget {
+            deadline,
+            cancellation: request_cancel.clone(),
+            workload: WorkloadKind::Query,
+        };
+        let remaining_budget_after_planning_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
         counter!(
             "astravector_query_processing_total",
             "mode" => query_plan_diagnostics.mode_code()
@@ -1519,6 +1935,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         histogram!("astravector_query_original_tokens")
             .record(query_plan.original_token_count as f64);
         histogram!("astravector_query_segment_count").record(query_plan.segments.len() as f64);
+        let _long_query_in_flight = if query_plan.mode == QueryProcessingMode::Segmented {
+            let segment_count = query_plan.segments.len() as f64;
+            gauge!("astravector_long_query_segments_in_flight").increment(segment_count);
+            gauge!("astravector_long_query_max_segments_in_flight").set(
+                query_plan
+                    .segments
+                    .len()
+                    .min(self.cfg.search.query_processing.max_parallel_segments)
+                    as f64,
+            );
+            Some(LongQueryInFlightGuard {
+                segments: segment_count,
+            })
+        } else {
+            None
+        };
         for segment in &query_plan.segments {
             counter!("astravector_query_segments_total", "segment_kind" => format!("{:?}", segment.kind))
                 .increment(1);
@@ -1544,6 +1976,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 &access_zone_ids,
                 caller_access_level,
                 candidate_limit,
+                top_k,
                 search_mode,
                 wants_dense,
                 wants_sparse,
@@ -1552,6 +1985,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 &version_filters,
                 deadline,
                 &qdrant_budget,
+                request_cancel.clone(),
                 &mut warnings,
             )
             .await?;
@@ -1793,38 +2227,60 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .min(self.cfg.search.lexical.max_candidate_limit)
                     .min(self.cfg.limits.search_candidate_limit_max)
                     .max(candidate_limit) as i64;
-                let lexical_timeout_ms = self
-                    .cfg
-                    .search
-                    .lexical
-                    .statement_timeout_ms
-                    .min(lexical_remaining_ms);
-                let lexical_segments = query_plan
-                    .segments
-                    .iter()
-                    .map(|segment| (segment.index, segment.text.as_str(), segment.weight))
-                    .collect::<Vec<_>>();
+                let lexical_inputs = query_plan.segments.clone();
+                let mut segment_lexical_results = stream::iter(lexical_inputs)
+                    .map(|segment| {
+                        let cancellation = request_cancel.clone();
+                        let segment_access_zone_ids = access_zone_ids.clone();
+                        let segment_quality_run_id = quality_run_id_filter.clone();
+                        async move {
+                            self.retrieve_lexical_for_segment(
+                                &segment,
+                                &segment_access_zone_ids,
+                                caller_access_level,
+                                segment_quality_run_id.as_deref(),
+                                lexical_limit,
+                                deadline,
+                                cancellation,
+                            )
+                            .await
+                        }
+                    })
+                    .buffer_unordered(
+                        self.cfg
+                            .search
+                            .query_processing
+                            .max_parallel_lexical_segments
+                            .max(1),
+                    )
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, Status>>()?;
+                segment_lexical_results.sort_by_key(|result| result.segment_index);
                 let mut lexical_candidates = Vec::new();
-                for (segment_index, segment_text, segment_weight) in lexical_segments {
-                    let segment_candidates = self
-                        .repo()?
-                        .search_active_parent_contexts_lexical_multi(
-                            &access_zone_ids,
-                            caller_access_level as i16,
-                            segment_text,
-                            quality_run_id_filter.as_deref(),
-                            lexical_limit,
-                            lexical_timeout_ms,
-                        )
-                        .await
-                        .map_err(Status::from)?;
-                    counter!("astravector_segment_lexical_search_total").increment(1);
-                    lexical_candidates.extend(segment_candidates.into_iter().map(|candidate| {
+                for result in segment_lexical_results {
+                    if result.candidates.is_empty()
+                        && result
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.code == "QUERY_SEGMENT_FTS_SKIPPED")
+                    {
+                        counter!("astravector_optional_stage_skipped_total", "stage" => "lexical_segment", "reason" => "insufficient_budget").increment(1);
+                    } else {
+                        counter!("astravector_segment_lexical_search_total").increment(1);
+                    }
+                    histogram!("astravector_segment_lexical_search_duration_seconds")
+                        .record(result.duration_ms as f64 / 1_000.0);
+                    histogram!("astravector_long_query_fts_duration_seconds")
+                        .record(result.duration_ms as f64 / 1_000.0);
+                    warnings.extend(result.warnings);
+                    lexical_candidates.extend(result.candidates.into_iter().map(|candidate| {
                         (
                             candidate,
-                            segment_index,
-                            segment_text.to_owned(),
-                            segment_weight,
+                            result.segment_index,
+                            result.segment_text.clone(),
+                            result.segment_weight,
                         )
                     }));
                 }
@@ -2022,6 +2478,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 preserve_primary_direct: true,
                                 preserve_strong_lexical: true,
                                 preserve_unique_source_block: true,
+                                preserve_required_segment_coverage: false,
                             },
                         );
                         protected_lexical_count += 1;
@@ -2048,48 +2505,6 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
             }
         }
-        let query_coverage = if query_plan.mode == QueryProcessingMode::Segmented {
-            let covered_segments = direct_results
-                .iter()
-                .flat_map(result_query_segment_indices)
-                .collect::<HashSet<_>>();
-            let coverage = evaluate_required_coverage(&query_plan.segments, &covered_segments);
-            match coverage.status {
-                QueryEvidenceStatus::Found => {}
-                QueryEvidenceStatus::Degraded => {
-                    warnings.push(pb::DiagnosticWarningV005 {
-                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
-                        message: format!(
-                            "required segment coverage is {}/{}",
-                            coverage.required_covered, coverage.required_total
-                        ),
-                    });
-                    counter!("astravector_long_query_partial_coverage_total").increment(1);
-                }
-                QueryEvidenceStatus::Insufficient => {
-                    warnings.push(pb::DiagnosticWarningV005 {
-                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
-                        message:
-                            "no required long-query segments produced admissible direct evidence"
-                                .into(),
-                    });
-                    direct_results.clear();
-                    counter!("astravector_long_query_partial_coverage_total").increment(1);
-                }
-            }
-            coverage
-        } else {
-            QueryCoverage {
-                required_total: 1,
-                required_covered: usize::from(!direct_results.is_empty()),
-                ratio: if direct_results.is_empty() { 0.0 } else { 1.0 },
-                status: if direct_results.is_empty() {
-                    QueryEvidenceStatus::Insufficient
-                } else {
-                    QueryEvidenceStatus::Found
-                },
-            }
-        };
         tracing::debug!(
             correlation_id = %r.correlation_id,
             parent_fetch_ms,
@@ -2122,6 +2537,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         preserve_primary_direct: true,
                         preserve_strong_lexical: true,
                         preserve_unique_source_block: result_source_block_id(result).is_some(),
+                        preserve_required_segment_coverage: false,
                     },
                 );
             }
@@ -2196,15 +2612,58 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             Vec::new()
         };
         if !skip_pre_mmr_no_answer_for_graph {
-            no_answer_stats.pre_mmr_filtered_count = apply_pre_mmr_no_answer_filter(
-                &mut direct_results,
-                query,
-                &query_technical_tokens,
-                search_mode,
-                &self.cfg.search.no_answer,
-                no_answer_debug,
-                preserve_partial_evidence_for_mmr,
-            );
+            no_answer_stats.pre_mmr_filtered_count =
+                if query_plan.mode == QueryProcessingMode::Segmented {
+                    apply_segmented_pre_mmr_no_answer_filter(
+                        &mut direct_results,
+                        &query_plan,
+                        search_mode,
+                        &self.cfg.search.no_answer,
+                        no_answer_debug,
+                        preserve_partial_evidence_for_mmr,
+                    )
+                } else {
+                    apply_pre_mmr_no_answer_filter(
+                        &mut direct_results,
+                        query,
+                        &query_technical_tokens,
+                        search_mode,
+                        &self.cfg.search.no_answer,
+                        no_answer_debug,
+                        preserve_partial_evidence_for_mmr,
+                    )
+                };
+        }
+        let coverage_after_direct = coverage_for_results(&query_plan, &direct_results);
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            histogram!("astravector_long_query_coverage_after_direct")
+                .record(coverage_after_direct.ratio as f64);
+        }
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            match coverage_after_direct.status {
+                QueryEvidenceStatus::Found => {}
+                QueryEvidenceStatus::Degraded => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                        message: format!(
+                            "required segment coverage after direct no-answer is {}/{}",
+                            coverage_after_direct.required_covered,
+                            coverage_after_direct.required_total
+                        ),
+                    });
+                    counter!("astravector_long_query_partial_coverage_total").increment(1);
+                }
+                QueryEvidenceStatus::Insufficient => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                        message:
+                            "no required long-query segments produced admissible direct evidence"
+                                .into(),
+                    });
+                    direct_results.clear();
+                    counter!("astravector_long_query_partial_coverage_total").increment(1);
+                }
+            }
         }
         ranking_trace.mark_removed(
             pb::RankingStageV005::PreMmrNoAnswer,
@@ -2749,8 +3208,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     preserve_primary_direct: true,
                     preserve_strong_lexical: is_strong_lexical_candidate(result),
                     preserve_unique_source_block: result_source_block_id(result).is_some(),
+                    preserve_required_segment_coverage: false,
                 },
             );
+        }
+        if reserve_required_segment_coverage(&mut direct_results, &query_plan, final_limit) {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "LONG_QUERY_COVERAGE_EXCEEDS_CONTEXT_LIMIT".into(),
+                message: format!(
+                    "required query segment count exceeds final context limit {final_limit}"
+                ),
+            });
         }
         let max_graph_contexts = ((final_limit as f32)
             * self.cfg.graph_rag.retrieval.max_graph_fraction)
@@ -2815,15 +3283,23 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
-        if !final_graph_evidence_present
-            && final_no_answer_should_trigger(
+        let post_mmr_no_answer_triggered = if query_plan.mode == QueryProcessingMode::Segmented {
+            segmented_final_no_answer_should_trigger(
+                &results,
+                &query_plan,
+                search_mode,
+                &self.cfg.search.no_answer,
+            )
+        } else {
+            final_no_answer_should_trigger(
                 &results,
                 query,
                 &query_technical_tokens,
                 search_mode,
                 &self.cfg.search.no_answer,
             )
-        {
+        };
+        if !final_graph_evidence_present && post_mmr_no_answer_triggered {
             no_answer_stats.post_mmr_triggered_count = 1;
             counter!("retrieval_no_answer_post_mmr_triggered_total").increment(1);
             warnings.push(pb::DiagnosticWarningV005 {
@@ -2836,6 +3312,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .into(),
             });
             results.clear();
+        }
+        let coverage_after_mmr = coverage_for_results(&query_plan, &results);
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            histogram!("astravector_long_query_coverage_after_mmr")
+                .record(coverage_after_mmr.ratio as f64);
         }
         ranking_trace.mark_removed(
             pb::RankingStageV005::PostMmrNoAnswer,
@@ -2871,6 +3352,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let token_budget_after =
             estimate_results_tokens(&results, self.cfg.rag_context.chars_per_token);
+        let coverage_after_token_budget = coverage_for_results(&query_plan, &results);
         if dropped_chunk_count > 0 {
             counter!("rag_context_token_budget_applied_total").increment(1);
             counter!("rag_context_chunks_dropped_total").increment(dropped_chunk_count as u64);
@@ -2926,6 +3408,49 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "final PostgreSQL visibility recheck",
         );
         let visibility_recheck_ms = visibility_recheck_started.elapsed().as_millis() as u64;
+        let coverage_after_visibility = coverage_for_results(&query_plan, &results);
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            histogram!("astravector_long_query_coverage_after_visibility")
+                .record(coverage_after_visibility.ratio as f64);
+        }
+        if query_plan.mode == QueryProcessingMode::Segmented
+            && coverage_after_visibility.ratio < coverage_after_token_budget.ratio
+        {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "LONG_QUERY_COVERAGE_REDUCED_BY_VISIBILITY_RECHECK".into(),
+                message: format!(
+                    "required segment coverage decreased from {:.3} to {:.3} during final visibility recheck",
+                    coverage_after_token_budget.ratio, coverage_after_visibility.ratio
+                ),
+            });
+        }
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            match coverage_after_visibility.status {
+                QueryEvidenceStatus::Found => {}
+                QueryEvidenceStatus::Degraded => {
+                    if !warnings
+                        .iter()
+                        .any(|warning| warning.code == "LONG_QUERY_PARTIAL_COVERAGE")
+                    {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                            message: format!(
+                                "final required segment coverage is {}/{}",
+                                coverage_after_visibility.required_covered,
+                                coverage_after_visibility.required_total
+                            ),
+                        });
+                    }
+                }
+                QueryEvidenceStatus::Insufficient => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_INSUFFICIENT_COVERAGE".into(),
+                        message: "final result set covers no required query segments".into(),
+                    });
+                    results.clear();
+                }
+            }
+        }
         strip_internal_embedding_metadata(&mut results);
         ranking_trace.observe(pb::RankingStageV005::FinalSelection, &results);
         let ranking_trace = ranking_trace.finish();
@@ -2974,6 +3499,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             duration_ms = merge_duration_ms,
             "GRAPH_MERGE_COMPLETED"
         );
+        let query_segments_v008 = query_segment_diagnostics(&query_plan, &results);
+        if query_plan.mode == QueryProcessingMode::Segmented {
+            histogram!("astravector_long_query_duration_seconds")
+                .record(started.elapsed().as_secs_f64());
+        }
         Ok(Response::new(pb::SearchResponseV004 {
             results,
             diagnostics: Some(pb::SearchDiagnosticsV004 {
@@ -3077,10 +3607,23 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 query_original_token_count: query_plan.original_token_count as u32,
                 query_segment_count: query_plan.segments.len() as u32,
                 query_was_truncated: query_plan_diagnostics.query_was_truncated,
-                query_coverage_ratio: query_coverage.ratio,
-                query_required_segments: query_coverage.required_total as u32,
-                query_covered_required_segments: query_coverage.required_covered as u32,
+                query_coverage_ratio: coverage_after_visibility.ratio,
+                query_required_segments: coverage_after_visibility.required_total as u32,
+                query_covered_required_segments: coverage_after_visibility.required_covered as u32,
                 query_segment_sha256: query_plan_diagnostics.segment_sha256,
+                effective_query_timeout_ms: timeout_ms,
+                remaining_budget_after_planning_ms,
+                query_coverage_after_direct: coverage_after_direct.ratio,
+                query_coverage_after_mmr: coverage_after_mmr.ratio,
+                query_coverage_after_token_budget: coverage_after_token_budget.ratio,
+                query_coverage_after_visibility: coverage_after_visibility.ratio,
+                uncovered_required_query_segment_ids: coverage_after_visibility
+                    .uncovered_required_segment_indices
+                    .iter()
+                    .map(|index| *index as u32)
+                    .collect(),
+                query_processing_mode_v008: query_processing_mode_v008(query_plan.mode),
+                query_segments_v008,
             }),
             warnings,
         }))
@@ -3642,8 +4185,6 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             r.candidate_limit
         }
         .min(self.cfg.limits.search_candidate_limit_max);
-        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, self.cfg.grpc.deadlines.query_ms);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let search_mode = Self::resolve_search_mode(r.search_mode, &self.cfg.search.default_mode);
         let version_filters = Self::version_filters_from_explain_request(&r);
         let wants_sparse = matches!(
@@ -3670,10 +4211,16 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         )
         .map_err(query_planning_status)?;
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
+        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, query_plan.mode, &self.cfg);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let request_cancel = self.shutdown.child_token();
+        let remaining_budget_after_planning_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
         if query_plan.mode == QueryProcessingMode::Segmented {
             let qdrant_budget = OperationBudget {
                 deadline,
-                cancellation: self.shutdown.child_token(),
+                cancellation: request_cancel.clone(),
                 workload: WorkloadKind::Query,
             };
             let mut warnings = Vec::new();
@@ -3683,6 +4230,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     &[access_zone_id],
                     caller_access_level,
                     candidate_limit,
+                    top_k,
                     search_mode,
                     wants_dense,
                     wants_sparse,
@@ -3691,6 +4239,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     &version_filters,
                     deadline,
                     &qdrant_budget,
+                    request_cancel.clone(),
                     &mut warnings,
                 )
                 .await?;
@@ -3800,6 +4349,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         .count() as u32,
                     query_covered_required_segments: 0,
                     query_segment_sha256: query_plan_diagnostics.segment_sha256,
+                    effective_query_timeout_ms: timeout_ms,
+                    remaining_budget_after_planning_ms,
+                    query_processing_mode_v008: query_processing_mode_v008(query_plan.mode),
+                    query_segments_v008: query_segment_diagnostics_from_hits(
+                        &query_plan,
+                        &direct.hits,
+                    ),
                     ..Default::default()
                 }),
             }));
@@ -3818,7 +4374,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     token_count_hint: query_plan.original_token_count,
                 },
                 deadline,
-                self.shutdown.child_token(),
+                request_cancel,
             )
             .await
             .map_err(Status::from)?;
@@ -4060,6 +4616,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 query_required_segments: 1,
                 query_covered_required_segments: u32::from(!fused.is_empty()),
                 query_segment_sha256: query_plan_diagnostics.segment_sha256,
+                effective_query_timeout_ms: timeout_ms,
+                remaining_budget_after_planning_ms,
+                query_processing_mode_v008: query_processing_mode_v008(query_plan.mode),
+                query_segments_v008: query_segment_diagnostics_from_hits(&query_plan, &fused),
                 ..Default::default()
             }),
         }))
@@ -6792,7 +7352,8 @@ impl AstraVectorRuntime for AstraVectorService {
                 "SPARSE_UNAVAILABLE: sparse embedding requested but loaded ONNX artifact has no sparse output",
             ));
         }
-        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, self.cfg.grpc.deadlines.query_ms);
+        let timeout_ms =
+            effective_query_timeout_ms(r.timeout_ms, QueryProcessingMode::Single, &self.cfg);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let result = self
             .scheduler
@@ -9523,6 +10084,7 @@ fn select_graph_append_with_group_mmr(
                 preserve_primary_direct: true,
                 preserve_strong_lexical: is_strong_lexical_candidate(seed),
                 preserve_unique_source_block: result_source_block_id(seed).is_some(),
+                preserve_required_segment_coverage: false,
             },
         );
     }
@@ -10153,6 +10715,7 @@ struct RankingProtection {
     preserve_primary_direct: bool,
     preserve_strong_lexical: bool,
     preserve_unique_source_block: bool,
+    preserve_required_segment_coverage: bool,
 }
 
 struct RankingTraceCollector {
@@ -10329,14 +10892,28 @@ fn mark_ranking_protection(result: &mut pb::SearchResultV004, protection: Rankin
         protection
             .preserve_unique_source_block
             .then_some("UNIQUE_SOURCE_BLOCK"),
+        protection
+            .preserve_required_segment_coverage
+            .then_some("REQUIRED_SEGMENT_COVERAGE"),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
     .join(",");
-    citation
+    let existing = citation
         .metadata
-        .insert("ranking_protection".into(), encoded);
+        .get("ranking_protection")
+        .map(String::as_str)
+        .unwrap_or("");
+    let protections = existing
+        .split(',')
+        .chain(encoded.split(','))
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    citation.metadata.insert(
+        "ranking_protection".into(),
+        protections.iter().copied().collect::<Vec<_>>().join(","),
+    );
 }
 
 fn is_ranking_protected(result: &pb::SearchResultV004) -> bool {
@@ -11076,6 +11653,90 @@ fn apply_pre_mmr_no_answer_filter(
             ))
     });
     before.saturating_sub(results.len())
+}
+
+fn apply_segmented_pre_mmr_no_answer_filter(
+    results: &mut Vec<pb::SearchResultV004>,
+    plan: &QueryPlan,
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+    debug_enabled: bool,
+    preserve_partial_evidence_for_mmr: bool,
+) -> usize {
+    if !cfg.enabled || results.is_empty() {
+        return 0;
+    }
+    let before = results.len();
+    let mut accepted = Vec::with_capacity(results.len());
+    for result in results.drain(..) {
+        let mut passed_segment_indices = Vec::new();
+        let mut accepted_result = None;
+        for segment_index in result_query_segment_indices(&result) {
+            let Some(segment) = plan
+                .segments
+                .iter()
+                .find(|segment| segment.index == segment_index)
+            else {
+                continue;
+            };
+            let mut candidate = vec![result.clone()];
+            let technical_tokens = strong_technical_query_tokens(&segment.text);
+            apply_pre_mmr_no_answer_filter(
+                &mut candidate,
+                &segment.text,
+                &technical_tokens,
+                search_mode,
+                cfg,
+                debug_enabled,
+                preserve_partial_evidence_for_mmr,
+            );
+            if let Some(passed) = candidate.pop() {
+                passed_segment_indices.push(segment_index);
+                accepted_result.get_or_insert(passed);
+            }
+        }
+        if let Some(mut passed) = accepted_result {
+            if let Some(citation) = passed.citation.as_mut() {
+                citation.metadata.insert(
+                    "passed_query_segment_indices".into(),
+                    serde_json::to_string(&passed_segment_indices).unwrap_or_else(|_| "[]".into()),
+                );
+            }
+            accepted.push(passed);
+        }
+    }
+    *results = accepted;
+    before.saturating_sub(results.len())
+}
+
+fn segmented_final_no_answer_should_trigger(
+    results: &[pb::SearchResultV004],
+    plan: &QueryPlan,
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    if !cfg.enabled || results.is_empty() {
+        return false;
+    }
+    !results.iter().any(|result| {
+        result_passed_query_segment_indices(result)
+            .into_iter()
+            .filter_map(|segment_index| {
+                plan.segments
+                    .iter()
+                    .find(|segment| segment.index == segment_index)
+            })
+            .any(|segment| {
+                let technical_tokens = strong_technical_query_tokens(&segment.text);
+                !final_no_answer_should_trigger(
+                    std::slice::from_ref(result),
+                    &segment.text,
+                    &technical_tokens,
+                    search_mode,
+                    cfg,
+                )
+            })
+    })
 }
 
 fn aggregate_no_answer_candidate_passes(
@@ -11856,13 +12517,134 @@ fn parse_timeout(s: &str) -> Option<Duration> {
     })
 }
 
-fn effective_query_timeout_ms(requested: u64, configured_max: u64) -> u64 {
+fn effective_query_timeout_ms(requested: u64, mode: QueryProcessingMode, cfg: &AppConfig) -> u64 {
+    let configured_max = match mode {
+        QueryProcessingMode::Single => cfg.grpc.deadlines.query_ms,
+        QueryProcessingMode::Segmented => cfg.search.query_processing.long_query_deadline_ms,
+    };
     if requested == 0 {
         configured_max
     } else {
         requested.min(configured_max)
     }
 }
+
+#[cfg(test)]
+mod fix483p_long_query_hardening_tests {
+    use super::*;
+    use crate::query_processing::classification::QuerySegmentKind;
+
+    fn segment(index: usize, text: &str) -> QuerySegment {
+        QuerySegment {
+            index,
+            text: text.into(),
+            token_count: text.split_whitespace().count(),
+            kind: QuerySegmentKind::Question,
+            has_question_form: true,
+            has_technical_identifier: false,
+            weight: 1.0,
+            required_for_coverage: true,
+            sha256: format!("segment-{index}"),
+        }
+    }
+
+    fn result_for_segment(index: usize, text: &str, score: f32) -> pb::SearchResultV004 {
+        let mut metadata = HashMap::new();
+        metadata.insert("query_segment_indices".into(), format!("[{index}]"));
+        pb::SearchResultV004 {
+            access_zone_id: "00000000-0000-0000-0000-000000000001".into(),
+            document_id: format!("document-{index}"),
+            document_version: 1,
+            parent_chunk_id: format!("parent-{index}"),
+            matched_chunk_id: format!("chunk-{index}"),
+            parent_text: text.into(),
+            matched_text: text.into(),
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: score,
+                sparse_score: score,
+                fusion_score: score,
+                final_score: score,
+            }),
+            citation: Some(pb::SearchCitationV004 { metadata }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn long_query_deadline_is_selected_and_client_timeout_caps_it() {
+        let cfg = AppConfig::load().expect("load test config");
+        assert_eq!(
+            effective_query_timeout_ms(0, QueryProcessingMode::Single, &cfg),
+            cfg.grpc.deadlines.query_ms
+        );
+        assert_eq!(
+            effective_query_timeout_ms(0, QueryProcessingMode::Segmented, &cfg),
+            cfg.search.query_processing.long_query_deadline_ms
+        );
+        assert_eq!(
+            effective_query_timeout_ms(25, QueryProcessingMode::Segmented, &cfg),
+            25
+        );
+    }
+
+    #[test]
+    fn pre_and_post_mmr_no_answer_are_segment_aware() {
+        let plan = QueryPlan {
+            original_query: "background unrelated words and legal hold cleanup".into(),
+            original_token_count: 7,
+            mode: QueryProcessingMode::Segmented,
+            segments: vec![
+                segment(0, "background unrelated words"),
+                segment(1, "legal hold cleanup"),
+            ],
+        };
+        let mut results = vec![result_for_segment(
+            1,
+            "legal hold cleanup prevents expiration deletion",
+            1.0,
+        )];
+        let cfg = NoAnswerConfig::default();
+        let filtered = apply_segmented_pre_mmr_no_answer_filter(
+            &mut results,
+            &plan,
+            pb::SearchModeV005::Dense,
+            &cfg,
+            false,
+            false,
+        );
+        assert_eq!(filtered, 0);
+        assert_eq!(result_passed_query_segment_indices(&results[0]), vec![1]);
+        assert!(!segmented_final_no_answer_should_trigger(
+            &results,
+            &plan,
+            pb::SearchModeV005::Dense,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn required_segment_candidate_is_mmr_protected() {
+        let plan = QueryPlan {
+            original_query: "first question second question".into(),
+            original_token_count: 4,
+            mode: QueryProcessingMode::Segmented,
+            segments: vec![segment(0, "first question"), segment(1, "second question")],
+        };
+        let mut results = vec![
+            result_for_segment(0, "first evidence", 0.9),
+            result_for_segment(1, "second evidence", 0.8),
+        ];
+        assert!(!reserve_required_segment_coverage(&mut results, &plan, 2));
+        assert!(results.iter().all(|result| {
+            result
+                .citation
+                .as_ref()
+                .and_then(|citation| citation.metadata.get("ranking_protection"))
+                .is_some_and(|value| value.contains("REQUIRED_SEGMENT_COVERAGE"))
+        }));
+    }
+}
+
 fn hash_text(t: &str) -> String {
     let c = t.nfc().collect::<String>().replace("\r\n", "\n");
     hex::encode(Sha256::digest(c.as_bytes()))
@@ -12811,6 +13593,7 @@ mod v007_fix1_tests {
                 preserve_primary_direct: true,
                 preserve_strong_lexical: true,
                 preserve_unique_source_block: true,
+                preserve_required_segment_coverage: false,
             },
         );
         let lexical_contribution = lexical.scores.as_ref().unwrap().fusion_score;
