@@ -9,7 +9,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.82.0
+          toolchain: 1.85.0
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo check --all-targets --all-features
@@ -25,5 +25,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.82.0
+          toolchain: 1.85.0
       - run: cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture
