@@ -1,6 +1,7 @@
 pub mod classification;
 pub mod coverage;
 pub mod diagnostics;
+pub mod evidence;
 pub mod fusion;
 pub mod intent;
 pub mod normalization;
@@ -11,6 +12,7 @@ pub mod segmenter;
 pub use classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
 };
+pub use evidence::{CandidateIntentEvidence, CandidateIntentEvidenceReason};
 pub use intent::{
     extract_query_intents, extract_query_intents_normalized, QueryIntentKind, QueryIntentUnit,
 };

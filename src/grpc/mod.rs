@@ -30,6 +30,7 @@ use crate::{
             QueryEvidenceStatus,
         },
         diagnostics::QueryPlanDiagnostics,
+        evidence::CandidateIntentEvidence,
         fusion::{cross_segment_rrf, GlobalCandidateIdentity, SegmentCandidate},
         planner::{QueryPlan, QueryPlanningError, QuerySegment, QueryTokenCounter},
         QueryProcessingMode, QueryProcessingTier,
@@ -1609,6 +1610,10 @@ fn result_passed_query_segment_indices(result: &pb::SearchResultV004) -> Vec<usi
     result_segment_indices_from_metadata(result, "passed_query_segment_indices")
 }
 
+fn result_passed_query_intent_ids(result: &pb::SearchResultV004) -> Vec<usize> {
+    result_segment_indices_from_metadata(result, "passed_query_intent_ids")
+}
+
 fn result_segment_indices_from_metadata(result: &pb::SearchResultV004, key: &str) -> Vec<usize> {
     let Some(raw) = result
         .citation
@@ -1668,17 +1673,24 @@ fn coverage_for_results(plan: &QueryPlan, results: &[pb::SearchResultV004]) -> Q
     if plan.intent_units.is_empty() {
         return evaluate_required_coverage(&plan.segments, &covered_segments);
     }
-    let covered_intent_ids = plan
-        .intent_units
+    let explicit_intent_ids = results
         .iter()
-        .filter(|intent| {
-            intent
-                .source_segment_indices
-                .iter()
-                .any(|index| covered_segments.contains(index))
-        })
-        .map(|intent| intent.id)
+        .flat_map(result_passed_query_intent_ids)
         .collect::<HashSet<_>>();
+    let covered_intent_ids = if explicit_intent_ids.is_empty() {
+        plan.intent_units
+            .iter()
+            .filter(|intent| {
+                intent
+                    .source_segment_indices
+                    .iter()
+                    .any(|index| covered_segments.contains(index))
+            })
+            .map(|intent| intent.id)
+            .collect::<HashSet<_>>()
+    } else {
+        explicit_intent_ids
+    };
     evaluate_intent_coverage(&plan.intent_units, &covered_intent_ids)
 }
 
@@ -2826,17 +2838,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     passed
                 }
             };
-            let intent_unit_ids = query_plan
-                .intent_units
-                .iter()
-                .filter(|intent| {
-                    intent
-                        .source_segment_indices
-                        .iter()
-                        .any(|index| matched_segment_indices.contains(index))
-                })
-                .map(|intent| intent.id)
-                .collect();
+            let explicit_intent_ids = result_passed_query_intent_ids(result);
+            let intent_unit_ids = if explicit_intent_ids.is_empty() {
+                query_plan
+                    .intent_units
+                    .iter()
+                    .filter(|intent| {
+                        intent
+                            .source_segment_indices
+                            .iter()
+                            .any(|index| matched_segment_indices.contains(index))
+                    })
+                    .map(|intent| intent.id)
+                    .collect()
+            } else {
+                explicit_intent_ids
+            };
             graph_seed_candidates.push(GraphSeedCandidate {
                 key,
                 score: seed_score,
@@ -2874,6 +2891,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             &required_intent_ids,
             query_plan.limits.max_graph_seeds.min(12),
         );
+        let graph_seed_intents_by_key = graph_seed_candidates
+            .iter()
+            .map(|candidate| (candidate.key, candidate.intent_unit_ids.clone()))
+            .collect::<HashMap<_, _>>();
         let graph_seed_keys = graph_seed_candidates
             .iter()
             .map(|candidate| candidate.key)
@@ -3133,6 +3154,25 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     "graph_seed_chunk_id".into(),
                                     rel.seed_chunk_id.to_string(),
                                 );
+                                if let Some(intent_ids) = graph_seed_intents_by_key
+                                    .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "passed_query_intent_ids".into(),
+                                        serde_json::to_string(intent_ids)
+                                            .unwrap_or_else(|_| "[]".into()),
+                                    );
+                                    let inherited = intent_ids
+                                        .iter()
+                                        .copied()
+                                        .map(CandidateIntentEvidence::graph_origin)
+                                        .collect::<Vec<_>>();
+                                    citation.metadata.insert(
+                                        "candidate_intent_evidence".into(),
+                                        serde_json::to_string(&inherited)
+                                            .unwrap_or_else(|_| "[]".into()),
+                                    );
+                                }
                                 if let Some(source_block_id) = graph_seed_source_block_by_key
                                     .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
                                 {
@@ -11869,37 +11909,128 @@ fn apply_segmented_pre_mmr_no_answer_filter(
     let before = results.len();
     let mut accepted = Vec::with_capacity(results.len());
     for result in results.drain(..) {
+        let matched_segment_indices = result_query_segment_indices(&result);
+        if plan.intent_units.is_empty() {
+            let mut passed_segment_indices = Vec::new();
+            let mut accepted_result = None;
+            for segment_index in &matched_segment_indices {
+                let Some(segment) = plan
+                    .segments
+                    .iter()
+                    .find(|segment| segment.index == *segment_index)
+                else {
+                    continue;
+                };
+                let mut candidate = vec![result.clone()];
+                let technical_tokens = strong_technical_query_tokens(&segment.text);
+                apply_pre_mmr_no_answer_filter(
+                    &mut candidate,
+                    &segment.text,
+                    &technical_tokens,
+                    search_mode,
+                    cfg,
+                    debug_enabled,
+                    preserve_partial_evidence_for_mmr,
+                );
+                if let Some(passed) = candidate.pop() {
+                    passed_segment_indices.push(*segment_index);
+                    accepted_result.get_or_insert(passed);
+                }
+            }
+            if let Some(mut passed) = accepted_result {
+                if let Some(citation) = passed.citation.as_mut() {
+                    citation.metadata.insert(
+                        "passed_query_segment_indices".into(),
+                        serde_json::to_string(&passed_segment_indices)
+                            .unwrap_or_else(|_| "[]".into()),
+                    );
+                }
+                accepted.push(passed);
+            }
+            continue;
+        }
         let mut passed_segment_indices = Vec::new();
+        let mut passed_intent_ids = Vec::new();
+        let mut intent_evidence = Vec::new();
         let mut accepted_result = None;
-        for segment_index in result_query_segment_indices(&result) {
-            let Some(segment) = plan
-                .segments
+        for intent in plan.intent_units.iter().filter(|intent| {
+            intent
+                .source_segment_indices
                 .iter()
-                .find(|segment| segment.index == segment_index)
-            else {
-                continue;
-            };
+                .any(|index| matched_segment_indices.contains(index))
+        }) {
             let mut candidate = vec![result.clone()];
-            let technical_tokens = strong_technical_query_tokens(&segment.text);
+            let technical_tokens = strong_technical_query_tokens(&intent.text);
             apply_pre_mmr_no_answer_filter(
                 &mut candidate,
-                &segment.text,
+                &intent.text,
                 &technical_tokens,
                 search_mode,
                 cfg,
                 debug_enabled,
                 preserve_partial_evidence_for_mmr,
             );
+            let scores = result.scores.as_ref();
+            let matched_tokens = matched_technical_tokens(&result, &technical_tokens);
+            let matched_terms = matched_term_count(&result, &intent.text);
+            let matched_discriminating_terms =
+                matched_discriminating_term_count(&result, &intent.text);
+            let intents_sharing_physical_segment = plan
+                .intent_units
+                .iter()
+                .filter(|other| other.required)
+                .filter(|other| {
+                    other
+                        .source_segment_indices
+                        .iter()
+                        .any(|index| intent.source_segment_indices.contains(index))
+                })
+                .count();
+            let independent_intent_evidence = intents_sharing_physical_segment <= 1
+                || !matched_tokens.is_empty()
+                || matched_discriminating_terms > 0;
+            let passed = !candidate.is_empty() && independent_intent_evidence;
+            if !passed {
+                candidate.clear();
+            }
+            intent_evidence.push(CandidateIntentEvidence::direct(
+                intent.id,
+                scores.map(|value| value.dense_score),
+                scores.map(|value| value.sparse_score),
+                Some(lexical_score_for_no_answer(&result)),
+                matched_terms,
+                matched_tokens.len(),
+                passed,
+            ));
             if let Some(passed) = candidate.pop() {
-                passed_segment_indices.push(segment_index);
+                passed_intent_ids.push(intent.id);
+                passed_segment_indices.extend(
+                    intent
+                        .source_segment_indices
+                        .iter()
+                        .filter(|index| matched_segment_indices.contains(index))
+                        .copied(),
+                );
                 accepted_result.get_or_insert(passed);
             }
         }
         if let Some(mut passed) = accepted_result {
+            passed_segment_indices.sort_unstable();
+            passed_segment_indices.dedup();
+            passed_intent_ids.sort_unstable();
+            passed_intent_ids.dedup();
             if let Some(citation) = passed.citation.as_mut() {
                 citation.metadata.insert(
                     "passed_query_segment_indices".into(),
                     serde_json::to_string(&passed_segment_indices).unwrap_or_else(|_| "[]".into()),
+                );
+                citation.metadata.insert(
+                    "passed_query_intent_ids".into(),
+                    serde_json::to_string(&passed_intent_ids).unwrap_or_else(|_| "[]".into()),
+                );
+                citation.metadata.insert(
+                    "candidate_intent_evidence".into(),
+                    serde_json::to_string(&intent_evidence).unwrap_or_else(|_| "[]".into()),
                 );
             }
             accepted.push(passed);
@@ -12791,6 +12922,25 @@ mod fix483p_long_query_hardening_tests {
         }
     }
 
+    fn intent(id: usize, text: &str) -> crate::query_processing::QueryIntentUnit {
+        crate::query_processing::QueryIntentUnit {
+            id,
+            kind: crate::query_processing::QueryIntentKind::ExplicitQuestion,
+            text: text.into(),
+            source_segment_indices: vec![0],
+            source_token_start: 0,
+            source_token_end: 12,
+            normalized_byte_start: 0,
+            normalized_byte_end: text.len(),
+            original_byte_start: 0,
+            original_byte_end: text.len(),
+            required: true,
+            searchable: true,
+            weight: 1.0,
+            normalized_sha256: format!("intent-{id}"),
+        }
+    }
+
     #[test]
     fn long_query_deadline_is_selected_and_client_timeout_caps_it() {
         let cfg = AppConfig::load().expect("load test config");
@@ -12849,6 +12999,63 @@ mod fix483p_long_query_hardening_tests {
             pb::SearchModeV005::Dense,
             &cfg,
         ));
+    }
+
+    #[test]
+    fn one_physical_segment_does_not_credit_unrelated_intent() {
+        let query = "Why is PostgreSQL the source of truth? How does legal hold affect TTL?";
+        let mut shared_segment = segment(0, query);
+        shared_segment.intent_unit_ids = vec![0, 1];
+        let plan = QueryPlan {
+            original_query: query.into(),
+            normalized_query: normalized_query(query),
+            original_token_count: query.split_whitespace().count(),
+            mode: QueryProcessingMode::Segmented,
+            tier: QueryProcessingTier::SegmentedStandard,
+            profile_version: "test".into(),
+            limits: crate::query_processing::EffectiveQueryProcessingLimits::for_segmented(
+                &crate::config::QueryProcessingConfig::default(),
+                &crate::config::QueryProcessingConfig::default().standard,
+            ),
+            segments: vec![shared_segment],
+            intent_units: vec![
+                intent(0, "Why is PostgreSQL the source of truth?"),
+                intent(1, "How does legal hold affect TTL?"),
+            ],
+        };
+        let mut results = vec![result_for_segment(
+            0,
+            "PostgreSQL is the canonical source of truth for document visibility.",
+            1.0,
+        )];
+
+        let filtered = apply_segmented_pre_mmr_no_answer_filter(
+            &mut results,
+            &plan,
+            pb::SearchModeV005::Dense,
+            &NoAnswerConfig::default(),
+            false,
+            false,
+        );
+
+        assert_eq!(filtered, 0);
+        assert_eq!(result_passed_query_intent_ids(&results[0]), vec![0]);
+        let evidence = results[0]
+            .citation
+            .as_ref()
+            .and_then(|citation| citation.metadata.get("candidate_intent_evidence"))
+            .and_then(|raw| serde_json::from_str::<Vec<CandidateIntentEvidence>>(raw).ok())
+            .expect("candidate-to-intent evidence metadata");
+        assert!(evidence
+            .iter()
+            .any(|item| item.intent_id == 0 && item.evidence_passed));
+        assert!(evidence
+            .iter()
+            .any(|item| item.intent_id == 1 && !item.evidence_passed));
+        let coverage = coverage_for_results(&plan, &results);
+        assert_eq!(coverage.status, QueryEvidenceStatus::Degraded);
+        assert_eq!(coverage.required_covered, 1);
+        assert_eq!(coverage.uncovered_required_intent_ids, vec![1]);
     }
 
     #[test]
