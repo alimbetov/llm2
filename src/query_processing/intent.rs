@@ -120,18 +120,11 @@ fn split_intent_sentences(text: &str) -> Vec<IntentSentence<'_>> {
             index += 3;
             continue;
         }
-        let ch = text[index..]
-            .chars()
-            .next()
-            .expect("valid char boundary");
+        let ch = text[index..].chars().next().expect("valid char boundary");
         let end = index + ch.len_utf8();
         let boundary = !in_code
             && (matches!(ch, '?' | '!' | '\n')
-                || (ch == '.'
-                    && text[end..]
-                        .chars()
-                        .next()
-                        .is_none_or(char::is_whitespace)));
+                || (ch == '.' && text[end..].chars().next().is_none_or(char::is_whitespace)));
         if boundary {
             let piece = &text[start..end];
             if !piece.trim().is_empty() {
@@ -233,7 +226,12 @@ fn looks_like_technical_evidence(text: &str) -> bool {
             >= 2
 }
 
-fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
     left_start < right_end && right_start < left_end
 }
 

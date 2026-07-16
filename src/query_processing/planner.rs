@@ -257,10 +257,7 @@ fn bind_intents_to_segments(segments: &mut [QuerySegment], intents: &[QueryInten
             }
         }
     }
-    if !segments
-        .iter()
-        .any(|segment| segment.required_for_coverage)
-    {
+    if !segments.iter().any(|segment| segment.required_for_coverage) {
         if let Some(first) = segments.first_mut() {
             first.required_for_coverage = true;
         }
@@ -288,13 +285,11 @@ fn validate_plan_segments(
     if segments.len() > limits.max_segments {
         return Err(QueryPlanningError::SegmentationInvariant(format!(
             "segment_count={} exceeds max_segments={}",
-            segments.len(), limits.max_segments
+            segments.len(),
+            limits.max_segments
         )));
     }
-    if !segments
-        .iter()
-        .any(|segment| segment.required_for_coverage)
-    {
+    if !segments.iter().any(|segment| segment.required_for_coverage) {
         return Err(QueryPlanningError::SegmentationInvariant(
             "no required logical intent representative".into(),
         ));
@@ -317,7 +312,8 @@ fn validate_plan_segments(
                 segment.index, segment.token_count, limits.segment_max_tokens
             )));
         }
-        for index in segment.source_token_start..segment.source_token_end.min(original_token_count) {
+        for index in segment.source_token_start..segment.source_token_end.min(original_token_count)
+        {
             covered[index] = true;
         }
     }

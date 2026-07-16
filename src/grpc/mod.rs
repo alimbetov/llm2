@@ -29,7 +29,7 @@ use crate::{
         diagnostics::QueryPlanDiagnostics,
         fusion::{cross_segment_rrf, GlobalCandidateIdentity, SegmentCandidate},
         planner::{QueryPlan, QueryPlanningError, QuerySegment, QueryTokenCounter},
-        QueryProcessingMode,
+        QueryProcessingMode, QueryProcessingTier,
     },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
@@ -151,6 +151,12 @@ fn query_planning_status(error: QueryPlanningError) -> Status {
         QueryPlanningError::LongQueryNotSupported => Status::out_of_range(
             "LONG_QUERY_NOT_SUPPORTED: query_processing.enabled=false rejects queries above tokenization.query.max_length",
         ),
+        QueryPlanningError::ExtendedQueryNotEnabled => Status::out_of_range(
+            "LONG_QUERY_EXTENDED_NOT_ENABLED: enable query_processing.extended_enabled for queries above the Standard tier",
+        ),
+        QueryPlanningError::IntentExtraction(message) => Status::internal(format!(
+            "QUERY_INTENT_EXTRACTION_FAILED: {message}"
+        )),
         QueryPlanningError::SegmentationInvariant(message) => Status::internal(format!(
             "QUERY_SEGMENTATION_INVARIANT_FAILED: {message}"
         )),
@@ -624,9 +630,14 @@ impl AstraVectorV004ControlService {
         warnings: &mut Vec<pb::DiagnosticWarningV005>,
     ) -> Result<DirectQdrantGeneration, Status> {
         warnings.push(pb::DiagnosticWarningV005 {
-            code: "LONG_QUERY_SEGMENTED".into(),
+            code: match plan.tier {
+                QueryProcessingTier::SegmentedExtended => "LONG_QUERY_SEGMENTED_EXTENDED",
+                _ => "LONG_QUERY_SEGMENTED_STANDARD",
+            }
+            .into(),
             message: format!(
-                "query segmented into {} bounded segments",
+                "query processed as {} with {} bounded segments",
+                plan.tier.code(),
                 plan.segments.len()
             ),
         });
@@ -636,7 +647,7 @@ impl AstraVectorV004ControlService {
             .iter()
             .map(|segment| InferenceInput {
                 text: segment.text.clone(),
-                max_length: self.cfg.search.query_processing.segment_max_tokens,
+                max_length: plan.limits.segment_max_tokens,
                 allow_truncation: false,
                 want_dense: wants_dense,
                 want_sparse: wants_sparse && sparse_available,
@@ -651,7 +662,7 @@ impl AstraVectorV004ControlService {
                 deadline,
                 request_cancel,
                 SubmitManyOptions {
-                    max_in_flight: self.cfg.search.query_processing.max_parallel_segments,
+                    max_in_flight: plan.limits.max_parallel_segments,
                     preserve_order: true,
                     cancel_on_error: true,
                 },
@@ -670,17 +681,15 @@ impl AstraVectorV004ControlService {
         }
         let query_embedding_ms = emb_started.elapsed().as_millis() as u64;
         let qdrant_started = std::time::Instant::now();
-        let per_segment_limit = self
-            .cfg
-            .search
-            .query_processing
-            .per_segment_candidate_limit
+        let per_segment_limit = plan
+            .limits
+            .local_fused_candidate_limit
             .min(candidate_limit)
             .min(self.cfg.limits.search_candidate_limit_max)
             .max(top_k.min(candidate_limit))
             .max(1) as usize;
         let global_limit = candidate_limit
-            .min(self.cfg.search.query_processing.global_candidate_limit)
+            .min(plan.limits.global_fused_candidate_limit)
             .max(1) as usize;
         let mut dense_failed = false;
         let mut sparse_failed = false;
@@ -723,13 +732,7 @@ impl AstraVectorV004ControlService {
                     .await
                 }
             })
-            .buffer_unordered(
-                self.cfg
-                    .search
-                    .query_processing
-                    .max_parallel_segments
-                    .max(1),
-            )
+            .buffer_unordered(plan.limits.max_parallel_segments.max(1))
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -1916,7 +1919,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         .map_err(query_planning_status)?;
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
         let timeout_ms =
-            effective_query_timeout_ms(r.timeout_ms as u64, query_plan.mode, &self.cfg);
+            effective_query_timeout_ms(r.timeout_ms as u64, query_plan.mode, &self.cfg)
+                .min(query_plan.limits.deadline_ms);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let request_cancel = self.shutdown.child_token();
         let qdrant_budget = OperationBudget {
@@ -1942,8 +1946,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 query_plan
                     .segments
                     .len()
-                    .min(self.cfg.search.query_processing.max_parallel_segments)
-                    as f64,
+                    .min(query_plan.limits.max_parallel_segments) as f64,
             );
             Some(LongQueryInFlightGuard {
                 segments: segment_count,
@@ -1958,7 +1961,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let candidate_limit = if query_plan.mode == QueryProcessingMode::Segmented {
             candidate_limit
-                .min(self.cfg.search.query_processing.global_candidate_limit)
+                .min(query_plan.limits.global_fused_candidate_limit)
                 .max(top_k)
         } else {
             candidate_limit

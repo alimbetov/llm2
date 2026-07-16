@@ -95,7 +95,7 @@ fn compare_global_rrf_candidates(
         .then_with(|| {
             left.identity
                 .document_version
-                .cmp(&left.identity.document_version)
+                .cmp(&right.identity.document_version)
         })
         .then_with(|| {
             left.identity

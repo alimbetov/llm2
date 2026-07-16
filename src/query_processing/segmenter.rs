@@ -139,18 +139,13 @@ fn compact_ranges(
     limits: &EffectiveQueryProcessingLimits,
 ) -> Result<Vec<(usize, usize)>, QueryPlanningError> {
     let window = limits.segment_max_tokens.max(1);
-    let overlap = limits
-        .segment_overlap_tokens
-        .min(window.saturating_sub(1));
-    let capacity = limits
-        .max_segments
-        .saturating_mul(window)
-        .saturating_sub(
-            limits
-                .max_segments
-                .saturating_sub(1)
-                .saturating_mul(overlap),
-        );
+    let overlap = limits.segment_overlap_tokens.min(window.saturating_sub(1));
+    let capacity = limits.max_segments.saturating_mul(window).saturating_sub(
+        limits
+            .max_segments
+            .saturating_sub(1)
+            .saturating_mul(overlap),
+    );
     if token_count > capacity {
         return Err(QueryPlanningError::SegmentationInvariant(format!(
             "query requires more than {} segments at max_tokens={} overlap={}",
@@ -181,7 +176,8 @@ fn validate_token_coverage(
 ) -> Result<(), QueryPlanningError> {
     let mut covered = vec![false; original_token_count];
     for segment in segments {
-        for index in segment.source_token_start..segment.source_token_end.min(original_token_count) {
+        for index in segment.source_token_start..segment.source_token_end.min(original_token_count)
+        {
             covered[index] = true;
         }
     }
