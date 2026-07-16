@@ -34,30 +34,46 @@ jobs:
       - name: Format
         run: cargo fmt --all
 
-      - name: Compile all targets and features
-        run: cargo check --all-targets --all-features
+      - name: Compile and capture diagnostics
+        id: compile
+        shell: bash
+        run: |
+          mkdir -p docs/evidence/fix484-bootstrap
+          set +e
+          cargo check --all-targets --all-features 2>&1 | tee docs/evidence/fix484-bootstrap/cargo-check.log
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Run query-processing unit tests
+        if: steps.compile.outputs.exit_code == '0'
         run: cargo test query_processing --lib -- --nocapture
 
       - name: Run query-processing contract tests
+        if: steps.compile.outputs.exit_code == '0'
         run: cargo test --test query_processing_contracts -- --nocapture
 
-      - name: Commit validated generated changes
+      - name: Commit generated changes and compiler evidence
         shell: bash
         run: |
           if git diff --quiet; then
             echo "No generated changes to commit"
-            exit 0
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add \
+              config/application.yaml \
+              config/application-prod.yaml \
+              src/config/mod.rs \
+              src/grpc/mod.rs \
+              src/query_processing \
+              docs/evidence/fix484-bootstrap/cargo-check.log
+            git commit -m "fix484: apply tiered runtime wiring and compiler evidence [fix484 generated]"
+            git push origin "HEAD:${{ github.head_ref }}"
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            config/application.yaml \
-            config/application-prod.yaml \
-            src/config/mod.rs \
-            src/grpc/mod.rs \
-            src/query_processing \
-            tests/query_processing_contracts.rs
-          git commit -m "fix484: apply validated tiered runtime wiring [fix484 generated]"
-          git push origin "HEAD:${{ github.head_ref }}"
+
+      - name: Fail when compile gate is red
+        if: steps.compile.outputs.exit_code != '0'
+        run: |
+          echo "cargo check failed; see docs/evidence/fix484-bootstrap/cargo-check.log"
+          exit 1
