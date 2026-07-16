@@ -12,8 +12,10 @@ jobs:
           toolchain: 1.82.0
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo check --all-targets
-      - run: cargo test --all-targets
+      - run: cargo check --all-targets --all-features
+      - run: cargo test query_processing --lib -- --nocapture
+      - run: cargo test --test query_processing_contracts -- --nocapture
+      - run: cargo test --all-targets --all-features
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo sqlx prepare --check -- --all-targets --all-features
       - run: cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture

@@ -39,6 +39,27 @@ pub fn has_question_form(text: &str) -> bool {
         "connect ",
         "compare ",
         "summarize ",
+        "объясни ",
+        "покажи ",
+        "найди ",
+        "сравни ",
+        "опиши ",
+        "как ",
+        "почему ",
+        "какой ",
+        "какие ",
+        "где ",
+        "когда ",
+        "что ",
+        "түсіндір ",
+        "көрсет ",
+        "тап ",
+        "салыстыр ",
+        "қалай ",
+        "неге ",
+        "қайда ",
+        "қашан ",
+        "не ",
     ];
     imperative_prefixes
         .iter()
@@ -105,5 +126,15 @@ mod tests {
             classify_query_segment("This is background context without a direct request."),
             QuerySegmentKind::Context
         );
+    }
+
+    #[test]
+    fn russian_imperative_is_question() {
+        assert!(has_question_form("Объясни порядок активации документа"));
+    }
+
+    #[test]
+    fn kazakh_imperative_is_question() {
+        assert!(has_question_form("Түсіндір құжатты белсендіру тәртібін"));
     }
 }

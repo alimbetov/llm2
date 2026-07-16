@@ -27,6 +27,10 @@ qdrant:
   validate_collection_schema: true
   ensure_payload_indexes: ${ASTRAVECTOR_QDRANT_ENSURE_PAYLOAD_INDEXES:-true}
 
+search:
+  query_processing:
+    enabled: ${ASTRAVECTOR_LONG_QUERY_ENABLED:-false}
+
 index_ttl:
   enabled: true
   cleanup_enabled: ${ASTRAVECTOR_INDEX_TTL_CLEANUP_ENABLED:-true}

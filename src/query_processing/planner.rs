@@ -3,6 +3,7 @@ use crate::query_processing::classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
 };
 use crate::query_processing::segmenter::segment_query;
+use crate::tokenizer::TokenOffset;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -56,6 +57,25 @@ pub trait QueryTokenCounter {
         max_length: usize,
         allow_truncation: bool,
     ) -> Result<usize, String>;
+
+    fn token_offsets(&self, text: &str) -> Result<Vec<TokenOffset>, String> {
+        let mut offsets = Vec::new();
+        let mut search_from = 0usize;
+        for (token_index, token) in text.split_whitespace().enumerate() {
+            let relative = text[search_from..]
+                .find(token)
+                .ok_or_else(|| "token offset fallback failed".to_string())?;
+            let start_byte = search_from + relative;
+            let end_byte = start_byte + token.len();
+            offsets.push(TokenOffset {
+                token_index,
+                start_byte,
+                end_byte,
+            });
+            search_from = end_byte;
+        }
+        Ok(offsets)
+    }
 }
 
 pub fn build_query_plan(

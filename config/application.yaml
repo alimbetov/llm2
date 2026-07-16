@@ -182,6 +182,7 @@ search:
     segment_overlap_tokens: ${ASTRAVECTOR_LONG_QUERY_SEGMENT_OVERLAP_TOKENS:-24}
     max_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_SEGMENTS:-6}
     max_parallel_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_PARALLEL_SEGMENTS:-3}
+    max_parallel_lexical_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_PARALLEL_FTS_SEGMENTS:-2}
     per_segment_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_CANDIDATE_LIMIT:-20}
     global_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_GLOBAL_CANDIDATE_LIMIT:-100}
     segment_rrf_k: ${ASTRAVECTOR_LONG_QUERY_RRF_K:-60}
@@ -206,6 +207,7 @@ search:
     max_candidate_limit: ${ASTRAVECTOR_LEXICAL_SEARCH_MAX_CANDIDATE_LIMIT:-100}
     min_remaining_budget_ms: ${ASTRAVECTOR_LEXICAL_SEARCH_MIN_REMAINING_BUDGET_MS:-150}
     statement_timeout_ms: ${ASTRAVECTOR_LEXICAL_SEARCH_STATEMENT_TIMEOUT_MS:-150}
+    response_reserve_ms: ${ASTRAVECTOR_LEXICAL_SEARCH_RESPONSE_RESERVE_MS:-75}
     exact_technical_enabled: ${ASTRAVECTOR_LEXICAL_SEARCH_EXACT_TECHNICAL_ENABLED:-true}
     trigram_enabled: ${ASTRAVECTOR_LEXICAL_SEARCH_TRIGRAM_ENABLED:-false}
     trigram_min_similarity: ${ASTRAVECTOR_LEXICAL_SEARCH_TRIGRAM_MIN_SIMILARITY:-0.70}

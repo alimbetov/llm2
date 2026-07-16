@@ -84,7 +84,7 @@ fn build_atoms(
                     &mut atoms,
                     current.trim(),
                     QueryAtomKind::CodeBlock,
-                    false,
+                    true,
                     token_counter,
                     config,
                 )?;
@@ -128,7 +128,7 @@ fn build_atoms(
                 &mut atoms,
                 current.trim(),
                 QueryAtomKind::CodeBlock,
-                false,
+                true,
                 token_counter,
                 config,
             )?;
@@ -221,21 +221,28 @@ fn push_hard_windows(
     token_counter: &dyn QueryTokenCounter,
     config: &QueryProcessingConfig,
 ) -> Result<(), QueryPlanningError> {
-    let words = text.split_whitespace().collect::<Vec<_>>();
-    if words.is_empty() {
+    let offsets = token_counter
+        .token_offsets(text)
+        .map_err(QueryPlanningError::Tokenization)?;
+    if offsets.is_empty() {
         return Ok(());
     }
     let mut start = 0usize;
-    while start < words.len() {
-        let mut end = (start + config.segment_target_tokens.max(1)).min(words.len());
-        let mut candidate = words[start..end].join(" ");
+    let window = config.segment_max_tokens.max(1);
+    let stride = window.saturating_sub(config.segment_overlap_tokens).max(1);
+    while start < offsets.len() {
+        let mut end = (start + window).min(offsets.len());
+        let start_byte = offsets[start].start_byte;
+        let mut end_byte = offsets[end - 1].end_byte;
+        let mut candidate = text[start_byte..end_byte].trim().to_owned();
         while token_counter
             .count_tokens(&candidate, config.segment_max_tokens, false)
             .is_err()
             && end > start + 1
         {
             end -= 1;
-            candidate = words[start..end].join(" ");
+            end_byte = offsets[end - 1].end_byte;
+            candidate = text[start_byte..end_byte].trim().to_owned();
         }
         let token_count =
             count_segment_tokens(&candidate, token_counter, config.segment_max_tokens)?;
@@ -245,10 +252,10 @@ fn push_hard_windows(
             kind: QueryAtomKind::HardTokenWindow,
             splittable: false,
         });
-        if end == words.len() {
+        if end == offsets.len() {
             break;
         }
-        start = end;
+        start = start.saturating_add(stride).min(end);
     }
     Ok(())
 }
@@ -283,18 +290,25 @@ fn pack_atoms(
         {
             segments.push(current.trim().to_owned());
             if segments.len() >= config.max_segments {
-                return Ok(repack_to_max_segments(
-                    segments,
-                    atoms,
-                    token_counter,
-                    config,
-                )?);
+                return repack_to_max_segments(segments, atoms, token_counter, config);
             }
-            let previous_tail = overlap_tail(&current, config.segment_overlap_tokens);
-            current = if previous_tail.is_empty() {
+            let previous_tail = if atom.kind == QueryAtomKind::HardTokenWindow {
+                String::new()
+            } else {
+                overlap_tail(&current, config.segment_overlap_tokens)
+            };
+            let overlapped = if previous_tail.is_empty() {
                 atom.text.clone()
             } else {
                 format!("{} {}", previous_tail, atom.text)
+            };
+            current = if token_counter
+                .count_tokens(&overlapped, config.segment_max_tokens, false)
+                .is_ok()
+            {
+                overlapped
+            } else {
+                atom.text.clone()
             };
             current_tokens =
                 count_segment_tokens(&current, token_counter, config.segment_max_tokens)?;
@@ -359,8 +373,13 @@ fn repack_to_max_segments(
 fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut start = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if matches!(ch, '.' | '!' | '?') {
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        let next_is_boundary = chars
+            .peek()
+            .map(|(_, next)| next.is_whitespace())
+            .unwrap_or(true);
+        if matches!(ch, '!' | '?') || (ch == '.' && next_is_boundary) {
             let end = idx + ch.len_utf8();
             let piece = text[start..end].trim();
             if !piece.is_empty() {
@@ -465,6 +484,34 @@ mod tests {
         let query = "Context\n```text\nORA-00904 in /api/v1/documents\n```\nWhat failed?";
         let segments = segment_query(query, &WhitespaceCounter, &config()).unwrap();
         assert!(segments.iter().any(|s| s.text.contains("ORA-00904")));
+    }
+
+    #[test]
+    fn oversized_code_block_is_split() {
+        let body = (0..40)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let query = format!("```text\n{body}\n```");
+        let segments = segment_query(&query, &WhitespaceCounter, &config()).unwrap();
+        assert!(segments.len() > 1);
+        assert!(segments.iter().all(|segment| segment.token_count <= 10));
+    }
+
+    #[test]
+    fn filename_is_not_split_as_sentence() {
+        assert_eq!(
+            split_sentences("Inspect runtime-quality-report.json before rollout.").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn version_is_not_split_as_sentence() {
+        assert_eq!(
+            split_sentences("Compare v1.2.3 with service.example.com.").len(),
+            1
+        );
     }
 
     #[test]

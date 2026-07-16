@@ -55,6 +55,9 @@ fn identity(chunk: &str) -> GlobalCandidateIdentity {
         document_version: 1,
         matched_chunk_id: chunk.into(),
         parent_chunk_id: chunk.into(),
+        source_block_id: chunk.into(),
+        representation_type: "ORIGINAL".into(),
+        qdrant_point_id: Some(chunk.into()),
     }
 }
 
