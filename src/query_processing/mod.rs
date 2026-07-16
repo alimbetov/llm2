@@ -13,7 +13,9 @@ pub mod status;
 pub use classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
 };
-pub use evidence::{CandidateIntentEvidence, CandidateIntentEvidenceReason};
+pub use evidence::{
+    inherit_proven_graph_intents, CandidateIntentEvidence, CandidateIntentEvidenceReason,
+};
 pub use intent::{
     extract_query_intents, extract_query_intents_normalized, QueryIntentKind, QueryIntentUnit,
 };

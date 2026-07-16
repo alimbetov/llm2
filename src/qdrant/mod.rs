@@ -478,6 +478,14 @@ impl QdrantClient {
         })
     }
 
+    pub fn canonical_search_filter(
+        access_zone_ids: &[Uuid],
+        caller_access_level: i16,
+        versions: Option<&QdrantVersionFilters>,
+    ) -> Value {
+        Self::base_search_filter_multi(access_zone_ids, caller_access_level, versions)
+    }
+
     fn document_filter(access_zone_id: Uuid, document_id: Uuid, document_version: i64) -> Value {
         json!({"must":[
             {"key":"access_zone_id","match":{"value":access_zone_id.to_string()}},

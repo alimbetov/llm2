@@ -72,3 +72,19 @@ impl CandidateIntentEvidence {
         }
     }
 }
+
+pub fn inherit_proven_graph_intents(
+    direct_evidence: &[CandidateIntentEvidence],
+) -> Vec<CandidateIntentEvidence> {
+    let mut intent_ids = direct_evidence
+        .iter()
+        .filter(|evidence| evidence.evidence_passed)
+        .map(|evidence| evidence.intent_id)
+        .collect::<Vec<_>>();
+    intent_ids.sort_unstable();
+    intent_ids.dedup();
+    intent_ids
+        .into_iter()
+        .map(CandidateIntentEvidence::graph_origin)
+        .collect()
+}
