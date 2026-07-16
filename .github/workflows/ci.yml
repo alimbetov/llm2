@@ -33,6 +33,7 @@ jobs:
       - run: cargo test --locked --test query_processing_contracts -- --nocapture
       - run: cargo test --locked --all-targets --all-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres --locked
       - run: cargo sqlx prepare --check -- --all-targets --all-features
       - run: cargo test --locked --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture
   smoke-load-testcontainers:
