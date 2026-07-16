@@ -1,0 +1,22 @@
+{
+  "run_id": "20260716T162258Z",
+  "host_rustc": "1.96.0",
+  "host_cargo": "1.96.0",
+  "declared_rust_version": "1.88",
+  "docker_builder": "rust:1.88-trixie",
+  "docker_version": "28.3.3",
+  "sqlx_cli": "0.9.0",
+  "postgres": {
+    "container": "astravector-postgres-1",
+    "image": "pgvector/pgvector:pg16",
+    "host_port": 55432
+  },
+  "qdrant": {
+    "container": "astravector-qdrant-1",
+    "image": "qdrant/qdrant:v1.14.1",
+    "http_port": 6333,
+    "grpc_port": 6334
+  },
+  "docker_image": "astravector:fix484v",
+  "docker_build": "PASS"
+}

@@ -19,6 +19,13 @@ pub struct SegmentCandidate {
     pub rank: usize,
     pub score: f32,
     pub segment_weight: f32,
+    pub intent_unit_ids: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ContributionKey {
+    Intent(usize),
+    PhysicalSegment(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -38,13 +45,35 @@ pub fn cross_segment_rrf(
 ) -> Vec<GlobalRrfCandidate> {
     let mut by_identity =
         std::collections::HashMap::<GlobalCandidateIdentity, GlobalRrfCandidate>::new();
+    let mut best_by_identity_and_intent =
+        std::collections::HashMap::<(GlobalCandidateIdentity, ContributionKey), f32>::new();
     let rrf_k = rrf_k.max(1.0);
     for candidate in candidates {
         let contribution = candidate.segment_weight / (rrf_k + candidate.rank.max(1) as f32);
+        let contribution_keys = if candidate.intent_unit_ids.is_empty() {
+            vec![ContributionKey::PhysicalSegment(candidate.segment_index)]
+        } else {
+            candidate
+                .intent_unit_ids
+                .iter()
+                .copied()
+                .map(ContributionKey::Intent)
+                .collect()
+        };
+        let mut score_delta = 0.0_f32;
+        for key in contribution_keys {
+            let best = best_by_identity_and_intent
+                .entry((candidate.identity.clone(), key))
+                .or_insert(0.0);
+            if contribution > *best {
+                score_delta += contribution - *best;
+                *best = contribution;
+            }
+        }
         by_identity
             .entry(candidate.identity.clone())
             .and_modify(|global| {
-                global.score += contribution;
+                global.score += score_delta;
                 if contribution > global.best_contribution
                     || (contribution == global.best_contribution
                         && candidate.rank < global.best_local_rank)
@@ -60,7 +89,7 @@ pub fn cross_segment_rrf(
             })
             .or_insert_with(|| GlobalRrfCandidate {
                 identity: candidate.identity,
-                score: contribution,
+                score: score_delta,
                 best_segment_index: candidate.segment_index,
                 best_contribution: contribution,
                 best_local_rank: candidate.rank,
@@ -151,6 +180,7 @@ mod tests {
                     rank: 1,
                     score: 1.0,
                     segment_weight: 1.0,
+                    intent_unit_ids: Vec::new(),
                 },
                 SegmentCandidate {
                     identity: identity("a"),
@@ -158,6 +188,7 @@ mod tests {
                     rank: 2,
                     score: 0.9,
                     segment_weight: 1.0,
+                    intent_unit_ids: Vec::new(),
                 },
             ],
             60.0,
@@ -177,6 +208,7 @@ mod tests {
                     rank: 1,
                     score: 1.0,
                     segment_weight: 0.5,
+                    intent_unit_ids: Vec::new(),
                 },
                 SegmentCandidate {
                     identity: identity("question"),
@@ -184,6 +216,7 @@ mod tests {
                     rank: 1,
                     score: 1.0,
                     segment_weight: 1.0,
+                    intent_unit_ids: Vec::new(),
                 },
             ],
             60.0,
@@ -201,6 +234,7 @@ mod tests {
                 rank: 0,
                 score: 1.0,
                 segment_weight: 1.0,
+                intent_unit_ids: Vec::new(),
             }],
             60.0,
             10,
@@ -217,6 +251,7 @@ mod tests {
                 rank: 1,
                 score: 1.0,
                 segment_weight: 1.0,
+                intent_unit_ids: Vec::new(),
             }),
             60.0,
             2,
@@ -234,6 +269,7 @@ mod tests {
                     rank: 3,
                     score: 1.0,
                     segment_weight: 1.0,
+                    intent_unit_ids: Vec::new(),
                 },
                 SegmentCandidate {
                     identity: identity("a"),
@@ -241,6 +277,7 @@ mod tests {
                     rank: 1,
                     score: 1.0,
                     segment_weight: 1.0,
+                    intent_unit_ids: Vec::new(),
                 },
             ],
             60.0,
@@ -248,5 +285,34 @@ mod tests {
         );
         assert_eq!(fused[0].best_segment_index, 2);
         assert_eq!(fused[0].best_local_rank, 1);
+    }
+
+    #[test]
+    fn overlapping_segments_do_not_double_count_one_logical_intent() {
+        let fused = cross_segment_rrf(
+            [
+                SegmentCandidate {
+                    identity: identity("a"),
+                    segment_index: 0,
+                    rank: 1,
+                    score: 1.0,
+                    segment_weight: 1.0,
+                    intent_unit_ids: vec![7],
+                },
+                SegmentCandidate {
+                    identity: identity("a"),
+                    segment_index: 1,
+                    rank: 2,
+                    score: 0.9,
+                    segment_weight: 1.0,
+                    intent_unit_ids: vec![7],
+                },
+            ],
+            60.0,
+            10,
+        );
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].score, 1.0 / 61.0);
+        assert_eq!(fused[0].matched_segments, vec![0, 1]);
     }
 }

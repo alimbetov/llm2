@@ -1,0 +1,25 @@
+   Compiling astravector-runtime v0.4.1 (/Users/ruslanalimbetov/Documents/llm2/astravector-fix484v)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.92s
+     Running tests/quality_fixtures_contracts.rs (target/debug/deps/quality_fixtures_contracts-c6124df84d4e5dfd)
+
+running 18 tests
+test enriched_quality_bench_structure_exists ... ok
+test candidate_pool_contains_at_least_four_sources ... ok
+test candidate_pool_depth_is_at_least_twenty ... ok
+test enriched_quality_profiles_and_schemas_are_valid_json ... ok
+test fix481_validation_pool_distinguishes_prepared_from_adjudicated_qrels ... ok
+test fix480_quality_splits_are_disjoint_and_have_structural_qrel_coverage ... ok
+test enriched_quality_document_bank_has_required_scale_and_metadata ... ok
+test enriched_quality_relations_reference_existing_documents_and_blocks ... ok
+test fix482_rag_quality_bank_v1_loads_exactly_42_queries ... ok
+test blind_template_hides_identity_rank_and_source ... ok
+test fix482_rag_quality_bank_v1_queries_reference_existing_fixture_ids ... ok
+test pool_manifest_contains_runtime_identity ... ok
+test fix482_rag_quality_bank_v1_blind_judgment_template_is_pending ... ok
+test enriched_quality_queries_are_valid_and_reference_existing_ids ... ok
+test candidate_pool_does_not_read_expected_labels ... ok
+test pool_generation_respects_access_filters ... ok
+test pool_generation_is_deterministic ... ok
+test candidate_pool_is_independent_of_structural_expectations ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s

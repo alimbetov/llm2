@@ -176,9 +176,12 @@ fn validate_token_coverage(
 ) -> Result<(), QueryPlanningError> {
     let mut covered = vec![false; original_token_count];
     for segment in segments {
-        for index in segment.source_token_start..segment.source_token_end.min(original_token_count)
+        for token_covered in covered
+            .iter_mut()
+            .take(segment.source_token_end.min(original_token_count))
+            .skip(segment.source_token_start)
         {
-            covered[index] = true;
+            *token_covered = true;
         }
     }
     if let Some(missing) = covered.iter().position(|covered| !covered) {

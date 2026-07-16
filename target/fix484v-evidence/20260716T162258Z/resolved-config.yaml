@@ -1,0 +1,40 @@
+query_processing:
+  profile_version: tiered-query-v1
+  extended_enabled_in_production_by_default: false
+  tiers:
+    single:
+      max_tokens: 256
+      max_segments: 1
+      dense_candidate_limit: 18
+      sparse_candidate_limit: 18
+      lexical_candidate_limit: 12
+      global_fused_candidate_limit: 100
+      max_graph_seeds: 5
+      admission_weight: 1
+    standard:
+      max_tokens: 1024
+      max_segments: 7
+      dense_candidate_limit: 18
+      sparse_candidate_limit: 18
+      lexical_candidate_limit: 12
+      global_fused_candidate_limit: 100
+      max_graph_seeds: 8
+      admission_weight: 3
+    extended:
+      max_tokens: 2048
+      max_segments: 14
+      dense_candidate_limit: 10
+      sparse_candidate_limit: 10
+      lexical_candidate_limit: 8
+      global_fused_candidate_limit: 140
+      max_graph_seeds: 10
+      admission_weight: 6
+  absolute_max_tokens: 2048
+  compatibility:
+    legacy_long_query_keys_map_to: standard
+    new_keys_take_precedence: true
+retrieval:
+  graph_expansion_calls_per_request_max: 1
+  mmr_selection_calls_per_request_max: 1
+  cancellation_propagation: enabled
+  deadline_origin: rpc_receipt

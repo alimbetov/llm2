@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
+     Running tests/query_processing_contracts.rs (target/debug/deps/query_processing_contracts-60fa2bedec5aeb46)
+
+running 14 tests
+test long_query_disabled_fails_closed_without_truncation ... ok
+test absolute_limit_cannot_be_bypassed_by_a_larger_extended_tier ... ok
+test global_rrf_deduplicates_full_identity ... ok
+test overlap_fusion_uses_best_contribution_per_logical_intent ... ok
+test production_profile_keeps_extended_tier_disabled ... ok
+test retrieval_pipeline_has_one_graph_and_one_mmr_stage ... ok
+test too_large_query_is_out_of_range_contract ... ok
+test segment_aware_coverage_reports_partial ... ok
+test logical_intents_are_independent_from_physical_tail_segments ... ok
+test one_question_input_uses_automatic_modes ... ok
+test successful_plan_never_truncates_segments ... ok
+test effective_limits_are_frozen_into_the_selected_plan ... ok
+test physical_segments_preserve_tail_and_bounded_overlap ... ok
+test exact_tier_boundaries_are_fail_closed ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

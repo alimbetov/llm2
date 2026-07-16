@@ -3,9 +3,7 @@ use crate::query_processing::classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
 };
 use crate::query_processing::intent::{extract_query_intents, QueryIntentUnit};
-use crate::query_processing::profile::{
-    EffectiveQueryProcessingLimits, QueryProcessingTier, QUERY_PROCESSING_PROFILE_VERSION,
-};
+use crate::query_processing::profile::{EffectiveQueryProcessingLimits, QueryProcessingTier};
 use crate::query_processing::segmenter::segment_query;
 use crate::tokenizer::TokenOffset;
 use sha2::{Digest, Sha256};
@@ -112,7 +110,7 @@ pub fn build_query_plan(
         return Err(QueryPlanningError::Empty);
     }
 
-    let hard_max = config.extended.max_tokens;
+    let hard_max = config.absolute_max_tokens.min(config.extended.max_tokens);
     let original_token_count = token_counter
         .count_tokens(trimmed, hard_max, false)
         .map_err(map_tokenization_error)?;
@@ -187,7 +185,7 @@ pub fn build_query_plan(
         original_token_count,
         mode,
         tier,
-        profile_version: QUERY_PROCESSING_PROFILE_VERSION.to_owned(),
+        profile_version: config.profile_version.clone(),
         limits,
         segments,
         intent_units,
@@ -312,9 +310,12 @@ fn validate_plan_segments(
                 segment.index, segment.token_count, limits.segment_max_tokens
             )));
         }
-        for index in segment.source_token_start..segment.source_token_end.min(original_token_count)
+        for token_covered in covered
+            .iter_mut()
+            .take(segment.source_token_end.min(original_token_count))
+            .skip(segment.source_token_start)
         {
-            covered[index] = true;
+            *token_covered = true;
         }
     }
     if let Some(index) = covered.iter().position(|covered| !covered) {
@@ -355,8 +356,10 @@ mod tests {
 
     #[test]
     fn boundary_tiers_are_selected() {
-        let mut config = QueryProcessingConfig::default();
-        config.extended_enabled = true;
+        let config = QueryProcessingConfig {
+            extended_enabled: true,
+            ..Default::default()
+        };
         assert_eq!(
             build_query_plan(&words(256), &WhitespaceCounter, &config, 256)
                 .unwrap()

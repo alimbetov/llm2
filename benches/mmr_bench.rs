@@ -31,7 +31,7 @@ fn search_result(id: usize, score: f32, with_embedding: bool) -> pb::SearchResul
         citation: Some(pb::SearchCitationV004 { metadata }),
         access_zone_id: "zone".to_string(),
         access_level: pb::AccessLevel::Public as i32,
-        matched_text: if id % 3 == 0 {
+        matched_text: if id.is_multiple_of(3) {
             format!("early loan repayment without commission variant {id}")
         } else if id % 3 == 1 {
             format!("branch address service schedule variant {id}")

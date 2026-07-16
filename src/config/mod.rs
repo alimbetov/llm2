@@ -1,6 +1,6 @@
 use crate::graph::GraphRelationType;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::{env, path::Path};
@@ -1604,6 +1604,7 @@ impl AppConfig {
             }
         }
 
+        apply_query_processing_compatibility(&mut merged)?;
         let cfg: AppConfig =
             serde_yaml::from_value(merged).context("parse AstraVector configuration")?;
         Ok(cfg)
@@ -2253,6 +2254,15 @@ impl AppConfig {
                 tier.admission_weight > 0,
                 "search.query_processing.{name}.admission_weight must be positive"
             );
+            anyhow::ensure!(
+                tier.admission_weight as usize
+                    <= self.limits.max_concurrent_retrieve_context,
+                "search.query_processing.{name}.admission_weight exceeds retrieval admission capacity"
+            );
+            anyhow::ensure!(
+                tier.max_graph_seeds > 0 && tier.max_graph_seeds <= 12,
+                "search.query_processing.{name}.max_graph_seeds must be between 1 and 12"
+            );
         }
 
         anyhow::ensure!(
@@ -2477,8 +2487,141 @@ fn merge_yaml(base: &mut Value, overlay: Value) {
     }
 }
 
+fn apply_query_processing_compatibility(config: &mut Value) -> Result<()> {
+    let Some(query_processing) = config
+        .get_mut("search")
+        .and_then(|search| search.get_mut("query_processing"))
+        .and_then(Value::as_mapping_mut)
+    else {
+        return Ok(());
+    };
+    let legacy_mappings = [
+        ("max_segments", &["max_segments"][..]),
+        ("max_parallel_segments", &["max_parallel_segments"]),
+        (
+            "max_parallel_lexical_segments",
+            &["max_parallel_lexical_segments"],
+        ),
+        (
+            "per_segment_candidate_limit",
+            &[
+                "dense_candidate_limit",
+                "sparse_candidate_limit",
+                "local_fused_candidate_limit",
+            ],
+        ),
+        ("global_candidate_limit", &["global_fused_candidate_limit"]),
+        ("long_query_deadline_ms", &["deadline_ms"]),
+    ];
+    if !legacy_mappings
+        .iter()
+        .any(|(legacy, _)| query_processing.contains_key(Value::String((*legacy).to_string())))
+    {
+        return Ok(());
+    }
+
+    let standard_key = Value::String("standard".into());
+    let explicit_standard_keys = query_processing
+        .get(&standard_key)
+        .and_then(Value::as_mapping)
+        .map(|mapping| {
+            mapping
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    if !query_processing.contains_key(&standard_key) {
+        query_processing.insert(
+            standard_key.clone(),
+            serde_yaml::to_value(QueryProcessingTierConfig::standard())?,
+        );
+    }
+    let legacy_values = legacy_mappings
+        .iter()
+        .filter_map(|(legacy, targets)| {
+            query_processing
+                .get(Value::String((*legacy).to_string()))
+                .cloned()
+                .map(|value| (*legacy, *targets, value))
+        })
+        .collect::<Vec<_>>();
+    let standard = query_processing
+        .get_mut(&standard_key)
+        .and_then(Value::as_mapping_mut)
+        .context("search.query_processing.standard must be a mapping")?;
+    for (legacy, targets, value) in legacy_values {
+        let mut applied = false;
+        for target in targets {
+            let target_key = Value::String((*target).to_string());
+            if !explicit_standard_keys.contains(&target_key) {
+                standard.insert(target_key, value.clone());
+                applied = true;
+            }
+        }
+        if applied {
+            tracing::warn!(
+                legacy_key = legacy,
+                "LEGACY_QUERY_PROCESSING_KEY_DEPRECATED"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn expand_env(input: &str) -> String {
     let mut out = input.to_owned();
+    for (new_key, legacy_key) in [
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_MAX_SEGMENTS",
+            "ASTRAVECTOR_LONG_QUERY_MAX_SEGMENTS",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_PARALLEL_SEGMENTS",
+            "ASTRAVECTOR_LONG_QUERY_MAX_PARALLEL_SEGMENTS",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_PARALLEL_FTS",
+            "ASTRAVECTOR_LONG_QUERY_MAX_PARALLEL_FTS_SEGMENTS",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_DENSE_LIMIT",
+            "ASTRAVECTOR_LONG_QUERY_CANDIDATE_LIMIT",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_SPARSE_LIMIT",
+            "ASTRAVECTOR_LONG_QUERY_CANDIDATE_LIMIT",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_LOCAL_FUSED_LIMIT",
+            "ASTRAVECTOR_LONG_QUERY_CANDIDATE_LIMIT",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_GLOBAL_FUSED_LIMIT",
+            "ASTRAVECTOR_LONG_QUERY_GLOBAL_CANDIDATE_LIMIT",
+        ),
+        (
+            "ASTRAVECTOR_LONG_QUERY_STANDARD_DEADLINE_MS",
+            "ASTRAVECTOR_LONG_QUERY_DEADLINE_MS",
+        ),
+    ] {
+        if env::var(new_key).is_err() {
+            if let Ok(value) = env::var(legacy_key) {
+                let marker = format!("${{{new_key}:-");
+                while let Some(start) = out.find(&marker) {
+                    let Some(relative_end) = out[start..].find('}') else {
+                        break;
+                    };
+                    out.replace_range(start..start + relative_end + 1, &value);
+                }
+                tracing::warn!(
+                    legacy_key,
+                    new_key,
+                    "LEGACY_QUERY_PROCESSING_ENV_DEPRECATED"
+                );
+            }
+        }
+    }
     for (k, v) in env::vars() {
         out = out.replace(&format!("${{{k}}}"), &v);
         let marker = format!("${{{k}:-");
@@ -2553,7 +2696,7 @@ pub struct SearchConfig {
     #[serde(default)]
     pub no_answer: NoAnswerConfig,
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QueryProcessingTierConfig {
     pub max_tokens: usize,
     pub max_segments: usize,
@@ -2896,4 +3039,40 @@ pub struct RelevanceConfig {
     pub enabled: bool,
     pub min_candidate_score: f32,
     pub min_reuse_score: f32,
+}
+
+#[cfg(test)]
+mod query_processing_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_keys_populate_standard_when_new_tier_is_absent() {
+        let mut value: Value = serde_yaml::from_str(
+            "search:\n  query_processing:\n    max_segments: 5\n    per_segment_candidate_limit: 9\n    global_candidate_limit: 70\n    long_query_deadline_ms: 2500\n",
+        )
+        .unwrap();
+        apply_query_processing_compatibility(&mut value).unwrap();
+        let standard = value["search"]["query_processing"]["standard"]
+            .as_mapping()
+            .unwrap();
+        assert_eq!(standard["max_segments"].as_u64(), Some(5));
+        assert_eq!(standard["dense_candidate_limit"].as_u64(), Some(9));
+        assert_eq!(standard["sparse_candidate_limit"].as_u64(), Some(9));
+        assert_eq!(standard["local_fused_candidate_limit"].as_u64(), Some(9));
+        assert_eq!(standard["global_fused_candidate_limit"].as_u64(), Some(70));
+        assert_eq!(standard["deadline_ms"].as_u64(), Some(2500));
+    }
+
+    #[test]
+    fn explicit_new_keys_take_precedence_over_legacy_keys() {
+        let mut value: Value = serde_yaml::from_str(
+            "search:\n  query_processing:\n    max_segments: 5\n    standard:\n      max_segments: 7\n      dense_candidate_limit: 18\n      sparse_candidate_limit: 18\n      lexical_candidate_limit: 12\n      local_fused_candidate_limit: 18\n      global_fused_candidate_limit: 100\n      max_parallel_segments: 3\n      max_parallel_lexical_segments: 2\n      deadline_ms: 3000\n      max_tokens: 1024\n      max_graph_seeds: 8\n      admission_weight: 3\n",
+        )
+        .unwrap();
+        apply_query_processing_compatibility(&mut value).unwrap();
+        assert_eq!(
+            value["search"]["query_processing"]["standard"]["max_segments"].as_u64(),
+            Some(7)
+        );
+    }
 }

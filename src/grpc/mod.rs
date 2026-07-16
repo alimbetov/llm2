@@ -25,7 +25,10 @@ use crate::{
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
     query_processing::{
         build_query_plan,
-        coverage::{evaluate_required_coverage, QueryCoverage, QueryEvidenceStatus},
+        coverage::{
+            evaluate_intent_coverage, evaluate_required_coverage, QueryCoverage,
+            QueryEvidenceStatus,
+        },
         diagnostics::QueryPlanDiagnostics,
         fusion::{cross_segment_rrf, GlobalCandidateIdentity, SegmentCandidate},
         planner::{QueryPlan, QueryPlanningError, QuerySegment, QueryTokenCounter},
@@ -59,6 +62,31 @@ use uuid::Uuid;
 struct AdmissionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     scope: &'static str,
+    weight: f64,
+}
+
+struct RequestCancellationGuard(CancellationToken);
+
+#[derive(Clone, Copy)]
+struct RequestTiming {
+    started: Instant,
+    transport_deadline: Option<Instant>,
+}
+
+impl RequestTiming {
+    fn from_request<T>(request: &Request<T>) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            transport_deadline: grpc_transport_deadline(request.metadata(), started),
+        }
+    }
+}
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 struct LongQueryInFlightGuard {
@@ -92,6 +120,7 @@ struct DirectQdrantGeneration {
 struct SegmentQdrantResult {
     segment_index: usize,
     segment_weight: f32,
+    intent_unit_ids: Vec<usize>,
     hits: Vec<QdrantSearchHit>,
     dense_executed: bool,
     sparse_executed: bool,
@@ -259,7 +288,7 @@ mod downstream_budget_tests {
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        gauge!("astravector_admission_in_flight", "scope" => self.scope).decrement(1.0);
+        gauge!("astravector_admission_in_flight", "scope" => self.scope).decrement(self.weight);
     }
 }
 
@@ -310,27 +339,34 @@ impl AstraVectorV004ControlService {
         semaphore: Arc<Semaphore>,
         timeout_ms: u64,
         metric_scope: &'static str,
+        weight: u32,
+        cancellation: &CancellationToken,
     ) -> Result<AdmissionPermit, Status> {
         let started = std::time::Instant::now();
-        let result = tokio::time::timeout(
+        let weight = weight.max(1);
+        let acquire = tokio::time::timeout(
             Duration::from_millis(timeout_ms.max(1)),
-            semaphore.acquire_owned(),
-        )
-            .await
-            .map_err(|_| {
+            semaphore.acquire_many_owned(weight),
+        );
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(Status::cancelled(format!("{metric_scope}_admission_cancelled")));
+            }
+            result = acquire => result.map_err(|_| {
                 counter!("backpressure_acquire_timeout_total", "scope" => metric_scope).increment(1);
                 counter!("retrieval_rejected_total", "scope" => metric_scope, "reason" => "acquire_timeout").increment(1);
                 counter!("astravector_admission_rejected_total", "scope" => metric_scope, "reason" => "admission_timeout").increment(1);
                 Status::resource_exhausted(format!("{metric_scope}_admission_timeout"))
             })?
-            .map_err(|_| Status::unavailable(format!("{metric_scope} semaphore closed")));
+        }.map_err(|_| Status::unavailable(format!("{metric_scope} semaphore closed")));
         histogram!("astravector_admission_wait_seconds", "scope" => metric_scope)
             .record(started.elapsed().as_secs_f64());
         let permit = result?;
-        gauge!("astravector_admission_in_flight", "scope" => metric_scope).increment(1.0);
+        gauge!("astravector_admission_in_flight", "scope" => metric_scope).increment(weight as f64);
         Ok(AdmissionPermit {
             _permit: permit,
             scope: metric_scope,
+            weight: weight as f64,
         })
     }
 
@@ -739,6 +775,7 @@ impl AstraVectorV004ControlService {
             .collect::<Result<Vec<_>, Status>>()?;
         segment_results.sort_by_key(|result| result.segment_index);
         for result in segment_results {
+            let intent_unit_ids = result.intent_unit_ids.clone();
             dense_failed |= result.dense_failed;
             sparse_failed |= result.sparse_failed;
             all_dense_executed &= result.dense_executed;
@@ -778,6 +815,7 @@ impl AstraVectorV004ControlService {
                     rank: local_rank,
                     score: hit.score,
                     segment_weight: result.segment_weight,
+                    intent_unit_ids: intent_unit_ids.clone(),
                 });
             }
         }
@@ -947,6 +985,7 @@ impl AstraVectorV004ControlService {
         Ok(SegmentQdrantResult {
             segment_index: segment.index,
             segment_weight: segment.weight,
+            intent_unit_ids: segment.intent_unit_ids.clone(),
             hits,
             dense_executed: wants_dense && !dense_failed,
             sparse_executed: wants_sparse && !sparse_failed,
@@ -1612,6 +1651,7 @@ fn coverage_for_results(plan: &QueryPlan, results: &[pb::SearchResultV004]) -> Q
                 QueryEvidenceStatus::Found
             },
             uncovered_required_segment_indices: if covered == 0 { vec![0] } else { Vec::new() },
+            uncovered_required_intent_ids: Vec::new(),
         };
     }
     let covered_segments = results
@@ -1625,7 +1665,21 @@ fn coverage_for_results(plan: &QueryPlan, results: &[pb::SearchResultV004]) -> Q
             }
         })
         .collect::<HashSet<_>>();
-    evaluate_required_coverage(&plan.segments, &covered_segments)
+    if plan.intent_units.is_empty() {
+        return evaluate_required_coverage(&plan.segments, &covered_segments);
+    }
+    let covered_intent_ids = plan
+        .intent_units
+        .iter()
+        .filter(|intent| {
+            intent
+                .source_segment_indices
+                .iter()
+                .any(|index| covered_segments.contains(index))
+        })
+        .map(|intent| intent.id)
+        .collect::<HashSet<_>>();
+    evaluate_intent_coverage(&plan.intent_units, &covered_intent_ids)
 }
 
 fn reserve_required_segment_coverage(
@@ -1800,6 +1854,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         request: Request<pb::SearchRequestV004>,
     ) -> Result<Response<pb::SearchResponseV004>, Status> {
         let started = std::time::Instant::now();
+        let request_timing = request
+            .extensions()
+            .get::<RequestTiming>()
+            .copied()
+            .unwrap_or_else(|| RequestTiming::from_request(&request));
         let r = request.into_inner();
         let mut ranking_trace = RankingTraceCollector::new(
             r.include_debug && self.cfg.search.ranking_trace.enabled,
@@ -1919,10 +1978,56 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         .map_err(query_planning_status)?;
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
         let timeout_ms =
-            effective_query_timeout_ms(r.timeout_ms as u64, query_plan.mode, &self.cfg)
-                .min(query_plan.limits.deadline_ms);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            effective_query_timeout_ms(r.timeout_ms as u64, query_plan.limits.deadline_ms);
+        let server_deadline = request_timing.started + Duration::from_millis(timeout_ms);
+        let deadline = request_timing
+            .transport_deadline
+            .map_or(server_deadline, |transport| transport.min(server_deadline));
+        if deadline <= Instant::now() {
+            return Err(Status::deadline_exceeded(
+                "query deadline exhausted during planning",
+            ));
+        }
+        let timeout_ms = deadline
+            .saturating_duration_since(request_timing.started)
+            .as_millis() as u64;
         let request_cancel = self.shutdown.child_token();
+        let _request_cancel_guard = RequestCancellationGuard(request_cancel.clone());
+        let admission_timeout_ms = self
+            .cfg
+            .limits
+            .backpressure_acquire_timeout_ms
+            .min(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+            )
+            .max(1);
+        let _retrieve_permit = Self::acquire_backpressure_permit(
+            self.retrieve_context_semaphore.clone(),
+            admission_timeout_ms,
+            "retrieve_context",
+            query_plan.limits.admission_weight,
+            &request_cancel,
+        )
+        .await
+        .inspect_err(|_status| {
+            tracing::warn!(
+                correlation_id = %r.correlation_id,
+                tier = query_plan.tier.code(),
+                admission_weight = query_plan.limits.admission_weight,
+                reason = "retrieve_context_admission_timeout",
+                "RETRIEVE_CONTEXT_ADMISSION_REJECTED"
+            );
+        })?;
+        gauge!("retrieval_concurrent_active").set(
+            (self
+                .cfg
+                .limits
+                .max_concurrent_retrieve_context
+                .saturating_sub(self.retrieve_context_semaphore.available_permits()))
+                as f64,
+        );
         let qdrant_budget = OperationBudget {
             deadline,
             cancellation: request_cancel.clone(),
@@ -2666,6 +2771,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     direct_results.clear();
                     counter!("astravector_long_query_partial_coverage_total").increment(1);
                 }
+                QueryEvidenceStatus::Unavailable => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_COVERAGE_UNAVAILABLE".into(),
+                        message: "required long-query coverage could not be evaluated".into(),
+                    });
+                    direct_results.clear();
+                    counter!("astravector_long_query_coverage_unavailable_total").increment(1);
+                }
             }
         }
         ranking_trace.mark_removed(
@@ -2707,12 +2820,32 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let strong_lexical_evidence = matched_terms >= 2
                 && matched_discriminating_terms >= 1
                 && matched_terms.saturating_mul(2) >= query_term_count(query);
+            let matched_segment_indices = {
+                let passed = result_passed_query_segment_indices(result);
+                if passed.is_empty() {
+                    result_query_segment_indices(result)
+                } else {
+                    passed
+                }
+            };
+            let intent_unit_ids = query_plan
+                .intent_units
+                .iter()
+                .filter(|intent| {
+                    intent
+                        .source_segment_indices
+                        .iter()
+                        .any(|index| matched_segment_indices.contains(index))
+                })
+                .map(|intent| intent.id)
+                .collect();
             graph_seed_candidates.push(GraphSeedCandidate {
                 key,
                 score: seed_score,
                 matched_terms,
                 matched_discriminating_terms,
                 strong_lexical_evidence,
+                intent_unit_ids,
             });
             seed_scores.entry(key).or_insert(seed_score);
             let source_block_id = result
@@ -2732,9 +2865,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 )
             });
         }
-        let mut seen_graph_seed_keys = HashSet::new();
-        graph_seed_candidates.retain(|candidate| seen_graph_seed_keys.insert(candidate.key));
-        graph_seed_candidates.sort_by(compare_graph_seed_candidates);
+        let required_intent_ids = query_plan
+            .intent_units
+            .iter()
+            .filter(|intent| intent.required)
+            .map(|intent| intent.id)
+            .collect::<Vec<_>>();
+        graph_seed_candidates = select_graph_seed_candidates(
+            graph_seed_candidates,
+            &required_intent_ids,
+            query_plan.limits.max_graph_seeds.min(12),
+        );
         let graph_seed_keys = graph_seed_candidates
             .iter()
             .map(|candidate| candidate.key)
@@ -2792,6 +2933,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 self.graph_expansion_semaphore.clone(),
                 self.cfg.limits.backpressure_acquire_timeout_ms,
                 "graph_expansion",
+                1,
+                &request_cancel,
             )
             .await;
             if maybe_graph_permit.is_err() {
@@ -2839,7 +2982,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     graph_seed_keys_count = graph_seed_keys.len(),
                     graph_seed_preview = %graph_seed_preview,
                     max_related,
-                    max_seed_chunks = self.cfg.graph_rag.retrieval.max_seed_chunks,
+                    max_seed_chunks = query_plan.limits.max_graph_seeds.min(12),
                     max_edges_visited = self.cfg.graph_rag.retrieval.max_edges_visited,
                     allowed_relations = ?self.cfg.graph_rag.retrieval.allowed_relations,
                     "GRAPH_EXPANSION_CALL"
@@ -2848,12 +2991,18 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     &graph_seed_keys,
                     caller_access_level as i16,
                     max_related,
-                    self.cfg.graph_rag.retrieval.max_seed_chunks,
+                    query_plan.limits.max_graph_seeds.min(12),
                     self.cfg.graph_rag.retrieval.max_edges_visited,
                     &self.cfg.graph_rag.retrieval.allowed_relations,
                     quality_run_id_filter.as_deref(),
                 );
-                match tokio::time::timeout(graph_timeout, graph_call).await {
+                let graph_outcome = tokio::select! {
+                    _ = request_cancel.cancelled() => {
+                        return Err(Status::cancelled("query cancelled during graph expansion"));
+                    }
+                    outcome = tokio::time::timeout(graph_timeout, graph_call) => outcome,
+                };
+                match graph_outcome {
                     Ok(Ok(related)) => {
                         let related_preview = related
                             .iter()
@@ -3150,6 +3299,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             self.mmr_fetch_semaphore.clone(),
             self.cfg.limits.backpressure_acquire_timeout_ms,
             "mmr_fetch",
+            1,
+            &request_cancel,
         )
         .await
         {
@@ -3161,16 +3312,20 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .saturating_sub(self.mmr_fetch_semaphore.available_permits()))
                     as f64,
             );
-            enrich_dense_embeddings_for_mmr(
-                self.repo.as_ref(),
-                &access_zone_ids,
-                &mut direct_results,
-                &mut graph_results,
-                &self.cfg,
-                embedding_fetch_limit,
-                mmr_fetch_timeout,
-            )
-            .await
+            tokio::select! {
+                _ = request_cancel.cancelled() => {
+                    return Err(Status::cancelled("query cancelled during MMR embedding fetch"));
+                }
+                stats = enrich_dense_embeddings_for_mmr(
+                    self.repo.as_ref(),
+                    &access_zone_ids,
+                    &mut direct_results,
+                    &mut graph_results,
+                    &self.cfg,
+                    embedding_fetch_limit,
+                    mmr_fetch_timeout,
+                ) => stats,
+            }
         } else {
             if !self
                 .cfg
@@ -3451,6 +3606,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         message: "final result set covers no required query segments".into(),
                     });
                     results.clear();
+                }
+                QueryEvidenceStatus::Unavailable => {
+                    warnings.push(pb::DiagnosticWarningV005 {
+                        code: "LONG_QUERY_COVERAGE_UNAVAILABLE".into(),
+                        message: "final required segment coverage could not be evaluated".into(),
+                    });
+                    results.clear();
+                    counter!("astravector_long_query_coverage_unavailable_total").increment(1);
                 }
             }
         }
@@ -4170,6 +4333,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
     ) -> Result<Response<pb::ExplainSearchResponse>, Status> {
         self.require_internal_or_admin(request.metadata())?;
         let started = std::time::Instant::now();
+        let request_timing = request
+            .extensions()
+            .get::<RequestTiming>()
+            .copied()
+            .unwrap_or_else(|| RequestTiming::from_request(&request));
         let r = request.into_inner();
         let query = r.query.trim();
         if query.is_empty() {
@@ -4214,9 +4382,33 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         )
         .map_err(query_planning_status)?;
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
-        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, query_plan.mode, &self.cfg);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, query_plan.limits.deadline_ms);
+        let server_deadline = request_timing.started + Duration::from_millis(timeout_ms);
+        let deadline = request_timing
+            .transport_deadline
+            .map_or(server_deadline, |transport| transport.min(server_deadline));
+        if deadline <= Instant::now() {
+            return Err(Status::deadline_exceeded(
+                "explain deadline exhausted during planning",
+            ));
+        }
+        let timeout_ms = deadline
+            .saturating_duration_since(request_timing.started)
+            .as_millis() as u64;
         let request_cancel = self.shutdown.child_token();
+        let _request_cancel_guard = RequestCancellationGuard(request_cancel.clone());
+        let _retrieve_permit = Self::acquire_backpressure_permit(
+            self.retrieve_context_semaphore.clone(),
+            self.cfg.limits.backpressure_acquire_timeout_ms.min(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+            ),
+            "explain_search",
+            query_plan.limits.admission_weight,
+            &request_cancel,
+        )
+        .await?;
         let remaining_budget_after_planning_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis() as u64;
@@ -5943,34 +6135,8 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
         &self,
         request: Request<pb::RetrieveContextRequest>,
     ) -> Result<Response<pb::RetrieveContextResponse>, Status> {
+        let request_timing = RequestTiming::from_request(&request);
         let metadata = request.metadata().clone();
-        let admission_correlation_id = request
-            .get_ref()
-            .context
-            .as_ref()
-            .map(|context| context.correlation_id.as_str())
-            .unwrap_or("");
-        let _retrieve_permit = Self::acquire_backpressure_permit(
-            self.retrieve_context_semaphore.clone(),
-            self.cfg.limits.backpressure_acquire_timeout_ms,
-            "retrieve_context",
-        )
-        .await
-        .inspect_err(|_status| {
-            tracing::warn!(
-                correlation_id = admission_correlation_id,
-                reason = "retrieve_context_admission_timeout",
-                "RETRIEVE_CONTEXT_ADMISSION_REJECTED"
-            );
-        })?;
-        gauge!("retrieval_concurrent_active").set(
-            (self
-                .cfg
-                .limits
-                .max_concurrent_retrieve_context
-                .saturating_sub(self.retrieve_context_semaphore.available_permits()))
-                as f64,
-        );
         if self.cfg.security.enabled {
             self.require_trusted_forwarded_identity_headers(&metadata)?;
         }
@@ -6043,6 +6209,7 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
             access_zone_codes: r.access_zone_codes,
         });
         *inner.metadata_mut() = metadata;
+        inner.extensions_mut().insert(request_timing);
         let search = <Self as AstraVectorV004Control>::search(self, inner)
             .await?
             .into_inner();
@@ -6119,6 +6286,7 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
         &self,
         request: Request<pb::ExplainRetrieveRequest>,
     ) -> Result<Response<pb::ExplainRetrieveResponse>, Status> {
+        let request_timing = RequestTiming::from_request(&request);
         let metadata = request.metadata().clone();
         if self.cfg.security.enabled {
             self.require_trusted_forwarded_identity_headers(&metadata)?;
@@ -6150,6 +6318,7 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
             chunking_version: None,
         });
         *inner.metadata_mut() = metadata;
+        inner.extensions_mut().insert(request_timing);
         let explain = <Self as AstraVectorV004Control>::explain_search(self, inner)
             .await?
             .into_inner();
@@ -7355,8 +7524,7 @@ impl AstraVectorRuntime for AstraVectorService {
                 "SPARSE_UNAVAILABLE: sparse embedding requested but loaded ONNX artifact has no sparse output",
             ));
         }
-        let timeout_ms =
-            effective_query_timeout_ms(r.timeout_ms, QueryProcessingMode::Single, &self.cfg);
+        let timeout_ms = effective_query_timeout_ms(r.timeout_ms, self.cfg.grpc.deadlines.query_ms);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let result = self
             .scheduler
@@ -10963,6 +11131,58 @@ struct GraphSeedCandidate {
     matched_terms: usize,
     matched_discriminating_terms: usize,
     strong_lexical_evidence: bool,
+    intent_unit_ids: Vec<usize>,
+}
+
+fn select_graph_seed_candidates(
+    candidates: Vec<GraphSeedCandidate>,
+    required_intent_ids: &[usize],
+    limit: usize,
+) -> Vec<GraphSeedCandidate> {
+    let mut by_key = HashMap::<(Uuid, Uuid), GraphSeedCandidate>::new();
+    for candidate in candidates {
+        by_key
+            .entry(candidate.key)
+            .and_modify(|existing| {
+                if compare_graph_seed_candidates(&candidate, existing).is_lt() {
+                    existing.score = candidate.score;
+                    existing.matched_terms = candidate.matched_terms;
+                    existing.matched_discriminating_terms = candidate.matched_discriminating_terms;
+                    existing.strong_lexical_evidence = candidate.strong_lexical_evidence;
+                }
+                for intent_id in &candidate.intent_unit_ids {
+                    if !existing.intent_unit_ids.contains(intent_id) {
+                        existing.intent_unit_ids.push(*intent_id);
+                    }
+                }
+                existing.intent_unit_ids.sort_unstable();
+            })
+            .or_insert(candidate);
+    }
+    let mut ranked = by_key.into_values().collect::<Vec<_>>();
+    ranked.sort_by(compare_graph_seed_candidates);
+    let mut selected_keys = HashSet::new();
+    let mut selected = Vec::new();
+    for intent_id in required_intent_ids {
+        if let Some(candidate) = ranked.iter().find(|candidate| {
+            candidate.intent_unit_ids.contains(intent_id) && !selected_keys.contains(&candidate.key)
+        }) {
+            selected_keys.insert(candidate.key);
+            selected.push(candidate.clone());
+            if selected.len() == limit {
+                return selected;
+            }
+        }
+    }
+    for candidate in ranked {
+        if selected_keys.insert(candidate.key) {
+            selected.push(candidate);
+            if selected.len() == limit {
+                break;
+            }
+        }
+    }
+    selected
 }
 
 fn compare_graph_seed_candidates(
@@ -12500,6 +12720,14 @@ fn deadline_from(m: &MetadataMap, fallback: u64) -> Instant {
         .unwrap_or(Duration::from_millis(fallback));
     Instant::now() + d
 }
+
+fn grpc_transport_deadline(metadata: &MetadataMap, started: Instant) -> Option<Instant> {
+    metadata
+        .get("grpc-timeout")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_timeout)
+        .map(|timeout| started + timeout)
+}
 fn parse_timeout(s: &str) -> Option<Duration> {
     // gRPC timeout format is <digits><unit>, e.g. "100m", "2S", "1H".
     // fix463: split into (number, unit). The previous code inverted these and
@@ -12520,11 +12748,7 @@ fn parse_timeout(s: &str) -> Option<Duration> {
     })
 }
 
-fn effective_query_timeout_ms(requested: u64, mode: QueryProcessingMode, cfg: &AppConfig) -> u64 {
-    let configured_max = match mode {
-        QueryProcessingMode::Single => cfg.grpc.deadlines.query_ms,
-        QueryProcessingMode::Segmented => cfg.search.query_processing.long_query_deadline_ms,
-    };
+fn effective_query_timeout_ms(requested: u64, configured_max: u64) -> u64 {
     if requested == 0 {
         configured_max
     } else {
@@ -12542,11 +12766,17 @@ mod fix483p_long_query_hardening_tests {
             index,
             text: text.into(),
             token_count: text.split_whitespace().count(),
+            source_token_start: index,
+            source_token_end: index + text.split_whitespace().count(),
+            source_byte_start: 0,
+            source_byte_end: text.len(),
             kind: QuerySegmentKind::Question,
             has_question_form: true,
             has_technical_identifier: false,
+            searchable: true,
             weight: 1.0,
             required_for_coverage: true,
+            intent_unit_ids: Vec::new(),
             sha256: format!("segment-{index}"),
         }
     }
@@ -12577,15 +12807,15 @@ mod fix483p_long_query_hardening_tests {
     fn long_query_deadline_is_selected_and_client_timeout_caps_it() {
         let cfg = AppConfig::load().expect("load test config");
         assert_eq!(
-            effective_query_timeout_ms(0, QueryProcessingMode::Single, &cfg),
+            effective_query_timeout_ms(0, cfg.grpc.deadlines.query_ms),
             cfg.grpc.deadlines.query_ms
         );
         assert_eq!(
-            effective_query_timeout_ms(0, QueryProcessingMode::Segmented, &cfg),
-            cfg.search.query_processing.long_query_deadline_ms
+            effective_query_timeout_ms(0, cfg.search.query_processing.standard.deadline_ms),
+            cfg.search.query_processing.standard.deadline_ms
         );
         assert_eq!(
-            effective_query_timeout_ms(25, QueryProcessingMode::Segmented, &cfg),
+            effective_query_timeout_ms(25, cfg.search.query_processing.standard.deadline_ms),
             25
         );
     }
@@ -12596,10 +12826,17 @@ mod fix483p_long_query_hardening_tests {
             original_query: "background unrelated words and legal hold cleanup".into(),
             original_token_count: 7,
             mode: QueryProcessingMode::Segmented,
+            tier: QueryProcessingTier::SegmentedStandard,
+            profile_version: "test".into(),
+            limits: crate::query_processing::EffectiveQueryProcessingLimits::for_segmented(
+                &crate::config::QueryProcessingConfig::default(),
+                &crate::config::QueryProcessingConfig::default().standard,
+            ),
             segments: vec![
                 segment(0, "background unrelated words"),
                 segment(1, "legal hold cleanup"),
             ],
+            intent_units: Vec::new(),
         };
         let mut results = vec![result_for_segment(
             1,
@@ -12631,7 +12868,14 @@ mod fix483p_long_query_hardening_tests {
             original_query: "first question second question".into(),
             original_token_count: 4,
             mode: QueryProcessingMode::Segmented,
+            tier: QueryProcessingTier::SegmentedStandard,
+            profile_version: "test".into(),
+            limits: crate::query_processing::EffectiveQueryProcessingLimits::for_segmented(
+                &crate::config::QueryProcessingConfig::default(),
+                &crate::config::QueryProcessingConfig::default().standard,
+            ),
             segments: vec![segment(0, "first question"), segment(1, "second question")],
+            intent_units: Vec::new(),
         };
         let mut results = vec![
             result_for_segment(0, "first evidence", 0.9),
@@ -12645,6 +12889,52 @@ mod fix483p_long_query_hardening_tests {
                 .and_then(|citation| citation.metadata.get("ranking_protection"))
                 .is_some_and(|value| value.contains("REQUIRED_SEGMENT_COVERAGE"))
         }));
+    }
+
+    #[tokio::test]
+    async fn weighted_admission_permit_is_released_on_drop() {
+        let semaphore = Arc::new(Semaphore::new(6));
+        let cancellation = CancellationToken::new();
+        let permit = AstraVectorV004ControlService::acquire_backpressure_permit(
+            semaphore.clone(),
+            50,
+            "test_weighted_admission",
+            3,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(semaphore.available_permits(), 3);
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 6);
+    }
+
+    #[tokio::test]
+    async fn weighted_admission_honors_cancellation_without_leaking() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = AstraVectorV004ControlService::acquire_backpressure_permit(
+            semaphore.clone(),
+            50,
+            "test_weighted_admission",
+            2,
+            &cancellation,
+        )
+        .await
+        .err()
+        .expect("cancelled admission must fail");
+        assert_eq!(error.code(), tonic::Code::Cancelled);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn transport_deadline_is_measured_from_request_receipt() {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("grpc-timeout", "25m".parse().unwrap());
+        let started = Instant::now();
+        let deadline = grpc_transport_deadline(&metadata, started).unwrap();
+        assert_eq!(deadline.duration_since(started), Duration::from_millis(25));
     }
 }
 
@@ -13353,6 +13643,7 @@ mod v007_fix1_tests {
             matched_terms: 1,
             matched_discriminating_terms: 0,
             strong_lexical_evidence: false,
+            intent_unit_ids: Vec::new(),
         };
         let strong_lower_score = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(20)),
@@ -13360,6 +13651,7 @@ mod v007_fix1_tests {
             matched_terms: 3,
             matched_discriminating_terms: 2,
             strong_lexical_evidence: true,
+            intent_unit_ids: vec![0],
         };
         let strong_stable_tie = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(10)),
@@ -13367,6 +13659,7 @@ mod v007_fix1_tests {
             matched_terms: 3,
             matched_discriminating_terms: 2,
             strong_lexical_evidence: true,
+            intent_unit_ids: vec![1],
         };
         let mut candidates = [weak_high_score, strong_lower_score, strong_stable_tie];
 
@@ -13375,6 +13668,29 @@ mod v007_fix1_tests {
         assert_eq!(candidates[0].key.1, Uuid::from_u128(10));
         assert_eq!(candidates[1].key.1, Uuid::from_u128(20));
         assert_eq!(candidates[2].key.1, Uuid::from_u128(30));
+    }
+
+    #[test]
+    fn graph_seed_selection_reserves_required_intents_and_enforces_cap() {
+        let zone = Uuid::from_u128(1);
+        let candidates = (0..15)
+            .map(|index| GraphSeedCandidate {
+                key: (zone, Uuid::from_u128(index + 1)),
+                score: 1.0 - index as f32 / 100.0,
+                matched_terms: 2,
+                matched_discriminating_terms: 1,
+                strong_lexical_evidence: true,
+                intent_unit_ids: if index == 14 { vec![2] } else { vec![1] },
+            })
+            .collect();
+        let selected = select_graph_seed_candidates(candidates, &[1, 2], 12);
+        assert_eq!(selected.len(), 12);
+        assert!(selected
+            .iter()
+            .any(|candidate| candidate.intent_unit_ids.contains(&1)));
+        assert!(selected
+            .iter()
+            .any(|candidate| candidate.intent_unit_ids.contains(&2)));
     }
 
     #[test]

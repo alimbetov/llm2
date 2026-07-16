@@ -1,8 +1,8 @@
 {
-  "blind_candidates_total": 1061,
-  "blind_template_sha256": "067b3dccb01f3c3043d719b3c73d0dc7cafd5f78ddc460225241416ccd3790ad",
-  "candidate_pool_sha256": "196832311da646e6de66bcae1b8db1985dd5fe097308721d1576b7146b2a93fd",
-  "candidate_pool_total": 1061,
+  "blind_candidates_total": 1052,
+  "blind_template_sha256": "b46ee1170d630d14b4fd04e6fc56343bf6140f3b37e2605419e2310f7a65a583",
+  "candidate_pool_sha256": "9cb23e4f31b771ca3d80a7fa9964945c8ddc85f6d1fe97fc994fd5435211bf62",
+  "candidate_pool_total": 1052,
   "candidate_selection": {
     "runtime_rank_independent": true,
     "sources": [
@@ -15,21 +15,21 @@
     "uses_expected_labels_for_selection": false,
     "uses_production_ranking_output": false
   },
-  "corpus_sha256": "fa3ff5fb468229d76a59d40b66d3172e483b311dd3b72e5f3976a67d30b3d748",
-  "dense_result_sha256": "4c1bcb7fc66f2fc8cccde4b4b5a345bcbc4f07a9defddcdf536e50b8e0296e46",
+  "corpus_sha256": "c5d1d5e6dc8c8304170fd5b24356d42dafc2f3321762dfa0ee336aee0b1617a8",
+  "dense_result_sha256": "454add9ed10825bbada389b8fe52f4b11be53df49588eb97c74b29587951e1f1",
   "dense_run_id": "fix482-rag-quality-bank-v1-dense",
-  "effective_config_sha256": "d0377e56dbc9296cf07c3ad30fd6cb036e9abd98ac4e49b6f3c056a16b4beea4",
-  "git_sha": "d405a5bb276070be4a42f7eb29fffe6a37d58330",
-  "hybrid_graph_result_sha256": "9197d1ab6e4cef8a521ffb1fd43a17acc3e8851dfb10063e218d569d68869d2b",
+  "effective_config_sha256": "6d327451475a866c4687b8de2ff75090cebda3eccb54abbb801bdbec1d533d16",
+  "git_sha": "9817c4b03d401efbc59bcbcdff00583a890f8e55",
+  "hybrid_graph_result_sha256": "04a98f311a443a415f01a39db1e062ff124dfd5f1faf643e1dfd5fa4ea1a3d3f",
   "hybrid_graph_run_id": "fix482-rag-quality-bank-v1-hybrid_graph",
-  "hybrid_result_sha256": "205e4349b098c3964d9a87c7f76aaa68290593a1c399233583bbb249e690508c",
+  "hybrid_result_sha256": "0f2d392d90b4980894d81aca4ff60628a11d49f411b7c132fe019dacc3e31a50",
   "hybrid_run_id": "fix482-rag-quality-bank-v1-hybrid",
-  "identity_map_sha256": "666d4f640e225e7108011224a9b59c98b051db88387a57d78ddfa8a4133c18eb",
+  "identity_map_sha256": "b13f9bd9678cef595aef127764537f3ac0abf136329a60f476a3f4009239eff7",
   "judged_candidates_total": 0,
   "minimum_pool_source_count": 4,
   "model_sha256": "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
   "pool_depth": 20,
-  "postgres_fts_result_sha256": "0f4f3fe4cf8bde205eda43cc5f22fe38ff093b697d0173d20f51cca91d7a10b3",
+  "postgres_fts_result_sha256": "2b8dd52e19fe9c0fbb670da9bd8ab309d132f5151a297daa4982bde37c9450b8",
   "postgres_fts_run_id": "fix482-rag-quality-bank-v1-postgres_fts",
   "profile": "rag-quality-bank-v1",
   "qrels_complete": false,
@@ -290,8 +290,8 @@
       "reason": null
     },
     {
-      "available_corpus_blocks": 118,
-      "candidate_count": 30,
+      "available_corpus_blocks": 176,
+      "candidate_count": 28,
       "candidate_counts_by_source": {
         "dense": 20,
         "hybrid": 20,
@@ -455,8 +455,8 @@
       "reason": null
     },
     {
-      "available_corpus_blocks": 118,
-      "candidate_count": 25,
+      "available_corpus_blocks": 176,
+      "candidate_count": 26,
       "candidate_counts_by_source": {
         "dense": 20,
         "hybrid": 20,
@@ -470,7 +470,7 @@
       "reason": null
     },
     {
-      "available_corpus_blocks": 118,
+      "available_corpus_blocks": 176,
       "candidate_count": 26,
       "candidate_counts_by_source": {
         "dense": 20,
@@ -485,8 +485,8 @@
       "reason": null
     },
     {
-      "available_corpus_blocks": 118,
-      "candidate_count": 28,
+      "available_corpus_blocks": 24,
+      "candidate_count": 20,
       "candidate_counts_by_source": {
         "dense": 20,
         "hybrid": 20,
@@ -666,14 +666,14 @@
     }
   ],
   "queries_total": 42,
-  "query_bank_sha256": "8508d2f6429ce21140a1db46521b7140ce07d5a60432b5259685f154aacf5cc4",
-  "retrieval_sources_sha256": "44517221b94ff4122587711b3fb56b386415ee63d0ad43c53781a4497bb4f674",
-  "runtime_binary_sha256": "ab90d97e17594698b2ba92a41fe7eac70ce4efca9785a22d66fe56f4155d506b",
+  "query_bank_sha256": "1252438ea30442a6bdb39db647b9cc31ccc0b6f87fbb7a146f3fd948ef4ba045",
+  "retrieval_sources_sha256": "b155f6644e28278060868965ec883c25a5997e64b20d56d18b6bc74acc579e7f",
+  "runtime_binary_sha256": "9fab0794453eaa4c072efbfb8ab90bbeecc9210d588cb3dca3073cd2b98e0e65",
   "schema_version": 1,
-  "sparse_result_sha256": "b58427270d94af2659016c62e08da97e19e0825ef27ebcc4b93fa00927d71ea1",
+  "sparse_result_sha256": "ed4b7536006fe14652fb0b4be0293e59ea45e1167a7bec895d0588b163b436be",
   "sparse_run_id": "fix482-rag-quality-bank-v1-sparse",
   "status": "AWAITING_BLIND_JUDGMENT",
   "status_failures": [],
   "tokenizer_sha256": "21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08",
-  "unjudged_candidates_total": 1061
+  "unjudged_candidates_total": 1052
 }

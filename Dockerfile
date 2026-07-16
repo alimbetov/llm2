@@ -1,7 +1,7 @@
-FROM rust:1.96-trixie AS builder
+FROM rust:1.88-trixie AS builder
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bins
+RUN cargo build --locked --release --bins
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgomp1 && rm -rf /var/lib/apt/lists/*
