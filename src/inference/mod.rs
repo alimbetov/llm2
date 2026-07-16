@@ -266,10 +266,8 @@ impl InferenceEngine for OnnxBgeM3Engine {
         max_length: usize,
         allow_truncation: bool,
     ) -> Result<usize, AstraError> {
-        Ok(self
-            .tokenizer
-            .encode(text, max_length, allow_truncation)?
-            .token_count)
+        self.tokenizer
+            .count_canonical_tokens(text, max_length, allow_truncation)
     }
     fn token_offsets(&self, text: &str) -> Result<Vec<TokenOffset>, AstraError> {
         self.tokenizer.token_offsets(text)
