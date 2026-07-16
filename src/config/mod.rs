@@ -2219,6 +2219,41 @@ impl AppConfig {
             qp.long_query_deadline_ms >= self.grpc.deadlines.query_ms,
             "search.query_processing.long_query_deadline_ms must be >= normal query deadline"
         );
+        anyhow::ensure!(
+            qp.standard.max_tokens > query_max
+                && qp.standard.max_tokens < qp.extended.max_tokens
+                && qp.extended.max_tokens <= 2_048,
+            "query processing tiers must satisfy single < standard < extended <= 2048"
+        );
+        for (name, tier) in [("standard", &qp.standard), ("extended", &qp.extended)] {
+            anyhow::ensure!(
+                tier.max_segments >= 2 && tier.max_segments <= 16,
+                "search.query_processing.{name}.max_segments must be between 2 and 16"
+            );
+            anyhow::ensure!(
+                tier.max_parallel_segments > 0 && tier.max_parallel_segments <= tier.max_segments,
+                "search.query_processing.{name}.max_parallel_segments is invalid"
+            );
+            anyhow::ensure!(
+                tier.max_parallel_lexical_segments > 0
+                    && tier.max_parallel_lexical_segments <= tier.max_segments,
+                "search.query_processing.{name}.max_parallel_lexical_segments is invalid"
+            );
+            anyhow::ensure!(
+                tier.local_fused_candidate_limit > 0
+                    && tier.global_fused_candidate_limit >= tier.local_fused_candidate_limit
+                    && tier.global_fused_candidate_limit <= self.limits.search_candidate_limit_max,
+                "search.query_processing.{name} candidate limits are invalid"
+            );
+            anyhow::ensure!(
+                tier.deadline_ms >= self.grpc.deadlines.query_ms,
+                "search.query_processing.{name}.deadline_ms must be >= normal query deadline"
+            );
+            anyhow::ensure!(
+                tier.admission_weight > 0,
+                "search.query_processing.{name}.admission_weight must be positive"
+            );
+        }
 
         anyhow::ensure!(
             self.ingestion.max_blocks_per_document > 0,
@@ -2519,9 +2554,65 @@ pub struct SearchConfig {
     pub no_answer: NoAnswerConfig,
 }
 #[derive(Debug, Clone, Deserialize)]
+pub struct QueryProcessingTierConfig {
+    pub max_tokens: usize,
+    pub max_segments: usize,
+    pub dense_candidate_limit: u32,
+    pub sparse_candidate_limit: u32,
+    pub lexical_candidate_limit: u32,
+    pub local_fused_candidate_limit: u32,
+    pub global_fused_candidate_limit: u32,
+    pub max_parallel_segments: usize,
+    pub max_parallel_lexical_segments: usize,
+    pub deadline_ms: u64,
+    pub max_graph_seeds: usize,
+    pub admission_weight: u32,
+}
+
+impl QueryProcessingTierConfig {
+    fn standard() -> Self {
+        Self {
+            max_tokens: 1_024,
+            max_segments: 7,
+            dense_candidate_limit: 18,
+            sparse_candidate_limit: 18,
+            lexical_candidate_limit: 12,
+            local_fused_candidate_limit: 18,
+            global_fused_candidate_limit: 100,
+            max_parallel_segments: 3,
+            max_parallel_lexical_segments: 2,
+            deadline_ms: 3_000,
+            max_graph_seeds: 8,
+            admission_weight: 3,
+        }
+    }
+
+    fn extended() -> Self {
+        Self {
+            max_tokens: 2_048,
+            max_segments: 14,
+            dense_candidate_limit: 10,
+            sparse_candidate_limit: 10,
+            lexical_candidate_limit: 8,
+            local_fused_candidate_limit: 10,
+            global_fused_candidate_limit: 140,
+            max_parallel_segments: 3,
+            max_parallel_lexical_segments: 2,
+            deadline_ms: 6_000,
+            max_graph_seeds: 10,
+            admission_weight: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueryProcessingConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub extended_enabled: bool,
+    #[serde(default = "default_query_profile_version")]
+    pub profile_version: String,
     #[serde(default = "default_long_query_absolute_max_tokens")]
     pub absolute_max_tokens: usize,
     #[serde(default = "default_long_query_absolute_max_bytes")]
@@ -2532,6 +2623,7 @@ pub struct QueryProcessingConfig {
     pub segment_max_tokens: usize,
     #[serde(default = "default_query_segment_overlap_tokens")]
     pub segment_overlap_tokens: usize,
+    // v008 compatibility aliases. Runtime limits resolve from standard/extended.
     #[serde(default = "default_query_max_segments")]
     pub max_segments: usize,
     #[serde(default = "default_query_max_parallel_segments")]
@@ -2552,11 +2644,24 @@ pub struct QueryProcessingConfig {
     pub context_segment_weight: f32,
     #[serde(default = "default_long_query_deadline_ms")]
     pub long_query_deadline_ms: u64,
+    #[serde(default = "default_single_query_deadline_ms")]
+    pub single_deadline_ms: u64,
+    #[serde(default = "default_single_graph_seeds")]
+    pub single_graph_seeds: usize,
+    #[serde(default = "default_single_admission_weight")]
+    pub single_admission_weight: u32,
+    #[serde(default = "QueryProcessingTierConfig::standard")]
+    pub standard: QueryProcessingTierConfig,
+    #[serde(default = "QueryProcessingTierConfig::extended")]
+    pub extended: QueryProcessingTierConfig,
 }
+
 impl Default for QueryProcessingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            extended_enabled: false,
+            profile_version: default_query_profile_version(),
             absolute_max_tokens: default_long_query_absolute_max_tokens(),
             absolute_max_bytes: default_long_query_absolute_max_bytes(),
             segment_target_tokens: default_query_segment_target_tokens(),
@@ -2572,11 +2677,20 @@ impl Default for QueryProcessingConfig {
             technical_segment_weight: default_technical_segment_weight(),
             context_segment_weight: default_context_segment_weight(),
             long_query_deadline_ms: default_long_query_deadline_ms(),
+            single_deadline_ms: default_single_query_deadline_ms(),
+            single_graph_seeds: default_single_graph_seeds(),
+            single_admission_weight: default_single_admission_weight(),
+            standard: QueryProcessingTierConfig::standard(),
+            extended: QueryProcessingTierConfig::extended(),
         }
     }
 }
+
+fn default_query_profile_version() -> String {
+    "tiered-query-v1".into()
+}
 fn default_long_query_absolute_max_tokens() -> usize {
-    1024
+    2_048
 }
 fn default_long_query_absolute_max_bytes() -> usize {
     65_536
@@ -2591,7 +2705,7 @@ fn default_query_segment_overlap_tokens() -> usize {
     24
 }
 fn default_query_max_segments() -> usize {
-    6
+    7
 }
 fn default_query_max_parallel_segments() -> usize {
     3
@@ -2600,7 +2714,7 @@ fn default_query_max_parallel_lexical_segments() -> usize {
     2
 }
 fn default_query_per_segment_candidate_limit() -> u32 {
-    20
+    18
 }
 fn default_query_global_candidate_limit() -> u32 {
     100
@@ -2619,6 +2733,15 @@ fn default_context_segment_weight() -> f32 {
 }
 fn default_long_query_deadline_ms() -> u64 {
     3_000
+}
+fn default_single_query_deadline_ms() -> u64 {
+    1_000
+}
+fn default_single_graph_seeds() -> usize {
+    5
+}
+fn default_single_admission_weight() -> u32 {
+    1
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct FusionSearchConfig {

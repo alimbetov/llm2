@@ -79,7 +79,7 @@ sparse:
   version: bge_m3_sparse_max_top256_v1_onnx_int8
 
 tokenization:
-  query: { max_length: 256, truncation_allowed: true }
+  query: { max_length: 256, truncation_allowed: false }
   child: { max_length: 512, truncation_allowed: false }
   parent: { enabled: false, max_length: 2048, truncation_allowed: false }
 
@@ -175,21 +175,52 @@ search:
   rrf_k: ${ASTRAVECTOR_SEARCH_RRF_K:-60}
   query_processing:
     enabled: ${ASTRAVECTOR_LONG_QUERY_ENABLED:-true}
-    absolute_max_tokens: ${ASTRAVECTOR_LONG_QUERY_ABSOLUTE_MAX_TOKENS:-1024}
+    extended_enabled: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_ENABLED:-false}
+    profile_version: tiered-query-v1
+    absolute_max_tokens: ${ASTRAVECTOR_LONG_QUERY_ABSOLUTE_MAX_TOKENS:-2048}
     absolute_max_bytes: ${ASTRAVECTOR_LONG_QUERY_ABSOLUTE_MAX_BYTES:-65536}
     segment_target_tokens: ${ASTRAVECTOR_LONG_QUERY_SEGMENT_TARGET_TOKENS:-180}
     segment_max_tokens: ${ASTRAVECTOR_LONG_QUERY_SEGMENT_MAX_TOKENS:-220}
     segment_overlap_tokens: ${ASTRAVECTOR_LONG_QUERY_SEGMENT_OVERLAP_TOKENS:-24}
-    max_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_SEGMENTS:-6}
+    max_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_SEGMENTS:-7}
     max_parallel_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_PARALLEL_SEGMENTS:-3}
     max_parallel_lexical_segments: ${ASTRAVECTOR_LONG_QUERY_MAX_PARALLEL_FTS_SEGMENTS:-2}
-    per_segment_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_CANDIDATE_LIMIT:-20}
+    per_segment_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_CANDIDATE_LIMIT:-18}
     global_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_GLOBAL_CANDIDATE_LIMIT:-100}
     segment_rrf_k: ${ASTRAVECTOR_LONG_QUERY_RRF_K:-60}
     question_segment_weight: ${ASTRAVECTOR_LONG_QUERY_QUESTION_WEIGHT:-1.0}
     technical_segment_weight: ${ASTRAVECTOR_LONG_QUERY_TECHNICAL_WEIGHT:-1.0}
     context_segment_weight: ${ASTRAVECTOR_LONG_QUERY_CONTEXT_WEIGHT:-0.5}
     long_query_deadline_ms: ${ASTRAVECTOR_LONG_QUERY_DEADLINE_MS:-3000}
+    single_deadline_ms: ${ASTRAVECTOR_SINGLE_QUERY_DEADLINE_MS:-1000}
+    single_graph_seeds: ${ASTRAVECTOR_SINGLE_QUERY_GRAPH_SEEDS:-5}
+    single_admission_weight: ${ASTRAVECTOR_SINGLE_QUERY_ADMISSION_WEIGHT:-1}
+    standard:
+      max_tokens: ${ASTRAVECTOR_LONG_QUERY_STANDARD_MAX_TOKENS:-1024}
+      max_segments: ${ASTRAVECTOR_LONG_QUERY_STANDARD_MAX_SEGMENTS:-7}
+      dense_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_STANDARD_DENSE_LIMIT:-18}
+      sparse_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_STANDARD_SPARSE_LIMIT:-18}
+      lexical_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_STANDARD_FTS_LIMIT:-12}
+      local_fused_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_STANDARD_LOCAL_FUSED_LIMIT:-18}
+      global_fused_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_STANDARD_GLOBAL_FUSED_LIMIT:-100}
+      max_parallel_segments: ${ASTRAVECTOR_LONG_QUERY_STANDARD_PARALLEL_SEGMENTS:-3}
+      max_parallel_lexical_segments: ${ASTRAVECTOR_LONG_QUERY_STANDARD_PARALLEL_FTS:-2}
+      deadline_ms: ${ASTRAVECTOR_LONG_QUERY_STANDARD_DEADLINE_MS:-3000}
+      max_graph_seeds: ${ASTRAVECTOR_LONG_QUERY_STANDARD_GRAPH_SEEDS:-8}
+      admission_weight: ${ASTRAVECTOR_LONG_QUERY_STANDARD_ADMISSION_WEIGHT:-3}
+    extended:
+      max_tokens: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_MAX_TOKENS:-2048}
+      max_segments: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_MAX_SEGMENTS:-14}
+      dense_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_DENSE_LIMIT:-10}
+      sparse_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_SPARSE_LIMIT:-10}
+      lexical_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_FTS_LIMIT:-8}
+      local_fused_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_LOCAL_FUSED_LIMIT:-10}
+      global_fused_candidate_limit: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_GLOBAL_FUSED_LIMIT:-140}
+      max_parallel_segments: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_PARALLEL_SEGMENTS:-3}
+      max_parallel_lexical_segments: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_PARALLEL_FTS:-2}
+      deadline_ms: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_DEADLINE_MS:-6000}
+      max_graph_seeds: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_GRAPH_SEEDS:-10}
+      admission_weight: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_ADMISSION_WEIGHT:-6}
   hybrid_fusion_method: ${ASTRAVECTOR_HYBRID_FUSION_METHOD:-RRF}
   hybrid_dense_weight: ${ASTRAVECTOR_HYBRID_DENSE_WEIGHT:-0.6}
   hybrid_sparse_weight: ${ASTRAVECTOR_HYBRID_SPARSE_WEIGHT:-0.4}

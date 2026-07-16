@@ -30,6 +30,7 @@ qdrant:
 search:
   query_processing:
     enabled: ${ASTRAVECTOR_LONG_QUERY_ENABLED:-false}
+    extended_enabled: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_ENABLED:-false}
 
 index_ttl:
   enabled: true
