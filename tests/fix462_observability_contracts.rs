@@ -4,7 +4,7 @@ fn fix462_alerts_reference_existing_metrics_and_runbooks() {
     let lifecycle = std::fs::read_to_string("src/lifecycle/mod.rs").expect("read lifecycle");
     let grpc = std::fs::read_to_string("src/grpc/mod.rs").expect("read grpc");
     let qdrant = std::fs::read_to_string("src/qdrant/mod.rs").expect("read qdrant");
-    let docs = format!("{alerts}\n{}\n{}\n{}", lifecycle, grpc, qdrant);
+    let docs = format!("{alerts}\n{lifecycle}\n{grpc}\n{qdrant}");
     for metric in [
         "qdrant_cleanup_extra_points_detected_total",
         "qdrant_cleanup_extra_points_deleted_total",

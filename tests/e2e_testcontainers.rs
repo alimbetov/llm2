@@ -231,7 +231,7 @@ async fn test_e2e_index_logical_document_via_tonic_ingestion_facade_and_activate
         .index_logical_document(Request::new(pb::IndexLogicalDocumentRequest {
             context: Some(pb::RequestContext {
                 correlation_id: "fix464-ingestion-e2e".into(),
-                idempotency_key: format!("fix464-ingestion:{}", document_id),
+                idempotency_key: format!("fix464-ingestion:{document_id}"),
                 caller_service: "e2e-ingestion-client".into(),
                 caller_user_id: "e2e".into(),
                 caller_access_level: pb::AccessLevel::Restricted as i32,

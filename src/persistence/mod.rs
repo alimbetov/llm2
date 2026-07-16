@@ -991,7 +991,7 @@ FROM binding_state"#,
             );
             let point_id = Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
-                format!("v004-qdrant-point:{}:{}", access_zone_id, binding_id).as_bytes(),
+                format!("v004-qdrant-point:{access_zone_id}:{binding_id}").as_bytes(),
             );
             let mut hasher = Sha256::new();
             hasher.update(format!(

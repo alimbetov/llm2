@@ -378,13 +378,13 @@ pub fn build_limited_structural_graph(
     let document_node_id = node_id(
         access_zone_id,
         GraphNodeType::Document,
-        &format!("{}:{}", document_id, document_version),
+        &format!("{document_id}:{document_version}"),
     );
     nodes.push(GraphNode {
         access_zone_id,
         node_id: document_node_id,
         node_type: GraphNodeType::Document,
-        external_id: format!("{}:{}", document_id, document_version),
+        external_id: format!("{document_id}:{document_version}"),
         document_id: Some(document_id),
         document_version: Some(document_version),
         chunk_id: None,

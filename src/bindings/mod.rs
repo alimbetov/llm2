@@ -56,7 +56,7 @@ impl Repository {
         let ttl = item.ttl_days.map(|x| x as i32);
         let rep = pb::SearchRepresentationType::try_from(item.representation_type)
             .unwrap_or(pb::SearchRepresentationType::Original);
-        let rep_name = format!("{:?}", rep).to_uppercase();
+        let rep_name = format!("{rep:?}").to_uppercase();
         let metadata =
             serde_json::to_value(&item.metadata).unwrap_or(Value::Object(Default::default()));
         let namespace = Uuid::NAMESPACE_URL;

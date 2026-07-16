@@ -1886,8 +1886,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let top_k = if r.top_k == 0 { 10 } else { r.top_k }.min(top_k_max);
         if r.top_k > top_k_max {
             return Err(Status::invalid_argument(format!(
-                "top_k must be <= {}",
-                top_k_max
+                "top_k must be <= {top_k_max}"
             )));
         }
         let candidate_limit = if r.candidate_limit == 0 {
@@ -2442,10 +2441,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             "query_processing_mode".into(),
                             query_plan_diagnostics.mode_code().into(),
                         );
-                        citation.metadata.insert(
-                            "query_segment_indices".into(),
-                            format!("[{}]", segment_index),
-                        );
+                        citation
+                            .metadata
+                            .insert("query_segment_indices".into(), format!("[{segment_index}]"));
                     }
                     let score = candidate.lexical_score * *segment_weight;
                     let exact_phrase_match = candidate.exact_match;
@@ -2521,7 +2519,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 );
                                 citation.metadata.insert(
                                     "query_segment_indices".into(),
-                                    format!("[{}]", sibling_segment_index),
+                                    format!("[{sibling_segment_index}]"),
                                 );
                             }
                             let sibling_score = (seed_score * 0.8 + sibling_sequence_bonus(parent))
@@ -5215,10 +5213,7 @@ impl AstraVectorIngestionFacade for AstraVectorV004ControlService {
         let idempotency_key = if !ctx.idempotency_key.trim().is_empty() {
             ctx.idempotency_key.clone()
         } else {
-            format!(
-                "v007-index-logical:{}:{}:{}",
-                access_zone_id, document_id, document_version
-            )
+            format!("v007-index-logical:{access_zone_id}:{document_id}:{document_version}")
         };
         let mut inner = Request::new(pb::CreateMultiGranularityChunksRequest {
             access_zone_id: access_zone_id.to_string(),
@@ -6997,7 +6992,7 @@ impl AstraVectorService {
             status: task as i32,
             items: responses,
             persistence: Some(pb::PersistenceResult {
-                mode: format!("{:?}", mode),
+                mode: format!("{mode:?}"),
                 status: if persistence_error.is_some() {
                     "FAILED".into()
                 } else {
@@ -7907,8 +7902,7 @@ fn access_level_from_metadata(metadata: &MetadataMap) -> Result<Option<pb::Acces
         }
         _ => {
             return Err(Status::invalid_argument(format!(
-                "INVALID_ACCESS_LEVEL: unsupported x-astravector-access-level value: {}",
-                raw
+                "INVALID_ACCESS_LEVEL: unsupported x-astravector-access-level value: {raw}"
             )));
         }
     };
@@ -7983,16 +7977,14 @@ fn validate_and_sort_logical_blocks(
         }
         if by_id.insert(block_id.to_string(), block).is_some() {
             return Err(Status::invalid_argument(format!(
-                "LOGICAL_BLOCK_DUPLICATE_ID: duplicate logical block_id: {}",
-                block_id
+                "LOGICAL_BLOCK_DUPLICATE_ID: duplicate logical block_id: {block_id}"
             )));
         }
         let block_type =
             pb::BlockType::try_from(block.block_type).unwrap_or(pb::BlockType::Unspecified);
         if block_type == pb::BlockType::Unspecified {
             return Err(Status::invalid_argument(format!(
-                "LOGICAL_BLOCK_TYPE_INVALID: block {} has BLOCK_TYPE_UNSPECIFIED",
-                block_id
+                "LOGICAL_BLOCK_TYPE_INVALID: block {block_id} has BLOCK_TYPE_UNSPECIFIED"
             )));
         }
         if block_type == pb::BlockType::Document {
@@ -8000,14 +7992,12 @@ fn validate_and_sort_logical_blocks(
         }
         if block.text.trim().is_empty() {
             return Err(Status::invalid_argument(format!(
-                "LOGICAL_BLOCK_TEXT_EMPTY: logical block {} has empty text",
-                block_id
+                "LOGICAL_BLOCK_TEXT_EMPTY: logical block {block_id} has empty text"
             )));
         }
         if block.parent_block_id.trim() == block_id {
             return Err(Status::invalid_argument(format!(
-                "LOGICAL_BLOCK_SELF_PARENT: logical block {} cannot reference itself as parent",
-                block_id
+                "LOGICAL_BLOCK_SELF_PARENT: logical block {block_id} cannot reference itself as parent"
             )));
         }
         validate_source_location(block_id, block.source_location.as_ref())?;
@@ -8016,8 +8006,7 @@ fn validate_and_sort_logical_blocks(
 
     if root_count != 1 {
         return Err(Status::invalid_argument(format!(
-            "LOGICAL_BLOCK_ROOT_INVALID: expected exactly one BLOCK_TYPE_DOCUMENT root, found {}",
-            root_count
+            "LOGICAL_BLOCK_ROOT_INVALID: expected exactly one BLOCK_TYPE_DOCUMENT root, found {root_count}"
         )));
     }
 
@@ -8029,16 +8018,14 @@ fn validate_and_sort_logical_blocks(
                 != pb::BlockType::Document
             {
                 return Err(Status::invalid_argument(format!(
-                    "LOGICAL_BLOCK_PARENT_REQUIRED: non-root block {} must have parent_block_id",
-                    block_id
+                    "LOGICAL_BLOCK_PARENT_REQUIRED: non-root block {block_id} must have parent_block_id"
                 )));
             }
             continue;
         }
         let parent = by_id.get(parent_id).ok_or_else(|| {
             Status::invalid_argument(format!(
-                "LOGICAL_BLOCK_PARENT_NOT_FOUND: block {} references missing parent_block_id {}",
-                block_id, parent_id
+                "LOGICAL_BLOCK_PARENT_NOT_FOUND: block {block_id} references missing parent_block_id {parent_id}"
             ))
         })?;
         validate_parent_child(block, parent)?;
@@ -8127,8 +8114,7 @@ fn assert_no_logical_block_cycle(
         let current_id = current.block_id.trim().to_string();
         if !visited.insert(current_id.clone()) {
             return Err(Status::invalid_argument(format!(
-                "LOGICAL_BLOCK_TREE_CYCLE: cycle detected at block {}",
-                current_id
+                "LOGICAL_BLOCK_TREE_CYCLE: cycle detected at block {current_id}"
             )));
         }
         current = by_id.get(current.parent_block_id.trim()).ok_or_else(|| {
@@ -8150,14 +8136,12 @@ fn validate_source_location(
     };
     if location.page_end > 0 && location.page_start > 0 && location.page_end < location.page_start {
         return Err(Status::invalid_argument(format!(
-            "SOURCE_LOCATION_INVALID: block {} has page_end < page_start",
-            block_id
+            "SOURCE_LOCATION_INVALID: block {block_id} has page_end < page_start"
         )));
     }
     if location.char_end > 0 && location.char_start > 0 && location.char_end < location.char_start {
         return Err(Status::invalid_argument(format!(
-            "SOURCE_LOCATION_INVALID: block {} has char_end < char_start",
-            block_id
+            "SOURCE_LOCATION_INVALID: block {block_id} has char_end < char_start"
         )));
     }
     Ok(())
@@ -8169,15 +8153,13 @@ fn validate_source_links(owner: &str, links: &[pb::SourceLink]) -> Result<(), St
             pb::SourceLinkType::try_from(link.r#type).unwrap_or(pb::SourceLinkType::Unspecified);
         if link_type == pb::SourceLinkType::Unspecified {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_TYPE_INVALID: {} contains SOURCE_LINK_TYPE_UNSPECIFIED",
-                owner
+                "SOURCE_LINK_TYPE_INVALID: {owner} contains SOURCE_LINK_TYPE_UNSPECIFIED"
             )));
         }
         let url = link.url.trim();
         if url.is_empty() {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_URL_REQUIRED: {} contains source link without url",
-                owner
+                "SOURCE_LINK_URL_REQUIRED: {owner} contains source link without url"
             )));
         }
         let lower = url.to_ascii_lowercase();
@@ -8186,8 +8168,7 @@ fn validate_source_links(owner: &str, links: &[pb::SourceLink]) -> Result<(), St
             || lower.starts_with("data:")
         {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_INVALID_SCHEME: {} contains unsafe source link scheme",
-                owner
+                "SOURCE_LINK_INVALID_SCHEME: {owner} contains unsafe source link scheme"
             )));
         }
         let allowed = lower.starts_with("http://")
@@ -8197,20 +8178,17 @@ fn validate_source_links(owner: &str, links: &[pb::SourceLink]) -> Result<(), St
             || lower.starts_with("internal://");
         if !allowed {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_INVALID_SCHEME: {} contains unsupported source link scheme",
-                owner
+                "SOURCE_LINK_INVALID_SCHEME: {owner} contains unsupported source link scheme"
             )));
         }
         if url.len() > 4096 {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_TOO_LONG: {} contains source link longer than 4096 characters",
-                owner
+                "SOURCE_LINK_TOO_LONG: {owner} contains source link longer than 4096 characters"
             )));
         }
         if link.label.len() > 512 {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_LABEL_TOO_LONG: {} contains source link label longer than 512 characters",
-                owner
+                "SOURCE_LINK_LABEL_TOO_LONG: {owner} contains source link label longer than 512 characters"
             )));
         }
         if link_type == pb::SourceLinkType::Download
@@ -8220,8 +8198,7 @@ fn validate_source_links(owner: &str, links: &[pb::SourceLink]) -> Result<(), St
             && link.expires_at.trim().is_empty()
         {
             return Err(Status::invalid_argument(format!(
-                "SOURCE_LINK_EXPIRES_AT_REQUIRED: {} contains signed download link without expires_at",
-                owner
+                "SOURCE_LINK_EXPIRES_AT_REQUIRED: {owner} contains signed download link without expires_at"
             )));
         }
     }
@@ -12628,7 +12605,7 @@ fn search_result_from_hit(
                 {
                     metadata
                         .entry("page_url".into())
-                        .or_insert_with(|| format!("{}?page={}", source_uri, page));
+                        .or_insert_with(|| format!("{source_uri}?page={page}"));
                 }
             }
         }

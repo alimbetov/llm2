@@ -620,7 +620,7 @@ impl<T: TokenCounter> ChunkingEngine<T> {
             let candidate = if current.is_empty() {
                 sentence.clone()
             } else {
-                format!("{} {}", current, sentence)
+                format!("{current} {sentence}")
             };
             if self.counter.count(&candidate) > p.max && !current.is_empty() {
                 groups.push(current);
@@ -639,7 +639,7 @@ impl<T: TokenCounter> ChunkingEngine<T> {
                 .unwrap_or(false);
             if last_is_short {
                 if let (Some(last), Some(prev)) = (groups.pop(), groups.pop()) {
-                    groups.push(format!("{} {}", prev, last));
+                    groups.push(format!("{prev} {last}"));
                 }
             }
         }
