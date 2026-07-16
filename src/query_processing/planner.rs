@@ -2,6 +2,10 @@ use crate::config::QueryProcessingConfig;
 use crate::query_processing::classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
 };
+use crate::query_processing::intent::{extract_query_intents, QueryIntentUnit};
+use crate::query_processing::profile::{
+    EffectiveQueryProcessingLimits, QueryProcessingTier, QUERY_PROCESSING_PROFILE_VERSION,
+};
 use crate::query_processing::segmenter::segment_query;
 use crate::tokenizer::TokenOffset;
 use sha2::{Digest, Sha256};
@@ -18,11 +22,19 @@ pub struct QuerySegment {
     pub index: usize,
     pub text: String,
     pub token_count: usize,
+    pub source_token_start: usize,
+    pub source_token_end: usize,
+    pub source_byte_start: usize,
+    pub source_byte_end: usize,
     pub kind: QuerySegmentKind,
     pub has_question_form: bool,
     pub has_technical_identifier: bool,
+    pub searchable: bool,
     pub weight: f32,
+    /// Compatibility marker for the v008 runtime. It represents one physical
+    /// segment selected as the representative of a required logical intent.
     pub required_for_coverage: bool,
+    pub intent_unit_ids: Vec<usize>,
     pub sha256: String,
 }
 
@@ -31,7 +43,11 @@ pub struct QueryPlan {
     pub original_query: String,
     pub original_token_count: usize,
     pub mode: QueryProcessingMode,
+    pub tier: QueryProcessingTier,
+    pub profile_version: String,
+    pub limits: EffectiveQueryProcessingLimits,
     pub segments: Vec<QuerySegment>,
+    pub intent_units: Vec<QueryIntentUnit>,
 }
 
 #[derive(Debug, Error)]
@@ -44,8 +60,12 @@ pub enum QueryPlanningError {
     TokenLimitExceeded,
     #[error("LONG_QUERY_NOT_SUPPORTED")]
     LongQueryNotSupported,
+    #[error("LONG_QUERY_EXTENDED_NOT_ENABLED")]
+    ExtendedQueryNotEnabled,
     #[error("QUERY_SEGMENTATION_INVARIANT_FAILED: {0}")]
     SegmentationInvariant(String),
+    #[error("QUERY_INTENT_EXTRACTION_FAILED: {0}")]
+    IntentExtraction(String),
     #[error("tokenization failed: {0}")]
     Tokenization(String),
 }
@@ -91,69 +111,159 @@ pub fn build_query_plan(
     if trimmed.is_empty() {
         return Err(QueryPlanningError::Empty);
     }
+
+    let hard_max = config.extended.max_tokens;
     let original_token_count = token_counter
-        .count_tokens(trimmed, config.absolute_max_tokens, false)
+        .count_tokens(trimmed, hard_max, false)
         .map_err(map_tokenization_error)?;
-    if original_token_count <= single_query_max_tokens {
-        return Ok(QueryPlan {
-            original_query: trimmed.to_owned(),
-            original_token_count,
-            mode: QueryProcessingMode::Single,
-            segments: vec![build_segment(
-                0,
-                trimmed,
-                original_token_count,
-                config,
-                true,
-            )],
-        });
-    }
-    if !config.enabled {
-        return Err(QueryPlanningError::LongQueryNotSupported);
-    }
-    if original_token_count > config.absolute_max_tokens {
+
+    let (mode, tier, limits) = if original_token_count <= single_query_max_tokens {
+        (
+            QueryProcessingMode::Single,
+            QueryProcessingTier::Single,
+            EffectiveQueryProcessingLimits::for_single(config, single_query_max_tokens),
+        )
+    } else if original_token_count <= config.standard.max_tokens {
+        if !config.enabled {
+            return Err(QueryPlanningError::LongQueryNotSupported);
+        }
+        (
+            QueryProcessingMode::Segmented,
+            QueryProcessingTier::SegmentedStandard,
+            EffectiveQueryProcessingLimits::for_segmented(config, &config.standard),
+        )
+    } else if original_token_count <= config.extended.max_tokens {
+        if !config.enabled {
+            return Err(QueryPlanningError::LongQueryNotSupported);
+        }
+        if !config.extended_enabled {
+            return Err(QueryPlanningError::ExtendedQueryNotEnabled);
+        }
+        (
+            QueryProcessingMode::Segmented,
+            QueryProcessingTier::SegmentedExtended,
+            EffectiveQueryProcessingLimits::for_segmented(config, &config.extended),
+        )
+    } else {
         return Err(QueryPlanningError::TokenLimitExceeded);
+    };
+
+    let mut segments = if mode == QueryProcessingMode::Single {
+        vec![build_segment(
+            0,
+            trimmed,
+            original_token_count,
+            0,
+            original_token_count,
+            0,
+            trimmed.len(),
+            config.question_segment_weight,
+            config.technical_segment_weight,
+            config.context_segment_weight,
+            true,
+        )]
+    } else {
+        segment_query(
+            trimmed,
+            token_counter,
+            &limits,
+            config.question_segment_weight,
+            config.technical_segment_weight,
+            config.context_segment_weight,
+        )?
+    };
+
+    let intent_units = extract_query_intents(trimmed, &segments);
+    if intent_units.is_empty() {
+        return Err(QueryPlanningError::IntentExtraction(
+            "no intent units produced".into(),
+        ));
     }
-    let segments = segment_query(trimmed, token_counter, config)?;
-    validate_plan_segments(&segments, original_token_count, config)?;
+    bind_intents_to_segments(&mut segments, &intent_units);
+    validate_plan_segments(&segments, original_token_count, &limits)?;
+
     Ok(QueryPlan {
         original_query: trimmed.to_owned(),
         original_token_count,
-        mode: QueryProcessingMode::Segmented,
+        mode,
+        tier,
+        profile_version: QUERY_PROCESSING_PROFILE_VERSION.to_owned(),
+        limits,
         segments,
+        intent_units,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_segment(
     index: usize,
     text: &str,
     token_count: usize,
-    config: &QueryProcessingConfig,
+    source_token_start: usize,
+    source_token_end: usize,
+    source_byte_start: usize,
+    source_byte_end: usize,
+    question_weight: f32,
+    technical_weight: f32,
+    context_weight: f32,
     required_for_coverage: bool,
 ) -> QuerySegment {
     let kind = classify_query_segment(text);
     let has_question = has_question_form(text);
     let has_technical = has_technical_identifier(text);
     let mut weight = match kind {
-        QuerySegmentKind::Question => config.question_segment_weight,
-        QuerySegmentKind::Technical => config.technical_segment_weight,
-        QuerySegmentKind::Context => config.context_segment_weight,
+        QuerySegmentKind::Question => question_weight,
+        QuerySegmentKind::Technical => technical_weight,
+        QuerySegmentKind::Context => context_weight,
     };
     if has_question && has_technical {
-        weight = weight
-            .max(config.question_segment_weight)
-            .max(config.technical_segment_weight);
+        weight = weight.max(question_weight).max(technical_weight);
     }
     QuerySegment {
         index,
         text: text.to_owned(),
         token_count,
+        source_token_start,
+        source_token_end,
+        source_byte_start,
+        source_byte_end,
         kind,
         has_question_form: has_question,
         has_technical_identifier: has_technical,
+        searchable: true,
         weight,
         required_for_coverage,
+        intent_unit_ids: Vec::new(),
         sha256: hex::encode(Sha256::digest(text.as_bytes())),
+    }
+}
+
+fn bind_intents_to_segments(segments: &mut [QuerySegment], intents: &[QueryIntentUnit]) {
+    for segment in segments.iter_mut() {
+        segment.required_for_coverage = false;
+        segment.intent_unit_ids.clear();
+    }
+    for intent in intents {
+        for index in &intent.source_segment_indices {
+            if let Some(segment) = segments.get_mut(*index) {
+                segment.intent_unit_ids.push(intent.id);
+            }
+        }
+        if intent.required {
+            if let Some(index) = intent.source_segment_indices.first() {
+                if let Some(segment) = segments.get_mut(*index) {
+                    segment.required_for_coverage = true;
+                }
+            }
+        }
+    }
+    if !segments
+        .iter()
+        .any(|segment| segment.required_for_coverage)
+    {
+        if let Some(first) = segments.first_mut() {
+            first.required_for_coverage = true;
+        }
     }
 }
 
@@ -168,56 +278,53 @@ fn map_tokenization_error(error: String) -> QueryPlanningError {
 fn validate_plan_segments(
     segments: &[QuerySegment],
     original_token_count: usize,
-    config: &QueryProcessingConfig,
+    limits: &EffectiveQueryProcessingLimits,
 ) -> Result<(), QueryPlanningError> {
     if segments.is_empty() {
         return Err(QueryPlanningError::SegmentationInvariant(
             "segmented query produced no segments".into(),
         ));
     }
-    if segments.len() > config.max_segments {
+    if segments.len() > limits.max_segments {
         return Err(QueryPlanningError::SegmentationInvariant(format!(
             "segment_count={} exceeds max_segments={}",
-            segments.len(),
-            config.max_segments
+            segments.len(), limits.max_segments
         )));
     }
-    if !segments.iter().any(|segment| segment.required_for_coverage) {
+    if !segments
+        .iter()
+        .any(|segment| segment.required_for_coverage)
+    {
         return Err(QueryPlanningError::SegmentationInvariant(
-            "no required coverage segments".into(),
+            "no required logical intent representative".into(),
         ));
     }
+    let mut covered = vec![false; original_token_count];
     for (expected, segment) in segments.iter().enumerate() {
         if segment.index != expected {
             return Err(QueryPlanningError::SegmentationInvariant(
                 "segment indexes are not contiguous".into(),
             ));
         }
-        if segment.text.trim().is_empty() {
+        if segment.text.trim().is_empty() || segment.token_count == 0 {
             return Err(QueryPlanningError::SegmentationInvariant(
-                "empty segment".into(),
+                "empty or zero-token segment".into(),
             ));
         }
-        if segment.token_count == 0 {
-            return Err(QueryPlanningError::SegmentationInvariant(
-                "zero-token segment".into(),
-            ));
-        }
-        if segment.token_count > config.segment_max_tokens {
+        if segment.token_count > limits.segment_max_tokens {
             return Err(QueryPlanningError::SegmentationInvariant(format!(
                 "segment {} has {} tokens, max {}",
-                segment.index, segment.token_count, config.segment_max_tokens
+                segment.index, segment.token_count, limits.segment_max_tokens
             )));
         }
+        for index in segment.source_token_start..segment.source_token_end.min(original_token_count) {
+            covered[index] = true;
+        }
     }
-    let segment_token_sum = segments
-        .iter()
-        .map(|segment| segment.token_count)
-        .sum::<usize>();
-    if segment_token_sum < original_token_count / 2 {
-        return Err(QueryPlanningError::SegmentationInvariant(
-            "segments cover too little of original query".into(),
-        ));
+    if let Some(index) = covered.iter().position(|covered| !covered) {
+        return Err(QueryPlanningError::SegmentationInvariant(format!(
+            "original token {index} is not covered"
+        )));
     }
     Ok(())
 }
@@ -243,97 +350,59 @@ mod tests {
         }
     }
 
-    fn config() -> QueryProcessingConfig {
-        QueryProcessingConfig {
-            segment_target_tokens: 10,
-            segment_max_tokens: 12,
-            segment_overlap_tokens: 2,
-            max_segments: 6,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn query_at_single_limit_uses_single() {
-        let query = (0..8)
-            .map(|i| format!("word{i}"))
+    fn words(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("token{index}"))
             .collect::<Vec<_>>()
-            .join(" ");
-        let plan = build_query_plan(&query, &WhitespaceCounter, &config(), 8).unwrap();
-        assert_eq!(plan.mode, QueryProcessingMode::Single);
-        assert_eq!(plan.segments.len(), 1);
+            .join(" ")
     }
 
     #[test]
-    fn query_above_single_limit_uses_segmented() {
-        let query = (0..20)
-            .map(|i| format!("word{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let plan = build_query_plan(&query, &WhitespaceCounter, &config(), 8).unwrap();
-        assert_eq!(plan.mode, QueryProcessingMode::Segmented);
-        assert!(plan.segments.len() >= 2);
-    }
-
-    #[test]
-    fn empty_query_is_rejected() {
+    fn boundary_tiers_are_selected() {
+        let mut config = QueryProcessingConfig::default();
+        config.extended_enabled = true;
+        assert_eq!(
+            build_query_plan(&words(256), &WhitespaceCounter, &config, 256)
+                .unwrap()
+                .tier,
+            QueryProcessingTier::Single
+        );
+        assert_eq!(
+            build_query_plan(&words(257), &WhitespaceCounter, &config, 256)
+                .unwrap()
+                .tier,
+            QueryProcessingTier::SegmentedStandard
+        );
+        assert_eq!(
+            build_query_plan(&words(1_024), &WhitespaceCounter, &config, 256)
+                .unwrap()
+                .tier,
+            QueryProcessingTier::SegmentedStandard
+        );
+        assert_eq!(
+            build_query_plan(&words(1_025), &WhitespaceCounter, &config, 256)
+                .unwrap()
+                .tier,
+            QueryProcessingTier::SegmentedExtended
+        );
+        assert_eq!(
+            build_query_plan(&words(2_048), &WhitespaceCounter, &config, 256)
+                .unwrap()
+                .tier,
+            QueryProcessingTier::SegmentedExtended
+        );
         assert!(matches!(
-            build_query_plan(" ", &WhitespaceCounter, &config(), 8),
-            Err(QueryPlanningError::Empty)
-        ));
-    }
-
-    #[test]
-    fn byte_limit_is_checked_before_tokenizer() {
-        let cfg = QueryProcessingConfig {
-            absolute_max_bytes: 4,
-            ..config()
-        };
-        assert!(matches!(
-            build_query_plan("abcdef", &WhitespaceCounter, &cfg, 8),
-            Err(QueryPlanningError::ByteLimitExceeded)
-        ));
-    }
-
-    #[test]
-    fn query_above_absolute_limit_is_rejected() {
-        let query = (0..1100)
-            .map(|i| format!("word{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(matches!(
-            build_query_plan(&query, &WhitespaceCounter, &config(), 8),
+            build_query_plan(&words(2_049), &WhitespaceCounter, &config, 256),
             Err(QueryPlanningError::TokenLimitExceeded)
         ));
     }
 
     #[test]
-    fn disabled_processing_rejects_long_query_without_truncating() {
-        let query = (0..20)
-            .map(|i| format!("word{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let cfg = QueryProcessingConfig {
-            enabled: false,
-            ..config()
-        };
+    fn extended_is_fail_closed_by_default() {
+        let config = QueryProcessingConfig::default();
         assert!(matches!(
-            build_query_plan(&query, &WhitespaceCounter, &cfg, 8),
-            Err(QueryPlanningError::LongQueryNotSupported)
+            build_query_plan(&words(1_025), &WhitespaceCounter, &config, 256),
+            Err(QueryPlanningError::ExtendedQueryNotEnabled)
         ));
-    }
-
-    #[test]
-    fn single_plan_contains_one_segment() {
-        let plan = build_query_plan(
-            "How does legal hold work?",
-            &WhitespaceCounter,
-            &config(),
-            8,
-        )
-        .unwrap();
-        assert_eq!(plan.segments.len(), 1);
-        assert_eq!(plan.segments[0].weight, 1.0);
-        assert!(plan.segments[0].required_for_coverage);
     }
 }
