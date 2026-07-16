@@ -23,6 +23,8 @@ this issue's executed gate set. The existing `AWAITING_BLIND_JUDGMENT` quality s
 - Added weighted admission, receipt-based deadlines, cancellation propagation, bounded GraphRAG seeds,
   and one-stage GraphRAG/MMR contracts.
 - Added backward-compatible legacy configuration migration with new-key precedence.
+- Decoupled candidate-selection self-tests from publication-only local model identity while
+  retaining fail-closed identity requirements for generated judgment bundles.
 
 ## Preservation
 
