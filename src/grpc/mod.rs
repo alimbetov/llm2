@@ -33,6 +33,7 @@ use crate::{
         evidence::CandidateIntentEvidence,
         fusion::{cross_segment_rrf, GlobalCandidateIdentity, SegmentCandidate},
         planner::{QueryPlan, QueryPlanningError, QuerySegment, QueryTokenCounter},
+        status::{summarize_retrieval_statuses, RetrievalBranchStatus, SegmentRetrievalStatus},
         QueryProcessingMode, QueryProcessingTier,
     },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
@@ -116,6 +117,8 @@ struct DirectQdrantGeneration {
     sparse_top_score: f32,
     dense_failed: bool,
     sparse_failed: bool,
+    branch_statuses: Vec<RetrievalBranchStatus>,
+    retrieval_status: SegmentRetrievalStatus,
 }
 
 struct SegmentQdrantResult {
@@ -128,6 +131,8 @@ struct SegmentQdrantResult {
     fusion_executed: bool,
     dense_failed: bool,
     sparse_failed: bool,
+    dense_status: Option<RetrievalBranchStatus>,
+    sparse_status: Option<RetrievalBranchStatus>,
     dense_candidates: usize,
     sparse_candidates: usize,
     dense_ms: u64,
@@ -580,11 +585,17 @@ impl AstraVectorV004ControlService {
         let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
         let mut dense_failed = false;
         let mut sparse_failed = false;
+        let mut dense_status = None;
+        let mut sparse_status = None;
         let (mut dense_hits, dense_search_ms) = match dense_result {
-            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(Some((hits, duration_ms))) => {
+                dense_status = Some(success_branch_status(&hits));
+                (hits, duration_ms)
+            }
             Ok(None) => (Vec::new(), 0),
             Err(e) => {
                 dense_failed = true;
+                dense_status = Some(failed_branch_status(&e));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "DENSE_SEARCH_FAILED".into(),
                     message: format!("Dense Qdrant search failed: {}", e.message()),
@@ -593,11 +604,15 @@ impl AstraVectorV004ControlService {
             }
         };
         let (mut sparse_hits, sparse_search_ms) = match sparse_result {
-            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(Some((hits, duration_ms))) => {
+                sparse_status = Some(success_branch_status(&hits));
+                (hits, duration_ms)
+            }
             Ok(None) => (Vec::new(), 0),
             Err(e) if sparse_required => return Err(e),
             Err(e) => {
                 sparse_failed = true;
+                sparse_status = Some(failed_branch_status(&e));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "SPARSE_SEARCH_FAILED".into(),
                     message: format!("Sparse Qdrant search failed: {}", e.message()),
@@ -628,6 +643,11 @@ impl AstraVectorV004ControlService {
         )?;
         let fusion_ms = fusion_started.elapsed().as_millis() as u64;
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        let branch_statuses = [dense_status, sparse_status]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let retrieval_status = summarize_retrieval_statuses(branch_statuses.iter().copied());
         Ok(DirectQdrantGeneration {
             fusion_candidate_count: hits.len() as u32,
             hits,
@@ -644,6 +664,8 @@ impl AstraVectorV004ControlService {
             sparse_top_score,
             dense_failed,
             sparse_failed,
+            branch_statuses,
+            retrieval_status,
         })
     }
 
@@ -739,6 +761,7 @@ impl AstraVectorV004ControlService {
         let mut all_sparse_executed = wants_sparse;
         let mut all_fusion_executed = search_mode == pb::SearchModeV005::Hybrid;
         let mut segment_fusion_ms = 0_u64;
+        let mut branch_statuses = Vec::new();
         let mut segment_candidates = Vec::new();
         let mut best_hits =
             HashMap::<GlobalCandidateIdentity, (QdrantSearchHit, f32, usize)>::new();
@@ -777,6 +800,11 @@ impl AstraVectorV004ControlService {
         segment_results.sort_by_key(|result| result.segment_index);
         for result in segment_results {
             let intent_unit_ids = result.intent_unit_ids.clone();
+            branch_statuses.extend(
+                [result.dense_status, result.sparse_status]
+                    .into_iter()
+                    .flatten(),
+            );
             dense_failed |= result.dense_failed;
             sparse_failed |= result.sparse_failed;
             all_dense_executed &= result.dense_executed;
@@ -837,6 +865,7 @@ impl AstraVectorV004ControlService {
             .collect::<Vec<_>>();
         let fusion_ms = fusion_started.elapsed().as_millis() as u64 + segment_fusion_ms;
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        let retrieval_status = summarize_retrieval_statuses(branch_statuses.iter().copied());
         Ok(DirectQdrantGeneration {
             fusion_candidate_count: hits.len() as u32,
             hits,
@@ -853,6 +882,8 @@ impl AstraVectorV004ControlService {
             sparse_top_score,
             dense_failed,
             sparse_failed,
+            branch_statuses,
+            retrieval_status,
         })
     }
 
@@ -900,10 +931,15 @@ impl AstraVectorV004ControlService {
             0
         };
         let mut dense_failed = false;
+        let mut dense_status = None;
         let mut dense_hits = match dense_result {
-            Some(Ok(hits)) => hits,
+            Some(Ok(hits)) => {
+                dense_status = Some(success_branch_status(&hits));
+                hits
+            }
             Some(Err(error)) => {
                 dense_failed = true;
+                dense_status = Some(failed_branch_status(&Status::from(error.clone())));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "DENSE_SEARCH_FAILED".into(),
                     message: format!(
@@ -951,11 +987,16 @@ impl AstraVectorV004ControlService {
             0
         };
         let mut sparse_failed = false;
+        let mut sparse_status = None;
         let mut sparse_hits = match sparse_result {
-            Some(Ok(hits)) => hits,
+            Some(Ok(hits)) => {
+                sparse_status = Some(success_branch_status(&hits));
+                hits
+            }
             Some(Err(error)) if sparse_required => return Err(Status::from(error)),
             Some(Err(error)) => {
                 sparse_failed = true;
+                sparse_status = Some(failed_branch_status(&Status::from(error.clone())));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "SPARSE_SEARCH_FAILED".into(),
                     message: format!(
@@ -997,6 +1038,8 @@ impl AstraVectorV004ControlService {
                 && !sparse_failed,
             dense_failed,
             sparse_failed,
+            dense_status,
+            sparse_status,
             dense_candidates,
             sparse_candidates,
             dense_ms,
@@ -2124,7 +2167,41 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             sparse_top_score,
             dense_failed,
             sparse_failed,
+            branch_statuses,
+            retrieval_status,
         } = direct_generation;
+        for status in &branch_statuses {
+            counter!(
+                "astravector_retrieval_branch_total",
+                "status" => status.metric_label(),
+                "tier" => format!("{:?}", query_plan.tier)
+            )
+            .increment(1);
+        }
+        let retrieval_infrastructure_failure = branch_statuses
+            .iter()
+            .any(|status| status.is_infrastructure_failure());
+        match retrieval_status {
+            SegmentRetrievalStatus::PartialFailure => {
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "RETRIEVAL_PARTIAL_FAILURE".into(),
+                    message: "one retrieval branch failed; successful branches remain eligible for evidence, but an empty result is not a successful no-answer".into(),
+                });
+                counter!("astravector_query_degraded_total", "reason" => "retrieval_partial_failure")
+                    .increment(1);
+            }
+            SegmentRetrievalStatus::Failed => {
+                return Err(Status::unavailable(
+                    "RETRIEVAL_BACKENDS_UNAVAILABLE: all requested retrieval branches failed",
+                ));
+            }
+            SegmentRetrievalStatus::Skipped => {
+                return Err(Status::deadline_exceeded(
+                    "RETRIEVAL_SKIPPED_BUDGET: no retrieval branch had sufficient budget",
+                ));
+            }
+            SegmentRetrievalStatus::Success => {}
+        }
         tracing::debug!(
             correlation_id = %r.correlation_id,
             search_mode = ?search_mode,
@@ -2772,14 +2849,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     counter!("astravector_long_query_partial_coverage_total").increment(1);
                 }
                 QueryEvidenceStatus::Insufficient => {
-                    warnings.push(pb::DiagnosticWarningV005 {
-                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
-                        message:
-                            "no required long-query segments produced admissible direct evidence"
-                                .into(),
-                    });
-                    direct_results.clear();
-                    counter!("astravector_long_query_partial_coverage_total").increment(1);
+                    if retrieval_infrastructure_failure {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "LONG_QUERY_COVERAGE_DEGRADED_BY_RETRIEVAL_FAILURE".into(),
+                            message: "required intent coverage is unknown because at least one retrieval branch failed".into(),
+                        });
+                        counter!("astravector_long_query_coverage_unavailable_total").increment(1);
+                    } else {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                            message:
+                                "no required long-query intents produced admissible direct evidence"
+                                    .into(),
+                        });
+                        direct_results.clear();
+                        counter!("astravector_long_query_partial_coverage_total").increment(1);
+                    }
                 }
                 QueryEvidenceStatus::Unavailable => {
                     warnings.push(pb::DiagnosticWarningV005 {
@@ -3640,8 +3725,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
                 QueryEvidenceStatus::Insufficient => {
                     warnings.push(pb::DiagnosticWarningV005 {
-                        code: "LONG_QUERY_INSUFFICIENT_COVERAGE".into(),
-                        message: "final result set covers no required query segments".into(),
+                        code: if retrieval_infrastructure_failure {
+                            "LONG_QUERY_COVERAGE_DEGRADED_BY_RETRIEVAL_FAILURE".into()
+                        } else {
+                            "LONG_QUERY_INSUFFICIENT_COVERAGE".into()
+                        },
+                        message: if retrieval_infrastructure_failure {
+                            "final intent coverage is unknown because a retrieval branch failed"
+                                .into()
+                        } else {
+                            "final result set covers no required query intents".into()
+                        },
                     });
                     results.clear();
                 }
@@ -11241,6 +11335,22 @@ fn stable_result_rank(
         .then_with(|| left.document_id.cmp(&right.document_id))
         .then_with(|| right.document_version.cmp(&left.document_version))
         .then_with(|| left.matched_chunk_id.cmp(&right.matched_chunk_id))
+}
+
+fn success_branch_status<T>(items: &[T]) -> RetrievalBranchStatus {
+    if items.is_empty() {
+        RetrievalBranchStatus::SuccessNoEvidence
+    } else {
+        RetrievalBranchStatus::SuccessWithEvidence
+    }
+}
+
+fn failed_branch_status(status: &Status) -> RetrievalBranchStatus {
+    match status.code() {
+        tonic::Code::DeadlineExceeded => RetrievalBranchStatus::Timeout,
+        tonic::Code::Cancelled => RetrievalBranchStatus::Cancelled,
+        _ => RetrievalBranchStatus::BackendUnavailable,
+    }
 }
 
 #[derive(Debug, Clone, Default)]

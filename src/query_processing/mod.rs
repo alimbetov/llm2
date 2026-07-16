@@ -8,6 +8,7 @@ pub mod normalization;
 pub mod planner;
 pub mod profile;
 pub mod segmenter;
+pub mod status;
 
 pub use classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
@@ -23,3 +24,7 @@ pub use planner::{
 };
 pub use profile::{EffectiveQueryProcessingLimits, QueryProcessingTier};
 pub use segmenter::segment_query;
+pub use status::{
+    no_answer_is_eligible, summarize_retrieval_statuses, RetrievalBranchStatus,
+    SegmentRetrievalStatus,
+};
