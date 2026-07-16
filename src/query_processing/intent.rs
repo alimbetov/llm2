@@ -1,5 +1,6 @@
 use crate::query_processing::classification::{has_question_form, has_technical_identifier};
 use crate::query_processing::planner::QuerySegment;
+use crate::query_processing::NormalizedQuery;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,6 +21,10 @@ pub struct QueryIntentUnit {
     pub source_segment_indices: Vec<usize>,
     pub source_token_start: usize,
     pub source_token_end: usize,
+    pub normalized_byte_start: usize,
+    pub normalized_byte_end: usize,
+    pub original_byte_start: usize,
+    pub original_byte_end: usize,
     pub required: bool,
     pub searchable: bool,
     pub weight: f32,
@@ -27,6 +32,20 @@ pub struct QueryIntentUnit {
 }
 
 pub fn extract_query_intents(query: &str, segments: &[QuerySegment]) -> Vec<QueryIntentUnit> {
+    let normalized = NormalizedQuery {
+        original_text: query.to_owned(),
+        normalized_text: query.to_owned(),
+        normalized_to_original_byte_map: (0..=query.len()).collect(),
+        token_offsets: Vec::new(),
+    };
+    extract_query_intents_normalized(&normalized, segments)
+}
+
+pub fn extract_query_intents_normalized(
+    normalized: &NormalizedQuery,
+    segments: &[QuerySegment],
+) -> Vec<QueryIntentUnit> {
+    let query = normalized.normalized_text.as_str();
     let mut units = Vec::new();
     for sentence in split_intent_sentences(query) {
         let trimmed = sentence.text.trim();
@@ -61,6 +80,11 @@ pub fn extract_query_intents(query: &str, segments: &[QuerySegment]) -> Vec<Quer
             .map(|segment| segment.source_token_end)
             .max()
             .unwrap_or(source_token_start);
+        let Some((original_byte_start, original_byte_end)) =
+            normalized.original_byte_range(sentence.start, sentence.end)
+        else {
+            continue;
+        };
         units.push(QueryIntentUnit {
             id: units.len(),
             kind,
@@ -68,6 +92,10 @@ pub fn extract_query_intents(query: &str, segments: &[QuerySegment]) -> Vec<Quer
             source_segment_indices,
             source_token_start,
             source_token_end,
+            normalized_byte_start: sentence.start,
+            normalized_byte_end: sentence.end,
+            original_byte_start,
+            original_byte_end,
             required,
             searchable: true,
             weight,
@@ -81,6 +109,9 @@ pub fn extract_query_intents(query: &str, segments: &[QuerySegment]) -> Vec<Quer
             .filter(|segment| segment.searchable)
             .map(|segment| segment.index)
             .collect::<Vec<_>>();
+        let (original_byte_start, original_byte_end) = normalized
+            .original_byte_range(0, query.len())
+            .unwrap_or((0, normalized.original_text.len()));
         units.push(QueryIntentUnit {
             id: units.len(),
             kind: QueryIntentKind::ImplicitSearchIntent,
@@ -91,6 +122,10 @@ pub fn extract_query_intents(query: &str, segments: &[QuerySegment]) -> Vec<Quer
                 .last()
                 .map(|segment| segment.source_token_end)
                 .unwrap_or(0),
+            normalized_byte_start: 0,
+            normalized_byte_end: query.len(),
+            original_byte_start,
+            original_byte_end,
             required: true,
             searchable: true,
             weight: 1.0,
@@ -259,6 +294,8 @@ mod tests {
             source_token_end: text.split_whitespace().count(),
             source_byte_start: 0,
             source_byte_end: text.len(),
+            original_byte_start: 0,
+            original_byte_end: text.len(),
             kind: QuerySegmentKind::Context,
             has_question_form: false,
             has_technical_identifier: false,
@@ -270,10 +307,19 @@ mod tests {
         }
     }
 
+    fn normalized(text: &str) -> NormalizedQuery {
+        NormalizedQuery {
+            original_text: text.to_owned(),
+            normalized_text: text.to_owned(),
+            normalized_to_original_byte_map: (0..=text.len()).collect(),
+            token_offsets: Vec::new(),
+        }
+    }
+
     #[test]
     fn technical_log_is_not_explicitly_required() {
         let query = "Caused by: java.lang.IllegalStateException\n at service.run(Service.java:12)";
-        let units = extract_query_intents(query, &[segment(query)]);
+        let units = extract_query_intents_normalized(&normalized(query), &[segment(query)]);
         assert!(units
             .iter()
             .any(|unit| unit.kind == QueryIntentKind::ImplicitSearchIntent));
@@ -282,7 +328,7 @@ mod tests {
     #[test]
     fn question_is_required() {
         let query = "Why does Sparse miss the document?";
-        let units = extract_query_intents(query, &[segment(query)]);
+        let units = extract_query_intents_normalized(&normalized(query), &[segment(query)]);
         assert!(units.iter().any(|unit| unit.required));
     }
 }

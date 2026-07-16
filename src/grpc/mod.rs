@@ -12747,6 +12747,8 @@ mod fix483p_long_query_hardening_tests {
             source_token_end: index + text.split_whitespace().count(),
             source_byte_start: 0,
             source_byte_end: text.len(),
+            original_byte_start: 0,
+            original_byte_end: text.len(),
             kind: QuerySegmentKind::Question,
             has_question_form: true,
             has_technical_identifier: false,
@@ -12755,6 +12757,15 @@ mod fix483p_long_query_hardening_tests {
             required_for_coverage: true,
             intent_unit_ids: Vec::new(),
             sha256: format!("segment-{index}"),
+        }
+    }
+
+    fn normalized_query(text: &str) -> crate::query_processing::NormalizedQuery {
+        crate::query_processing::NormalizedQuery {
+            original_text: text.into(),
+            normalized_text: text.into(),
+            normalized_to_original_byte_map: (0..=text.len()).collect(),
+            token_offsets: Vec::new(),
         }
     }
 
@@ -12801,6 +12812,7 @@ mod fix483p_long_query_hardening_tests {
     fn pre_and_post_mmr_no_answer_are_segment_aware() {
         let plan = QueryPlan {
             original_query: "background unrelated words and legal hold cleanup".into(),
+            normalized_query: normalized_query("background unrelated words and legal hold cleanup"),
             original_token_count: 7,
             mode: QueryProcessingMode::Segmented,
             tier: QueryProcessingTier::SegmentedStandard,
@@ -12843,6 +12855,7 @@ mod fix483p_long_query_hardening_tests {
     fn required_segment_candidate_is_mmr_protected() {
         let plan = QueryPlan {
             original_query: "first question second question".into(),
+            normalized_query: normalized_query("first question second question"),
             original_token_count: 4,
             mode: QueryProcessingMode::Segmented,
             tier: QueryProcessingTier::SegmentedStandard,
