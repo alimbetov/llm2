@@ -54,6 +54,7 @@ jobs:
         run: cargo test --test query_processing_contracts -- --nocapture
 
       - name: Commit generated changes and compiler evidence
+        if: always()
         shell: bash
         run: |
           if git diff --quiet; then
@@ -66,14 +67,14 @@ jobs:
               config/application-prod.yaml \
               src/config/mod.rs \
               src/grpc/mod.rs \
-              src/query_processing \
-              docs/evidence/fix484-bootstrap/cargo-check.log
+              src/query_processing
+            git add -f docs/evidence/fix484-bootstrap/cargo-check.log
             git commit -m "fix484: apply tiered runtime wiring and compiler evidence [fix484 generated]"
             git push origin "HEAD:${{ github.head_ref }}"
           fi
 
       - name: Fail when compile gate is red
-        if: steps.compile.outputs.exit_code != '0'
+        if: always() && steps.compile.outputs.exit_code != '0'
         run: |
           echo "cargo check failed; see docs/evidence/fix484-bootstrap/cargo-check.log"
           exit 1
