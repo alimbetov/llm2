@@ -1,8 +1,0 @@
-   Compiling astravector-runtime v0.4.1 (/Users/ruslanalimbetov/Documents/llm2/astravector-fix484v)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.68s
-     Running tests/smoke_load_retrieve_context_testcontainers.rs (target/debug/deps/smoke_load_retrieve_context_testcontainers-1a62ef9ab4de1231)
-
-running 1 test
-test test_smoke_load_retrieve_context_50_concurrent_testcontainers ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.02s
