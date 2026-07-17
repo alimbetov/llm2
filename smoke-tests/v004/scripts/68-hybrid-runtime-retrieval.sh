@@ -4,6 +4,9 @@ source "$(dirname "$0")/../lib/common.sh"
 source "$SMOKE_ROOT/lib/fix485.sh"
 fix485_evidence_dir hybrid-runtime
 
+export ASTRAVECTOR_MODEL_PATH="${ASTRAVECTOR_MODEL_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/model.onnx}"
+export ASTRAVECTOR_TOKENIZER_PATH="${ASTRAVECTOR_TOKENIZER_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/tokenizer.json}"
+
 endpoint="${ASTRAVECTOR_QUALITY_ENDPOINT:-http://127.0.0.1:50051}"
 grpc_target="${endpoint#http://}"
 grpc_target="${grpc_target#https://}"

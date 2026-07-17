@@ -320,6 +320,7 @@ impl AstraVectorV004ControlService {
         engine: Arc<dyn InferenceEngine>,
         shutdown: CancellationToken,
     ) -> Self {
+        register_query_observability_metrics();
         let retrieve_context_semaphore = Arc::new(Semaphore::new(
             cfg.limits.max_concurrent_retrieve_context.max(1),
         ));
@@ -2023,6 +2024,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let query_counter = EngineQueryTokenCounter {
             engine: self.engine.as_ref(),
         };
+        let query_planning_started = Instant::now();
         let query_plan = build_query_plan(
             query,
             &query_counter,
@@ -2030,6 +2032,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             self.cfg.tokenization.query.max_length,
         )
         .map_err(query_planning_status)?;
+        let query_tier = query_plan.tier.code();
+        histogram!("astravector_query_planning_duration_seconds", "tier" => query_tier)
+            .record(query_planning_started.elapsed().as_secs_f64());
+        histogram!("astravector_query_segment_count", "tier" => query_tier)
+            .record(query_plan.segments.len() as f64);
+        histogram!("astravector_query_intent_count", "tier" => query_tier)
+            .record(query_plan.intent_units.len() as f64);
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
         let timeout_ms =
             effective_query_timeout_ms(r.timeout_ms as u64, query_plan.limits.deadline_ms);
@@ -3798,6 +3807,23 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "GRAPH_MERGE_COMPLETED"
         );
         let query_segments_v008 = query_segment_diagnostics(&query_plan, &results);
+        let query_status = if retrieval_status == SegmentRetrievalStatus::PartialFailure
+            || matches!(
+                coverage_after_visibility.status,
+                QueryEvidenceStatus::Degraded | QueryEvidenceStatus::Unavailable
+            ) {
+            "degraded"
+        } else {
+            "success"
+        };
+        counter!("astravector_query_total", "tier" => query_tier, "status" => query_status)
+            .increment(1);
+        histogram!("astravector_query_duration_seconds", "tier" => query_tier)
+            .record(started.elapsed().as_secs_f64());
+        histogram!("astravector_intent_coverage_ratio", "tier" => query_tier, "stage" => "final_visibility")
+            .record(coverage_after_visibility.ratio as f64);
+        histogram!("astravector_graph_seed_count", "tier" => query_tier)
+            .record(graph_seed_candidates.len() as f64);
         if query_plan.mode == QueryProcessingMode::Segmented {
             histogram!("astravector_long_query_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
@@ -11343,6 +11369,26 @@ fn success_branch_status<T>(items: &[T]) -> RetrievalBranchStatus {
     } else {
         RetrievalBranchStatus::SuccessWithEvidence
     }
+}
+
+fn register_query_observability_metrics() {
+    for tier in ["SINGLE", "STANDARD", "EXTENDED"] {
+        counter!("astravector_query_total", "tier" => tier, "status" => "success").increment(0);
+        counter!("astravector_query_total", "tier" => tier, "status" => "degraded").increment(0);
+        counter!("astravector_query_total", "tier" => tier, "status" => "failed").increment(0);
+        counter!("astravector_query_degraded_total", "tier" => tier, "reason" => "retrieval_partial_failure")
+            .increment(0);
+        counter!("astravector_optional_stage_skipped_total", "tier" => tier, "stage" => "graph", "reason" => "insufficient_budget")
+            .increment(0);
+        counter!("astravector_optional_stage_skipped_total", "tier" => tier, "stage" => "mmr", "reason" => "insufficient_budget")
+            .increment(0);
+        counter!("astravector_admission_rejected_total", "tier" => tier, "reason" => "admission_timeout")
+            .increment(0);
+        counter!("astravector_mmr_skipped_total", "tier" => tier, "reason" => "insufficient_budget")
+            .increment(0);
+        gauge!("astravector_work_units_in_flight", "tier" => tier).set(0.0);
+    }
+    histogram!("astravector_long_query_coverage_after_direct").record(0.0);
 }
 
 fn failed_branch_status(status: &Status) -> RetrievalBranchStatus {

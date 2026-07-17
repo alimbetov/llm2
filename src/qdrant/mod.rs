@@ -731,6 +731,7 @@ impl QdrantClient {
         versions: Option<&QdrantVersionFilters>,
         budget: Option<&OperationBudget>,
     ) -> Result<Vec<QdrantSearchHit>, AstraError> {
+        smoke_failpoints::hit("qdrant_dense_search")?;
         let _permit = tokio::time::timeout(
             Duration::from_millis(self.search_acquire_timeout_ms),
             self.search_semaphore.clone().acquire_owned(),
@@ -848,6 +849,7 @@ impl QdrantClient {
         versions: Option<&QdrantVersionFilters>,
         budget: Option<&OperationBudget>,
     ) -> Result<Vec<QdrantSearchHit>, AstraError> {
+        smoke_failpoints::hit("qdrant_sparse_search")?;
         let _permit = tokio::time::timeout(
             Duration::from_millis(self.search_acquire_timeout_ms),
             self.search_semaphore.clone().acquire_owned(),
