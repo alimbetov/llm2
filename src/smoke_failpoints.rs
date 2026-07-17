@@ -15,7 +15,11 @@ pub fn hit(name: &str) -> Result<(), AstraError> {
     let configured = std::env::var("ASTRA_SMOKE_FAILPOINT")
         .or_else(|_| std::env::var("ASTRAVECTOR_SMOKE_FAILPOINT"))
         .unwrap_or_default();
-    if configured == name {
+    if configured
+        .split(',')
+        .map(str::trim)
+        .any(|configured_name| configured_name == name)
+    {
         return Err(AstraError::Internal(format!("smoke failpoint hit: {name}")));
     }
     Ok(())

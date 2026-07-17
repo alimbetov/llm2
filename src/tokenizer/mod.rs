@@ -68,6 +68,21 @@ impl CanonicalTokenizer {
         self.special_ids.as_ref()
     }
 
+    pub fn count_canonical_tokens(
+        &self,
+        text: &str,
+        max_length: usize,
+        allow_truncation: bool,
+    ) -> Result<usize, AstraError> {
+        let count = self.token_offsets(text)?.len();
+        if count > max_length && !allow_truncation {
+            return Err(AstraError::OutOfRange(format!(
+                "{count} tokens exceeds max_length={max_length}"
+            )));
+        }
+        Ok(count.min(max_length))
+    }
+
     pub fn token_offsets(&self, text: &str) -> Result<Vec<TokenOffset>, AstraError> {
         let encoding = self
             .inner

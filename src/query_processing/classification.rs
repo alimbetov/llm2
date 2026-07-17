@@ -39,6 +39,9 @@ pub fn has_question_form(text: &str) -> bool {
         "connect ",
         "compare ",
         "summarize ",
+        "please explain ",
+        "could you compare ",
+        "could you explain ",
         "объясни ",
         "покажи ",
         "найди ",
@@ -51,6 +54,12 @@ pub fn has_question_form(text: &str) -> bool {
         "где ",
         "когда ",
         "что ",
+        "пожалуйста, объясните ",
+        "пожалуйста, объясни ",
+        "подскажите, почему ",
+        "мне нужно понять ",
+        "можно ли сравнить ",
+        "нужно определить ",
         "түсіндір ",
         "көрсет ",
         "тап ",
@@ -60,6 +69,8 @@ pub fn has_question_form(text: &str) -> bool {
         "қайда ",
         "қашан ",
         "не ",
+        "маған түсіндіріңіз ",
+        "маған түсіндір ",
     ];
     imperative_prefixes
         .iter()

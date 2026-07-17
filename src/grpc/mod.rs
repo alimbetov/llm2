@@ -30,8 +30,10 @@ use crate::{
             QueryEvidenceStatus,
         },
         diagnostics::QueryPlanDiagnostics,
+        evidence::CandidateIntentEvidence,
         fusion::{cross_segment_rrf, GlobalCandidateIdentity, SegmentCandidate},
         planner::{QueryPlan, QueryPlanningError, QuerySegment, QueryTokenCounter},
+        status::{summarize_retrieval_statuses, RetrievalBranchStatus, SegmentRetrievalStatus},
         QueryProcessingMode, QueryProcessingTier,
     },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
@@ -115,6 +117,8 @@ struct DirectQdrantGeneration {
     sparse_top_score: f32,
     dense_failed: bool,
     sparse_failed: bool,
+    branch_statuses: Vec<RetrievalBranchStatus>,
+    retrieval_status: SegmentRetrievalStatus,
 }
 
 struct SegmentQdrantResult {
@@ -127,6 +131,8 @@ struct SegmentQdrantResult {
     fusion_executed: bool,
     dense_failed: bool,
     sparse_failed: bool,
+    dense_status: Option<RetrievalBranchStatus>,
+    sparse_status: Option<RetrievalBranchStatus>,
     dense_candidates: usize,
     sparse_candidates: usize,
     dense_ms: u64,
@@ -314,6 +320,7 @@ impl AstraVectorV004ControlService {
         engine: Arc<dyn InferenceEngine>,
         shutdown: CancellationToken,
     ) -> Self {
+        register_query_observability_metrics();
         let retrieve_context_semaphore = Arc::new(Semaphore::new(
             cfg.limits.max_concurrent_retrieve_context.max(1),
         ));
@@ -579,11 +586,17 @@ impl AstraVectorV004ControlService {
         let (dense_result, sparse_result) = tokio::join!(dense_future, sparse_future);
         let mut dense_failed = false;
         let mut sparse_failed = false;
+        let mut dense_status = None;
+        let mut sparse_status = None;
         let (mut dense_hits, dense_search_ms) = match dense_result {
-            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(Some((hits, duration_ms))) => {
+                dense_status = Some(success_branch_status(&hits));
+                (hits, duration_ms)
+            }
             Ok(None) => (Vec::new(), 0),
             Err(e) => {
                 dense_failed = true;
+                dense_status = Some(failed_branch_status(&e));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "DENSE_SEARCH_FAILED".into(),
                     message: format!("Dense Qdrant search failed: {}", e.message()),
@@ -592,11 +605,15 @@ impl AstraVectorV004ControlService {
             }
         };
         let (mut sparse_hits, sparse_search_ms) = match sparse_result {
-            Ok(Some((hits, duration_ms))) => (hits, duration_ms),
+            Ok(Some((hits, duration_ms))) => {
+                sparse_status = Some(success_branch_status(&hits));
+                (hits, duration_ms)
+            }
             Ok(None) => (Vec::new(), 0),
             Err(e) if sparse_required => return Err(e),
             Err(e) => {
                 sparse_failed = true;
+                sparse_status = Some(failed_branch_status(&e));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "SPARSE_SEARCH_FAILED".into(),
                     message: format!("Sparse Qdrant search failed: {}", e.message()),
@@ -627,6 +644,11 @@ impl AstraVectorV004ControlService {
         )?;
         let fusion_ms = fusion_started.elapsed().as_millis() as u64;
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        let branch_statuses = [dense_status, sparse_status]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let retrieval_status = summarize_retrieval_statuses(branch_statuses.iter().copied());
         Ok(DirectQdrantGeneration {
             fusion_candidate_count: hits.len() as u32,
             hits,
@@ -643,6 +665,8 @@ impl AstraVectorV004ControlService {
             sparse_top_score,
             dense_failed,
             sparse_failed,
+            branch_statuses,
+            retrieval_status,
         })
     }
 
@@ -738,6 +762,7 @@ impl AstraVectorV004ControlService {
         let mut all_sparse_executed = wants_sparse;
         let mut all_fusion_executed = search_mode == pb::SearchModeV005::Hybrid;
         let mut segment_fusion_ms = 0_u64;
+        let mut branch_statuses = Vec::new();
         let mut segment_candidates = Vec::new();
         let mut best_hits =
             HashMap::<GlobalCandidateIdentity, (QdrantSearchHit, f32, usize)>::new();
@@ -776,6 +801,11 @@ impl AstraVectorV004ControlService {
         segment_results.sort_by_key(|result| result.segment_index);
         for result in segment_results {
             let intent_unit_ids = result.intent_unit_ids.clone();
+            branch_statuses.extend(
+                [result.dense_status, result.sparse_status]
+                    .into_iter()
+                    .flatten(),
+            );
             dense_failed |= result.dense_failed;
             sparse_failed |= result.sparse_failed;
             all_dense_executed &= result.dense_executed;
@@ -836,6 +866,7 @@ impl AstraVectorV004ControlService {
             .collect::<Vec<_>>();
         let fusion_ms = fusion_started.elapsed().as_millis() as u64 + segment_fusion_ms;
         let qdrant_search_ms = qdrant_started.elapsed().as_millis() as u64;
+        let retrieval_status = summarize_retrieval_statuses(branch_statuses.iter().copied());
         Ok(DirectQdrantGeneration {
             fusion_candidate_count: hits.len() as u32,
             hits,
@@ -852,6 +883,8 @@ impl AstraVectorV004ControlService {
             sparse_top_score,
             dense_failed,
             sparse_failed,
+            branch_statuses,
+            retrieval_status,
         })
     }
 
@@ -899,10 +932,15 @@ impl AstraVectorV004ControlService {
             0
         };
         let mut dense_failed = false;
+        let mut dense_status = None;
         let mut dense_hits = match dense_result {
-            Some(Ok(hits)) => hits,
+            Some(Ok(hits)) => {
+                dense_status = Some(success_branch_status(&hits));
+                hits
+            }
             Some(Err(error)) => {
                 dense_failed = true;
+                dense_status = Some(failed_branch_status(&Status::from(error.clone())));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "DENSE_SEARCH_FAILED".into(),
                     message: format!(
@@ -950,11 +988,16 @@ impl AstraVectorV004ControlService {
             0
         };
         let mut sparse_failed = false;
+        let mut sparse_status = None;
         let mut sparse_hits = match sparse_result {
-            Some(Ok(hits)) => hits,
+            Some(Ok(hits)) => {
+                sparse_status = Some(success_branch_status(&hits));
+                hits
+            }
             Some(Err(error)) if sparse_required => return Err(Status::from(error)),
             Some(Err(error)) => {
                 sparse_failed = true;
+                sparse_status = Some(failed_branch_status(&Status::from(error.clone())));
                 warnings.push(pb::DiagnosticWarningV005 {
                     code: "SPARSE_SEARCH_FAILED".into(),
                     message: format!(
@@ -996,6 +1039,8 @@ impl AstraVectorV004ControlService {
                 && !sparse_failed,
             dense_failed,
             sparse_failed,
+            dense_status,
+            sparse_status,
             dense_candidates,
             sparse_candidates,
             dense_ms,
@@ -1609,6 +1654,10 @@ fn result_passed_query_segment_indices(result: &pb::SearchResultV004) -> Vec<usi
     result_segment_indices_from_metadata(result, "passed_query_segment_indices")
 }
 
+fn result_passed_query_intent_ids(result: &pb::SearchResultV004) -> Vec<usize> {
+    result_segment_indices_from_metadata(result, "passed_query_intent_ids")
+}
+
 fn result_segment_indices_from_metadata(result: &pb::SearchResultV004, key: &str) -> Vec<usize> {
     let Some(raw) = result
         .citation
@@ -1668,17 +1717,24 @@ fn coverage_for_results(plan: &QueryPlan, results: &[pb::SearchResultV004]) -> Q
     if plan.intent_units.is_empty() {
         return evaluate_required_coverage(&plan.segments, &covered_segments);
     }
-    let covered_intent_ids = plan
-        .intent_units
+    let explicit_intent_ids = results
         .iter()
-        .filter(|intent| {
-            intent
-                .source_segment_indices
-                .iter()
-                .any(|index| covered_segments.contains(index))
-        })
-        .map(|intent| intent.id)
+        .flat_map(result_passed_query_intent_ids)
         .collect::<HashSet<_>>();
+    let covered_intent_ids = if explicit_intent_ids.is_empty() {
+        plan.intent_units
+            .iter()
+            .filter(|intent| {
+                intent
+                    .source_segment_indices
+                    .iter()
+                    .any(|index| covered_segments.contains(index))
+            })
+            .map(|intent| intent.id)
+            .collect::<HashSet<_>>()
+    } else {
+        explicit_intent_ids
+    };
     evaluate_intent_coverage(&plan.intent_units, &covered_intent_ids)
 }
 
@@ -1968,6 +2024,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let query_counter = EngineQueryTokenCounter {
             engine: self.engine.as_ref(),
         };
+        let query_planning_started = Instant::now();
         let query_plan = build_query_plan(
             query,
             &query_counter,
@@ -1975,6 +2032,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             self.cfg.tokenization.query.max_length,
         )
         .map_err(query_planning_status)?;
+        let query_tier = query_plan.tier.code();
+        histogram!("astravector_query_planning_duration_seconds", "tier" => query_tier)
+            .record(query_planning_started.elapsed().as_secs_f64());
+        histogram!("astravector_query_segment_count", "tier" => query_tier)
+            .record(query_plan.segments.len() as f64);
+        histogram!("astravector_query_intent_count", "tier" => query_tier)
+            .record(query_plan.intent_units.len() as f64);
         let query_plan_diagnostics = QueryPlanDiagnostics::from_plan(&query_plan);
         let timeout_ms =
             effective_query_timeout_ms(r.timeout_ms as u64, query_plan.limits.deadline_ms);
@@ -2112,7 +2176,41 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             sparse_top_score,
             dense_failed,
             sparse_failed,
+            branch_statuses,
+            retrieval_status,
         } = direct_generation;
+        for status in &branch_statuses {
+            counter!(
+                "astravector_retrieval_branch_total",
+                "status" => status.metric_label(),
+                "tier" => format!("{:?}", query_plan.tier)
+            )
+            .increment(1);
+        }
+        let retrieval_infrastructure_failure = branch_statuses
+            .iter()
+            .any(|status| status.is_infrastructure_failure());
+        match retrieval_status {
+            SegmentRetrievalStatus::PartialFailure => {
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: "RETRIEVAL_PARTIAL_FAILURE".into(),
+                    message: "one retrieval branch failed; successful branches remain eligible for evidence, but an empty result is not a successful no-answer".into(),
+                });
+                counter!("astravector_query_degraded_total", "reason" => "retrieval_partial_failure")
+                    .increment(1);
+            }
+            SegmentRetrievalStatus::Failed => {
+                return Err(Status::unavailable(
+                    "RETRIEVAL_BACKENDS_UNAVAILABLE: all requested retrieval branches failed",
+                ));
+            }
+            SegmentRetrievalStatus::Skipped => {
+                return Err(Status::deadline_exceeded(
+                    "RETRIEVAL_SKIPPED_BUDGET: no retrieval branch had sufficient budget",
+                ));
+            }
+            SegmentRetrievalStatus::Success => {}
+        }
         tracing::debug!(
             correlation_id = %r.correlation_id,
             search_mode = ?search_mode,
@@ -2760,14 +2858,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     counter!("astravector_long_query_partial_coverage_total").increment(1);
                 }
                 QueryEvidenceStatus::Insufficient => {
-                    warnings.push(pb::DiagnosticWarningV005 {
-                        code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
-                        message:
-                            "no required long-query segments produced admissible direct evidence"
-                                .into(),
-                    });
-                    direct_results.clear();
-                    counter!("astravector_long_query_partial_coverage_total").increment(1);
+                    if retrieval_infrastructure_failure {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "LONG_QUERY_COVERAGE_DEGRADED_BY_RETRIEVAL_FAILURE".into(),
+                            message: "required intent coverage is unknown because at least one retrieval branch failed".into(),
+                        });
+                        counter!("astravector_long_query_coverage_unavailable_total").increment(1);
+                    } else {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "LONG_QUERY_PARTIAL_COVERAGE".into(),
+                            message:
+                                "no required long-query intents produced admissible direct evidence"
+                                    .into(),
+                        });
+                        direct_results.clear();
+                        counter!("astravector_long_query_partial_coverage_total").increment(1);
+                    }
                 }
                 QueryEvidenceStatus::Unavailable => {
                     warnings.push(pb::DiagnosticWarningV005 {
@@ -2826,17 +2932,22 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     passed
                 }
             };
-            let intent_unit_ids = query_plan
-                .intent_units
-                .iter()
-                .filter(|intent| {
-                    intent
-                        .source_segment_indices
-                        .iter()
-                        .any(|index| matched_segment_indices.contains(index))
-                })
-                .map(|intent| intent.id)
-                .collect();
+            let explicit_intent_ids = result_passed_query_intent_ids(result);
+            let intent_unit_ids = if explicit_intent_ids.is_empty() {
+                query_plan
+                    .intent_units
+                    .iter()
+                    .filter(|intent| {
+                        intent
+                            .source_segment_indices
+                            .iter()
+                            .any(|index| matched_segment_indices.contains(index))
+                    })
+                    .map(|intent| intent.id)
+                    .collect()
+            } else {
+                explicit_intent_ids
+            };
             graph_seed_candidates.push(GraphSeedCandidate {
                 key,
                 score: seed_score,
@@ -2874,6 +2985,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             &required_intent_ids,
             query_plan.limits.max_graph_seeds.min(12),
         );
+        let graph_seed_intents_by_key = graph_seed_candidates
+            .iter()
+            .map(|candidate| (candidate.key, candidate.intent_unit_ids.clone()))
+            .collect::<HashMap<_, _>>();
         let graph_seed_keys = graph_seed_candidates
             .iter()
             .map(|candidate| candidate.key)
@@ -3133,6 +3248,25 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     "graph_seed_chunk_id".into(),
                                     rel.seed_chunk_id.to_string(),
                                 );
+                                if let Some(intent_ids) = graph_seed_intents_by_key
+                                    .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "passed_query_intent_ids".into(),
+                                        serde_json::to_string(intent_ids)
+                                            .unwrap_or_else(|_| "[]".into()),
+                                    );
+                                    let inherited = intent_ids
+                                        .iter()
+                                        .copied()
+                                        .map(CandidateIntentEvidence::graph_origin)
+                                        .collect::<Vec<_>>();
+                                    citation.metadata.insert(
+                                        "candidate_intent_evidence".into(),
+                                        serde_json::to_string(&inherited)
+                                            .unwrap_or_else(|_| "[]".into()),
+                                    );
+                                }
                                 if let Some(source_block_id) = graph_seed_source_block_by_key
                                     .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
                                 {
@@ -3600,8 +3734,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 }
                 QueryEvidenceStatus::Insufficient => {
                     warnings.push(pb::DiagnosticWarningV005 {
-                        code: "LONG_QUERY_INSUFFICIENT_COVERAGE".into(),
-                        message: "final result set covers no required query segments".into(),
+                        code: if retrieval_infrastructure_failure {
+                            "LONG_QUERY_COVERAGE_DEGRADED_BY_RETRIEVAL_FAILURE".into()
+                        } else {
+                            "LONG_QUERY_INSUFFICIENT_COVERAGE".into()
+                        },
+                        message: if retrieval_infrastructure_failure {
+                            "final intent coverage is unknown because a retrieval branch failed"
+                                .into()
+                        } else {
+                            "final result set covers no required query intents".into()
+                        },
                     });
                     results.clear();
                 }
@@ -3664,6 +3807,23 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "GRAPH_MERGE_COMPLETED"
         );
         let query_segments_v008 = query_segment_diagnostics(&query_plan, &results);
+        let query_status = if retrieval_status == SegmentRetrievalStatus::PartialFailure
+            || matches!(
+                coverage_after_visibility.status,
+                QueryEvidenceStatus::Degraded | QueryEvidenceStatus::Unavailable
+            ) {
+            "degraded"
+        } else {
+            "success"
+        };
+        counter!("astravector_query_total", "tier" => query_tier, "status" => query_status)
+            .increment(1);
+        histogram!("astravector_query_duration_seconds", "tier" => query_tier)
+            .record(started.elapsed().as_secs_f64());
+        histogram!("astravector_intent_coverage_ratio", "tier" => query_tier, "stage" => "final_visibility")
+            .record(coverage_after_visibility.ratio as f64);
+        histogram!("astravector_graph_seed_count", "tier" => query_tier)
+            .record(graph_seed_candidates.len() as f64);
         if query_plan.mode == QueryProcessingMode::Segmented {
             histogram!("astravector_long_query_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
@@ -11203,6 +11363,42 @@ fn stable_result_rank(
         .then_with(|| left.matched_chunk_id.cmp(&right.matched_chunk_id))
 }
 
+fn success_branch_status<T>(items: &[T]) -> RetrievalBranchStatus {
+    if items.is_empty() {
+        RetrievalBranchStatus::SuccessNoEvidence
+    } else {
+        RetrievalBranchStatus::SuccessWithEvidence
+    }
+}
+
+fn register_query_observability_metrics() {
+    for tier in ["SINGLE", "STANDARD", "EXTENDED"] {
+        counter!("astravector_query_total", "tier" => tier, "status" => "success").increment(0);
+        counter!("astravector_query_total", "tier" => tier, "status" => "degraded").increment(0);
+        counter!("astravector_query_total", "tier" => tier, "status" => "failed").increment(0);
+        counter!("astravector_query_degraded_total", "tier" => tier, "reason" => "retrieval_partial_failure")
+            .increment(0);
+        counter!("astravector_optional_stage_skipped_total", "tier" => tier, "stage" => "graph", "reason" => "insufficient_budget")
+            .increment(0);
+        counter!("astravector_optional_stage_skipped_total", "tier" => tier, "stage" => "mmr", "reason" => "insufficient_budget")
+            .increment(0);
+        counter!("astravector_admission_rejected_total", "tier" => tier, "reason" => "admission_timeout")
+            .increment(0);
+        counter!("astravector_mmr_skipped_total", "tier" => tier, "reason" => "insufficient_budget")
+            .increment(0);
+        gauge!("astravector_work_units_in_flight", "tier" => tier).set(0.0);
+    }
+    histogram!("astravector_long_query_coverage_after_direct").record(0.0);
+}
+
+fn failed_branch_status(status: &Status) -> RetrievalBranchStatus {
+    match status.code() {
+        tonic::Code::DeadlineExceeded => RetrievalBranchStatus::Timeout,
+        tonic::Code::Cancelled => RetrievalBranchStatus::Cancelled,
+        _ => RetrievalBranchStatus::BackendUnavailable,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct NoAnswerFilterStats {
     pre_mmr_filtered_count: usize,
@@ -11869,37 +12065,128 @@ fn apply_segmented_pre_mmr_no_answer_filter(
     let before = results.len();
     let mut accepted = Vec::with_capacity(results.len());
     for result in results.drain(..) {
+        let matched_segment_indices = result_query_segment_indices(&result);
+        if plan.intent_units.is_empty() {
+            let mut passed_segment_indices = Vec::new();
+            let mut accepted_result = None;
+            for segment_index in &matched_segment_indices {
+                let Some(segment) = plan
+                    .segments
+                    .iter()
+                    .find(|segment| segment.index == *segment_index)
+                else {
+                    continue;
+                };
+                let mut candidate = vec![result.clone()];
+                let technical_tokens = strong_technical_query_tokens(&segment.text);
+                apply_pre_mmr_no_answer_filter(
+                    &mut candidate,
+                    &segment.text,
+                    &technical_tokens,
+                    search_mode,
+                    cfg,
+                    debug_enabled,
+                    preserve_partial_evidence_for_mmr,
+                );
+                if let Some(passed) = candidate.pop() {
+                    passed_segment_indices.push(*segment_index);
+                    accepted_result.get_or_insert(passed);
+                }
+            }
+            if let Some(mut passed) = accepted_result {
+                if let Some(citation) = passed.citation.as_mut() {
+                    citation.metadata.insert(
+                        "passed_query_segment_indices".into(),
+                        serde_json::to_string(&passed_segment_indices)
+                            .unwrap_or_else(|_| "[]".into()),
+                    );
+                }
+                accepted.push(passed);
+            }
+            continue;
+        }
         let mut passed_segment_indices = Vec::new();
+        let mut passed_intent_ids = Vec::new();
+        let mut intent_evidence = Vec::new();
         let mut accepted_result = None;
-        for segment_index in result_query_segment_indices(&result) {
-            let Some(segment) = plan
-                .segments
+        for intent in plan.intent_units.iter().filter(|intent| {
+            intent
+                .source_segment_indices
                 .iter()
-                .find(|segment| segment.index == segment_index)
-            else {
-                continue;
-            };
+                .any(|index| matched_segment_indices.contains(index))
+        }) {
             let mut candidate = vec![result.clone()];
-            let technical_tokens = strong_technical_query_tokens(&segment.text);
+            let technical_tokens = strong_technical_query_tokens(&intent.text);
             apply_pre_mmr_no_answer_filter(
                 &mut candidate,
-                &segment.text,
+                &intent.text,
                 &technical_tokens,
                 search_mode,
                 cfg,
                 debug_enabled,
                 preserve_partial_evidence_for_mmr,
             );
+            let scores = result.scores.as_ref();
+            let matched_tokens = matched_technical_tokens(&result, &technical_tokens);
+            let matched_terms = matched_term_count(&result, &intent.text);
+            let matched_discriminating_terms =
+                matched_discriminating_term_count(&result, &intent.text);
+            let intents_sharing_physical_segment = plan
+                .intent_units
+                .iter()
+                .filter(|other| other.required)
+                .filter(|other| {
+                    other
+                        .source_segment_indices
+                        .iter()
+                        .any(|index| intent.source_segment_indices.contains(index))
+                })
+                .count();
+            let independent_intent_evidence = intents_sharing_physical_segment <= 1
+                || !matched_tokens.is_empty()
+                || matched_discriminating_terms > 0;
+            let passed = !candidate.is_empty() && independent_intent_evidence;
+            if !passed {
+                candidate.clear();
+            }
+            intent_evidence.push(CandidateIntentEvidence::direct(
+                intent.id,
+                scores.map(|value| value.dense_score),
+                scores.map(|value| value.sparse_score),
+                Some(lexical_score_for_no_answer(&result)),
+                matched_terms,
+                matched_tokens.len(),
+                passed,
+            ));
             if let Some(passed) = candidate.pop() {
-                passed_segment_indices.push(segment_index);
+                passed_intent_ids.push(intent.id);
+                passed_segment_indices.extend(
+                    intent
+                        .source_segment_indices
+                        .iter()
+                        .filter(|index| matched_segment_indices.contains(index))
+                        .copied(),
+                );
                 accepted_result.get_or_insert(passed);
             }
         }
         if let Some(mut passed) = accepted_result {
+            passed_segment_indices.sort_unstable();
+            passed_segment_indices.dedup();
+            passed_intent_ids.sort_unstable();
+            passed_intent_ids.dedup();
             if let Some(citation) = passed.citation.as_mut() {
                 citation.metadata.insert(
                     "passed_query_segment_indices".into(),
                     serde_json::to_string(&passed_segment_indices).unwrap_or_else(|_| "[]".into()),
+                );
+                citation.metadata.insert(
+                    "passed_query_intent_ids".into(),
+                    serde_json::to_string(&passed_intent_ids).unwrap_or_else(|_| "[]".into()),
+                );
+                citation.metadata.insert(
+                    "candidate_intent_evidence".into(),
+                    serde_json::to_string(&intent_evidence).unwrap_or_else(|_| "[]".into()),
                 );
             }
             accepted.push(passed);
@@ -12747,6 +13034,8 @@ mod fix483p_long_query_hardening_tests {
             source_token_end: index + text.split_whitespace().count(),
             source_byte_start: 0,
             source_byte_end: text.len(),
+            original_byte_start: 0,
+            original_byte_end: text.len(),
             kind: QuerySegmentKind::Question,
             has_question_form: true,
             has_technical_identifier: false,
@@ -12755,6 +13044,15 @@ mod fix483p_long_query_hardening_tests {
             required_for_coverage: true,
             intent_unit_ids: Vec::new(),
             sha256: format!("segment-{index}"),
+        }
+    }
+
+    fn normalized_query(text: &str) -> crate::query_processing::NormalizedQuery {
+        crate::query_processing::NormalizedQuery {
+            original_text: text.into(),
+            normalized_text: text.into(),
+            normalized_to_original_byte_map: (0..=text.len()).collect(),
+            token_offsets: Vec::new(),
         }
     }
 
@@ -12780,6 +13078,25 @@ mod fix483p_long_query_hardening_tests {
         }
     }
 
+    fn intent(id: usize, text: &str) -> crate::query_processing::QueryIntentUnit {
+        crate::query_processing::QueryIntentUnit {
+            id,
+            kind: crate::query_processing::QueryIntentKind::ExplicitQuestion,
+            text: text.into(),
+            source_segment_indices: vec![0],
+            source_token_start: 0,
+            source_token_end: 12,
+            normalized_byte_start: 0,
+            normalized_byte_end: text.len(),
+            original_byte_start: 0,
+            original_byte_end: text.len(),
+            required: true,
+            searchable: true,
+            weight: 1.0,
+            normalized_sha256: format!("intent-{id}"),
+        }
+    }
+
     #[test]
     fn long_query_deadline_is_selected_and_client_timeout_caps_it() {
         let cfg = AppConfig::load().expect("load test config");
@@ -12801,6 +13118,7 @@ mod fix483p_long_query_hardening_tests {
     fn pre_and_post_mmr_no_answer_are_segment_aware() {
         let plan = QueryPlan {
             original_query: "background unrelated words and legal hold cleanup".into(),
+            normalized_query: normalized_query("background unrelated words and legal hold cleanup"),
             original_token_count: 7,
             mode: QueryProcessingMode::Segmented,
             tier: QueryProcessingTier::SegmentedStandard,
@@ -12840,9 +13158,67 @@ mod fix483p_long_query_hardening_tests {
     }
 
     #[test]
+    fn one_physical_segment_does_not_credit_unrelated_intent() {
+        let query = "Why is PostgreSQL the source of truth? How does legal hold affect TTL?";
+        let mut shared_segment = segment(0, query);
+        shared_segment.intent_unit_ids = vec![0, 1];
+        let plan = QueryPlan {
+            original_query: query.into(),
+            normalized_query: normalized_query(query),
+            original_token_count: query.split_whitespace().count(),
+            mode: QueryProcessingMode::Segmented,
+            tier: QueryProcessingTier::SegmentedStandard,
+            profile_version: "test".into(),
+            limits: crate::query_processing::EffectiveQueryProcessingLimits::for_segmented(
+                &crate::config::QueryProcessingConfig::default(),
+                &crate::config::QueryProcessingConfig::default().standard,
+            ),
+            segments: vec![shared_segment],
+            intent_units: vec![
+                intent(0, "Why is PostgreSQL the source of truth?"),
+                intent(1, "How does legal hold affect TTL?"),
+            ],
+        };
+        let mut results = vec![result_for_segment(
+            0,
+            "PostgreSQL is the canonical source of truth for document visibility.",
+            1.0,
+        )];
+
+        let filtered = apply_segmented_pre_mmr_no_answer_filter(
+            &mut results,
+            &plan,
+            pb::SearchModeV005::Dense,
+            &NoAnswerConfig::default(),
+            false,
+            false,
+        );
+
+        assert_eq!(filtered, 0);
+        assert_eq!(result_passed_query_intent_ids(&results[0]), vec![0]);
+        let evidence = results[0]
+            .citation
+            .as_ref()
+            .and_then(|citation| citation.metadata.get("candidate_intent_evidence"))
+            .and_then(|raw| serde_json::from_str::<Vec<CandidateIntentEvidence>>(raw).ok())
+            .expect("candidate-to-intent evidence metadata");
+        assert!(evidence
+            .iter()
+            .any(|item| item.intent_id == 0 && item.evidence_passed));
+        assert!(evidence
+            .iter()
+            .any(|item| item.intent_id == 1 && !item.evidence_passed));
+        let coverage = coverage_for_results(&plan, &results);
+        assert_eq!(coverage.status, QueryEvidenceStatus::Degraded);
+        assert_eq!(coverage.required_covered, 1);
+        assert_eq!(coverage.uncovered_required_intent_ids, vec![1]);
+    }
+
+    #[test]
     fn required_segment_candidate_is_mmr_protected() {
         let plan = QueryPlan {
             original_query: "first question second question".into(),
+            normalized_query: normalized_query("first question second question"),
             original_token_count: 4,
             mode: QueryProcessingMode::Segmented,
             tier: QueryProcessingTier::SegmentedStandard,

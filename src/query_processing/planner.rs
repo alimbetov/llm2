@@ -2,9 +2,10 @@ use crate::config::QueryProcessingConfig;
 use crate::query_processing::classification::{
     classify_query_segment, has_question_form, has_technical_identifier, QuerySegmentKind,
 };
-use crate::query_processing::intent::{extract_query_intents, QueryIntentUnit};
+use crate::query_processing::intent::{extract_query_intents_normalized, QueryIntentUnit};
+use crate::query_processing::normalization::{normalize_query, NormalizedQuery};
 use crate::query_processing::profile::{EffectiveQueryProcessingLimits, QueryProcessingTier};
-use crate::query_processing::segmenter::segment_query;
+use crate::query_processing::segmenter::segment_normalized_query;
 use crate::tokenizer::TokenOffset;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,6 +25,8 @@ pub struct QuerySegment {
     pub source_token_end: usize,
     pub source_byte_start: usize,
     pub source_byte_end: usize,
+    pub original_byte_start: usize,
+    pub original_byte_end: usize,
     pub kind: QuerySegmentKind,
     pub has_question_form: bool,
     pub has_technical_identifier: bool,
@@ -39,6 +42,7 @@ pub struct QuerySegment {
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub original_query: String,
+    pub normalized_query: NormalizedQuery,
     pub original_token_count: usize,
     pub mode: QueryProcessingMode,
     pub tier: QueryProcessingTier,
@@ -105,14 +109,15 @@ pub fn build_query_plan(
     if query.len() > config.absolute_max_bytes {
         return Err(QueryPlanningError::ByteLimitExceeded);
     }
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
+    let normalized_query =
+        normalize_query(query, token_counter).map_err(QueryPlanningError::Tokenization)?;
+    if normalized_query.normalized_text.is_empty() {
         return Err(QueryPlanningError::Empty);
     }
 
     let hard_max = config.absolute_max_tokens.min(config.extended.max_tokens);
     let original_token_count = token_counter
-        .count_tokens(trimmed, hard_max, false)
+        .count_tokens(&normalized_query.normalized_text, hard_max, false)
         .map_err(map_tokenization_error)?;
 
     let (mode, tier, limits) = if original_token_count <= single_query_max_tokens {
@@ -149,20 +154,28 @@ pub fn build_query_plan(
     let mut segments = if mode == QueryProcessingMode::Single {
         vec![build_segment(
             0,
-            trimmed,
+            &normalized_query.normalized_text,
             original_token_count,
             0,
             original_token_count,
             0,
-            trimmed.len(),
+            normalized_query.normalized_text.len(),
+            normalized_query
+                .original_byte_range(0, normalized_query.normalized_text.len())
+                .map(|range| range.0)
+                .unwrap_or(0),
+            normalized_query
+                .original_byte_range(0, normalized_query.normalized_text.len())
+                .map(|range| range.1)
+                .unwrap_or(query.len()),
             config.question_segment_weight,
             config.technical_segment_weight,
             config.context_segment_weight,
             true,
         )]
     } else {
-        segment_query(
-            trimmed,
+        segment_normalized_query(
+            &normalized_query,
             token_counter,
             &limits,
             config.question_segment_weight,
@@ -171,7 +184,7 @@ pub fn build_query_plan(
         )?
     };
 
-    let intent_units = extract_query_intents(trimmed, &segments);
+    let intent_units = extract_query_intents_normalized(&normalized_query, &segments);
     if intent_units.is_empty() {
         return Err(QueryPlanningError::IntentExtraction(
             "no intent units produced".into(),
@@ -181,7 +194,8 @@ pub fn build_query_plan(
     validate_plan_segments(&segments, original_token_count, &limits)?;
 
     Ok(QueryPlan {
-        original_query: trimmed.to_owned(),
+        original_query: normalized_query.normalized_text.clone(),
+        normalized_query,
         original_token_count,
         mode,
         tier,
@@ -201,6 +215,8 @@ pub(crate) fn build_segment(
     source_token_end: usize,
     source_byte_start: usize,
     source_byte_end: usize,
+    original_byte_start: usize,
+    original_byte_end: usize,
     question_weight: f32,
     technical_weight: f32,
     context_weight: f32,
@@ -225,6 +241,8 @@ pub(crate) fn build_segment(
         source_token_end,
         source_byte_start,
         source_byte_end,
+        original_byte_start,
+        original_byte_end,
         kind,
         has_question_form: has_question,
         has_technical_identifier: has_technical,

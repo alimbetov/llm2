@@ -3,10 +3,11 @@ set -uo pipefail
 
 SMOKE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR="$(cd "$SMOKE_ROOT/../.." && pwd)"
-RESULTS_DIR="$SMOKE_ROOT/results"
-REPORTS_DIR="$SMOKE_ROOT/reports"
-LOGS_DIR="$SMOKE_ROOT/logs"
-RUNTIME_DIR="$SMOKE_ROOT/runtime"
+SMOKE_ARTIFACT_DIR="${SMOKE_ARTIFACT_DIR:-$SMOKE_ROOT}"
+RESULTS_DIR="$SMOKE_ARTIFACT_DIR/results"
+REPORTS_DIR="$SMOKE_ARTIFACT_DIR/reports"
+LOGS_DIR="$SMOKE_ARTIFACT_DIR/logs"
+RUNTIME_DIR="$SMOKE_ARTIFACT_DIR/runtime"
 mkdir -p "$RESULTS_DIR" "$REPORTS_DIR" "$LOGS_DIR" "$RUNTIME_DIR"
 
 PASS=0
@@ -20,16 +21,20 @@ load_smoke_env() {
     env_file="$SMOKE_ROOT/.env.smoke.example"
   fi
   export SMOKE_ENV_FILE="$env_file"
-  set -a
-  # shellcheck disable=SC1090
-  . "$env_file"
-  set +a
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$env_file"
+    set +a
+  fi
   export SMOKE_RUN_ID="${SMOKE_RUN_ID:-$(date +%Y%m%d%H%M%S)}"
   export ASTRAVECTOR_PROJECT_DIR="${ASTRAVECTOR_PROJECT_DIR:-$PROJECT_DIR}"
   export ASTRAVECTOR_CONFIG="${ASTRAVECTOR_CONFIG:-$SMOKE_ROOT/config/application-smoke.yaml}"
-  export ASTRAVECTOR_DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-  export ASTRAVECTOR_QDRANT_URL="${QDRANT_HTTP_URL}"
-  export ASTRAVECTOR_QDRANT_COLLECTION="${QDRANT_COLLECTION}"
+  if [[ -n "${POSTGRES_USER:-}" && -n "${POSTGRES_PASSWORD:-}" && -n "${POSTGRES_HOST:-}" && -n "${POSTGRES_PORT:-}" && -n "${POSTGRES_DB:-}" ]]; then
+    export ASTRAVECTOR_DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+  fi
+  [[ -n "${QDRANT_HTTP_URL:-}" ]] && export ASTRAVECTOR_QDRANT_URL="$QDRANT_HTTP_URL"
+  [[ -n "${QDRANT_COLLECTION:-}" ]] && export ASTRAVECTOR_QDRANT_COLLECTION="$QDRANT_COLLECTION"
 }
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }

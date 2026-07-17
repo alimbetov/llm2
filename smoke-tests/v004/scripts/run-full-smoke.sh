@@ -62,6 +62,12 @@ steps=(
   "outbox-fencing:63-outbox-fencing.sh"
   "full-power-wave3:64-full-power-wave3.sh"
   "dead-letter-qdrant-failure:66-dead-letter-qdrant-failure.sh"
+  "long-query-model-backed:67-long-query-model-backed.sh"
+  "hybrid-runtime-retrieval:68-hybrid-runtime-retrieval.sh"
+  "partial-backend-failure:69-partial-backend-failure.sh"
+  "mixed-tier-fairness:70-mixed-tier-fairness.sh"
+  "query-observability:71-query-observability.sh"
+  "deployment-container:72-deployment-container.sh"
   "observability:22-observability-smoke.sh"
   "shutdown:20-shutdown-smoke.sh"
 )
@@ -175,12 +181,20 @@ generate_reports() {
     echo "- Git commit: $(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "- Rust: $(rustc --version 2>/dev/null || echo 'not found')"
     echo "- Cargo: $(cargo --version 2>/dev/null || echo 'not found')"
-    echo "- PostgreSQL: $(psql "$(postgres_url)" -Atqc 'select version()' 2>/dev/null | head -n 1 || echo 'not checked')"
-    echo "- Qdrant: $(curl -sS "$QDRANT_HTTP_URL" 2>/dev/null | jq -r '.title // "not checked"' 2>/dev/null || echo 'not checked')"
+    if [[ -n "${POSTGRES_USER:-}" ]]; then
+      echo "- PostgreSQL: $(psql "$(postgres_url)" -Atqc 'select version()' 2>/dev/null | head -n 1 || echo 'not checked')"
+    else
+      echo "- PostgreSQL: not configured for this isolated step"
+    fi
+    if [[ -n "${QDRANT_HTTP_URL:-}" ]]; then
+      echo "- Qdrant: $(curl -sS "$QDRANT_HTTP_URL" 2>/dev/null | jq -r '.title // "not checked"' 2>/dev/null || echo 'not checked')"
+    else
+      echo "- Qdrant: not configured for this isolated step"
+    fi
     echo
     echo "| ID | Test | Status | Duration ms | Evidence |"
     echo "|---|---|---:|---:|---|"
-    jq -r '.results | to_entries[] | "| \(.key+1) | \(.value.test) | \(.value.status) | \(.value.duration_ms) | smoke-tests/v004/results/\(.value.test).json |"' "$summary"
+    jq -r --arg results_dir "$RESULTS_DIR" '.results | to_entries[] | "| \(.key+1) | \(.value.test) | \(.value.status) | \(.value.duration_ms) | \($results_dir)/\(.value.test).json |"' "$summary"
     echo
     echo "## Counts"
     jq -r '.counts | to_entries[] | "- \(.key): \(.value)"' "$summary"

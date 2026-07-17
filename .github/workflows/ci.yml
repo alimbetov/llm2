@@ -31,6 +31,12 @@ jobs:
       - run: cargo check --locked --all-targets --all-features
       - run: cargo test --locked query_processing --lib -- --nocapture
       - run: cargo test --locked --test query_processing_contracts -- --nocapture
+      - run: cargo test --locked --test query_normalization_offsets -- --nocapture
+      - run: cargo test --locked --test multi_intent_evidence -- --nocapture
+      - run: cargo test --locked --test retrieval_failure_semantics -- --nocapture
+      - run: cargo test --locked --test graph_intent_provenance -- --nocapture
+      - run: cargo test --locked --test explain_search_parity -- --nocapture
+      - run: cargo test --locked --test mixed_tier_fairness -- --nocapture
       - run: cargo test --locked --all-targets --all-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres --locked

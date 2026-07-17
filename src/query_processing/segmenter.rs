@@ -2,6 +2,7 @@ use crate::query_processing::planner::{
     build_segment, QueryPlanningError, QuerySegment, QueryTokenCounter,
 };
 use crate::query_processing::profile::EffectiveQueryProcessingLimits;
+use crate::query_processing::{normalize_query, NormalizedQuery};
 
 pub fn segment_query(
     query: &str,
@@ -11,17 +12,35 @@ pub fn segment_query(
     technical_weight: f32,
     context_weight: f32,
 ) -> Result<Vec<QuerySegment>, QueryPlanningError> {
-    let normalized = normalize_query_text(query);
-    let offsets = token_counter
-        .token_offsets(&normalized)
-        .map_err(QueryPlanningError::Tokenization)?;
+    let normalized =
+        normalize_query(query, token_counter).map_err(QueryPlanningError::Tokenization)?;
+    segment_normalized_query(
+        &normalized,
+        token_counter,
+        limits,
+        question_weight,
+        technical_weight,
+        context_weight,
+    )
+}
+
+pub(crate) fn segment_normalized_query(
+    normalized: &NormalizedQuery,
+    token_counter: &dyn QueryTokenCounter,
+    limits: &EffectiveQueryProcessingLimits,
+    question_weight: f32,
+    technical_weight: f32,
+    context_weight: f32,
+) -> Result<Vec<QuerySegment>, QueryPlanningError> {
+    let text = normalized.normalized_text.as_str();
+    let offsets = normalized.token_offsets.as_slice();
     if offsets.is_empty() {
         return Err(QueryPlanningError::SegmentationInvariant(
             "query tokenizer produced no offsets".into(),
         ));
     }
 
-    let mut ranges = build_ranges(&normalized, &offsets, limits);
+    let mut ranges = build_ranges(text, offsets, limits);
     if ranges.len() > limits.max_segments {
         ranges = compact_ranges(offsets.len(), limits)?;
     }
@@ -35,18 +54,27 @@ pub fn segment_query(
         }
         let byte_start = offsets[start].start_byte;
         let byte_end = offsets[end - 1].end_byte;
-        let text = normalized[byte_start..byte_end].trim();
+        let segment_text = &text[byte_start..byte_end];
         let token_count = token_counter
-            .count_tokens(text, limits.segment_max_tokens, false)
+            .count_tokens(segment_text, limits.segment_max_tokens, false)
             .map_err(QueryPlanningError::Tokenization)?;
+        let (original_byte_start, original_byte_end) = normalized
+            .original_byte_range(byte_start, byte_end)
+            .ok_or_else(|| {
+                QueryPlanningError::SegmentationInvariant(
+                    "normalized segment range has no original mapping".into(),
+                )
+            })?;
         segments.push(build_segment(
             index,
-            text,
+            segment_text,
             token_count,
             start,
             end,
             byte_start,
             byte_end,
+            original_byte_start,
+            original_byte_end,
             question_weight,
             technical_weight,
             context_weight,
@@ -56,25 +84,6 @@ pub fn segment_query(
 
     validate_token_coverage(&segments, offsets.len())?;
     Ok(segments)
-}
-
-fn normalize_query_text(text: &str) -> String {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut out = String::with_capacity(text.len());
-    let mut empty_lines = 0usize;
-    for line in text.trim().lines() {
-        if line.trim().is_empty() {
-            empty_lines += 1;
-            if empty_lines <= 2 {
-                out.push('\n');
-            }
-        } else {
-            empty_lines = 0;
-            out.push_str(line.trim_end());
-            out.push('\n');
-        }
-    }
-    out.trim().to_owned()
 }
 
 fn build_ranges(
