@@ -70,4 +70,8 @@ fn phase_infrastructure_is_isolated_from_default_project_state() {
     assert!(runner.contains("compose down -v"));
     assert!(!runner.contains("docker volume prune"));
     assert!(!runner.contains("docker system prune"));
+    assert!(
+        !runner.contains("${run,,}"),
+        "runner must remain compatible with macOS Bash 3.2"
+    );
 }

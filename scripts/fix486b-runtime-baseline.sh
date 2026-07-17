@@ -29,6 +29,7 @@ mkdir -p "$EVIDENCE"/{environment,source,static,infrastructure,migrations,model-
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 fail() { FAILURES+=("$1"); printf 'FIX486B_FAIL=%s\n' "$1" >&2; }
 
 record() {
@@ -116,11 +117,12 @@ runtime_env() {
 }
 
 start_runtime() {
-  local run=$1
-  local log="$EVIDENCE/runtime/${run,,}-runtime.log"
+  local run=$1 label
+  label=$(lower "$run")
+  local log="$EVIDENCE/runtime/$label-runtime.log"
   runtime_env "$RUNTIME" >"$log" 2>&1 &
   RUNTIME_PID=$!
-  echo "$RUNTIME_PID" >"$EVIDENCE/runtime/${run,,}-runtime.pid"
+  echo "$RUNTIME_PID" >"$EVIDENCE/runtime/$label-runtime.pid"
   for _ in $(seq 1 90); do
     grpcurl -plaintext "$GRPC_ADDR" list >/dev/null 2>&1 && return 0
     kill -0 "$RUNTIME_PID" 2>/dev/null || return 1
@@ -171,8 +173,10 @@ wait_indexed() {
 }
 
 ingest_and_probe() {
-  local run=$1 dir="$EVIDENCE/ingestion/${1,,}"
-  mkdir -p "$dir" "$EVIDENCE/retrieval/${run,,}"
+  local run=$1 label dir
+  label=$(lower "$run")
+  dir="$EVIDENCE/ingestion/$label"
+  mkdir -p "$dir" "$EVIDENCE/retrieval/$label"
   jq '.request' "$FIXTURE" >"$dir/request.json"
   grpcurl -plaintext -d @ "$GRPC_ADDR" \
     astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument \
@@ -194,61 +198,65 @@ ingest_and_probe() {
   jq -e --slurp '.[0] == .[1]' "$dir/before-repeat.json" "$dir/after-repeat.json" >/dev/null
 
   probe_existing "$run" "$zone" "$doc"
-  jq -n --arg zone "$zone" --arg doc "$doc" '{access_zone_id:$zone,document_id:$doc,document_version:1}' >"$EVIDENCE/fixture/${run,,}-physical-identity.json"
-  psql "$DB_URL" -Atqc "SELECT coalesce(json_agg(x ORDER BY x.granularity,x.sequence_no),'[]') FROM (SELECT id::text chunk_id,root_chunk_id::text,source_chunk_id::text,parent_chunk_id::text,granularity,sequence_no,content_hash::text FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND document_id='$doc')x" | jq . >"$EVIDENCE/fixture/${run,,}-hierarchy.json"
-  curl -fsS "$QDRANT_URL/collections/$COLLECTION" | jq . >"$EVIDENCE/retrieval/${run,,}/qdrant-collection.json"
+  jq -n --arg zone "$zone" --arg doc "$doc" '{access_zone_id:$zone,document_id:$doc,document_version:1}' >"$EVIDENCE/fixture/$label-physical-identity.json"
+  psql "$DB_URL" -Atqc "SELECT coalesce(json_agg(x ORDER BY x.granularity,x.sequence_no),'[]') FROM (SELECT id::text chunk_id,root_chunk_id::text,source_chunk_id::text,parent_chunk_id::text,granularity,sequence_no,content_hash::text FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND document_id='$doc')x" | jq . >"$EVIDENCE/fixture/$label-hierarchy.json"
+  curl -fsS "$QDRANT_URL/collections/$COLLECTION" | jq . >"$EVIDENCE/retrieval/$label/qdrant-collection.json"
 }
 
 probe_existing() {
-  local run=$1 zone=$2 doc=$3
-  mkdir -p "$EVIDENCE/retrieval/${run,,}"
+  local run=$1 zone=$2 doc=$3 label
+  label=$(lower "$run")
+  mkdir -p "$EVIDENCE/retrieval/$label"
 
-  jq -n --arg zone "$zone" '{correlationId:"fix486b-search",accessZoneId:$zone,callerAccessLevel:"INTERNAL",query:"ASTRA_FIX486B_RUNTIME_CONTROL canonical state",topK:5,candidateLimit:20,parentLimit:5,timeoutMs:5000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true}' >"$EVIDENCE/retrieval/${run,,}/search-request.json"
+  jq -n --arg zone "$zone" '{correlationId:"fix486b-search",accessZoneId:$zone,callerAccessLevel:"INTERNAL",query:"ASTRA_FIX486B_RUNTIME_CONTROL canonical state",topK:5,candidateLimit:20,parentLimit:5,timeoutMs:5000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true}' >"$EVIDENCE/retrieval/$label/search-request.json"
   grpcurl -plaintext -d @ "$GRPC_ADDR" astravector.embedding.v1.AstraVectorV004Control/Search \
-    <"$EVIDENCE/retrieval/${run,,}/search-request.json" >"$EVIDENCE/retrieval/${run,,}/search-response.json"
-  jq -e --arg doc "$doc" --arg zone "$zone" '.results|length>0 and any(.[]; .documentId==$doc and .accessZoneId==$zone and (.matchedChunkId|length)>0 and (.parentChunkId|length)>0 and (.parentText|length)>0 and (.matchedText|length)>0)' "$EVIDENCE/retrieval/${run,,}/search-response.json" >/dev/null
+    <"$EVIDENCE/retrieval/$label/search-request.json" >"$EVIDENCE/retrieval/$label/search-response.json"
+  jq -e --arg doc "$doc" --arg zone "$zone" '.results|length>0 and any(.[]; .documentId==$doc and .accessZoneId==$zone and (.matchedChunkId|length)>0 and (.parentChunkId|length)>0 and (.parentText|length)>0 and (.matchedText|length)>0)' "$EVIDENCE/retrieval/$label/search-response.json" >/dev/null
 
-  jq -n --arg zone "$zone" '{context:{correlationId:"fix486b-retrieve",callerService:"fix486b-runtime-baseline",callerUserId:"fix486b-runtime-baseline",callerAccessLevel:"INTERNAL"},accessZoneId:$zone,question:"ASTRA_FIX486B_RUNTIME_CONTROL canonical state",profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:false}' >"$EVIDENCE/retrieval/${run,,}/retrieve-request.json"
+  jq -n --arg zone "$zone" '{context:{correlationId:"fix486b-retrieve",callerService:"fix486b-runtime-baseline",callerUserId:"fix486b-runtime-baseline",callerAccessLevel:"INTERNAL"},accessZoneId:$zone,question:"ASTRA_FIX486B_RUNTIME_CONTROL canonical state",profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:false}' >"$EVIDENCE/retrieval/$label/retrieve-request.json"
   grpcurl -plaintext -d @ "$GRPC_ADDR" astravector.embedding.v1.AstraVectorRetrievalFacade/RetrieveContext \
-    <"$EVIDENCE/retrieval/${run,,}/retrieve-request.json" >"$EVIDENCE/retrieval/${run,,}/retrieve-response.json"
-  jq -e --arg doc "$doc" --arg zone "$zone" '.contexts|length>0 and any(.[]; .documentId==$doc and .accessZoneId==$zone and (.matchedChunkId|length)>0 and (.parentChunkId|length)>0 and (.parentText|length)>0 and (.matchedText|length)>0)' "$EVIDENCE/retrieval/${run,,}/retrieve-response.json" >/dev/null
+    <"$EVIDENCE/retrieval/$label/retrieve-request.json" >"$EVIDENCE/retrieval/$label/retrieve-response.json"
+  jq -e --arg doc "$doc" --arg zone "$zone" '.contexts|length>0 and any(.[]; .documentId==$doc and .accessZoneId==$zone and (.matchedChunkId|length)>0 and (.parentChunkId|length)>0 and (.parentText|length)>0 and (.matchedText|length)>0)' "$EVIDENCE/retrieval/$label/retrieve-response.json" >/dev/null
 }
 
 start_infrastructure() {
-  local run=$1
+  local run=$1 label
+  label=$(lower "$run")
   ACTIVE_PROJECT=$(printf 'fix486b-%s-%s' "$RUN_ID" "$run" | tr '[:upper:]_' '[:lower:]-' | tr -cd 'a-z0-9-')
-  compose up -d >"$EVIDENCE/infrastructure/${run,,}-compose-up.log" 2>&1
+  compose up -d >"$EVIDENCE/infrastructure/$label-compose-up.log" 2>&1
   wait_postgres
   wait_http "$QDRANT_URL/readyz"
-  compose ps --format json >"$EVIDENCE/infrastructure/${run,,}-compose-ps.json"
-  docker inspect "${ACTIVE_PROJECT}-postgres-1" >"$EVIDENCE/infrastructure/${run,,}-postgres-inspect.json"
-  docker inspect "${ACTIVE_PROJECT}-qdrant-1" >"$EVIDENCE/infrastructure/${run,,}-qdrant-inspect.json"
+  compose ps --format json >"$EVIDENCE/infrastructure/$label-compose-ps.json"
+  docker inspect "${ACTIVE_PROJECT}-postgres-1" >"$EVIDENCE/infrastructure/$label-postgres-inspect.json"
+  docker inspect "${ACTIVE_PROJECT}-qdrant-1" >"$EVIDENCE/infrastructure/$label-qdrant-inspect.json"
 }
 
 migrate() {
-  local run=$1
-  DATABASE_URL="$DB_URL" cargo sqlx migrate run --source migrations >"$EVIDENCE/migrations/${run,,}-clean-apply.log" 2>&1
-  DATABASE_URL="$DB_URL" cargo sqlx migrate run --source migrations >"$EVIDENCE/migrations/${run,,}-reapply.log" 2>&1
-  psql "$DB_URL" -Atqc "SELECT json_build_object('count',count(*),'failed',count(*) FILTER(WHERE NOT success),'head',max(version)) FROM _sqlx_migrations" | jq . >"$EVIDENCE/migrations/${run,,}-migration-head.json"
-  jq -e '.failed==0' "$EVIDENCE/migrations/${run,,}-migration-head.json" >/dev/null
+  local run=$1 label
+  label=$(lower "$run")
+  DATABASE_URL="$DB_URL" cargo sqlx migrate run --source migrations >"$EVIDENCE/migrations/$label-clean-apply.log" 2>&1
+  DATABASE_URL="$DB_URL" cargo sqlx migrate run --source migrations >"$EVIDENCE/migrations/$label-reapply.log" 2>&1
+  psql "$DB_URL" -Atqc "SELECT json_build_object('count',count(*),'failed',count(*) FILTER(WHERE NOT success),'head',max(version)) FROM _sqlx_migrations" | jq . >"$EVIDENCE/migrations/$label-migration-head.json"
+  jq -e '.failed==0' "$EVIDENCE/migrations/$label-migration-head.json" >/dev/null
 }
 
 run_clean() {
-  local run=$1 prepared=${2:-false}
+  local run=$1 prepared=${2:-false} label
+  label=$(lower "$run")
   if [[ "$prepared" != true ]]; then
     start_infrastructure "$run"
     migrate "$run"
   fi
   start_runtime "$run"
-  grpcurl -plaintext "$GRPC_ADDR" list >"$EVIDENCE/runtime/${run,,}-services.txt"
-  curl -fsS "http://127.0.0.1:$METRICS_PORT/metrics" >"$EVIDENCE/metrics/${run,,}-metrics.prom"
+  grpcurl -plaintext "$GRPC_ADDR" list >"$EVIDENCE/runtime/$label-services.txt"
+  curl -fsS "http://127.0.0.1:$METRICS_PORT/metrics" >"$EVIDENCE/metrics/$label-metrics.prom"
   if ! wait_health SERVING; then
-    grpcurl -plaintext -d '{"service":"astravector.embedding.v1.AstraVectorV004Control"}' "$GRPC_ADDR" grpc.health.v1.Health/Check >"$EVIDENCE/runtime/${run,,}-health-failed.json" 2>&1 || true
+    grpcurl -plaintext -d '{"service":"astravector.embedding.v1.AstraVectorV004Control"}' "$GRPC_ADDR" grpc.health.v1.Health/Check >"$EVIDENCE/runtime/$label-health-failed.json" 2>&1 || true
     fail "${run}_HEALTH_NOT_SERVING"
     return 1
   fi
   ingest_and_probe "$run"
-  snapshot "$EVIDENCE/fixture/${run,,}-snapshot.json"
+  snapshot "$EVIDENCE/fixture/$label-snapshot.json"
   stop_runtime
 }
 
