@@ -1,0 +1,81 @@
+{
+  "schema_version": "1",
+  "fixture_id": "fix486-hierarchical-lifecycle-v1",
+  "status": "ANALYSIS_SEED",
+  "scenarios": [
+    {
+      "scenario_id": "active-v1",
+      "access_zone": "zone-a",
+      "document": "doc-hierarchy",
+      "version": 1,
+      "document_state": "ACTIVE",
+      "chunk_state": "ACTIVE",
+      "expected_searchable": true
+    },
+    {
+      "scenario_id": "inactive-v2-higher-score",
+      "access_zone": "zone-a",
+      "document": "doc-hierarchy",
+      "version": 2,
+      "document_state": "INDEXING",
+      "chunk_state": "ACTIVE_OR_PENDING_AS_IMPLEMENTED",
+      "expected_searchable": false,
+      "fault_purpose": "higher lexical attraction must not bypass active-version filtering"
+    },
+    {
+      "scenario_id": "deleted-v3-stale-qdrant-child",
+      "access_zone": "zone-a",
+      "document": "doc-hierarchy",
+      "version": 3,
+      "document_state": "DELETED",
+      "parent_state": "DELETED_OR_MISSING",
+      "qdrant_child_state": "STALE_PRESENT",
+      "expected_searchable": false,
+      "expected_drop_reason_any": ["HYDRATION_MISSING", "VISIBILITY_REJECTED", "DELETED_PARENT"]
+    },
+    {
+      "scenario_id": "expired-v4",
+      "access_zone": "zone-a",
+      "document": "doc-hierarchy",
+      "version": 4,
+      "document_state": "ACTIVE_OR_EXPIRED_AS_IMPLEMENTED",
+      "expires_at": "PAST_RELATIVE_TO_TEST_CLOCK",
+      "expected_searchable": false
+    },
+    {
+      "scenario_id": "legal-hold-active",
+      "access_zone": "zone-a",
+      "document": "doc-hierarchy",
+      "version": 1,
+      "legal_hold": true,
+      "ttl_policy": "CONTROLLED_BY_TEST",
+      "expected_cleanup_protected": true,
+      "expected_retrieval_policy": "FOLLOW_CANONICAL_ACTIVE_STATE"
+    },
+    {
+      "scenario_id": "parent-hydration-timeout-partial",
+      "access_zone": "zone-a",
+      "failpoint": "parent_hydration_timeout",
+      "affected_parent": "parent-a3",
+      "unaffected_parent": "parent-a1",
+      "expected_request_behavior": "SUCCESS_DEGRADED_WITH_SURVIVING_CONTEXT",
+      "forbidden_behavior": "SUCCESS_NO_EVIDENCE"
+    },
+    {
+      "scenario_id": "parent-hydration-timeout-total",
+      "access_zone": "zone-a",
+      "failpoint": "parent_hydration_timeout",
+      "affected_parents": ["parent-a1", "parent-a2", "parent-a3"],
+      "expected_request_behavior_any": ["UNAVAILABLE", "DEADLINE_EXCEEDED", "DEGRADED_WITHOUT_FALSE_FOUND"],
+      "forbidden_behavior_any": ["SUCCESS_NO_EVIDENCE", "FOUND_WITH_EMPTY_PARENT"]
+    }
+  ],
+  "hard_gates": {
+    "wrong_version_results": 0,
+    "deleted_results": 0,
+    "expired_results": 0,
+    "stale_child_contexts": 0,
+    "false_no_answer_after_hydration_failure": 0,
+    "empty_parent_contexts": 0
+  }
+}

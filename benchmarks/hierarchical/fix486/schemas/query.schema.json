@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astravector.local/schemas/fix486-query.schema.json",
+  "title": "FIX486 hierarchical query",
+  "type": "object",
+  "required": ["query_id", "case_id", "access_zone", "question", "profile", "max_contexts", "required_intents"],
+  "properties": {
+    "query_id": {"type": "string", "minLength": 1},
+    "case_id": {"type": "string", "pattern": "^FIX486-[0-9]{2}$"},
+    "access_zone": {"type": "string", "minLength": 1},
+    "question": {"type": "string", "minLength": 1},
+    "profile": {"type": "string"},
+    "max_contexts": {"type": "integer", "minimum": 1},
+    "max_context_tokens": {"type": "integer", "minimum": 1},
+    "enable_graph_expansion": {"type": "boolean"},
+    "graph_max_hops": {"type": "integer", "minimum": 0},
+    "required_intents": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "required_failpoint": {"type": "string"},
+    "fault_setup": {"type": "string"},
+    "fixture_generation_required": {"type": "string"}
+  },
+  "additionalProperties": true
+}

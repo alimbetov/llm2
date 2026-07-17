@@ -908,6 +908,37 @@ async fn test_e2e_retrieve_context_full_rag_lifecycle_over_tonic_network() {
             .collect::<Vec<_>>()
     );
 
+    // A visible graph child must never masquerade as its parent when the real
+    // parent is no longer lifecycle-visible.
+    sqlx::query(
+        "UPDATE astravector.content_chunks_v004
+         SET lifecycle_status='DELETED', deleted_at=now()
+         WHERE access_zone_id=$1 AND id=$2",
+    )
+    .bind(access_zone_id)
+    .bind(related_parent_id)
+    .execute(&pool)
+    .await
+    .expect("hide graph parent for fail-closed hydration check");
+    let stale_child_contexts = repo
+        .fetch_contexts_for_graph_related_chunks_multi(&[access_zone_id], &[related_chunk_id], 2)
+        .await
+        .expect("graph hydration query must execute");
+    assert!(
+        stale_child_contexts.is_empty(),
+        "graph child with a missing lifecycle-visible parent must be dropped, not returned as parent evidence: {stale_child_contexts:?}"
+    );
+    sqlx::query(
+        "UPDATE astravector.content_chunks_v004
+         SET lifecycle_status='ACTIVE', deleted_at=NULL
+         WHERE access_zone_id=$1 AND id=$2",
+    )
+    .bind(access_zone_id)
+    .bind(related_parent_id)
+    .execute(&pool)
+    .await
+    .expect("restore graph parent after fail-closed hydration check");
+
     sqlx::query(
         "UPDATE astravector.document_versions
          SET lifecycle_status='ACTIVE', expires_at=now() - interval '1 minute'
