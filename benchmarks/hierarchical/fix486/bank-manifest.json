@@ -1,0 +1,50 @@
+{
+  "bank_id": "fix486-hierarchical-bank",
+  "bank_version": "0.1.0-analysis-seed",
+  "schema_version": "1",
+  "status": "NOT_FROZEN",
+  "created_from_source_sha": "cfa01b2d615582ac736f1ef844d8fc79280e3ff1",
+  "target_branch": "codex/fix486a-analysis-readiness",
+  "freeze_target_version": "1.0.0",
+  "languages": ["ru", "en"],
+  "critical_cases": [
+    "FIX486-01",
+    "FIX486-02",
+    "FIX486-03",
+    "FIX486-04",
+    "FIX486-05",
+    "FIX486-06",
+    "FIX486-07",
+    "FIX486-08",
+    "FIX486-09",
+    "FIX486-10"
+  ],
+  "files": {
+    "corpus": "corpus/hierarchical-fixture-v1.json",
+    "queries": "queries/hierarchical-queries-v1.jsonl",
+    "qrels": "qrels/hierarchical-qrels-v1.jsonl",
+    "graph": "graph-relations/hierarchical-graph-v1.json",
+    "lifecycle": "lifecycle/hierarchical-lifecycle-v1.json"
+  },
+  "hashes": {
+    "aggregate_sha256": null,
+    "corpus_sha256": null,
+    "queries_sha256": null,
+    "qrels_sha256": null,
+    "graph_sha256": null,
+    "lifecycle_sha256": null,
+    "status": "TO_BE_RESOLVED_BY_FIX486A"
+  },
+  "identity_policy": {
+    "logical_ids_are_expectations": true,
+    "runtime_ids_must_be_captured": true,
+    "same_logical_ids_across_zones_required": true,
+    "same_qdrant_point_uuid_not_assumed": true
+  },
+  "immutability_policy": {
+    "frozen_after_version": "1.0.0",
+    "qrels_must_not_follow_runtime_output": true,
+    "bank_change_requires_new_version": true,
+    "production_fix_must_be_separate_commit": true
+  }
+}
