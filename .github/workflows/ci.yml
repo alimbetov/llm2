@@ -27,6 +27,19 @@ jobs:
         with:
           toolchain: 1.88.0
           components: rustfmt, clippy
+      - name: Provision pinned BGE-M3 tokenizer
+        env:
+          TOKENIZER_URL: https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/tokenizer.json
+          TOKENIZER_SHA256: 21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08
+        run: |
+          tokenizer_dir="$RUNNER_TEMP/models/bge-m3"
+          tokenizer_path="$tokenizer_dir/tokenizer.json"
+          mkdir -p "$tokenizer_dir"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$TOKENIZER_URL" \
+            --output "$tokenizer_path"
+          printf '%s  %s\n' "$TOKENIZER_SHA256" "$tokenizer_path" | sha256sum --check --strict
+          printf 'ASTRAVECTOR_TOKENIZER_PATH=%s\n' "$tokenizer_path" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo check --locked --all-targets --all-features
       - run: cargo test --locked query_processing --lib -- --nocapture
