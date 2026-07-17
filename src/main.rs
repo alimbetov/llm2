@@ -111,6 +111,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    if cfg.qdrant.auto_create_collection {
+        let qdrant = qdrant.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("qdrant.auto_create_collection=true requires qdrant.enabled=true")
+        })?;
+        qdrant.ensure_collection(cfg.dense.dimension).await?;
+    }
     if let Some(r) = repo.clone() {
         if cfg.recovery.enabled {
             recovery::spawn(r.clone(), cfg.recovery.clone(), shutdown.child_token())
