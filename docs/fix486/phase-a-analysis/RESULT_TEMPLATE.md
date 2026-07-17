@@ -1,177 +1,88 @@
-# FIX486A analysis and repair result
+# FIX486A final analysis result
 
-## 1. Identity
+## Identity
 
 ```text
-SOURCE_BRANCH=
-BASELINE_SOURCE_SHA=
-FINAL_CANDIDATE_SHA=
-ORIGIN_MAIN_SHA=
-EPIC_SHA=
-CARGO_LOCK_SHA256=
-MODEL_SHA256=
-TOKENIZER_SHA256=
-CONFIG_SHA256=
-BANK_ID=fix486-hierarchical-bank
+BASELINE_SOURCE_SHA=bb6fd6781623cbe0a84f91a204f59da2a32e5c55
+RUNTIME_FIX_CANDIDATE_SHA=f160a76c78fc775e633d5d17760219eb8af8f40b
+EPIC_SHA=cfa01b2d615582ac736f1ef844d8fc79280e3ff1
 BANK_VERSION=0.1.0-analysis-seed
-BANK_SHA256=
-EVIDENCE_PATH=
-EVIDENCE_MANIFEST_SHA256=
+BANK_FILES_SHA256=cb5b80c25f30f20a2e68a70952be2223905ad9bb2c731ab58603a670d57e4933
+MODEL_SHA256=f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b
+TOKENIZER_SHA256=21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08
+FINAL_EVIDENCE=/Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix486a/fix486a-final-20260717T150000Z
 ```
 
-## 2. Baseline before fixes
+## Baseline and final gates
 
-| Gate | Status | Evidence | Failure code |
+| Gate | Baseline | Final | Assertion |
 |---|---|---|---|
-| fmt | | | |
-| check locked all targets/features | | | |
-| tests locked all targets/features | | | |
-| clippy locked all targets/features | | | |
-| targeted hierarchical tests | | | |
-| integration/Testcontainers | | | |
-| affected model-backed gates | | | |
+| `cargo fmt --all --check` | PASS | PASS | exit 0 |
+| `cargo check --locked --all-targets --all-features` | PASS | PASS | exit 0 |
+| `cargo test --locked --all-targets --all-features` | PASS | PASS | exit 0; real assertions and Testcontainers executed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS | PASS | exit 0 |
+| FIX486 bank contracts | not present | PASS | 3 passed, 0 failed; 11 queries/qrels, 10 cases |
+| Graph parent regression | FAIL before repair | PASS | 1 passed, 0 failed after repair |
+| affected model-backed gate | PASS | PASS | real BGE-M3 tokenizer boundary tests 2 passed |
 
-## 3. Architecture findings
+The two repository tests marked ignored by the all-target command are pre-existing opt-in full
+production-candidate/live-endpoint suites and are not used as FIX486 Phase A evidence. No mandatory
+Phase A stage is represented as PASS because of an ignored test.
 
-### Ingestion hierarchy
+## Critical proof readiness
 
-TBD
+| Case | Status | Blocking future runtime proof |
+|---|---|---|
+| FIX486-01 | IMPLEMENTED_PARTIALLY_PROVEN | immutable-bank exact child/parent run |
+| FIX486-02 | IMPLEMENTED_PARTIALLY_PROVEN | two-child winner/dedup trace |
+| FIX486-03 | IMPLEMENTED_PARTIALLY_PROVEN | executable Zone A/B collision run |
+| FIX486-04 | IMPLEMENTED_PARTIALLY_PROVEN | higher-attraction inactive version run |
+| FIX486-05 | IMPLEMENTED_PARTIALLY_PROVEN | stale Qdrant projection drop trace |
+| FIX486-06 | IMPLEMENTED_NOT_PROVEN | deterministic hydration failpoints |
+| FIX486-07 | IMPLEMENTED_PARTIALLY_PROVEN | exact sparse/FTS child assertion |
+| FIX486-08 | IMPLEMENTED_PARTIALLY_PROVEN | bank REPAIRED_BY identity run |
+| FIX486-09 | IMPLEMENTED_PARTIALLY_PROVEN | production-token constrained budget run |
+| FIX486-10 | IMPLEMENTED_NOT_PROVEN | generated 900-token parent selection run |
 
-### Child retrieval and parent hydration
-
-TBD
-
-### Parent grouping and deduplication
-
-TBD
-
-### Isolation and lifecycle
-
-TBD
-
-### GraphRAG parent resolution
-
-TBD
-
-### MMR, token budget and final coverage
-
-TBD
-
-## 4. Critical proof readiness
-
-| Case | Status | Current proof | Missing proof | Blocking work |
-|---|---|---|---|---|
-| FIX486-01 | | | | |
-| FIX486-02 | | | | |
-| FIX486-03 | | | | |
-| FIX486-04 | | | | |
-| FIX486-05 | | | | |
-| FIX486-06 | | | | |
-| FIX486-07 | | | | |
-| FIX486-08 | | | | |
-| FIX486-09 | | | | |
-| FIX486-10 | | | | |
-
-## 5. Defect register
-
-| ID | Severity | Category | Scenario | Root cause | Before evidence | Regression test | Fix commit | After evidence | Status |
-|---|---|---|---|---|---|---|---|---|---|
-
-## 6. Before/after comparison
-
-For every repaired defect include:
+## Defect closeout
 
 ```text
-DEFECT_ID=
-BANK_VERSION=
-BANK_SHA256=
-QUERY_OR_SCENARIO_ID=
-EXPECTED_RESULT=
-BEFORE_SOURCE_SHA=
-BEFORE_ACTUAL_RESULT=
-BEFORE_EVIDENCE=
-REGRESSION_TEST=
-ROOT_CAUSE=
-FIX_COMMIT=
-AFTER_SOURCE_SHA=
-AFTER_ACTUAL_RESULT=
-AFTER_EVIDENCE=
-QUERIES_UNCHANGED=
-QRELS_UNCHANGED=
-REMAINING_RISK=
-```
-
-## 7. Testability and observability gaps
-
-| ID | Gap | Required change | Production impact | Priority | Resolution/status |
-|---|---|---|---|---|---|
-
-## 8. Bank feasibility
-
-```text
-SCHEMAS_VALID=
-LOGICAL_IDENTITIES_FEASIBLE=
-CROSS_ZONE_SCENARIO_FEASIBLE=
-LIFECYCLE_SCENARIOS_FEASIBLE=
-GRAPH_SCENARIO_FEASIBLE=
-BANK_1_0_0_FREEZE_READY=
-```
-
-## 9. Mandatory final rerun
-
-| Gate | Status | Evidence | Failure code |
-|---|---|---|---|
-| cargo fmt --all --check | | | |
-| cargo check --locked --all-targets --all-features | | | |
-| cargo test --locked --all-targets --all-features | | | |
-| cargo clippy --locked --all-targets --all-features -- -D warnings | | | |
-| all new regression tests | | | |
-| relevant integration/Testcontainers tests | | | |
-| affected model-backed gates | | | |
-| executable bank scenarios | | | |
-
-## 10. Unresolved defects
-
-| ID | Severity | Reason unresolved | Risk | Target phase | Final blocker |
-|---|---|---|---|---|---|
-
-Any reproducible in-scope unresolved P0/P1 defect must set `Final blocker = YES`.
-
-## 11. Mac methodology readiness
-
-TBD
-
-## 12. Implementation backlog summary
-
-TBD
-
-## 13. Remaining blockers
-
-TBD
-
-## 14. Final verdict
-
-`FIX486_ANALYSIS_READY` is allowed only when:
-
-```text
+DEFECT_ID=FIX486A-P1-001
+SEVERITY=P1
+BEFORE=FAIL, stale graph child substituted for deleted parent
+REGRESSION=tests/e2e_testcontainers.rs
+ROOT_CAUSE=LEFT JOIN plus COALESCE parent-to-child fallback
+FIX_COMMIT=388d7fd
+AFTER=PASS, stale child hydration returns zero contexts
+QUERIES_UNCHANGED=true
+QRELS_UNCHANGED=true
 UNRESOLVED_IN_SCOPE_P0=0
 UNRESOLVED_IN_SCOPE_P1=0
-REPAIRED_DEFECTS_WITHOUT_REGRESSION_TEST=0
-REPAIRED_DEFECTS_WITHOUT_BEFORE_AFTER_EVIDENCE=0
-MANDATORY_FINAL_FAILED=0
-MANDATORY_FINAL_BLOCKED=0
-MANDATORY_FINAL_SKIPPED=0
-IDENTITY_MISMATCH=0
 ```
 
-Exactly one:
+## Bank feasibility
+
+```text
+SCHEMAS_STRUCTURALLY_VALID=true
+QUERY_QREL_RECORDS_LOADED=11/11
+CRITICAL_CASES_COVERED=10/10
+LOGICAL_IDENTITIES_FEASIBLE=true
+CROSS_ZONE_SCENARIO_FEASIBLE=true
+LIFECYCLE_SCENARIOS_FEASIBLE=true
+GRAPH_SCENARIO_FEASIBLE=true
+BANK_1_0_0_FREEZE_READY=false
+FREEZE_BLOCKERS=generated parent-large text, production token counts, physical identity map, manifest hashes
+```
+
+## Scope boundary
+
+`FIX486_ANALYSIS_READY` means the production path is mapped, the seed bank is feasible, all ten
+cases have executable proof designs, the discovered P1 is fixed with regression evidence, and all
+mandatory Phase A gates pass. It does not mean the complete hierarchical bank, model-backed
+quality program or Mac load certification has passed.
+
+## Verdict
 
 ```text
 FIX486_ANALYSIS_READY
-```
-
-or:
-
-```text
-FIX486_ANALYSIS_BLOCKED
 ```
