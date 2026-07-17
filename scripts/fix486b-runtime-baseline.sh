@@ -175,6 +175,23 @@ qdrant_snapshot() {
   jq -e '.count_match' "$output" >/dev/null
 }
 
+integrity_audit() {
+  local run=$1 label audit
+  label=$(lower "$run")
+  audit="$EVIDENCE/migrations/$label-schema-audit.json"
+  psql "$DB_URL" -f "$ROOT/scripts/fix486b-audit.sql" \
+    >"$EVIDENCE/migrations/$label-integrity-audit.log" 2>&1
+  snapshot "$audit"
+  jq -e '
+    .active_documents == 1 and
+    .source_chunks > 0 and .parent_chunks > 0 and .child_chunks > 0 and
+    .bindings > 0 and .synced_bindings == .bindings and
+    .completed_outbox == .bindings and .dead_letters == 0 and
+    .orphan_children == 0 and .duplicate_chunks == 0 and
+    .duplicate_bindings == 0 and .duplicate_outbox_effects == 0
+  ' "$audit" >/dev/null
+}
+
 normalize_probe() {
   local label=$1 output=$2
   jq -n \
@@ -281,6 +298,7 @@ run_clean() {
   ingest_and_probe "$run"
   snapshot "$EVIDENCE/fixture/$label-snapshot.json"
   qdrant_snapshot "$EVIDENCE/fixture/$label-qdrant.json"
+  integrity_audit "$run"
   stop_runtime
 }
 
@@ -362,6 +380,8 @@ finalize() {
       "$EVIDENCE/fixture/r1-qdrant.json" \
       "$EVIDENCE/fixture/r2-qdrant.json" \
       "$EVIDENCE/fixture/r3-qdrant.json" \
+      "$EVIDENCE/migrations/r1-schema-audit.json" \
+      "$EVIDENCE/migrations/r2-schema-audit.json" \
       "$EVIDENCE/comparisons/r1-r2-normalized.json" \
       "$EVIDENCE/comparisons/r2-r3-normalized.json" \
       "$EVIDENCE/retrieval/r3-restart/search-response.json" \
