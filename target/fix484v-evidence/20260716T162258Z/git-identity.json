@@ -1,8 +1,0 @@
-{
-  "run_id": "20260716T162258Z",
-  "repository": "git@github.com:alimbetov/llm2.git",
-  "branch": "codex/fix484v-verify-and-harden",
-  "base_commit": "9817c4b03d401efbc59bcbcdff00583a890f8e55",
-  "origin_main": "9817c4b03d401efbc59bcbcdff00583a890f8e55",
-  "worktree": "/Users/ruslanalimbetov/Documents/llm2/astravector-fix484v"
-}
