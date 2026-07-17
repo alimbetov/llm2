@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -31,6 +31,32 @@ db-up:
 	docker compose up -d postgres
 db-down:
 	docker compose down
+
+verify-rag-core:
+	cargo fmt --all --check
+	cargo check --locked --all-targets --all-features
+	cargo test --locked --all-targets --all-features
+	cargo clippy --locked --all-targets --all-features -- -D warnings
+	cargo sqlx prepare --check -- --all-targets --all-features
+
+smoke-rag-long-query:
+	SMOKE_ARTIFACT_DIR=$${SMOKE_ARTIFACT_DIR:-$${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/$${FIX485_RUN_ID:-fix485-local}/smoke} bash ./smoke-tests/v004/scripts/run-full-smoke.sh --only long-query-model-backed --keep-running --strict
+
+smoke-rag-hybrid:
+	SMOKE_ARTIFACT_DIR=$${SMOKE_ARTIFACT_DIR:-$${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/$${FIX485_RUN_ID:-fix485-local}/smoke} bash ./smoke-tests/v004/scripts/run-full-smoke.sh --only hybrid-runtime-retrieval --keep-running --strict
+
+smoke-rag-failures:
+	SMOKE_ARTIFACT_DIR=$${SMOKE_ARTIFACT_DIR:-$${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/$${FIX485_RUN_ID:-fix485-local}/smoke} bash ./smoke-tests/v004/scripts/run-full-smoke.sh --only partial-backend-failure --keep-running --strict
+
+smoke-rag-mixed-load:
+	SMOKE_ARTIFACT_DIR=$${SMOKE_ARTIFACT_DIR:-$${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/$${FIX485_RUN_ID:-fix485-local}/smoke} bash ./smoke-tests/v004/scripts/run-full-smoke.sh --only mixed-tier-fairness --keep-running --strict
+
+verify-rag-production-candidate: verify-rag-core
+	$(MAKE) smoke-rag-long-query
+	$(MAKE) smoke-rag-hybrid
+	$(MAKE) smoke-rag-failures
+	$(MAKE) smoke-rag-mixed-load
+	$(MAKE) quality-runtime-confidence-remote
 
 
 sqlx-prepare:
