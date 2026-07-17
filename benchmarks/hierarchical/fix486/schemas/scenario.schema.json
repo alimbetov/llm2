@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astravector.local/schemas/fix486-scenario.schema.json",
+  "title": "FIX486 lifecycle or failure scenario",
+  "type": "object",
+  "required": ["scenario_id", "access_zone"],
+  "properties": {
+    "scenario_id": {"type": "string", "minLength": 1},
+    "access_zone": {"type": "string", "minLength": 1},
+    "document": {"type": "string"},
+    "version": {"type": "integer", "minimum": 1},
+    "document_state": {"type": "string"},
+    "chunk_state": {"type": "string"},
+    "parent_state": {"type": "string"},
+    "qdrant_child_state": {"type": "string"},
+    "failpoint": {"type": "string"},
+    "expected_searchable": {"type": "boolean"},
+    "expected_request_behavior": {"type": "string"},
+    "expected_request_behavior_any": {"type": "array", "items": {"type": "string"}},
+    "forbidden_behavior": {"type": "string"},
+    "forbidden_behavior_any": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}
