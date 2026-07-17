@@ -3,7 +3,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
-LOAD_RUN_ID="${LOAD_RUN_ID:-macbook-m2-load-$(date +%Y%m%d-%H%M%S)}"
+LOAD_RUN_ID="${LOAD_RUN_ID:-macbook-model-backed-load-$(date +%Y%m%d-%H%M%S)}"
 if [[ -n "$(git status --porcelain)" ]]; then
   printf 'OVERALL_VERDICT=BLOCKED\nFAILURE_REASON=DIRTY_GIT_AT_START\n' >&2
   exit 2
@@ -29,6 +29,7 @@ RESOURCE_PID=""
 METRICS_PID=""
 OVERALL_VERDICT="INCOMPLETE"
 RECOVERY_P95_SLO_MS="${RECOVERY_P95_SLO_MS:-1000}"
+LOAD_QUERY_DEADLINE_MS="${ASTRAVECTOR_LOAD_QUERY_DEADLINE_MS:-8000}"
 
 mkdir -p "$EVIDENCE_DIR"/{environment,static,infrastructure,runtime,corpus,contract,warmup,baseline,step,soak,spike,recovery,post-load-quality,system,metrics}
 FAILURE_REGISTRY="$EVIDENCE_DIR/stage-failures.json"
@@ -172,18 +173,31 @@ start_samplers() {
 
 write_report() {
   local report="$EVIDENCE_DIR/astravector-macbook-load-report.json"
-  local git_sha model_sha tokenizer_sha binary_sha
+  local git_sha model_sha tokenizer_sha binary_sha cargo_lock_sha machine_chip cpu_cores memory_bytes
+  local config_sha corpus_sha postgres_image_id qdrant_image_id
   git_sha="$(git rev-parse HEAD 2>/dev/null || true)"
   model_sha="$(shasum -a 256 "$MODEL_PATH" 2>/dev/null | awk '{print $1}')"
   tokenizer_sha="$(shasum -a 256 "$TOKENIZER_PATH" 2>/dev/null | awk '{print $1}')"
   binary_sha="$(shasum -a 256 target/release/astravector-runtime 2>/dev/null | awk '{print $1}')"
+  cargo_lock_sha="$(shasum -a 256 Cargo.lock 2>/dev/null | awk '{print $1}')"
+  machine_chip="$(cat "$EVIDENCE_DIR/environment/chip.txt" 2>/dev/null || printf unknown)"
+  cpu_cores="$(cat "$EVIDENCE_DIR/environment/cpu-count.txt" 2>/dev/null || printf 0)"
+  memory_bytes="$(cat "$EVIDENCE_DIR/environment/memory-bytes.txt" 2>/dev/null || printf 0)"
+  config_sha="$(cat "$EVIDENCE_DIR/runtime/config.sha256" 2>/dev/null | awk '{print $1}')"
+  corpus_sha="$(cat "$EVIDENCE_DIR/corpus/corpus-snapshot.sha256" 2>/dev/null || true)"
+  postgres_image_id="$(jq -r '.[0].Image // empty' "$EVIDENCE_DIR/infrastructure/docker-inspect-postgres.json" 2>/dev/null || true)"
+  qdrant_image_id="$(jq -r '.[0].Image // empty' "$EVIDENCE_DIR/infrastructure/docker-inspect-qdrant.json" 2>/dev/null || true)"
   local reasons; reasons="$(jq '[.failures[].code] | unique' "$FAILURE_REGISTRY")"
   jq -n --arg id "$LOAD_RUN_ID" --arg sha "$git_sha" \
     --arg verdict "$OVERALL_VERDICT" --arg model "$model_sha" --arg tokenizer "$tokenizer_sha" \
-    --arg binary "$binary_sha" --argjson reasons "$reasons" \
-    '{schema_version:"3.0",report_schema_version:"3.0",load_run_id:$id,source:{git_sha:$sha,git_clean_at_start:true},machine:{chip:"Apple M2",cpu_cores:8,memory_bytes:17179869184},tools:{ghz:"0.121.0"},runtime:{binary_sha256:($binary|select(length>0)//null),model_sha256:($model|select(length>0)//null),tokenizer_sha256:($tokenizer|select(length>0)//null),model_backed:true,release_build:true},overall_verdict:$verdict,failure_reasons:$reasons,evidence:{simulation_detected:false,incomplete_processes:[]}}' > "$report"
+    --arg binary "$binary_sha" --arg cargo_lock "$cargo_lock_sha" --arg chip "$machine_chip" \
+    --arg config "$config_sha" --arg corpus "$corpus_sha" \
+    --arg postgres_image "$postgres_image_id" --arg qdrant_image "$qdrant_image_id" \
+    --argjson cpu_cores "$cpu_cores" --argjson memory_bytes "$memory_bytes" \
+    --argjson query_deadline_ms "$LOAD_QUERY_DEADLINE_MS" --argjson reasons "$reasons" \
+    '{schema_version:"3.0",report_schema_version:"3.0",load_run_id:$id,source:{git_sha:$sha,git_clean_at_start:true,cargo_lock_sha256:($cargo_lock|select(length>0)//null)},machine:{chip:$chip,cpu_cores:$cpu_cores,memory_bytes:$memory_bytes},tools:{ghz:"0.121.0"},runtime:{binary_sha256:($binary|select(length>0)//null),model_sha256:($model|select(length>0)//null),tokenizer_sha256:($tokenizer|select(length>0)//null),config_sha256:($config|select(length>0)//null),corpus_snapshot_sha256:($corpus|select(length>0)//null),postgres_image_id:($postgres_image|select(length>0)//null),qdrant_image_id:($qdrant_image|select(length>0)//null),model_backed:true,release_build:true,query_deadline_ms:$query_deadline_ms},overall_verdict:$verdict,failure_reasons:$reasons,evidence:{simulation_detected:false,incomplete_processes:[]}}' > "$report"
   cat > "$EVIDENCE_DIR/astravector-macbook-load-report.md" <<EOF
-# AstraVector MacBook M2 Load Report
+# AstraVector MacBook Model-Backed Load Report
 
 ## Executive verdict
 
@@ -204,6 +218,7 @@ EOF
 } > "$EVIDENCE_DIR/environment/git.txt"
 { ghz --version; grpcurl --version; docker --version; docker compose version; rustc --version; cargo --version; jq --version; } > "$EVIDENCE_DIR/environment/tools.txt" 2>&1
 system_profiler SPHardwareDataType > "$EVIDENCE_DIR/environment/mac-hardware.txt"
+awk -F ': ' '/Chip|Processor Name/ {print $2; exit}' "$EVIDENCE_DIR/environment/mac-hardware.txt" > "$EVIDENCE_DIR/environment/chip.txt"
 sw_vers > "$EVIDENCE_DIR/environment/macos.txt"
 sysctl -n hw.ncpu > "$EVIDENCE_DIR/environment/cpu-count.txt"
 sysctl -n hw.memsize > "$EVIDENCE_DIR/environment/memory-bytes.txt"
@@ -219,9 +234,9 @@ grep -q 'AC Power' "$EVIDENCE_DIR/environment/power.txt" || block BLOCKED_BY_POW
 [[ "$(ghz --version 2>&1)" == "0.121.0" ]] || block BLOCKED_BY_GHZ_VERSION
 
 record "$EVIDENCE_DIR/static/fmt" cargo fmt --check || block BLOCKED_BY_STATIC_GATE
-record "$EVIDENCE_DIR/static/check" cargo check --all-targets --all-features || block BLOCKED_BY_STATIC_GATE
-record "$EVIDENCE_DIR/static/clippy" cargo clippy --all-targets --all-features -- -D warnings || block BLOCKED_BY_STATIC_GATE
-record "$EVIDENCE_DIR/static/concurrency-smoke" cargo test --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture || block BLOCKED_BY_CONCURRENCY_SMOKE
+record "$EVIDENCE_DIR/static/check" cargo check --locked --all-targets --all-features || block BLOCKED_BY_STATIC_GATE
+record "$EVIDENCE_DIR/static/clippy" cargo clippy --locked --all-targets --all-features -- -D warnings || block BLOCKED_BY_STATIC_GATE
+record "$EVIDENCE_DIR/static/concurrency-smoke" cargo test --locked --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture || block BLOCKED_BY_CONCURRENCY_SMOKE
 
 docker compose config --services > "$EVIDENCE_DIR/infrastructure/docker-compose-config.txt" 2>&1
 docker compose up -d postgres qdrant > "$EVIDENCE_DIR/infrastructure/docker-compose-up.log" 2>&1 || block BLOCKED_BY_INFRASTRUCTURE
@@ -252,12 +267,17 @@ psql "$DB_URL" -Atc 'select max(version) from _sqlx_migrations where success=tru
 [[ -f "$MODEL_PATH" && -f "$TOKENIZER_PATH" ]] || block MODEL_FILES_NOT_FOUND
 shasum -a 256 "$MODEL_PATH" "$TOKENIZER_PATH" > "$EVIDENCE_DIR/runtime/model-tokenizer.sha256"
 cat config/application.yaml config/application-load-m2.yaml | shasum -a 256 > "$EVIDENCE_DIR/runtime/config.sha256"
-record "$EVIDENCE_DIR/runtime/release-build" cargo build --release --bin astravector-runtime --bin retrieval-load-driver || block BLOCKED_BY_RELEASE_BUILD
+record "$EVIDENCE_DIR/runtime/release-build" cargo build --locked --release --bin astravector-runtime --bin retrieval-load-driver || block BLOCKED_BY_RELEASE_BUILD
 shasum -a 256 target/release/astravector-runtime > "$EVIDENCE_DIR/runtime/binary.sha256"
 if lsof -nP -iTCP:50051 -sTCP:LISTEN > "$EVIDENCE_DIR/runtime/port-before.txt" 2>&1; then block BLOCKED_BY_EXISTING_RUNTIME; fi
 
 ASTRAVECTOR_PROFILE=load-m2 ASTRAVECTOR_DB_URL="$DB_URL" ASTRAVECTOR_QDRANT_URL=http://127.0.0.1:6333 \
 ASTRAVECTOR_MODEL_PATH="$MODEL_PATH" ASTRAVECTOR_TOKENIZER_PATH="$TOKENIZER_PATH" \
+ASTRAVECTOR_GRPC_QUERY_DEADLINE_MS="$LOAD_QUERY_DEADLINE_MS" \
+ASTRAVECTOR_SINGLE_QUERY_DEADLINE_MS="$LOAD_QUERY_DEADLINE_MS" \
+ASTRAVECTOR_LONG_QUERY_DEADLINE_MS="$LOAD_QUERY_DEADLINE_MS" \
+ASTRAVECTOR_LONG_QUERY_STANDARD_DEADLINE_MS="$LOAD_QUERY_DEADLINE_MS" \
+ASTRAVECTOR_LONG_QUERY_EXTENDED_DEADLINE_MS="$LOAD_QUERY_DEADLINE_MS" \
 ASTRAVECTOR_GRAPH_MERGE_STRATEGY=GRAPH_AS_CONTEXT_APPEND ASTRAVECTOR_GRAPH_MAX_SEED_CHUNKS=16 \
 ASTRAVECTOR_GRAPH_CONTEXT_APPEND_LIMIT=5 ASTRAVECTOR_GRAPH_EXPANSION_RESULT_LIMIT=12 ASTRAVECTOR_GRAPH_TIMEOUT_MS=500 \
 ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true target/release/astravector-runtime > "$EVIDENCE_DIR/runtime/runtime.log" 2>&1 &

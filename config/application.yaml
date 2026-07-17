@@ -10,7 +10,7 @@ grpc:
   max_response_message_mb: 16
   max_items_per_batch: 32
   deadlines:
-    query_ms: 1000
+    query_ms: ${ASTRAVECTOR_GRPC_QUERY_DEADLINE_MS:-1000}
     document_batch_ms: 10000
     contract_ms: 1000
     health_ms: 500

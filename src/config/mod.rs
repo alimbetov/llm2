@@ -3046,6 +3046,12 @@ mod query_processing_compatibility_tests {
     use super::*;
 
     #[test]
+    fn grpc_query_deadline_keeps_default_and_supports_runtime_override() {
+        let application = include_str!("../../config/application.yaml");
+        assert!(application.contains("query_ms: ${ASTRAVECTOR_GRPC_QUERY_DEADLINE_MS:-1000}"));
+    }
+
+    #[test]
     fn legacy_keys_populate_standard_when_new_tier_is_absent() {
         let mut value: Value = serde_yaml::from_str(
             "search:\n  query_processing:\n    max_segments: 5\n    per_segment_candidate_limit: 9\n    global_candidate_limit: 70\n    long_query_deadline_ms: 2500\n",

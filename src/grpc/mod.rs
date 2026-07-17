@@ -216,6 +216,20 @@ fn postgres_statement_timeout_ms(
         .max(1))
 }
 
+fn optional_lexical_failure_can_degrade(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::DeadlineExceeded | tonic::Code::Unavailable
+    )
+}
+
+fn optional_lexical_failure_has_fallback(
+    successful_lexical_segments: usize,
+    direct_evidence_count: usize,
+) -> bool {
+    successful_lexical_segments > 0 || direct_evidence_count > 0
+}
+
 #[cfg(test)]
 mod downstream_budget_tests {
     use super::*;
@@ -225,6 +239,25 @@ mod downstream_budget_tests {
         assert_eq!(postgres_statement_timeout_ms(5_000, 800, 50).unwrap(), 750);
         assert_eq!(postgres_statement_timeout_ms(500, 800, 50).unwrap(), 500);
         assert!(postgres_statement_timeout_ms(5_000, 50, 50).is_err());
+    }
+
+    #[test]
+    fn only_transient_lexical_failures_are_degradable() {
+        assert!(optional_lexical_failure_can_degrade(
+            &Status::deadline_exceeded("statement timeout")
+        ));
+        assert!(optional_lexical_failure_can_degrade(&Status::unavailable(
+            "postgres unavailable"
+        )));
+        assert!(!optional_lexical_failure_can_degrade(&Status::cancelled(
+            "client cancelled"
+        )));
+        assert!(!optional_lexical_failure_can_degrade(&Status::internal(
+            "query defect"
+        )));
+        assert!(optional_lexical_failure_has_fallback(0, 1));
+        assert!(optional_lexical_failure_has_fallback(1, 0));
+        assert!(!optional_lexical_failure_has_fallback(0, 0));
     }
 
     #[test]
@@ -2433,7 +2466,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     .min(self.cfg.limits.search_candidate_limit_max)
                     .max(candidate_limit) as i64;
                 let lexical_inputs = query_plan.segments.clone();
-                let mut segment_lexical_results = stream::iter(lexical_inputs)
+                let segment_lexical_attempts = stream::iter(lexical_inputs)
                     .map(|segment| {
                         let cancellation = request_cancel.clone();
                         let segment_access_zone_ids = access_zone_ids.clone();
@@ -2459,9 +2492,36 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             .max(1),
                     )
                     .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, Status>>()?;
+                    .await;
+                let mut segment_lexical_results = Vec::new();
+                let mut segment_lexical_failures = Vec::new();
+                for attempt in segment_lexical_attempts {
+                    match attempt {
+                        Ok(result) => segment_lexical_results.push(result),
+                        Err(status) if optional_lexical_failure_can_degrade(&status) => {
+                            segment_lexical_failures.push(status)
+                        }
+                        Err(status) => return Err(status),
+                    }
+                }
+                if !segment_lexical_failures.is_empty() {
+                    if !optional_lexical_failure_has_fallback(
+                        segment_lexical_results.len(),
+                        direct_results.len(),
+                    ) {
+                        return Err(segment_lexical_failures.remove(0));
+                    }
+                    for status in segment_lexical_failures {
+                        warnings.push(pb::DiagnosticWarningV005 {
+                            code: "QUERY_SEGMENT_FTS_DEGRADED".into(),
+                            message: format!(
+                                "PostgreSQL FTS degraded after transient backend failure: {}",
+                                status.message()
+                            ),
+                        });
+                        counter!("astravector_optional_stage_skipped_total", "stage" => "lexical_segment", "reason" => "backend_failure").increment(1);
+                    }
+                }
                 segment_lexical_results.sort_by_key(|result| result.segment_index);
                 let mut lexical_candidates = Vec::new();
                 for result in segment_lexical_results {
