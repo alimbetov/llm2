@@ -442,6 +442,11 @@ async fn invalidate_cache() {
     *guard = None;
 }
 
+fn deterministic_access_zone_id(code: &str) -> Uuid {
+    let name = format!("astravector:access-zone-code:{code}");
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
+}
+
 async fn create_access_zone_from_code(
     pool: &PgPool,
     cfg: &AppConfig,
@@ -465,7 +470,7 @@ async fn create_access_zone_from_code(
     let ttl_days = default_ttl_days_from_access_zone_code(code).map_err(Status::from)?;
     let allow_never_expire = ttl_days == 0;
     let status = cfg.access_zone_registry.auto_create_default_status.as_str();
-    let new_id = Uuid::new_v4();
+    let new_id = deterministic_access_zone_id(code);
 
     let inserted = sqlx::query(
         "INSERT INTO astravector.access_zones (
@@ -650,7 +655,17 @@ pub async fn resolve_ingestion_zone(
 
 #[cfg(test)]
 mod tests {
-    use super::{default_ttl_days_from_access_zone_code, is_valid_access_zone_code};
+    use super::{
+        default_ttl_days_from_access_zone_code, deterministic_access_zone_id,
+        is_valid_access_zone_code,
+    };
+
+    #[test]
+    fn auto_created_zone_identity_is_stable_per_code() {
+        let first = deterministic_access_zone_id("1500");
+        assert_eq!(first, deterministic_access_zone_id("1500"));
+        assert_ne!(first, deterministic_access_zone_id("1501"));
+    }
 
     #[test]
     fn access_zone_code_validation_accepts_exactly_four_digits() {
