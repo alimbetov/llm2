@@ -14,3 +14,17 @@ fn runtime_creates_required_qdrant_collection_before_readiness_evaluation() {
         "Qdrant collection creation must precede initial readiness evaluation"
     );
 }
+
+#[test]
+fn access_zone_auto_creation_is_deterministic_for_a_stable_zone_code() {
+    let registry =
+        fs::read_to_string("src/access_zone_registry/mod.rs").expect("read access-zone registry");
+    assert!(
+        registry.contains("deterministic_access_zone_id(code)"),
+        "auto-create must derive a stable UUID from the validated zone code"
+    );
+    assert!(
+        !registry.contains("let new_id = Uuid::new_v4()"),
+        "random zone UUIDs make clean-run hierarchy identities nondeterministic"
+    );
+}
