@@ -166,6 +166,24 @@ snapshot() {
     )" | jq . >"$output"
 }
 
+qdrant_snapshot() {
+  local output=$1 synced points
+  synced=$(jq -r '.synced_bindings' "$EVIDENCE/fixture/$(basename "$output" -qdrant.json)-snapshot.json")
+  points=$(curl -fsS "$QDRANT_URL/collections/$COLLECTION" | jq -r '.result.points_count')
+  jq -n --argjson synced "$synced" --argjson points "$points" \
+    '{synced_bindings:$synced,qdrant_points:$points,count_match:($synced==$points)}' >"$output"
+  jq -e '.count_match' "$output" >/dev/null
+}
+
+normalize_probe() {
+  local label=$1 output=$2
+  jq -n \
+    --slurpfile search "$EVIDENCE/retrieval/$label/search-response.json" \
+    --slurpfile retrieve "$EVIDENCE/retrieval/$label/retrieve-response.json" \
+    '{search:([$search[0].results[]|{documentId,documentVersion,rootChunkId,sourceChunkId,parentChunkId,matchedChunkId,matchedGranularity,parentText,matchedText}]|sort_by(.matchedChunkId)),retrieve:([$retrieve[0].contexts[]|{documentId,documentVersion,rootChunkId,sourceChunkId,parentChunkId,matchedChunkId,matchedGranularity,parentText,matchedText}]|sort_by(.matchedChunkId))}' \
+    >"$output"
+}
+
 wait_indexed() {
   local zone=$1 doc=$2
   for _ in $(seq 1 120); do
@@ -262,6 +280,7 @@ run_clean() {
   fi
   ingest_and_probe "$run"
   snapshot "$EVIDENCE/fixture/$label-snapshot.json"
+  qdrant_snapshot "$EVIDENCE/fixture/$label-qdrant.json"
   stop_runtime
 }
 
@@ -319,6 +338,18 @@ run_r3() {
   wait_postgres
   wait_health SERVING
   probe_existing R3-recovered "$zone" "$doc"
+  snapshot "$EVIDENCE/fixture/r3-snapshot.json"
+  qdrant_snapshot "$EVIDENCE/fixture/r3-qdrant.json"
+  normalize_probe r2 "$EVIDENCE/comparisons/r2-probe-normalized.json"
+  normalize_probe r3-recovered "$EVIDENCE/comparisons/r3-probe-normalized.json"
+  jq -n \
+    --slurpfile r2 "$EVIDENCE/fixture/r2-snapshot.json" \
+    --slurpfile r3 "$EVIDENCE/fixture/r3-snapshot.json" \
+    --slurpfile p2 "$EVIDENCE/comparisons/r2-probe-normalized.json" \
+    --slurpfile p3 "$EVIDENCE/comparisons/r3-probe-normalized.json" \
+    '{snapshot_match:($r2[0]==$r3[0]),probe_match:($p2[0]==$p3[0]),r2:$r2[0],r3:$r3[0]}' \
+    >"$EVIDENCE/comparisons/r2-r3-normalized.json"
+  jq -e '.snapshot_match and .probe_match' "$EVIDENCE/comparisons/r2-r3-normalized.json" >/dev/null
   stop_runtime
 }
 
@@ -328,7 +359,11 @@ finalize() {
     for required in \
       "$EVIDENCE/fixture/r1-snapshot.json" \
       "$EVIDENCE/fixture/r2-snapshot.json" \
+      "$EVIDENCE/fixture/r1-qdrant.json" \
+      "$EVIDENCE/fixture/r2-qdrant.json" \
+      "$EVIDENCE/fixture/r3-qdrant.json" \
       "$EVIDENCE/comparisons/r1-r2-normalized.json" \
+      "$EVIDENCE/comparisons/r2-r3-normalized.json" \
       "$EVIDENCE/retrieval/r3-restart/search-response.json" \
       "$EVIDENCE/retrieval/r3-restart/retrieve-response.json" \
       "$EVIDENCE/dependency-recovery/qdrant-down-health.txt" \
@@ -340,9 +375,11 @@ finalize() {
   local verdict=FIX486_RUNTIME_BASELINE_PASS
   ((${#FAILURES[@]} == 0)) || verdict=FIX486_RUNTIME_BASELINE_BLOCKED
   jq -n --arg run_id "$RUN_ID" --arg verdict "$verdict" --argjson failures "$(printf '%s\n' "${FAILURES[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
-    '{schema_version:1,run_id:$run_id,phase:"FIX486B_REPRODUCIBLE_RUNTIME_BASELINE",verdict:$verdict,failure_codes:$failures,bank_version:"0.1.0-analysis-seed",bank_frozen:false}' >"$EVIDENCE/stage-results.json"
+    --slurpfile stages <(jq -s '.' "$EVIDENCE"/logs/*.json 2>/dev/null || printf '[]') \
+    '{schema_version:1,run_id:$run_id,phase:"FIX486B_REPRODUCIBLE_RUNTIME_BASELINE",verdict:$verdict,failure_codes:$failures,bank_version:"0.1.0-analysis-seed",bank_frozen:false,recorded_stages:($stages[0] // [])}' >"$EVIDENCE/stage-results.json"
   find "$EVIDENCE" -type f ! -name manifest.json -print0 | sort -z | xargs -0 shasum -a 256 | \
-    jq -Rsc 'split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]+)  (?<path>.*)$"))' >"$EVIDENCE/manifest.json"
+    jq -Rsc --arg run_id "$RUN_ID" --arg verdict "$verdict" \
+      '{schema_version:1,run_id:$run_id,verdict:$verdict,generated_at:(now|todate),files:(split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]+)  (?<path>.*)$")))}' >"$EVIDENCE/manifest.json"
   cat >"$EVIDENCE/FIX486B-RUNTIME-BASELINE-RESULT.md" <<EOF
 # FIX486B runtime baseline result
 
