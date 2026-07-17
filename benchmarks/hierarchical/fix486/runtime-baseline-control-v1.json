@@ -1,0 +1,77 @@
+{
+  "fixture_id": "fix486b-runtime-control-v1",
+  "access_zone_code": "4861",
+  "external_document_id": "fix486b-runtime-control",
+  "document_version": 1,
+  "anchor": "ASTRA_FIX486B_RUNTIME_CONTROL",
+  "request": {
+    "context": {
+      "correlationId": "fix486b-runtime-control-ingest",
+      "idempotencyKey": "fix486b-runtime-control-v1",
+      "callerService": "fix486b-runtime-baseline",
+      "callerUserId": "fix486b-runtime-baseline",
+      "callerAccessLevel": "INTERNAL"
+    },
+    "accessZoneCode": "4861",
+    "document": {
+      "externalDocumentId": "fix486b-runtime-control",
+      "documentVersion": 1,
+      "title": "FIX486B Runtime Control",
+      "sourceUri": "fixture://fix486b/runtime-control-v1",
+      "sourceType": "FIX486B_CONTROL_FIXTURE",
+      "mimeType": "application/json",
+      "contentHash": ""
+    },
+    "blocks": [
+      {
+        "blockId": "fix486b-source",
+        "parentBlockId": "",
+        "blockType": "BLOCK_TYPE_DOCUMENT",
+        "text": "FIX486B runtime baseline control document.",
+        "orderIndex": 0,
+        "sourceLocation": {
+          "pageStart": 1,
+          "pageEnd": 1,
+          "sectionPath": "runtime-control",
+          "heading": "Runtime control"
+        }
+      },
+      {
+        "blockId": "fix486b-parent-canonical",
+        "parentBlockId": "fix486b-source",
+        "blockType": "BLOCK_TYPE_SECTION",
+        "text": "ASTRA_FIX486B_RUNTIME_CONTROL. PostgreSQL is the canonical state and Qdrant is a search projection. Canonical document versions, lifecycle state, access-zone authorization, content chunks, vector bindings, and publication state remain authoritative in PostgreSQL. Qdrant contains searchable dense and sparse representations, but a vector hit cannot authorize itself and must be hydrated against the canonical database. The production ingestion path tokenizes logical blocks, creates a SOURCE container, creates original PARENT context, creates searchable SUB_180 and SUB_260 children, computes model-backed embeddings, persists vector bindings, and publishes Qdrant points through the outbox. The production Search method embeds the query, searches indexed child and parent points, groups hits by canonical parent identity, and fetches original parent evidence in one PostgreSQL batch. RetrieveContext delegates to the same Search pipeline and preserves the matched child identity together with non-empty parent text. Repeating the same request identity is idempotent: it must not create another document version, duplicate chunks, duplicate bindings, duplicate outbox effects, or extra Qdrant points. Restarting AstraVector must preserve the indexed state because PostgreSQL is canonical and Qdrant is a durable projection. Readiness must become NOT_SERVING when PostgreSQL or required Qdrant is unavailable, and it must recover after the dependency returns. This control paragraph is intentionally long enough for production token-aware chunking to produce at least one child representation while retaining the exact anchor in original evidence.",
+        "orderIndex": 1,
+        "sourceLocation": {
+          "pageStart": 1,
+          "pageEnd": 1,
+          "sectionPath": "runtime-control/canonical-state",
+          "heading": "Canonical state and projection"
+        }
+      }
+    ],
+    "chunkingOptions": {
+      "profile": "CHUNKING_PROFILE_TECHNICAL",
+      "parentTargetTokens": 256,
+      "parentMaxTokens": 512,
+      "childTargetTokens": 180,
+      "childMaxTokens": 260,
+      "childOverlapTokens": 30,
+      "minChunkTokens": 8,
+      "preserveBlockBoundaries": true,
+      "allowSplitInsideParagraph": false,
+      "allowSplitInsideTable": false,
+      "createParentContext": true
+    },
+    "indexingOptions": {
+      "activationPolicy": "ACTIVATION_POLICY_MANUAL",
+      "embeddingMode": "EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",
+      "publishMode": "PUBLISH_MODE_V005_OUTBOX",
+      "replaceExistingVersion": true
+    },
+    "metadata": {
+      "fix486b_fixture_id": "fix486b-runtime-control-v1",
+      "fix486b_phase": "runtime-baseline"
+    }
+  }
+}
