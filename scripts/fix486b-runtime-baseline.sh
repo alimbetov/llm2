@@ -112,9 +112,11 @@ wait_health() {
   return 1
 }
 
-runtime_env() {
-  env \
-    ASTRAVECTOR_CONFIG="$ROOT/config/application.yaml" \
+start_runtime() {
+  local run=$1 label
+  label=$(lower "$run")
+  local log="$EVIDENCE/runtime/$label-runtime.log"
+  ASTRAVECTOR_CONFIG="$ROOT/config/application.yaml" \
     ASTRAVECTOR_PROFILE_CONFIG="$OVERLAY" \
     ASTRAVECTOR_PROFILE=fix486b \
     ASTRAVECTOR_DB_URL="$DB_URL" DATABASE_URL="$DB_URL" \
@@ -123,14 +125,7 @@ runtime_env() {
     ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true \
     ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_SEARCH=false \
     FIX486B_GRPC_PORT="$GRPC_PORT" FIX486B_METRICS_PORT="$METRICS_PORT" \
-    RUST_LOG=${RUST_LOG:-info} "$@"
-}
-
-start_runtime() {
-  local run=$1 label
-  label=$(lower "$run")
-  local log="$EVIDENCE/runtime/$label-runtime.log"
-  runtime_env "$RUNTIME" >"$log" 2>&1 &
+    RUST_LOG=${RUST_LOG:-info} "$RUNTIME" >"$log" 2>&1 &
   RUNTIME_PID=$!
   echo "$RUNTIME_PID" >"$EVIDENCE/runtime/$label-runtime.pid"
   for _ in $(seq 1 90); do
