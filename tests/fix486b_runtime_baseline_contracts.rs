@@ -52,6 +52,9 @@ fn phase_runner_contains_every_mandatory_gate_and_runtime_stage() {
         "run_clean R2",
         "run_r3",
         "r1-r2-normalized.json",
+        "EVIDENCE_INCOMPLETE",
+        "R1_RUNTIME_FAILED",
+        "R2_RUNTIME_FAILED",
         "FIX486_RUNTIME_BASELINE_PASS",
         "FIX486_RUNTIME_BASELINE_BLOCKED",
     ] {

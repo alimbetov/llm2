@@ -58,16 +58,26 @@ compose() {
 }
 
 cleanup() {
-  if [[ -n "$RUNTIME_PID" ]] && kill -0 "$RUNTIME_PID" 2>/dev/null; then
-    kill -INT "$RUNTIME_PID" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-      kill -0 "$RUNTIME_PID" 2>/dev/null || break
+  local pid=$RUNTIME_PID
+  RUNTIME_PID=""
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill -INT "$pid" 2>/dev/null || true
+    for _ in $(seq 1 45); do
+      kill -0 "$pid" 2>/dev/null || break
       sleep 1
     done
-    kill -TERM "$RUNTIME_PID" 2>/dev/null || true
-    wait "$RUNTIME_PID" 2>/dev/null || true
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+      done
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
   fi
-  RUNTIME_PID=""
 }
 trap cleanup EXIT
 
@@ -318,6 +328,20 @@ run_r3() {
 }
 
 finalize() {
+  if ((${#FAILURES[@]} == 0)); then
+    local required
+    for required in \
+      "$EVIDENCE/fixture/r1-snapshot.json" \
+      "$EVIDENCE/fixture/r2-snapshot.json" \
+      "$EVIDENCE/comparisons/r1-r2-normalized.json" \
+      "$EVIDENCE/retrieval/r3-restart/search-response.json" \
+      "$EVIDENCE/retrieval/r3-restart/retrieve-response.json" \
+      "$EVIDENCE/dependency-recovery/qdrant-down-health.txt" \
+      "$EVIDENCE/dependency-recovery/postgres-down-health.txt" \
+      "$EVIDENCE/environment/ports-after.txt"; do
+      [[ -f "$required" ]] || fail "EVIDENCE_INCOMPLETE:$(basename "$required")"
+    done
+  fi
   local verdict=FIX486_RUNTIME_BASELINE_PASS
   ((${#FAILURES[@]} == 0)) || verdict=FIX486_RUNTIME_BASELINE_BLOCKED
   jq -n --arg run_id "$RUN_ID" --arg verdict "$verdict" --argjson failures "$(printf '%s\n' "${FAILURES[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
@@ -345,9 +369,9 @@ main() {
   migrate R1 || { fail R1_MIGRATION_FAILED; finalize; return 1; }
   run_static_gates || { finalize; return 1; }
   build_release || { finalize; return 1; }
-  run_clean R1 true || { finalize; return 1; }
+  run_clean R1 true || { fail R1_RUNTIME_FAILED; compose down -v >/dev/null 2>&1 || true; finalize; return 1; }
   compose down -v >"$EVIDENCE/infrastructure/r1-compose-down.log" 2>&1
-  run_clean R2 || { finalize; return 1; }
+  run_clean R2 || { fail R2_RUNTIME_FAILED; compose down -v >/dev/null 2>&1 || true; finalize; return 1; }
   jq -n --slurpfile r1 "$EVIDENCE/fixture/r1-snapshot.json" --slurpfile r2 "$EVIDENCE/fixture/r2-snapshot.json" \
     --slurpfile h1 "$EVIDENCE/fixture/r1-hierarchy.json" --slurpfile h2 "$EVIDENCE/fixture/r2-hierarchy.json" \
     '{snapshot_match:($r1[0]==$r2[0]),hierarchy_match:($h1[0]==$h2[0]),r1:$r1[0],r2:$r2[0]}' >"$EVIDENCE/comparisons/r1-r2-normalized.json"
