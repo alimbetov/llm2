@@ -234,9 +234,11 @@ migrate() {
 }
 
 run_clean() {
-  local run=$1
-  start_infrastructure "$run"
-  migrate "$run"
+  local run=$1 prepared=${2:-false}
+  if [[ "$prepared" != true ]]; then
+    start_infrastructure "$run"
+    migrate "$run"
+  fi
   start_runtime "$run"
   grpcurl -plaintext "$GRPC_ADDR" list >"$EVIDENCE/runtime/${run,,}-services.txt"
   curl -fsS "http://127.0.0.1:$METRICS_PORT/metrics" >"$EVIDENCE/metrics/${run,,}-metrics.prom"
@@ -270,10 +272,10 @@ record_identity() {
 run_static_gates() {
   record static-fmt cargo fmt --all --check || fail STATIC_FMT_FAILED
   record static-check env CARGO_TARGET_DIR="$TARGET_DIR" cargo check --locked --all-targets --all-features || fail STATIC_CHECK_FAILED
-  record static-tests env CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --all-targets --all-features || fail STATIC_TESTS_FAILED
+  record static-tests env CARGO_TARGET_DIR="$TARGET_DIR" RUST_TEST_THREADS=1 cargo test --locked --all-targets --all-features || fail STATIC_TESTS_FAILED
   record static-clippy env CARGO_TARGET_DIR="$TARGET_DIR" cargo clippy --locked --all-targets --all-features -- -D warnings || fail STATIC_CLIPPY_FAILED
-  record static-sqlx env CARGO_TARGET_DIR="$TARGET_DIR" cargo sqlx prepare --check -- --all-targets --all-features || fail SQLX_PREPARE_FAILED
-  record test-e2e env CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features integration-tests --test e2e_testcontainers -- --nocapture || fail E2E_TESTCONTAINERS_FAILED
+  record static-sqlx env CARGO_TARGET_DIR="$TARGET_DIR" DATABASE_URL="$DB_URL" cargo sqlx prepare --check -- --all-targets --all-features || fail SQLX_PREPARE_FAILED
+  record test-e2e env CARGO_TARGET_DIR="$TARGET_DIR" RUST_TEST_THREADS=1 cargo test --locked --features integration-tests --test e2e_testcontainers -- --nocapture || fail E2E_TESTCONTAINERS_FAILED
   record test-concurrency env CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features integration-tests --test smoke_load_retrieve_context_testcontainers -- --nocapture || fail CONCURRENCY_TESTCONTAINERS_FAILED
   record test-bank env CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --test fix486_hierarchical_bank_contracts -- --nocapture || fail FIX486_BANK_CONTRACT_FAILED
   ((${#FAILURES[@]} == 0))
@@ -331,9 +333,11 @@ main() {
   cd "$ROOT"
   record_identity || { finalize; return 1; }
   lsof -nP -iTCP:"$GRPC_PORT" -iTCP:"$METRICS_PORT" -iTCP:"$PG_PORT" -iTCP:"$QDRANT_PORT" -sTCP:LISTEN >"$EVIDENCE/environment/ports-before.txt" 2>&1 && { fail PREEXISTING_PORT_OWNER; finalize; return 1; } || true
+  start_infrastructure R1 || { fail R1_INFRASTRUCTURE_FAILED; finalize; return 1; }
+  migrate R1 || { fail R1_MIGRATION_FAILED; finalize; return 1; }
   run_static_gates || { finalize; return 1; }
   build_release || { finalize; return 1; }
-  run_clean R1 || { finalize; return 1; }
+  run_clean R1 true || { finalize; return 1; }
   compose down -v >"$EVIDENCE/infrastructure/r1-compose-down.log" 2>&1
   run_clean R2 || { finalize; return 1; }
   jq -n --slurpfile r1 "$EVIDENCE/fixture/r1-snapshot.json" --slurpfile r2 "$EVIDENCE/fixture/r2-snapshot.json" \
