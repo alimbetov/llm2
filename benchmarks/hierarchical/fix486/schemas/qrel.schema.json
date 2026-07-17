@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astravector.local/schemas/fix486-qrel.schema.json",
+  "title": "FIX486 hierarchical qrel",
+  "type": "object",
+  "required": ["query_id", "case_id", "expected_zone"],
+  "properties": {
+    "query_id": {"type": "string", "minLength": 1},
+    "case_id": {"type": "string", "pattern": "^FIX486-[0-9]{2}$"},
+    "expected_zone": {"type": "string", "minLength": 1},
+    "expected_document": {"type": "string"},
+    "expected_version": {"type": "integer", "minimum": 1},
+    "expected_parent": {"type": "string"},
+    "expected_child_any": {"type": "array", "items": {"type": "string"}},
+    "expected_status": {"type": "string"},
+    "expected_status_any": {"type": "array", "items": {"type": "string"}},
+    "forbidden_statuses": {"type": "array", "items": {"type": "string"}},
+    "required_anchors_in_matched_text": {"type": "array", "items": {"type": "string"}},
+    "required_anchors_in_parent_text": {"type": "array", "items": {"type": "string"}},
+    "forbidden_anchors": {"type": "array", "items": {"type": "string"}},
+    "hard_gate": {"type": "object", "additionalProperties": {"type": ["integer", "number", "string", "boolean"]}}
+  },
+  "additionalProperties": true
+}

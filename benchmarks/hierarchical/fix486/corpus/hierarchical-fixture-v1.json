@@ -1,0 +1,199 @@
+{
+  "schema_version": "1",
+  "fixture_id": "fix486-hierarchical-fixture-v1",
+  "status": "ANALYSIS_SEED",
+  "zones": [
+    {
+      "logical_zone_id": "zone-a",
+      "zone_code": "FIX486_ZONE_A",
+      "documents": [
+        {
+          "logical_document_id": "doc-hierarchy",
+          "external_document_id": "fix486-doc-hierarchy",
+          "title": "AstraVector Hierarchical Retrieval Operations",
+          "source_uri": "fixture://fix486/zone-a/doc-hierarchy",
+          "source_type": "FIXTURE",
+          "mime_type": "application/json",
+          "versions": [
+            {
+              "document_version": 1,
+              "expected_state": "ACTIVE",
+              "blocks": [
+                {
+                  "block_id": "source-a",
+                  "parent_block_id": "",
+                  "block_type": "DOCUMENT",
+                  "order_index": 0,
+                  "text": "AstraVector stores canonical document state in PostgreSQL and uses Qdrant as a searchable vector projection. The following sections describe hierarchy, lifecycle and recovery behavior.",
+                  "source_location": {"page_start": 1, "page_end": 1, "section_path": "root", "heading": "AstraVector operations"}
+                },
+                {
+                  "block_id": "parent-a1",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 10,
+                  "text": "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for document versions, content chunks, lifecycle, access zone and vector bindings. Qdrant is a projection and cannot independently authorize a result. The exact technical identifiers content_chunks_v004, parent_chunk_id and /api/v1/search are retained as child-level evidence. When ORA-00904 appears in a migrated integration log, exact lexical and sparse evidence should identify the matching child while the broader parent explains canonical-state validation.",
+                  "source_location": {"page_start": 2, "page_end": 2, "section_path": "operations/canonical-state", "heading": "PostgreSQL canonical state"},
+                  "expected_hierarchy": {
+                    "logical_parent_id": "parent-a1",
+                    "children": [
+                      {"logical_child_id": "child-a1-180", "granularity": "SUB_180", "must_contain": ["ASTRA_CANONICAL_STATE_A1", "ORA-00904", "content_chunks_v004"]},
+                      {"logical_child_id": "child-a1-260", "granularity": "SUB_260", "must_contain": ["parent_chunk_id", "/api/v1/search"]}
+                    ]
+                  }
+                },
+                {
+                  "block_id": "parent-a2",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 20,
+                  "text": "ASTRA_LEGAL_HOLD_A2. TTL normally removes expired searchable representations after lifecycle checks and reconciliation. Legal hold prevents destructive cleanup while preserving audit metadata and the active retrieval policy defined by the document state. Releasing the hold allows the ordinary expiry and deletion workflow to continue. This section is the only authoritative fixture evidence for the interaction between legal hold and TTL.",
+                  "source_location": {"page_start": 3, "page_end": 3, "section_path": "operations/lifecycle", "heading": "Legal hold and TTL"},
+                  "expected_hierarchy": {
+                    "logical_parent_id": "parent-a2",
+                    "children": [
+                      {"logical_child_id": "child-a2-180", "granularity": "SUB_180", "must_contain": ["ASTRA_LEGAL_HOLD_A2", "Legal hold"]},
+                      {"logical_child_id": "child-a2-260", "granularity": "SUB_260", "must_contain": ["TTL", "expiry"]}
+                    ]
+                  }
+                },
+                {
+                  "block_id": "parent-a3",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 30,
+                  "text": "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected by comparing PostgreSQL vector bindings and the expected active document version with the actual collection projection. Reconciliation republishes missing points through controlled recovery and removes or quarantines extra stale points. A stale vector candidate is never sufficient when PostgreSQL hydration or visibility validation rejects its parent or version.",
+                  "source_location": {"page_start": 4, "page_end": 4, "section_path": "operations/reconciliation", "heading": "Qdrant reconciliation"},
+                  "expected_hierarchy": {
+                    "logical_parent_id": "parent-a3",
+                    "children": [
+                      {"logical_child_id": "child-a3-180", "granularity": "SUB_180", "must_contain": ["ASTRA_RECONCILIATION_A3", "Missing Qdrant points"]},
+                      {"logical_child_id": "child-a3-260", "granularity": "SUB_260", "must_contain": ["stale vector candidate", "PostgreSQL hydration"]}
+                    ]
+                  }
+                },
+                {
+                  "block_id": "parent-large",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 40,
+                  "text_generation": {
+                    "purpose": "large-parent token pressure",
+                    "target_canonical_tokens": 900,
+                    "required_anchor": "ASTRA_LARGE_PARENT_ONLY_A",
+                    "semantic_scope": "canonical state only",
+                    "must_not_cover": ["legal hold and TTL", "missing Qdrant point reconciliation"]
+                  },
+                  "source_location": {"page_start": 5, "page_end": 8, "section_path": "operations/large-context", "heading": "Large canonical-state appendix"},
+                  "expected_hierarchy": {
+                    "logical_parent_id": "parent-large",
+                    "children": [
+                      {"logical_child_id": "child-large-180", "granularity": "SUB_180", "must_contain": ["ASTRA_LARGE_PARENT_ONLY_A"]}
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "document_version": 2,
+              "expected_state": "INDEXING",
+              "purpose": "higher-attraction inactive version",
+              "blocks": [
+                {
+                  "block_id": "parent-a1",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 10,
+                  "text": "ASTRA_INACTIVE_VERSION_TRAP. ORA-00904 content_chunks_v004 parent_chunk_id /api/v1/search repeated exact identifiers. This version intentionally has stronger lexical attraction but must never be searchable before activation.",
+                  "source_location": {"page_start": 2, "page_end": 2, "section_path": "inactive/canonical-state", "heading": "Inactive trap"}
+                }
+              ]
+            },
+            {
+              "document_version": 3,
+              "expected_state": "DELETED",
+              "purpose": "deleted parent and stale child projection",
+              "blocks": [
+                {
+                  "block_id": "parent-a3",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 30,
+                  "text": "ASTRA_DELETED_PARENT_TRAP. This deleted content must never form a final context even if a stale Qdrant child point remains.",
+                  "source_location": {"page_start": 4, "page_end": 4, "section_path": "deleted/reconciliation", "heading": "Deleted trap"}
+                }
+              ]
+            },
+            {
+              "document_version": 4,
+              "expected_state": "EXPIRED",
+              "purpose": "expired parent filtering",
+              "blocks": [
+                {
+                  "block_id": "parent-a2",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 20,
+                  "text": "ASTRA_EXPIRED_PARENT_TRAP. This expired legal-hold text must never be returned after its effective expiry.",
+                  "source_location": {"page_start": 3, "page_end": 3, "section_path": "expired/lifecycle", "heading": "Expired trap"}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "logical_zone_id": "zone-b",
+      "zone_code": "FIX486_ZONE_B",
+      "documents": [
+        {
+          "logical_document_id": "doc-hierarchy",
+          "external_document_id": "fix486-doc-hierarchy",
+          "title": "Zone B collision document",
+          "source_uri": "fixture://fix486/zone-b/doc-hierarchy",
+          "source_type": "FIXTURE",
+          "mime_type": "application/json",
+          "versions": [
+            {
+              "document_version": 1,
+              "expected_state": "ACTIVE",
+              "blocks": [
+                {
+                  "block_id": "source-a",
+                  "parent_block_id": "",
+                  "block_type": "DOCUMENT",
+                  "order_index": 0,
+                  "text": "ZONE_B_PRIVATE_SOURCE. This document deliberately reuses logical identifiers from zone A but contains unrelated private content.",
+                  "source_location": {"page_start": 1, "page_end": 1, "section_path": "root", "heading": "Zone B private source"}
+                },
+                {
+                  "block_id": "parent-a1",
+                  "parent_block_id": "source-a",
+                  "block_type": "SECTION",
+                  "order_index": 10,
+                  "text": "ZONE_B_SECRET_PARENT_A1. This content must never appear in a zone A request. It intentionally reuses parent-a1 and child-a1 logical labels to test composite identity and access-zone scoping.",
+                  "source_location": {"page_start": 2, "page_end": 2, "section_path": "private/collision", "heading": "Zone B collision"},
+                  "expected_hierarchy": {
+                    "logical_parent_id": "parent-a1",
+                    "children": [
+                      {"logical_child_id": "child-a1-180", "granularity": "SUB_180", "must_contain": ["ZONE_B_SECRET_PARENT_A1"]}
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "distractors": [
+    {
+      "logical_document_id": "doc-distractor-flat-search",
+      "zone": "zone-a",
+      "text": "A generic vector database description mentioning PostgreSQL and Qdrant without canonical-state, lifecycle, parent hydration or reconciliation evidence.",
+      "must_not_satisfy": ["FIX486-01", "FIX486-07", "FIX486-08", "FIX486-09", "FIX486-10"]
+    }
+  ]
+}

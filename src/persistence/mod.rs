@@ -2121,19 +2121,19 @@ SELECT DISTINCT ON (c.access_zone_id, c.id)
   ce.dense_version,
   ce.model_version,
   b.payload_version,
-  COALESCE(p.access_zone_id,c.access_zone_id) AS p_access_zone_id,
-  COALESCE(p.id,c.id) AS p_id,
-  COALESCE(p.document_id,c.document_id) AS p_document_id,
-  COALESCE(p.document_version,c.document_version) AS p_document_version,
-  COALESCE(p.root_chunk_id,c.root_chunk_id) AS p_root_chunk_id,
-  COALESCE(p.source_chunk_id,c.source_chunk_id) AS p_source_chunk_id,
-  COALESCE(p.access_level,c.access_level) AS p_access_level,
-  COALESCE(p.content,c.content) AS p_content,
-  COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
-  COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
-  COALESCE(p.sequence_no,c.sequence_no) AS p_sequence_no,
-  COALESCE(p.source_block_id,c.source_block_id) AS p_source_block_id,
-  COALESCE(p.metadata,c.metadata) AS p_metadata
+  p.access_zone_id AS p_access_zone_id,
+  p.id AS p_id,
+  p.document_id AS p_document_id,
+  p.document_version AS p_document_version,
+  p.root_chunk_id AS p_root_chunk_id,
+  p.source_chunk_id AS p_source_chunk_id,
+  p.access_level AS p_access_level,
+  p.content AS p_content,
+  p.content_hash AS p_content_hash,
+  p.actual_token_count AS p_token_count,
+  p.sequence_no AS p_sequence_no,
+  p.source_block_id AS p_source_block_id,
+  p.metadata AS p_metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2142,9 +2142,12 @@ JOIN astravector.document_versions d
  AND d.status='ACTIVE'
  AND d.lifecycle_status='ACTIVE'
  AND (d.expires_at IS NULL OR d.expires_at > now())
-LEFT JOIN astravector.content_chunks_v004 p
+JOIN astravector.content_chunks_v004 p
   ON p.access_zone_id=c.access_zone_id
  AND p.id=COALESCE(c.parent_chunk_id,c.id)
+ AND p.document_id=c.document_id
+ AND p.document_version=c.document_version
+ AND p.granularity='PARENT'
  AND p.lifecycle_status='ACTIVE'
  AND p.access_level <= $3
  AND (p.expires_at IS NULL OR p.expires_at > now())
@@ -2278,19 +2281,19 @@ SELECT DISTINCT ON (c.access_zone_id, c.id)
   ce.dense_version,
   ce.model_version,
   b.payload_version,
-  COALESCE(p.access_zone_id,c.access_zone_id) AS p_access_zone_id,
-  COALESCE(p.id,c.id) AS p_id,
-  COALESCE(p.document_id,c.document_id) AS p_document_id,
-  COALESCE(p.document_version,c.document_version) AS p_document_version,
-  COALESCE(p.root_chunk_id,c.root_chunk_id) AS p_root_chunk_id,
-  COALESCE(p.source_chunk_id,c.source_chunk_id) AS p_source_chunk_id,
-  COALESCE(p.access_level,c.access_level) AS p_access_level,
-  COALESCE(p.content,c.content) AS p_content,
-  COALESCE(p.content_hash,c.content_hash) AS p_content_hash,
-  COALESCE(p.actual_token_count,c.actual_token_count) AS p_token_count,
-  COALESCE(p.sequence_no,c.sequence_no) AS p_sequence_no,
-  COALESCE(p.source_block_id,c.source_block_id) AS p_source_block_id,
-  COALESCE(p.metadata,c.metadata) AS p_metadata
+  p.access_zone_id AS p_access_zone_id,
+  p.id AS p_id,
+  p.document_id AS p_document_id,
+  p.document_version AS p_document_version,
+  p.root_chunk_id AS p_root_chunk_id,
+  p.source_chunk_id AS p_source_chunk_id,
+  p.access_level AS p_access_level,
+  p.content AS p_content,
+  p.content_hash AS p_content_hash,
+  p.actual_token_count AS p_token_count,
+  p.sequence_no AS p_sequence_no,
+  p.source_block_id AS p_source_block_id,
+  p.metadata AS p_metadata
 FROM astravector.content_chunks_v004 c
 JOIN astravector.document_versions d
   ON d.access_zone_id=c.access_zone_id
@@ -2299,9 +2302,12 @@ JOIN astravector.document_versions d
  AND d.status='ACTIVE'
  AND d.lifecycle_status='ACTIVE'
  AND (d.expires_at IS NULL OR d.expires_at > now())
-LEFT JOIN astravector.content_chunks_v004 p
+JOIN astravector.content_chunks_v004 p
   ON p.access_zone_id=c.access_zone_id
  AND p.id=COALESCE(c.parent_chunk_id,c.id)
+ AND p.document_id=c.document_id
+ AND p.document_version=c.document_version
+ AND p.granularity='PARENT'
  AND p.lifecycle_status='ACTIVE'
  AND p.access_level <= $3
  AND (p.expires_at IS NULL OR p.expires_at > now())

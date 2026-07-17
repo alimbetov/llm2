@@ -1,0 +1,48 @@
+{
+  "schema_version": "1",
+  "fixture_id": "fix486-hierarchical-graph-v1",
+  "status": "ANALYSIS_SEED",
+  "relations": [
+    {
+      "relation_id": "graph-a1-repaired-by-a3",
+      "access_zone": "zone-a",
+      "from_document": "doc-hierarchy",
+      "from_version": 1,
+      "from_logical_child": "child-a1-180",
+      "to_document": "doc-hierarchy",
+      "to_version": 1,
+      "to_logical_child": "child-a3-180",
+      "relation_type": "REPAIRED_BY",
+      "weight": 0.95,
+      "expected_from_parent": "parent-a1",
+      "expected_to_parent": "parent-a3",
+      "required_provenance": [
+        "seed_chunk_id",
+        "related_chunk_id",
+        "relation_type",
+        "relation_score",
+        "access_zone_id",
+        "document_version"
+      ]
+    },
+    {
+      "relation_id": "graph-zone-b-private-self-relation",
+      "access_zone": "zone-b",
+      "from_document": "doc-hierarchy",
+      "from_version": 1,
+      "from_logical_child": "child-a1-180",
+      "to_document": "doc-hierarchy",
+      "to_version": 1,
+      "to_logical_child": "child-a1-180",
+      "relation_type": "RELATED_TO",
+      "weight": 0.8,
+      "purpose": "prove that a zone A seed cannot traverse a zone B relation"
+    }
+  ],
+  "hard_gates": {
+    "cross_zone_graph_edges_used": 0,
+    "graph_child_wrong_parent": 0,
+    "graph_provenance_missing": 0,
+    "inactive_or_deleted_graph_results": 0
+  }
+}
