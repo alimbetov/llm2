@@ -15,6 +15,7 @@ use astravector_runtime::{
     persistence::{PreparedV004IndexEmbedding, Repository},
     qdrant::QdrantClient,
     scheduler::Scheduler,
+    tokenizer::TokenOffset,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -69,6 +70,24 @@ impl InferenceEngine for FixedSmokeEngine {
         _allow_truncation: bool,
     ) -> Result<usize, AstraError> {
         Ok(text.split_whitespace().count().max(1))
+    }
+    fn token_offsets(&self, text: &str) -> Result<Vec<TokenOffset>, AstraError> {
+        let mut offsets = Vec::new();
+        let mut search_from = 0usize;
+        for (token_index, token) in text.split_whitespace().enumerate() {
+            let relative = text[search_from..]
+                .find(token)
+                .ok_or_else(|| AstraError::Internal("test token offset mismatch".into()))?;
+            let start_byte = search_from + relative;
+            let end_byte = start_byte + token.len();
+            offsets.push(TokenOffset {
+                token_index,
+                start_byte,
+                end_byte,
+            });
+            search_from = end_byte;
+        }
+        Ok(offsets)
     }
     async fn self_test(&self) -> Result<(), AstraError> {
         Ok(())

@@ -295,6 +295,15 @@ Verification note: `cargo` is unavailable in this execution environment; Rust fm
 
 # Changelog
 
+- fix485 follow-up: make the gRPC query deadline runtime-configurable through
+  `ASTRAVECTOR_GRPC_QUERY_DEADLINE_MS` while preserving the 1000 ms default.
+- Degrade a Hybrid request with an explicit diagnostic when an optional
+  PostgreSQL FTS segment times out or is unavailable and another retrieval
+  branch already produced evidence; cancellation and failures without fallback
+  evidence remain request failures.
+- Harden the Mac model-backed load evidence with detected hardware values,
+  Cargo.lock identity, explicit load deadline budgets, and locked Cargo gates.
+
 ## 0.2.0
 - Production reliability redesign according to AstraVector_v002 specification.
 - Real ONNX adapter, provider self-test, checksums.
