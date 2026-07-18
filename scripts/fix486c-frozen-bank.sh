@@ -92,9 +92,10 @@ require_endpoint() {
 ingest() {
   require_endpoint || return 1
   python3 "$VERIFIER" --root "$ROOT/benchmarks/hierarchical/fix486" --emit-ingestion-plans --output "$EVIDENCE/ingestion/plans.json"
-  local total processed
+  local total processed started
   total=$(jq '.ingestion_plans|length' "$EVIDENCE/ingestion/plans.json")
   processed=0
+  started=$(timestamp)
   telemetry "RUNNING" "production-ingestion" "$processed" "$total"
   while IFS= read -r plan; do
     logical_zone=$(jq -r '.logical_zone_id' <<<"$plan")
@@ -115,6 +116,10 @@ ingest() {
     processed=$((processed + 1))
     telemetry "RUNNING" "production-ingestion" "$processed" "$total"
   done < <(jq -c '.ingestion_plans[]' "$EVIDENCE/ingestion/plans.json")
+  jq -n --arg stage_id "production-ingestion" --arg started "$started" --arg finished "$(timestamp)" \
+    --argjson documents "$processed" \
+    '{stage_id:$stage_id,status:"PASS",started_at_utc:$started,finished_at_utc:$finished,exit_code:0,failure_code:null,documents_ingested:$documents,evidence:[]}' \
+    >"$EVIDENCE/logs/production-ingestion.json"
   jq -s --arg source_sha "$(git -C "$ROOT" rev-parse HEAD)" --arg aggregate "$(jq -r '.hashes.aggregate_sha256' "$MANIFEST")" \
     '{schema_version:1,bank_id:"fix486-hierarchical-bank",bank_version:"1.0.0",bank_aggregate_sha256:$aggregate,source_sha:$source_sha,documents:.,access_zones:(map({key:.logical_zone_id,value:.response.document.accessZoneId})|from_entries)}' \
     "$EVIDENCE"/identity-map/*.json >"$EVIDENCE/identity-map/logical-to-runtime.json"
