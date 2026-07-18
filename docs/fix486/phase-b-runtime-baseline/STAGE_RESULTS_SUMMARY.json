@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "run_id": "fix486b-final-9e5250b-20260718T060000Z",
+  "source_sha": "9e5250becad48583960c888f37c09ad32a6597ad",
+  "verdict": "FIX486_RUNTIME_BASELINE_PASS",
+  "failure_codes": [],
+  "bank_version": "0.1.0-analysis-seed",
+  "bank_frozen": false,
+  "mandatory_gates": {
+    "fmt": "PASS",
+    "locked_check": "PASS",
+    "locked_all_targets_tests": "PASS",
+    "locked_clippy": "PASS",
+    "sqlx_prepare": "PASS",
+    "e2e_testcontainers": "PASS",
+    "concurrency_testcontainers": "PASS",
+    "fix486_bank_contracts": "PASS"
+  },
+  "runs": {
+    "r1": "PASS",
+    "r2": "PASS",
+    "r1_r2_comparison": "PASS",
+    "r3_restart_and_recovery": "PASS"
+  },
+  "integrity": {
+    "active_documents": 1,
+    "chunks": 7,
+    "bindings": 6,
+    "synced_bindings": 6,
+    "qdrant_points": 6,
+    "completed_outbox": 6,
+    "dead_letters": 0,
+    "orphan_children": 0,
+    "duplicate_chunks": 0,
+    "duplicate_bindings": 0,
+    "duplicate_outbox_effects": 0
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "unresolved_in_scope_p0": 0,
+  "unresolved_in_scope_p1": 0,
+  "defects": [
+    {
+      "id": "FIX486B-P1-001",
+      "severity": "P1",
+      "category": "RUNTIME_STARTUP_DEFECT",
+      "root_cause": "Qdrant collection creation occurred only after ingestion, while readiness required it before ingestion.",
+      "regression_commit": "8c4e4110b4a4758840fc4695bfb43c7be8f724f9",
+      "fix_commit": "84dc1b4a1177fef426746a960630819ce759f96b",
+      "status": "FIXED_AND_RERUN"
+    },
+    {
+      "id": "FIX486B-P1-002",
+      "severity": "P1",
+      "category": "DETERMINISM_DEFECT",
+      "root_cause": "Auto-created access zones used UUIDv4, changing otherwise deterministic physical hierarchy identities between clean runs.",
+      "regression_commit": "bcf34dd6502fbb9483df2b323c7e439321ae8b03",
+      "fix_commit": "36d77fc968a91d07dfd636eba01cb7d16c1141a5",
+      "status": "FIXED_AND_RERUN"
+    }
+  ]
+}
