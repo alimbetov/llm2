@@ -1,11 +1,15 @@
 {
   "bank_id": "fix486-hierarchical-bank",
-  "bank_version": "0.1.0-analysis-seed",
+  "bank_version": "1.0.0",
   "schema_version": "1",
-  "status": "NOT_FROZEN",
+  "status": "FROZEN",
   "created_from_source_sha": "cfa01b2d615582ac736f1ef844d8fc79280e3ff1",
-  "target_branch": "codex/fix486a-analysis-readiness",
-  "freeze_target_version": "1.0.0",
+  "freeze_source_sha": "af861e5c256d4d689d524bc16a9e50c5fa87d527",
+  "frozen_at_utc": "2026-07-18T05:25:22Z",
+  "target_branch": "codex/fix486c-frozen-executable-bank-1.0.0",
+  "query_count": 11,
+  "case_count": 10,
+  "hash_algorithm": "SHA-256",
   "languages": ["ru", "en"],
   "critical_cases": [
     "FIX486-01",
@@ -27,13 +31,13 @@
     "lifecycle": "lifecycle/hierarchical-lifecycle-v1.json"
   },
   "hashes": {
-    "aggregate_sha256": null,
-    "corpus_sha256": null,
-    "queries_sha256": null,
-    "qrels_sha256": null,
-    "graph_sha256": null,
-    "lifecycle_sha256": null,
-    "status": "TO_BE_RESOLVED_BY_FIX486A"
+    "aggregate_sha256": "cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff",
+    "corpus_sha256": "bd4b4da17c7747606230a18e20bbb81b2adb3128bc1f6d4d25be9aad43fb0d46",
+    "queries_sha256": "1fd4cff2a55ef8db2d4be3ab6b8e0bef9dc1ce366252a84c964afadb827da1e6",
+    "qrels_sha256": "24edfaf3f3788b2acafa9c2fec848a0fd9c7148f7a730985c84183374357ec92",
+    "graph_sha256": "877516d46c87fa843330fccd0551f71f61a469fd4c538679a958c9a804f02186",
+    "lifecycle_sha256": "7a8100f03097c0c48663e3ebea963221cce0adf17768e0919c5412b28a08f6c6",
+    "status": "RESOLVED"
   },
   "identity_policy": {
     "logical_ids_are_expectations": true,
