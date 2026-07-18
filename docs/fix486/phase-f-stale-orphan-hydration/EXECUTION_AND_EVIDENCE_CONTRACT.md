@@ -6,6 +6,10 @@ This contract defines how the future Phase F runner, fault campaign and evidence
 
 This PR is documentation-only. The files named below are future implementation targets and must not be added before document review is complete.
 
+Document review findings and their resolution are recorded in
+`DOCUMENT_REVIEW.md`. Runtime implementation remains prohibited while its verdict
+is `CHANGES_REQUIRED`.
+
 ## 2. Future implementation surface
 
 Expected files:
@@ -306,6 +310,10 @@ deactivation time
 actual activation count
 ```
 
+The activation artifact must also record the non-production capability flag,
+control-channel identity, and caller `correlation_id` used for request matching.
+No public production API field may activate a failpoint.
+
 PASS requires zero active failpoints after cleanup.
 
 ## 13. Qdrant fault provenance
@@ -436,6 +444,11 @@ Tier 2 requires:
 - two empty-parent rows or a proven invariant artifact.
 
 Missing required rows block PASS.
+
+Ranking rows are valid only when the clean control has at least one valid survivor
+and the injected candidate is observed inside the raw candidate window. Orphan
+`HYDRATION_MISSING` rows must use the post-binding hydration failpoint; a Qdrant
+parent-ID tamper is a separate `BINDING_INVALID` diagnostic.
 
 ## 18. Evidence directory structure
 

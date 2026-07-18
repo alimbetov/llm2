@@ -138,21 +138,27 @@ final_context_count = 0
 
 ## 6. Scenario B — orphan child with missing parent
 
-### 6.1 Preferred setup
+### 6.1 Canonical missing-parent setup
 
-The orphan point is derived from a production point but references a phase-owned, non-existent parent identity.
+The orphan proof starts from a production-ingested point with a valid canonical
+binding. A request-scoped `RETURN_NOT_FOUND_SELECTED` fault then returns not-found
+at the canonical parent hydration boundary after binding validation.
 
 Required sequence:
 
-1. capture valid production point;
-2. preserve zone, document, version, child and content provenance;
-3. replace only the parent identity with a deterministic non-existent phase-owned identity;
-4. insert the point into the phase-owned Qdrant collection;
-5. verify no corresponding canonical parent exists;
-6. execute Search and RetrieveContext;
-7. remove the point during cleanup.
+1. capture a valid production point and its canonical binding;
+2. preserve zone, document, version, child and parent provenance;
+3. activate `RETURN_NOT_FOUND_SELECTED` for the selected parent and request;
+4. execute Search and RetrieveContext;
+5. prove `HYDRATION_MISSING` at the hydration boundary;
+6. disable the fault and prove recovery without restart.
 
 Direct deletion of canonical PostgreSQL rows is not preferred because it may violate foreign-key invariants and distort the proof surface.
+
+An optional payload-tamper diagnostic may replace only Qdrant
+`parent_chunk_id`. Since the canonical child binding still points to the original
+parent, its expected classification is `BINDING_INVALID`. It must not be reported
+as the mandatory `HYDRATION_MISSING` row.
 
 ### 6.2 Expected result
 
@@ -182,6 +188,10 @@ The system must not reconstruct parent content from stale child text.
 ### 7.1 Clean control
 
 Run the relevant query when the stale/orphan point is absent.
+
+Use a runner-owned control query with at least one known-valid surviving parent.
+The injected candidate must appear inside the raw candidate window. A comparison
+with no valid survivor is vacuous and cannot PASS ranking non-interference.
 
 Capture:
 

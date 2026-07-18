@@ -32,6 +32,7 @@
 - [ ] Codex execution task reviewed.
 - [ ] Result template reviewed.
 - [ ] No runtime implementation committed before document review completion.
+- [ ] `DOCUMENT_REVIEW.md` has verdict `APPROVED_FOR_CAPABILITY_AUDIT`.
 
 ## Capability audit
 
@@ -167,6 +168,8 @@
 - [ ] Relative order of valid contexts unchanged.
 - [ ] Stale/orphan candidate does not displace valid result.
 - [ ] Candidate selection/refill strategy documented.
+- [ ] Ranking control has at least one valid survivor.
+- [ ] Injected candidate is inside the raw candidate window.
 
 ## Partial hydration timeout
 
@@ -217,6 +220,7 @@
 - [ ] Retry count recorded.
 - [ ] Observed latency is within request deadline plus jitter.
 - [ ] Per-parent retries do not multiply overall deadline.
+- [ ] Batch hydration remains batch-based; no proof-only N+1 SQL is introduced.
 
 ## Concurrency isolation
 
@@ -229,6 +233,8 @@
 - [ ] Negative cache is not poisoned.
 - [ ] Shared future/single-flight state is not poisoned.
 - [ ] Global timeout contamination is zero.
+- [ ] Failpoints require an explicit non-production startup capability.
+- [ ] Failpoints cannot be activated through a public production API.
 - [ ] Search concurrency control passes.
 - [ ] RetrieveContext concurrency control passes.
 
@@ -301,6 +307,7 @@
 - [ ] Total timeout snapshot exists.
 - [ ] Recovery snapshot exists.
 - [ ] Metric delta audit passes.
+- [ ] Metric deltas are scoped to runtime process epochs.
 - [ ] High-cardinality metric labels are zero.
 
 ## Diagnostic propagation

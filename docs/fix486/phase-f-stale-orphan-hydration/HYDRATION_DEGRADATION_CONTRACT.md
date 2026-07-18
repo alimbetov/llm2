@@ -164,6 +164,11 @@ retryable = true
 reason = PARENT_HYDRATION_TIMEOUT
 ```
 
+When gRPC returns `UNAVAILABLE` or `DEADLINE_EXCEEDED`, no ordinary response body
+is assumed. The normalized proof record must distinguish `transport_status` from
+`response_status` and derive diagnostics only from structured status details and
+protected trace evidence that were actually emitted.
+
 ### 5.4 Content prohibition
 
 During total timeout, the response must not contain:
@@ -229,6 +234,12 @@ Public diagnostics must use safe zone-scoped logical or opaque identities. Inter
 
 The failpoint must execute after candidate selection and before/during canonical parent hydration.
 
+It must preserve batch SQL hydration. If production performs one atomic batch
+fetch, `TIMEOUT_SELECTED_PARENTS` is an orchestration-boundary fault applied to the
+selected rows/results, not a claim that PostgreSQL timed out one row. A real batch
+statement timeout maps to `TIMEOUT_ALL_PARENTS`. Introducing N SQL queries for N
+parents solely for this proof is forbidden.
+
 It must not fail:
 
 - Qdrant search;
@@ -291,7 +302,16 @@ physical_parent_ids
 max_activations
 ```
 
+For activation matching, `request_id` means the caller-provided `correlation_id`
+or a documented equivalent available before hydration begins. A server-generated
+trace ID may be recorded but cannot be the only activation key.
+
 Global failpoint activation is forbidden.
+
+Failpoints must be disabled by default and unavailable in normal production
+configuration. The phase may enable them only through an explicit non-production
+startup capability plus a local phase-owned control mechanism or bounded startup
+plan. Public unauthenticated activation is forbidden.
 
 A timeout intended for Request A must not affect Request B unless Request B independently matches the activation contract.
 
@@ -316,7 +336,7 @@ Required outcomes:
 Hard gates:
 
 ```text
-cross_request_failpoint_leak = 0
+cross_request_failpoint_leaks = 0
 healthy_request_blocked_by_faulted_request = 0
 negative_cache_poisoning = 0
 shared_future_poisoning = 0
@@ -499,7 +519,10 @@ Response, trace and metric reason categories must agree.
 Hard gate:
 
 ```text
-telemetry_reason_mismatches = 0
+response_trace_reason_mismatches = 0
+trace_metric_reason_mismatches = 0
+retryable_mismatches = 0
+rejection_stage_mismatches = 0
 ```
 
 ## 17. Search/RetrieveContext parity

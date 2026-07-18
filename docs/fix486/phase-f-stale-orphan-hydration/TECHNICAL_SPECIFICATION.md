@@ -66,6 +66,14 @@ A candidate can become a final context only after successful canonical validatio
 
 Infrastructure degradation must never be presented as semantic no-answer.
 
+Phase F must preserve the production batch-hydration invariant. It must not
+introduce one SQL query per parent merely to manufacture a partial timeout. The
+capability audit must identify whether independently bounded hydration units
+already exist. If hydration is one atomic batch, a selected-parent failpoint may
+exercise the post-batch orchestration boundary, but the evidence must label it as
+an orchestration fault rather than a PostgreSQL row-level timeout. A real database
+deadline on an atomic batch is a total-hydration failure.
+
 ## 4. Scope
 
 ### 4.1 FIX486F-A — stale/orphan safety
@@ -200,6 +208,11 @@ retryable = true
 reason = PARENT_HYDRATION_TIMEOUT
 ```
 
+`UNAVAILABLE` and `DEADLINE_EXCEEDED` may be transport outcomes with no normal
+protobuf response body. In that case the runner must keep transport evidence and
+build the normalized result from gRPC status details plus the protected trace. It
+must not claim that response-only fields were observed.
+
 If the transport supports only `DEGRADED`, it must include:
 
 ```text
@@ -320,10 +333,16 @@ Any embedding-based similarity is non-gating and must not replace deterministic 
 
 ## 10. Ranking non-interference
 
-The proof must compare:
+The proof must compare a non-vacuous runner-owned control:
 
 1. clean control without stale/orphan point;
 2. otherwise identical state with injected stale/orphan point.
+
+The control query must have at least one known-valid surviving parent, and the raw
+injected candidate must rank inside the candidate window ahead of or alongside a
+valid candidate. A clean/faulted comparison with zero valid survivors cannot prove
+ranking non-interference and blocks this gate. The frozen query and qrel remain
+unchanged; the additional control belongs only to Phase F evidence.
 
 After removing the rejected candidate from analysis, the surviving result must remain equivalent by:
 
@@ -432,6 +451,12 @@ Forbidden implementation:
 - persistent fault state after cleanup;
 - failure of tokenizer, Qdrant retrieval, ingestion or entire gRPC transport.
 
+Failpoint code must be inert unless an explicit non-production runtime capability
+is enabled at startup. Activation must use a phase-owned local control channel or
+startup-loaded bounded plan, never an unauthenticated public retrieval/ingestion
+field. The matching request identity is the client-supplied `correlation_id` (or a
+documented production-equivalent), not an unknown server-generated request ID.
+
 ## 13. Fault-state provenance
 
 Every injected Qdrant point must originate from a production-ingested point.
@@ -464,14 +489,19 @@ content hash
 
 ### 13.2 Orphan missing-parent scenario
 
-Preferred method:
+Canonical missing-parent proof:
 
-1. Copy a production point.
-2. Assign a phase-owned non-existent `parent_chunk_id`.
-3. Preserve remaining provenance fields.
-4. Insert only into phase-owned Qdrant collection.
-5. Execute query and prove `HYDRATION_MISSING`.
-6. Remove injected point.
+1. Start from a production-ingested and canonically valid child/binding/parent.
+2. Activate request-scoped `RETURN_NOT_FOUND_SELECTED` after binding validation
+   and at the canonical parent hydration boundary.
+3. Execute the frozen query and prove `HYDRATION_MISSING`.
+4. Disable the failpoint and prove recovery without restart.
+
+A separate Qdrant payload-tamper diagnostic may copy a production point and assign
+a non-existent `parent_chunk_id`. Because its binding still identifies the real
+parent, a robust implementation should classify that candidate as
+`BINDING_INVALID`, not `HYDRATION_MISSING`. Payload tamper is not a substitute for
+the mandatory canonical missing-parent proof.
 
 Do not violate PostgreSQL foreign-key integrity by deleting canonical rows directly unless production schema explicitly supports that test path.
 
@@ -491,7 +521,7 @@ Request B: failpoint inactive, expected success
 Hard gates:
 
 ```text
-cross_request_failpoint_leak = 0
+cross_request_failpoint_leaks = 0
 healthy_request_blocked_by_faulted_request = 0
 negative_cache_poisoning = 0
 shared_future_poisoning = 0
@@ -577,6 +607,10 @@ Forbidden labels:
 - user ID.
 
 Request-level metric deltas must equal expected request counts. Attempt-level metrics must match the configured retry policy.
+
+Metric comparisons are process-epoch scoped. After runtime restart, capture a new
+baseline and compare deltas within that epoch; counter reset is not a failure and
+must not be added arithmetically to the pre-restart epoch.
 
 Response, trace and metrics must use consistent reason categories.
 
@@ -688,8 +722,10 @@ sticky_negative_cache = 0
 circuit_breaker_stuck_open = 0
 faultpoint_residual_state = 0
 cross_request_failpoint_leaks = 0
-healthy_request_blocked = 0
-shared_cache_poisoning = 0
+healthy_request_blocked_by_faulted_request = 0
+negative_cache_poisoning = 0
+shared_future_poisoning = 0
+global_timeout_contamination = 0
 deadline_multiplication = 0
 ```
 
@@ -701,7 +737,12 @@ wrong_version_results = 0
 dead_letters = 0
 unexpected_outbox_failures = 0
 unknown_failure_classifications = 0
-telemetry_reason_mismatches = 0
+response_trace_reason_mismatches = 0
+trace_metric_reason_mismatches = 0
+retryable_mismatches = 0
+rejection_stage_mismatches = 0
+high_cardinality_metric_labels = 0
+evidence_leaks = 0
 cleanup_leaks = 0
 ```
 

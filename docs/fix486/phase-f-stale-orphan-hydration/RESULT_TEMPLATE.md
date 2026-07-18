@@ -125,6 +125,8 @@ retryable: true
 | Surviving parent set changed | `0` |
 | Stale candidate promoted | `0` |
 | Candidate refill/selection strategy | `<strategy>` |
+| Valid survivors in clean control | `<count greater than 0>` |
+| Injected candidate inside raw window | `true` |
 
 ## Partial hydration timeout
 
@@ -165,6 +167,8 @@ false semantic no-answer: 0
 | Negative-cache poisoning | `0` |
 | Shared-state poisoning | `0` |
 | Concurrency proof | `PASS` |
+| Proof-only N+1 SQL introduced | `false` |
+| Non-production failpoint capability | `enabled for phase / disabled by default` |
 
 ## Recovery
 
@@ -200,6 +204,9 @@ false semantic no-answer: 0
 | Metric deltas | `PASS` |
 | Response/trace reason mismatches | `0` |
 | Trace/metric reason mismatches | `0` |
+| Retryable mismatches | `0` |
+| Rejection-stage mismatches | `0` |
+| Metric epoch resets recorded | `PASS` |
 | High-cardinality metric labels | `0` |
 | Evidence leaks | `0` |
 
@@ -249,9 +256,16 @@ false_semantic_no_answer = 0
 content_returned_during_total_timeout = 0
 deadline_multiplication = 0
 cross_request_failpoint_leaks = 0
+healthy_request_blocked_by_faulted_request = 0
+negative_cache_poisoning = 0
+shared_future_poisoning = 0
+global_timeout_contamination = 0
 post_fault_recovery_failures = 0
 entry_point_semantic_mismatches = 0
-telemetry_reason_mismatches = 0
+response_trace_reason_mismatches = 0
+trace_metric_reason_mismatches = 0
+retryable_mismatches = 0
+rejection_stage_mismatches = 0
 high_cardinality_metric_labels = 0
 evidence_leaks = 0
 cleanup_leaks = 0

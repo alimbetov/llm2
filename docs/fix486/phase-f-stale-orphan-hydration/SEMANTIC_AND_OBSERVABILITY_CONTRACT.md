@@ -136,6 +136,11 @@ response_stage
 trace_stage
 ```
 
+For a transport error with no response message, `response_reason` and
+`response_stage` are explicitly `NOT_EMITTED`; normalized transport status details
+are compared with trace/metric categories instead. `NOT_EMITTED` is allowed only
+when the captured gRPC outcome proves that no response body existed.
+
 Required artifact:
 
 ```text
@@ -249,6 +254,10 @@ Request-level exact deltas must equal executed request counts.
 Attempt-level deltas must equal documented retry behavior.
 
 Unexpected retries block PASS when they multiply deadlines or evidence counts.
+
+Each delta belongs to one runtime process epoch. Restart creates a new baseline;
+counter reset must be recorded and must not be interpreted as a negative delta or
+combined with the prior epoch.
 
 ## 11. Ranking semantic integrity
 

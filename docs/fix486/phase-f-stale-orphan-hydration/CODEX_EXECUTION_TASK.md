@@ -238,6 +238,11 @@ The alias must invoke the same canonical target.
 
 The failpoint belongs at canonical parent hydration boundary after candidate selection.
 
+Preserve production batch hydration. Do not introduce per-parent SQL calls solely
+to make `TIMEOUT_SELECTED_PARENTS` possible. Record whether the selected-parent
+fault is a real independently bounded hydration unit or a post-batch orchestration
+fault.
+
 Required modes:
 
 ```text
@@ -260,6 +265,11 @@ logical_parent_ids
 physical_parent_ids
 max_activations
 ```
+
+Use caller `correlation_id` (or a documented equivalent available before
+hydration) as the activation request identity. Enable failpoints only with an
+explicit non-production startup capability and a local phase-owned control
+mechanism; never add public unauthenticated activation.
 
 Deterministic delay:
 
@@ -460,18 +470,27 @@ false_semantic_no_answer
 content_returned_during_total_timeout
 deadline_multiplication
 cross_request_failpoint_leaks
-healthy_request_blocked
-shared_cache_poisoning
+healthy_request_blocked_by_faulted_request
+negative_cache_poisoning
+shared_future_poisoning
+global_timeout_contamination
 post_fault_recovery_failures
 sticky_degraded_cache
 sticky_negative_cache
 faultpoint_residual_state
 entry_point_semantic_mismatches
-telemetry_reason_mismatches
+response_trace_reason_mismatches
+trace_metric_reason_mismatches
+retryable_mismatches
+rejection_stage_mismatches
 high_cardinality_metric_labels
 evidence_leaks
 cleanup_leaks
 ```
+
+The implementation must use the canonical hard-gate names from
+`TECHNICAL_SPECIFICATION.md`. Aggregate aliases may be reported additionally but
+must not replace the four detailed propagation counters.
 
 ## 18. Step 14 — defect handling
 
