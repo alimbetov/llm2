@@ -11,6 +11,7 @@ PG=${FIX486D_POSTGRES_PORT:-57432}; QP=${FIX486D_QDRANT_HTTP_PORT:-6533}; QG=${F
 DB="postgres://astravector:astravector@127.0.0.1:$PG/astravector"; Q="http://127.0.0.1:$QP"; ADDR="127.0.0.1:$GP"; COL=${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486d}
 MODEL_PATH=${ASTRAVECTOR_MODEL_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/model.onnx}
 TOKENIZER_PATH=${ASTRAVECTOR_TOKENIZER_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/tokenizer.json}
+DOCUMENT_DEADLINE_MS=${ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS:-180000}
 PROJECT=$(printf 'fix486d-%s' "$RUN_ID" | tr '[:upper:]_' '[:lower:]-' | tr -cd 'a-z0-9-')
 PID=""; FINALIZED=false; SOURCE_SHA=$(git -C "$ROOT" rev-parse HEAD); BANK_SHA=cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff
 
@@ -74,11 +75,14 @@ verify_bank() {
 }
 verify_model_tokenizer() {
   [[ -s "$MODEL_PATH" && -s "$TOKENIZER_PATH" ]] || return 1
+  [[ "$DOCUMENT_DEADLINE_MS" =~ ^[0-9]+$ ]] &&
+    ((DOCUMENT_DEADLINE_MS >= 1000 && DOCUMENT_DEADLINE_MS <= 600000)) || return 1
   jq -n --arg model_path "$MODEL_PATH" --arg tokenizer_path "$TOKENIZER_PATH" \
     --arg model_sha "$(shasum -a 256 "$MODEL_PATH" | awk '{print $1}')" \
     --arg tokenizer_sha "$(shasum -a 256 "$TOKENIZER_PATH" | awk '{print $1}')" \
     --argjson model_bytes "$(stat -f %z "$MODEL_PATH")" --argjson tokenizer_bytes "$(stat -f %z "$TOKENIZER_PATH")" \
-    '{status:"PASS",model:{path:$model_path,sha256:$model_sha,size_bytes:$model_bytes},tokenizer:{path:$tokenizer_path,sha256:$tokenizer_sha,size_bytes:$tokenizer_bytes}}' \
+    --argjson document_deadline_ms "$DOCUMENT_DEADLINE_MS" \
+    '{status:"PASS",document_deadline_ms:$document_deadline_ms,deadline_bounded:($document_deadline_ms>=1000 and $document_deadline_ms<=600000),model:{path:$model_path,sha256:$model_sha,size_bytes:$model_bytes},tokenizer:{path:$tokenizer_path,sha256:$tokenizer_sha,size_bytes:$tokenizer_bytes}}' \
     >"$E/model-tokenizer/identity.json"
 }
 static_gates() {
@@ -110,6 +114,7 @@ start_runtime() {
   ASTRAVECTOR_CONFIG="$ROOT/config/application.yaml" ASTRAVECTOR_PROFILE_CONFIG="$ROOT/config/application-fix486d.yaml" ASTRAVECTOR_PROFILE=fix486d \
   ASTRAVECTOR_DB_URL="$DB" DATABASE_URL="$DB" ASTRAVECTOR_QDRANT_URL="$Q" ASTRAVECTOR_QDRANT_COLLECTION="$COL" \
   ASTRAVECTOR_MODEL_PATH="$MODEL_PATH" ASTRAVECTOR_TOKENIZER_PATH="$TOKENIZER_PATH" \
+  ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS="$DOCUMENT_DEADLINE_MS" RUST_LOG="${RUST_LOG:-info}" \
   ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true FIX486D_GRPC_PORT="$GP" FIX486D_METRICS_PORT="$MP" \
   "$ROOT/target/release/astravector-runtime" >"$E/logs/runtime-$label.log" 2>&1 & PID=$!
   wait_for grpcurl -plaintext "$ADDR" list && kill -0 "$PID" 2>/dev/null && grpcurl -plaintext "$ADDR" list >"$E/infrastructure/services-$label.txt"

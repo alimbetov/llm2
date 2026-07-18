@@ -184,6 +184,10 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     assert!(runner.contains("SEARCH_MODE_V005_SPARSE"));
     assert!(runner.contains(".bank_aggregate_sha256==$sha"));
     assert!(!runner.contains("'.aggregate_sha256==$sha'"));
+    assert!(runner
+        .contains("DOCUMENT_DEADLINE_MS=${ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS:-180000}"));
+    assert!(runner.contains("DOCUMENT_DEADLINE_MS >= 1000 && DOCUMENT_DEADLINE_MS <= 600000"));
+    assert!(runner.contains("ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS=\"$DOCUMENT_DEADLINE_MS\""));
     assert!(
         runner.contains("pre_dedup_distinct_child_count")
             || std::fs::read_to_string("src/grpc/mod.rs")
