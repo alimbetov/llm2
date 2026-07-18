@@ -182,6 +182,8 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     assert!(runner.contains("UNKNOWN_FROZEN_PROFILE"));
     assert!(runner.contains("RETRIEVAL_PROFILE_LEXICAL_STRICT"));
     assert!(runner.contains("SEARCH_MODE_V005_SPARSE"));
+    assert!(runner.contains(".bank_aggregate_sha256==$sha"));
+    assert!(!runner.contains("'.aggregate_sha256==$sha'"));
     assert!(
         runner.contains("pre_dedup_distinct_child_count")
             || std::fs::read_to_string("src/grpc/mod.rs")

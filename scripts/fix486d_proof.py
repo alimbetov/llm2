@@ -322,8 +322,14 @@ def verify_manifest(run: Path, manifest: dict) -> dict:
         "comparisons/entry-point-parity.json", "comparisons/warm-repeat.json",
         "restart/pre-post-restart.json", "cleanup/summary.json", "defect-register.json",
     }
-    if mandatory != expected:
+    expected_present = expected & seen
+    if mandatory != expected_present:
         failures.append("MANDATORY_MANIFEST_SET_INVALID")
+    aggregate_path = run / "aggregate.json"
+    if aggregate_path.is_file():
+        aggregate = read_json(aggregate_path)
+        if aggregate.get("verdict") == "FIX486_CHILD_PARENT_RUNTIME_PROOF_PASS" and not expected <= seen:
+            failures.append("PASS_MANIFEST_MISSING_MANDATORY_ARTIFACT")
     return {"status": "PASS" if not failures else "FAIL", "failure_codes": failures,
             "verified_files": len(seen)}
 

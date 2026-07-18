@@ -69,7 +69,7 @@ trap unexpected_exit EXIT
 verify_identity() { [[ -z $(git -C "$ROOT" status --porcelain) ]] && [[ $(git -C "$ROOT" rev-parse HEAD) == "$SOURCE_SHA" ]]; }
 verify_bank() {
   python3 "$ROOT/scripts/fix486c_verify_frozen_bank.py" --root "$BANK" >"$E/bank/verification.json" &&
-  jq -e --arg sha "$BANK_SHA" '.aggregate_sha256==$sha' "$E/bank/verification.json" >/dev/null &&
+  jq -e --arg sha "$BANK_SHA" '.status=="PASS" and .bank_aggregate_sha256==$sha' "$E/bank/verification.json" >/dev/null &&
   python3 "$H" select --bank "$BANK" --output "$E/bank/selected-queries.json" >/dev/null
 }
 verify_model_tokenizer() {
