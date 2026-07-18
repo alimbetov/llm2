@@ -84,6 +84,8 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
         "CANONICAL_BINDING_INVALID",
         "FIX486_CHILD_PARENT_RUNTIME_PROOF_BLOCKED",
         "IndexLogicalDocument",
+        "'4862' THEN 'zone-a'",
+        "'4863' THEN 'zone-b'",
     ] {
         assert!(
             runner.contains(required) || helper.contains(required),
