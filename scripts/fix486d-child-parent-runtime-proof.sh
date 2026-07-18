@@ -25,12 +25,20 @@ verify() {
   jq -n --arg branch "$(git branch --show-current)" --arg source "$(git rev-parse HEAD)" '{branch:$branch,source_sha:$source}' >"$E/source/git-identity.json"
 }
 start() {
+  for port in "$GP" "$MP"; do
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >"$E/infrastructure/port-$port-owner.txt" 2>&1; then
+      echo "FIX486D_FAIL=PREEXISTING_PORT_OWNER port=$port" >&2
+      return 1
+    fi
+  done
   compose up -d >"$E/infrastructure/compose-up.log" 2>&1
   wait_for psql "$DB" -Atqc 'select 1'; wait_for curl -fsS "$Q/readyz"
   DATABASE_URL="$DB" cargo sqlx migrate run --source "$ROOT/migrations" >"$E/logs/migrations.log" 2>&1
   cargo build --locked --release --bin astravector-runtime >"$E/logs/release-build.log" 2>&1
   ASTRAVECTOR_CONFIG="$ROOT/config/application.yaml" ASTRAVECTOR_PROFILE_CONFIG="$ROOT/config/application-fix486d.yaml" ASTRAVECTOR_PROFILE=fix486d ASTRAVECTOR_DB_URL="$DB" DATABASE_URL="$DB" ASTRAVECTOR_QDRANT_URL="$Q" ASTRAVECTOR_QDRANT_COLLECTION="$COL" ASTRAVECTOR_MODEL_PATH="${ASTRAVECTOR_MODEL_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/model.onnx}" ASTRAVECTOR_TOKENIZER_PATH="${ASTRAVECTOR_TOKENIZER_PATH:-/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/tokenizer.json}" ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true FIX486D_GRPC_PORT="$GP" FIX486D_METRICS_PORT="$MP" "$ROOT/target/release/astravector-runtime" >"$E/logs/runtime.log" 2>&1 & PID=$!
-  wait_for grpcurl -plaintext "$ADDR" list; grpcurl -plaintext "$ADDR" list >"$E/infrastructure/services.txt"
+  wait_for grpcurl -plaintext "$ADDR" list || return 1
+  kill -0 "$PID" 2>/dev/null || return 1
+  grpcurl -plaintext "$ADDR" list >"$E/infrastructure/services.txt"
 }
 ingest() {
   python3 "$ROOT/scripts/fix486c_verify_frozen_bank.py" --root "$BANK" --emit-ingestion-plans --output "$E/ingestion/plans.json"
