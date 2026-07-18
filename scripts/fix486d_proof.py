@@ -83,6 +83,35 @@ def validate_identity_map(rows: list[dict]) -> None:
         fail("IDENTITY_MAP_INCOMPLETE", f"missing logical rows {sorted(needed - seen)}")
 
 
+def frozen_child_lookup(bank: Path) -> dict[tuple[str, str, int, str, str], str]:
+    """Build child identities from immutable corpus hierarchy, never qrels/results."""
+    lookup: dict[tuple[str, str, int, str, str], str] = {}
+    corpus = read_json(bank / "corpus/hierarchical-fixture-v1.json")
+    for zone in corpus["zones"]:
+        for document in zone["documents"]:
+            for version in document["versions"]:
+                for block in version["blocks"]:
+                    for child in block.get("expected_hierarchy", {}).get("children", []):
+                        key = (zone["logical_zone_id"], document["logical_document_id"], version["document_version"], block["block_id"], child["granularity"])
+                        if key in lookup:
+                            fail("AMBIGUOUS_LOGICAL_CHILD_ID", str(key))
+                        lookup[key] = child["logical_child_id"]
+    return lookup
+
+
+def apply_frozen_child_identities(rows: list[dict], bank: Path) -> list[dict]:
+    lookup = frozen_child_lookup(bank)
+    for row in rows:
+        if row.get("chunk_role") != "CHILD":
+            continue
+        key = (row["logical_zone_id"], row["logical_document_id"], row["logical_version"], row["source_block_id"], row["granularity"])
+        logical = lookup.get(key)
+        if logical is None:
+            fail("UNRESOLVED_LOGICAL_CHILD_ID", str(key))
+        row["logical_chunk_id"] = logical
+    return rows
+
+
 def response_contexts(response: dict, entry_point: str) -> list[dict]:
     return response.get("results", []) if entry_point == "Search" else response.get("contexts", [])
 
@@ -197,12 +226,14 @@ def main() -> int:
     p_select.add_argument("--output", type=Path, required=True)
     p_identity = sub.add_parser("validate-identity")
     p_identity.add_argument("--input", type=Path, required=True)
+    p_identity.add_argument("--bank", type=Path)
     p_norm = sub.add_parser("normalize")
     p_norm.add_argument("--query", type=Path, required=True)
     p_norm.add_argument("--qrel", type=Path, required=True)
     p_norm.add_argument("--entry-point", required=True, choices=REQUIRED_ENTRY_POINTS)
     p_norm.add_argument("--response", type=Path, required=True)
     p_norm.add_argument("--identity-map", type=Path, required=True)
+    p_norm.add_argument("--bank", type=Path, required=True)
     p_norm.add_argument("--output", type=Path, required=True)
     p_agg = sub.add_parser("aggregate")
     p_agg.add_argument("--run", type=Path, required=True)
@@ -213,10 +244,13 @@ def main() -> int:
             payload = select_frozen_queries(args.bank)
         elif args.command == "validate-identity":
             payload = read_json(args.input)
-            validate_identity_map(payload["rows"] if isinstance(payload, dict) else payload)
+            rows = payload["rows"] if isinstance(payload, dict) else payload
+            if args.bank:
+                rows = apply_frozen_child_identities(rows, args.bank)
+            validate_identity_map(rows)
             payload = {"status": "PASS"}
         elif args.command == "normalize":
-            identity = read_json(args.identity_map)["rows"]
+            identity = apply_frozen_child_identities(read_json(args.identity_map)["rows"], args.bank)
             by_runtime = {row["runtime_chunk_id"]: row for row in identity}
             payload = normalize(read_json(args.query), read_json(args.qrel), args.entry_point, read_json(args.response), by_runtime)
         else:

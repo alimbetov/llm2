@@ -65,6 +65,9 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     let runner =
         std::fs::read_to_string("scripts/fix486d-child-parent-runtime-proof.sh").expect("runner");
     let helper = std::fs::read_to_string(HELPER).expect("helper");
+    assert!(helper.contains("frozen_child_lookup"));
+    assert!(helper.contains("expected_hierarchy"));
+    assert!(!helper.contains("replace(\"parent-\", \"child-\")"));
     for mode in [
         "--verify-identities",
         "--prepare",
