@@ -20,6 +20,39 @@ P0_DESIGN_REVIEW_REQUIRED
 
 No runtime code was changed during this audit.
 
+## Capability Classification
+
+| Capability | Classification | Current evidence |
+|---|---|---|
+| Search response/status/degradation schema | `REQUIRES_PRODUCTION_CHANGE` | warnings/diagnostics exist; no status, retryable or dropped-parent contract |
+| RetrieveContext degradation schema | `REQUIRES_PRODUCTION_CHANGE` | evidence status and degradation codes exist; per-parent diagnostics absent |
+| Shared Search/Retrieve semantic core | `ALREADY_SUPPORTED` | RetrieveContext delegates to Search |
+| Batch canonical parent hydration | `ALREADY_SUPPORTED` | one `unnest` SQL query with ordinality |
+| Binding-backed parent validation | `REQUIRES_PRODUCTION_CHANGE` | binding identity is not joined during hydration |
+| Total PostgreSQL statement timeout | `ALREADY_SUPPORTED` | bounded `statement_timeout` and gRPC deadline mapping |
+| Selected-parent timeout injection | `REQUIRES_TEST_ONLY` | must operate at orchestration boundary without N+1 SQL |
+| Missing-parent injection after binding validation | `REQUIRES_TEST_ONLY` | bounded `RETURN_NOT_FOUND_SELECTED` plan |
+| Per-candidate terminal hydration outcomes | `REQUIRES_PRODUCTION_CHANGE` | missing rows are silently skipped |
+| Candidate surplus | `ALREADY_SUPPORTED` | default `candidate_limit = top_k * 4` |
+| Rejection reserve/refill guarantee | `REQUIRES_PRODUCTION_CHANGE` | no explicit bounded refill after rejection |
+| Request deadline and cancellation | `ALREADY_SUPPORTED` | transport/config minimum and request token |
+| Parent-hydration retry | `ALREADY_SUPPORTED` | known policy is no retry; no multiplication |
+| Retrieval admission control | `ALREADY_SUPPORTED` | bounded semaphore |
+| Parent-hydration single-flight | `ALREADY_SUPPORTED` | known absent |
+| Parent-hydration negative cache | `ALREADY_SUPPORTED` | known absent |
+| Parent-hydration circuit breaker | `ALREADY_SUPPORTED` | known absent |
+| Request-scoped fault matching | `REQUIRES_TEST_ONLY` | correlation-ID keyed immutable plan proposed |
+| Hydration metrics and traces | `REQUIRES_PRODUCTION_CHANGE` | duration/candidate/missing totals only |
+| Blank PARENT schema invariant | `REQUIRES_PRODUCTION_CHANGE` | `NOT NULL` only; whitespace is permitted |
+| Production deletion fencing | `ALREADY_SUPPORTED` | Phase E `ttl_generation` fencing |
+| Qdrant payload identity | `ALREADY_SUPPORTED` | zone/binding/document/chunk/lifecycle identity present |
+| Stale/deleted/missing terminal reason | `REQUIRES_PRODUCTION_CHANGE` | no exhaustive rejection outcome |
+| Phase-owned fault runner/evidence | `REQUIRES_RUNNER_ONLY` | not implemented in docs-only branch |
+
+```text
+UNKNOWN_MATERIAL_CAPABILITIES = 0
+```
+
 ## Current API Surface
 
 ### Search
