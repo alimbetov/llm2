@@ -1,0 +1,41 @@
+service:
+  environment: development
+  instance_id: fix486d-child-parent-runtime
+grpc:
+  host: 127.0.0.1
+  port: ${FIX486D_GRPC_PORT:-50586}
+shutdown:
+  drain_timeout_seconds: 1
+security:
+  enabled: false
+  protect_health: false
+postgres:
+  url: ${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@127.0.0.1:57432/astravector}
+  auto_migrate: false
+  required_on_startup: true
+  required_for_readiness: true
+qdrant:
+  enabled: true
+  url: ${ASTRAVECTOR_QDRANT_URL:-http://127.0.0.1:6533}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486d}
+  auto_create_collection: true
+  validate_collection_schema: true
+  ensure_payload_indexes: true
+  publisher:
+    enabled: true
+    batch_size: 64
+    poll_interval_ms: 100
+    max_attempts: 10
+metrics:
+  host: 127.0.0.1
+  port: ${FIX486D_METRICS_PORT:-9056}
+recovery:
+  enabled: false
+lifecycle:
+  enabled: false
+index_ttl:
+  cleanup_enabled: false
+  qdrant_reconciliation_enabled: false
+access_zone_registry:
+  auto_create_on_ingestion: true
+  auto_create_on_search: false
