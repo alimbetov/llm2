@@ -163,7 +163,7 @@ lifecycle_setup() {
       accessZoneCode:"4862",document:{externalDocumentId:"fix486-doc-hierarchy",documentVersion:$version,title:("Phase E lifecycle trap v"+($version|tostring)),sourceUri:("fixture://fix486/lifecycle/v"+($version|tostring)),sourceType:"FIXTURE",mimeType:"application/json",contentHash:""},
       blocks:[{blockId:("source-lifecycle-v"+($version|tostring)),parentBlockId:"",blockType:"BLOCK_TYPE_DOCUMENT",text:("Lifecycle test container version "+($version|tostring)+"."),orderIndex:0},{blockId:("parent-lifecycle-v"+($version|tostring)),parentBlockId:("source-lifecycle-v"+($version|tostring)),blockType:"BLOCK_TYPE_SECTION",text:$anchor,orderIndex:10}],
       chunkingOptions:{profile:"CHUNKING_PROFILE_TECHNICAL",parentTargetTokens:256,parentMaxTokens:512,childTargetTokens:180,childMaxTokens:260,childOverlapTokens:30,minChunkTokens:4,preserveBlockBoundaries:true,allowSplitInsideParagraph:false,allowSplitInsideTable:false,createParentContext:true},
-      indexingOptions:{activationPolicy:"ACTIVATION_POLICY_MANUAL",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",publishMode:"PUBLISH_MODE_V005_OUTBOX",replaceExistingVersion:true},metadata:{fix486e_lifecycle_trap:true}
+      indexingOptions:{activationPolicy:"ACTIVATION_POLICY_MANUAL",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",publishMode:"PUBLISH_MODE_V005_OUTBOX",replaceExistingVersion:true},metadata:{fix486e_lifecycle_trap:"true"}
     }' >"$E/lifecycle/v$version.request.json"
     response="$E/lifecycle/v$version.response.json"
     grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument <"$E/lifecycle/v$version.request.json" >"$response" || return 1
@@ -326,7 +326,7 @@ restart_repeat() {
   jq -e '.zone_a_v1_active==1 and .zone_a_v2_indexing==1 and .zone_a_v3_deleted==1 and .zone_a_v4_expired==1 and .legal_hold_bindings>0' "$E/restart/lifecycle-audit.json" >/dev/null
 }
 write_defects() {
-  jq -n --arg source "$SOURCE_SHA" '{schema_version:1,source_sha:$source,unresolved_in_scope_p0:0,unresolved_in_scope_p1:0,defects:[]}' >"$E/defect-register.json"
+  jq -n --arg source "$SOURCE_SHA" '{schema_version:1,source_sha:$source,unresolved_in_scope_p0:0,unresolved_in_scope_p1:0,defects:[{id:"FIX486E-P1-001",classification:"RUNNER_PROTOBUF_METADATA_TYPE_MISMATCH",status:"RESOLVED",regression_test:"phase_e_lifecycle_metadata_matches_protobuf_string_map",failed_evidence_run:"fix486e-20260718T102746Z"}]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
   local required=(query-results.jsonl opposite-zone-results.jsonl lifecycle/probe-summary.json legal-hold/audit.json isolation/hard-gates.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json cleanup/summary.json defect-register.json)

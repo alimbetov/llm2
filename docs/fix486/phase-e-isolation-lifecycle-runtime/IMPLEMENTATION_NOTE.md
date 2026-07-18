@@ -54,3 +54,10 @@ The runner records the test clock, startup deadline telemetry, Health, metrics,
 binary/config/model/tokenizer/image identities, pre/post warm counts, restart
 results, legal-hold state, cleanup, and a verified manifest. Warm and restart
 reuse PostgreSQL and Qdrant without re-ingestion.
+
+## Resolved proof defects
+
+`FIX486E-P1-001` preserved the first external BLOCKED evidence run. Its lifecycle
+trap request encoded a protobuf `map<string,string>` metadata value as a JSON
+boolean. The request now uses the string `"true"`, and a contract regression test
+prevents the incompatible encoding from returning.

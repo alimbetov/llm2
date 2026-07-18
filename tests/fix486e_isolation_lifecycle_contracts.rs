@@ -134,3 +134,10 @@ fn phase_e_make_targets_share_official_execute_path() {
         1
     );
 }
+
+#[test]
+fn phase_e_lifecycle_metadata_matches_protobuf_string_map() {
+    let runner = runner();
+    assert!(runner.contains(r#"metadata:{fix486e_lifecycle_trap:"true"}"#));
+    assert!(!runner.contains("metadata:{fix486e_lifecycle_trap:true}"));
+}
