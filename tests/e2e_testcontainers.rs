@@ -403,6 +403,78 @@ async fn test_e2e_index_logical_document_via_tonic_ingestion_facade_and_activate
         .into_inner();
     assert_eq!(activation.status, "ACTIVE");
 
+    let delete_shutdown = CancellationToken::new();
+    outbox::spawn(
+        repo.clone(),
+        Arc::new(qdrant_client.clone()),
+        "ingestion-e2e-delete-publisher".into(),
+        10,
+        100,
+        5,
+        None,
+        delete_shutdown.clone(),
+    );
+    let delete = ingestion_client
+        .delete_document_vectors_facade(Request::new(pb::DeleteDocumentVectorsFacadeRequest {
+            context: Some(pb::RequestContext {
+                correlation_id: "fix486e-delete-fencing-e2e".into(),
+                caller_service: "e2e-ingestion-client".into(),
+                caller_user_id: "e2e".into(),
+                caller_access_level: pb::AccessLevel::Internal as i32,
+                ..Default::default()
+            }),
+            document: Some(pb::DocumentRef {
+                access_zone_id: access_zone_id.to_string(),
+                document_id: document_id.to_string(),
+                document_version,
+            }),
+            reason: "verify DELETE_POINT ttl-generation fencing".into(),
+        }))
+        .await
+        .expect("DeleteDocumentVectorsFacade must schedule fenced events")
+        .into_inner();
+    assert_eq!(
+        delete.operation.expect("delete operation").state,
+        pb::OperationState::DeleteScheduled as i32
+    );
+
+    let mut deleted = false;
+    for _ in 0..50 {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM astravector.vector_bindings_v004
+             WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3
+               AND qdrant_sync_status='DELETED'",
+        )
+        .bind(access_zone_id)
+        .bind(document_id)
+        .bind(document_version as i64)
+        .fetch_one(&pool)
+        .await
+        .expect("read delete completion");
+        if count == expected_synced {
+            deleted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    delete_shutdown.cancel();
+    assert!(
+        deleted,
+        "all bindings must complete the fenced Qdrant delete"
+    );
+    let mismatched_delete_events: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+         FROM astravector.vector_outbox o
+         JOIN astravector.vector_bindings_v004 b
+           ON b.access_zone_id=o.binding_access_zone_id AND b.id=o.binding_id
+         WHERE o.operation='DELETE_POINT'
+           AND o.operation_version<>b.ttl_generation",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit delete generation fence");
+    assert_eq!(mismatched_delete_events, 0);
+
     grpc_shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }

@@ -61,3 +61,10 @@ reuse PostgreSQL and Qdrant without re-ingestion.
 trap request encoded a protobuf `map<string,string>` metadata value as a JSON
 boolean. The request now uses the string `"true"`, and a contract regression test
 prevents the incompatible encoding from returning.
+
+`FIX486E-P1-002` preserved the next BLOCKED evidence run. Direct document deletion
+created `DELETE_POINT.operation_version` from `payload_version`, while the publisher
+correctly fences deletion on `ttl_generation`. Scheduling now atomically advances
+`ttl_generation`, marks the binding `DELETION_PENDING/DELETE_PENDING`, and writes the
+returned generation to outbox. The existing production-path Testcontainers E2E now
+asserts delete completion and zero outbox/binding generation mismatches.

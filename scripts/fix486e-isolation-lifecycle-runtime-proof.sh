@@ -326,7 +326,7 @@ restart_repeat() {
   jq -e '.zone_a_v1_active==1 and .zone_a_v2_indexing==1 and .zone_a_v3_deleted==1 and .zone_a_v4_expired==1 and .legal_hold_bindings>0' "$E/restart/lifecycle-audit.json" >/dev/null
 }
 write_defects() {
-  jq -n --arg source "$SOURCE_SHA" '{schema_version:1,source_sha:$source,unresolved_in_scope_p0:0,unresolved_in_scope_p1:0,defects:[{id:"FIX486E-P1-001",classification:"RUNNER_PROTOBUF_METADATA_TYPE_MISMATCH",status:"RESOLVED",regression_test:"phase_e_lifecycle_metadata_matches_protobuf_string_map",failed_evidence_run:"fix486e-20260718T102746Z"}]}' >"$E/defect-register.json"
+  jq -n --arg source "$SOURCE_SHA" '{schema_version:1,source_sha:$source,unresolved_in_scope_p0:0,unresolved_in_scope_p1:0,defects:[{id:"FIX486E-P1-001",classification:"RUNNER_PROTOBUF_METADATA_TYPE_MISMATCH",status:"RESOLVED",regression_test:"phase_e_lifecycle_metadata_matches_protobuf_string_map",failed_evidence_run:"fix486e-20260718T102746Z"},{id:"FIX486E-P1-002",classification:"DELETE_OUTBOX_OPERATION_VERSION_USED_PAYLOAD_VERSION",status:"RESOLVED",regression_test:"test_e2e_index_logical_document_via_tonic_ingestion_facade_and_activate",failed_evidence_run:"fix486e-20260718T103258Z"}]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
   local required=(query-results.jsonl opposite-zone-results.jsonl lifecycle/probe-summary.json legal-hold/audit.json isolation/hard-gates.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json cleanup/summary.json defect-register.json)

@@ -9602,7 +9602,22 @@ async fn schedule_v004_delete_document_vectors(
         .await
         .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
     let rows = sqlx::query(
-        "SELECT id FROM astravector.vector_bindings_v004 WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND qdrant_sync_status NOT IN('DELETE_PENDING') FOR UPDATE",
+        "WITH candidates AS (
+             SELECT id
+             FROM astravector.vector_bindings_v004
+             WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3
+               AND legal_hold=false
+               AND qdrant_sync_status NOT IN('DELETE_PENDING','DELETE_IN_PROGRESS','DELETED')
+             FOR UPDATE
+         )
+         UPDATE astravector.vector_bindings_v004 b
+         SET ttl_generation=b.ttl_generation+1,
+             lifecycle_status='DELETION_PENDING',
+             qdrant_sync_status='DELETE_PENDING',
+             updated_at=now()
+         FROM candidates c
+         WHERE b.access_zone_id=$1 AND b.id=c.id
+         RETURNING b.id,b.ttl_generation",
     )
     .bind(access_zone_id)
     .bind(document_id)
@@ -9612,16 +9627,12 @@ async fn schedule_v004_delete_document_vectors(
     .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
     for row in &rows {
         let id: Uuid = row.get("id");
-        sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='DELETE_PENDING', updated_at=now() WHERE access_zone_id=$1 AND id=$2")
-            .bind(access_zone_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
-        sqlx::query("INSERT INTO astravector.vector_outbox(id,binding_access_zone_id,binding_id,operation,operation_version,status) SELECT $1,$2,$3,'DELETE_POINT',payload_version,'PENDING' FROM astravector.vector_bindings_v004 WHERE access_zone_id=$2 AND id=$3 ON CONFLICT(binding_access_zone_id,binding_id,operation,operation_version) DO NOTHING")
+        let ttl_generation: i64 = row.get("ttl_generation");
+        sqlx::query("INSERT INTO astravector.vector_outbox(id,binding_access_zone_id,binding_id,operation,operation_version,status) VALUES($1,$2,$3,'DELETE_POINT',$4,'PENDING') ON CONFLICT(binding_access_zone_id,binding_id,operation,operation_version) DO NOTHING")
             .bind(Uuid::new_v4())
             .bind(access_zone_id)
             .bind(id)
+            .bind(ttl_generation)
             .execute(&mut *tx)
             .await
             .map_err(|e| Status::unavailable(format!("postgres: {e}")))?;
