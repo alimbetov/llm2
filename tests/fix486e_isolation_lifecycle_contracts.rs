@@ -137,6 +137,14 @@ fn phase_e_ingestion_assigns_zone_scoped_document_ids() {
 }
 
 #[test]
+fn phase_e_parent_only_qrels_do_not_invent_child_requirements() {
+    let helper = fs::read_to_string("scripts/fix486e_proof.py").unwrap();
+    assert!(helper.contains("requires_child = bool(qrel.get"));
+    assert!(helper.contains("requires_child and matched == parent"));
+    assert!(helper.contains("expected_children and matched_logical not in expected_children"));
+}
+
+#[test]
 fn phase_e_make_targets_share_official_execute_path() {
     let makefile = fs::read_to_string("Makefile").unwrap();
     assert!(makefile.contains("verify-fix486e-isolation-lifecycle-runtime:"));

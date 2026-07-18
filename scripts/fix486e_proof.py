@@ -190,7 +190,12 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict, identit
         failures.append("CANONICAL_BINDING_INVALID")
     if parent_logical != qrel.get("expected_parent"):
         failures.append("PARENT_HYDRATION_INVALID")
-    if not matched or not parent or matched == parent:
+    requires_child = bool(qrel.get("expected_child_any")
+                          or qrel.get("required_anchors_in_matched_text"))
+    if not matched or not parent or (requires_child and matched == parent):
+        failures.append("CANONICAL_BINDING_INVALID")
+    expected_children = qrel.get("expected_child_any", [])
+    if expected_children and matched_logical not in expected_children:
         failures.append("CANONICAL_BINDING_INVALID")
     for anchor in qrel.get("required_anchors_in_matched_text", []):
         if anchor not in matched_text:
@@ -225,6 +230,7 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict, identit
             "matched_anchor_results": {anchor: anchor in matched_text for anchor in qrel.get("required_anchors_in_matched_text", [])},
             "parent_anchor_results": {anchor: anchor in parent_text for anchor in qrel.get("required_anchors_in_parent_text", [])},
             "forbidden_anchors_found": forbidden,
+            "child_identity_required": requires_child,
             "trace_candidate_count": len(trace),
             "pre_dedup_distinct_child_count": pre_dedup_children,
             "final_unique_parent_count": len(set(c.get("parentChunkId") for c in contexts)),

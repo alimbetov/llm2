@@ -80,3 +80,9 @@ omitted `documentId`, so the facade's external-ID fallback produced the same raw
 UUID in both zones. Phase E now supplies a deterministic UUIDv5 derived from phase,
 logical zone, and logical document; lifecycle trap versions explicitly reuse the
 Zone A physical document ID.
+
+`FIX486E-P1-005` preserved the first run reaching primary retrieval. All responses
+returned the expected zone-local ACTIVE parent, but the normalizer inherited a
+Phase D-only requirement that matched and parent IDs must differ. Phase E now
+requires a child only when the immutable qrel declares child identities or
+matched-child anchors; parent-only isolation/lifecycle qrels accept direct PARENT.
