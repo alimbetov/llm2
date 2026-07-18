@@ -11385,9 +11385,7 @@ impl RankingTraceCollector {
                     stages: Vec::new(),
                     primary_direct: sources.iter().any(|s| s != "GRAPH_EXPANDED"),
                     graph_expanded: sources.iter().any(|s| s == "GRAPH_EXPANDED"),
-                    exact_technical_match: citation
-                        .and_then(|c| c.metadata.get("exact_technical_match"))
-                        .is_some_and(|v| v == "true"),
+                    exact_technical_match: trace_exact_technical_match(citation),
                     strong_lexical_evidence: is_strong_lexical_candidate(result),
                     ranking_protected: is_ranking_protected(result),
                 },
@@ -11396,6 +11394,9 @@ impl RankingTraceCollector {
         let Some(candidate) = self.candidates.get_mut(&key) else {
             return;
         };
+        candidate.exact_technical_match |= trace_exact_technical_match(result.citation.as_ref());
+        candidate.strong_lexical_evidence |= is_strong_lexical_candidate(result);
+        candidate.ranking_protected |= is_ranking_protected(result);
         if candidate.stages.len() >= self.max_stages {
             self.truncated = true;
             return;
@@ -11742,6 +11743,26 @@ fn matched_technical_tokens(
         .collect()
 }
 
+fn complete_technical_match(required: &[String], matched: &[String]) -> bool {
+    !required.is_empty() && required.iter().all(|token| matched.contains(token))
+}
+
+fn trace_exact_technical_match(citation: Option<&pb::SearchCitationV004>) -> bool {
+    citation.is_some_and(|citation| {
+        [
+            "exact_technical_match",
+            "candidate_debug.exact_technical_token_match",
+        ]
+        .iter()
+        .any(|key| {
+            citation
+                .metadata
+                .get(*key)
+                .is_some_and(|value| value == "true")
+        })
+    })
+}
+
 fn matched_term_count(result: &pb::SearchResultV004, query: &str) -> usize {
     let candidate_text = candidate_text_for_no_answer(result);
     let candidate_terms = lexical_terms(&candidate_text);
@@ -12005,6 +12026,7 @@ fn lexical_score_for_no_answer(result: &pb::SearchResultV004) -> f32 {
 
 fn apply_no_answer_exact_technical_boost(
     result: &mut pb::SearchResultV004,
+    required_tokens: &[String],
     matched_tokens: &[String],
     cfg: &NoAnswerConfig,
     debug_enabled: bool,
@@ -12014,7 +12036,7 @@ fn apply_no_answer_exact_technical_boost(
         .as_ref()
         .map(|scores| scores.sparse_score)
         .unwrap_or(0.0);
-    let exact_match = !matched_tokens.is_empty();
+    let exact_match = complete_technical_match(required_tokens, matched_tokens);
     let mut sparse_after = sparse_before;
     let mut boost_applied = false;
     if exact_match && sparse_before > 0.0 {
@@ -12031,6 +12053,13 @@ fn apply_no_answer_exact_technical_boost(
             citation.metadata.insert(
                 "candidate_debug.exact_technical_token_match".into(),
                 exact_match.to_string(),
+            );
+            citation
+                .metadata
+                .insert("exact_technical_match".into(), exact_match.to_string());
+            citation.metadata.insert(
+                "candidate_debug.required_technical_tokens".into(),
+                serde_json::to_string(required_tokens).unwrap_or_else(|_| "[]".into()),
             );
             citation.metadata.insert(
                 "candidate_debug.matched_technical_tokens".into(),
@@ -12070,7 +12099,7 @@ fn no_answer_candidate_passes(
     let strong_query_coverage = matched_terms.saturating_mul(5) >= query_terms.saturating_mul(3);
     let exact_sparse_allow =
         exact_technical_match && sparse_after_boost >= cfg.min_sparse_score * 2.0;
-    let exact_hybrid_allow = exact_sparse_allow && strong_query_coverage;
+    let exact_hybrid_allow = exact_sparse_allow && matched_discriminating_terms >= 1;
     let strong_lexical_match = strong_lexical_match(matched_terms, query_terms, cfg);
     let branch_confidence = scores
         .dense_score
@@ -12116,7 +12145,7 @@ fn no_answer_candidate_passes(
                 && strong_query_coverage)
                 || branch_confidence_allow
                 || strong_hybrid_lexical_allow
-                || (exact_hybrid_allow && matched_discriminating_terms >= 2)
+                || exact_hybrid_allow
         }
     }
 }
@@ -12232,13 +12261,20 @@ fn apply_pre_mmr_no_answer_filter(
     let query_terms = query_term_count(query);
     for result in results.iter_mut() {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
-        apply_no_answer_exact_technical_boost(result, &matched_tokens, cfg, debug_enabled);
+        apply_no_answer_exact_technical_boost(
+            result,
+            query_technical_tokens,
+            &matched_tokens,
+            cfg,
+            debug_enabled,
+        );
     }
     let strongly_seeded_documents = results
         .iter()
         .filter_map(|result| {
             let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
-            let exact_technical_match = !matched_tokens.is_empty();
+            let exact_technical_match =
+                complete_technical_match(query_technical_tokens, &matched_tokens);
             let sparse_after_boost = result
                 .scores
                 .as_ref()
@@ -12265,7 +12301,8 @@ fn apply_pre_mmr_no_answer_filter(
         .collect::<HashSet<_>>();
     results.retain(|result| {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
-        let exact_technical_match = !matched_tokens.is_empty();
+        let exact_technical_match =
+            complete_technical_match(query_technical_tokens, &matched_tokens);
         let sparse_after_boost = result
             .scores
             .as_ref()
@@ -12567,9 +12604,10 @@ fn aggregate_no_answer_group_passes(
         .find(|term| !is_common_retrieval_overlap_term(term))
         .map(|term| candidate_terms.contains(term))
         .unwrap_or(true);
-    let exact_technical_match = query_technical_tokens
-        .iter()
-        .any(|token| combined_text.contains(&token.to_lowercase()));
+    let exact_technical_match = !query_technical_tokens.is_empty()
+        && query_technical_tokens
+            .iter()
+            .all(|token| combined_text.contains(&token.to_lowercase()));
     let sparse_after_boost = results
         .iter()
         .filter_map(|result| result.scores.as_ref().map(|scores| scores.sparse_score))
@@ -12675,7 +12713,8 @@ fn final_no_answer_should_trigger(
     }
     let any_candidate_passes = results.iter().any(|result| {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
-        let exact_technical_match = !matched_tokens.is_empty();
+        let exact_technical_match =
+            complete_technical_match(query_technical_tokens, &matched_tokens);
         let sparse_after_boost = result
             .scores
             .as_ref()
@@ -13886,6 +13925,94 @@ mod v007_fix1_tests {
             pb::SearchModeV005::Hybrid,
             &cfg
         ));
+    }
+
+    #[test]
+    fn hybrid_no_answer_preserves_complete_technical_evidence_in_multilingual_query() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query =
+            "Как AstraVector обрабатывает ошибку ORA-00904 для таблицы content_chunks_v004?";
+        let technical_tokens = strong_technical_query_tokens(query);
+        assert!(technical_tokens.len() >= 2);
+        let mut candidate = test_result(
+            "canonical-child-001",
+            "ORA-00904 was recorded for content_chunks_v004 during canonical validation.",
+            0.03,
+        );
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.59;
+            scores.sparse_score = 0.34;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        let mut candidates = vec![candidate];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &technical_tokens,
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            true,
+            false,
+        );
+
+        assert_eq!(filtered, 0);
+        assert_eq!(candidates.len(), 1);
+        assert!(!final_no_answer_should_trigger(
+            &candidates,
+            query,
+            &technical_tokens,
+            pb::SearchModeV005::Hybrid,
+            &cfg
+        ));
+        let metadata = &candidates[0].citation.as_ref().unwrap().metadata;
+        assert_eq!(
+            metadata.get("exact_technical_match").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn hybrid_no_answer_rejects_partial_technical_match_in_multilingual_query() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query =
+            "Как AstraVector обрабатывает ошибку ORA-00904 для таблицы content_chunks_v004?";
+        let technical_tokens = strong_technical_query_tokens(query);
+        assert!(technical_tokens.len() >= 2);
+        let mut candidate = test_result(
+            "unrelated-error-child",
+            "ORA-00904 appears in an unrelated migration diagnostic.",
+            0.04,
+        );
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.10;
+            scores.sparse_score = 0.60;
+            scores.fusion_score = 0.04;
+            scores.final_score = 0.04;
+        }
+        let mut candidates = vec![candidate];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &technical_tokens,
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            true,
+            false,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(candidates.is_empty());
     }
 
     #[test]

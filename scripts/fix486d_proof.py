@@ -62,7 +62,7 @@ def select_frozen_queries(bank: Path) -> list[dict]:
 
 def validate_identity_map(rows: list[dict]) -> None:
     needed = {"parent-a1", "child-a1-180", "child-a1-260"}
-    seen = set()
+    seen: dict[str, int] = {}
     for row in rows:
         missing = REQUIRED_IDENTITY_FIELDS - row.keys()
         if missing:
@@ -73,14 +73,18 @@ def validate_identity_map(rows: list[dict]) -> None:
             continue
         logical = row.get("logical_chunk_id")
         if logical in needed:
-            seen.add(logical)
+            seen[logical] = seen.get(logical, 0) + 1
             if logical == "parent-a1":
                 if row["chunk_role"] != "PARENT" or row["granularity"] != "PARENT":
                     fail("IDENTITY_MAP_INCOMPLETE", "parent-a1 is not PARENT")
             elif row["chunk_role"] != "CHILD" or row["granularity"] not in {"SUB_180", "SUB_260"}:
                 fail("IDENTITY_MAP_INCOMPLETE", f"{logical} is not searchable child")
-    if seen != needed:
-        fail("IDENTITY_MAP_INCOMPLETE", f"missing logical rows {sorted(needed - seen)}")
+    missing = needed - seen.keys()
+    if missing:
+        fail("IDENTITY_MAP_INCOMPLETE", f"missing logical rows {sorted(missing)}")
+    duplicate = sorted(logical for logical, count in seen.items() if count != 1)
+    if duplicate:
+        fail("AMBIGUOUS_LOGICAL_CHILD_ID", f"non-unique logical rows {duplicate}")
 
 
 def frozen_child_lookup(bank: Path) -> dict[tuple[str, str, int, str, str], str]:
@@ -103,12 +107,19 @@ def apply_frozen_child_identities(rows: list[dict], bank: Path) -> list[dict]:
     lookup = frozen_child_lookup(bank)
     for row in rows:
         if row.get("chunk_role") != "CHILD":
+            row["identity_role"] = "PARENT" if row.get("chunk_role") == "PARENT" else "SOURCE_CONTAINER"
             continue
         key = (row["logical_zone_id"], row["logical_document_id"], row["logical_version"], row["source_block_id"], row["granularity"])
         logical = lookup.get(key)
         if logical is None:
-            fail("UNRESOLVED_LOGICAL_CHILD_ID", str(key))
-        row["logical_chunk_id"] = logical
+            # Production segmentation may create valid source/container descendants
+            # that are outside the immutable proof hierarchy. Keep them auditable,
+            # but never let them satisfy a frozen logical-child assertion.
+            row["logical_chunk_id"] = None
+            row["identity_role"] = "AUXILIARY_CHILD"
+        else:
+            row["logical_chunk_id"] = logical
+            row["identity_role"] = "PROOF_CHILD"
     return rows
 
 
@@ -248,7 +259,11 @@ def main() -> int:
             if args.bank:
                 rows = apply_frozen_child_identities(rows, args.bank)
             validate_identity_map(rows)
-            payload = {"status": "PASS"}
+            roles: dict[str, int] = {}
+            for row in rows:
+                role = row.get("identity_role", "UNCLASSIFIED")
+                roles[role] = roles.get(role, 0) + 1
+            payload = {"status": "PASS", "identity_roles": roles}
         elif args.command == "normalize":
             identity = apply_frozen_child_identities(read_json(args.identity_map)["rows"], args.bank)
             by_runtime = {row["runtime_chunk_id"]: row for row in identity}

@@ -61,6 +61,55 @@ fn phase_d_identity_validator_fails_closed_for_missing_child() {
 }
 
 #[test]
+fn phase_d_identity_validator_classifies_auxiliary_children_without_weakening_proof_rows() {
+    let temp = std::env::temp_dir().join("fix486d-auxiliary-identity.json");
+    let row = |chunk: &str, role: &str, granularity: &str, source: &str, logical: Value| {
+        serde_json::json!({
+            "logical_zone_id": "zone-a",
+            "runtime_access_zone_id": "zone-runtime-a",
+            "logical_document_id": "doc-hierarchy",
+            "runtime_document_id": "document-runtime-a",
+            "logical_version": 1,
+            "runtime_chunk_id": chunk,
+            "chunk_role": role,
+            "granularity": granularity,
+            "source_block_id": source,
+            "content_sha256": format!("hash-{chunk}"),
+            "logical_chunk_id": logical,
+            "runtime_parent_chunk_id": "parent-runtime-a"
+        })
+    };
+    let rows = serde_json::json!({"rows": [
+        row("parent-runtime-a", "PARENT", "PARENT", "parent-a1", Value::String("parent-a1".into())),
+        row("child-runtime-180", "CHILD", "SUB_180", "parent-a1", Value::Null),
+        row("child-runtime-260", "CHILD", "SUB_260", "parent-a1", Value::Null),
+        row("source-runtime-180", "CHILD", "SUB_180", "source-a", Value::String("source-a-180".into()))
+    ]});
+    std::fs::write(&temp, serde_json::to_vec(&rows).expect("identity JSON")).expect("write");
+    let command = Command::new("python3")
+        .args([
+            HELPER,
+            "validate-identity",
+            "--input",
+            temp.to_str().unwrap(),
+            "--bank",
+            BANK,
+        ])
+        .output()
+        .expect("run helper");
+    assert!(
+        command.status.success(),
+        "{}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let validation: Value = serde_json::from_slice(&command.stdout).expect("validation JSON");
+    assert_eq!(validation["status"], "PASS");
+    assert_eq!(validation["identity_roles"]["PROOF_CHILD"], 2);
+    assert_eq!(validation["identity_roles"]["AUXILIARY_CHILD"], 1);
+    let _ = std::fs::remove_file(temp);
+}
+
+#[test]
 fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     let runner =
         std::fs::read_to_string("scripts/fix486d-child-parent-runtime-proof.sh").expect("runner");
