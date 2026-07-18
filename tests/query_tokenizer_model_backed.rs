@@ -114,14 +114,30 @@ fn real_bge_m3_tokenizer_selects_exact_boundaries_without_truncation() {
         ),
     ];
     for (target, prefix, expected_tier) in cases {
+        let special_token_overhead = counter
+            .count_tokens(prefix, target, false)
+            .expect("count model input tokens")
+            .saturating_sub(
+                counter
+                    .token_offsets(prefix)
+                    .expect("count source-backed tokens")
+                    .len(),
+            );
+        assert!(special_token_overhead > 0);
         let query = exact_token_text(&counter, prefix, target);
         let plan = build_query_plan(&query, &counter, &extended_config(), 256)
             .unwrap_or_else(|error| panic!("target={target}: {error}"));
         assert_eq!(plan.original_token_count, target);
         assert_eq!(plan.tier, expected_tier);
-        assert_eq!(plan.normalized_query.token_offsets.len(), target);
+        assert_eq!(
+            plan.normalized_query.token_offsets.len(),
+            target - special_token_overhead
+        );
         assert_eq!(plan.segments.first().unwrap().source_token_start, 0);
-        assert_eq!(plan.segments.last().unwrap().source_token_end, target);
+        assert_eq!(
+            plan.segments.last().unwrap().source_token_end,
+            plan.normalized_query.token_offsets.len()
+        );
         assert!(plan
             .segments
             .iter()

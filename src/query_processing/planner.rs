@@ -119,6 +119,9 @@ pub fn build_query_plan(
     let original_token_count = token_counter
         .count_tokens(&normalized_query.normalized_text, hard_max, false)
         .map_err(map_tokenization_error)?;
+    // Model token counts include tokenizer-added special tokens, while source
+    // offsets intentionally contain only bytes backed by the user's text.
+    let source_token_count = normalized_query.token_offsets.len();
 
     let (mode, tier, limits) = if original_token_count <= single_query_max_tokens {
         (
@@ -157,7 +160,7 @@ pub fn build_query_plan(
             &normalized_query.normalized_text,
             original_token_count,
             0,
-            original_token_count,
+            source_token_count,
             0,
             normalized_query.normalized_text.len(),
             normalized_query
@@ -191,7 +194,7 @@ pub fn build_query_plan(
         ));
     }
     bind_intents_to_segments(&mut segments, &intent_units);
-    validate_plan_segments(&segments, original_token_count, &limits)?;
+    validate_plan_segments(&segments, source_token_count, &limits)?;
 
     Ok(QueryPlan {
         original_query: normalized_query.normalized_text.clone(),
