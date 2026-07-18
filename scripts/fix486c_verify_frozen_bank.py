@@ -242,7 +242,12 @@ def materialize_block_text(block: dict) -> str:
         raise VerificationError("text_generation target_canonical_tokens must be positive")
     sentence = f"{anchor} canonical-state evidence remains bounded and independent."
     words = (sentence.split() * (target // len(sentence.split()) + 1))[:target]
-    return " ".join(words)
+    # Preserve the declared 900-token scenario while giving the production chunker
+    # explicit safe boundaries when paragraph splitting is disabled.
+    return "\n\n".join(
+        " ".join(words[offset : offset + 192])
+        for offset in range(0, len(words), 192)
+    )
 
 
 def ingestion_plans(result: dict) -> list[dict]:
