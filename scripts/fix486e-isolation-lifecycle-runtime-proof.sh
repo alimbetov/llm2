@@ -138,9 +138,10 @@ start_runtime() {
 ingest() {
   python3 "$ROOT/scripts/fix486c_verify_frozen_bank.py" --root "$BANK" --emit-ingestion-plans --output "$E/ingestion/plans.json" || return 1
   while read -r plan; do
-    local z d rz rd active=false
+    local z d rz rd physical_document_id active=false
     z=$(jq -r .logical_zone_id <<<"$plan"); d=$(jq -r .logical_document_id <<<"$plan")
-    jq .request <<<"$plan" >"$E/ingestion/$z-$d.request.json"
+    physical_document_id=$(python3 -c 'import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, f"fix486e:{sys.argv[1]}:{sys.argv[2]}"))' "$z" "$d")
+    jq --arg document_id "$physical_document_id" '.request.document.documentId=$document_id | .request' <<<"$plan" >"$E/ingestion/$z-$d.request.json"
     grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument <"$E/ingestion/$z-$d.request.json" >"$E/ingestion/$z-$d.response.json" || return 1
     rz=$(jq -r .document.accessZoneId "$E/ingestion/$z-$d.response.json"); rd=$(jq -r .document.documentId "$E/ingestion/$z-$d.response.json")
     for _ in $(seq 1 90); do if grpcurl -plaintext -d "{\"accessZoneId\":\"$rz\",\"documentId\":\"$rd\",\"documentVersion\":1}" "$ADDR" astravector.embedding.v1.AstraVectorV004Control/ActivateDocumentVersion >"$E/ingestion/$z-$d.activate.json" 2>&1; then active=true; break; fi; sleep 1; done
@@ -158,9 +159,9 @@ lifecycle_setup() {
       3) anchor='ASTRA_DELETED_PARENT_TRAP deleted canonical parent must never be returned.';;
       4) anchor='ASTRA_EXPIRED_PARENT_TRAP expired canonical parent must never be returned.';;
     esac
-    jq -n --argjson version "$version" --arg anchor "$anchor" '{
+    jq -n --argjson version "$version" --arg anchor "$anchor" --arg document_id "$document_id" '{
       context:{correlationId:("fix486e-lifecycle-v"+($version|tostring)),idempotencyKey:("fix486e-lifecycle-v"+($version|tostring)),callerService:"fix486e",callerUserId:"fix486e",callerAccessLevel:"INTERNAL"},
-      accessZoneCode:"4862",document:{externalDocumentId:"fix486-doc-hierarchy",documentVersion:$version,title:("Phase E lifecycle trap v"+($version|tostring)),sourceUri:("fixture://fix486/lifecycle/v"+($version|tostring)),sourceType:"FIXTURE",mimeType:"application/json",contentHash:""},
+      accessZoneCode:"4862",document:{externalDocumentId:"fix486-doc-hierarchy",documentId:$document_id,documentVersion:$version,title:("Phase E lifecycle trap v"+($version|tostring)),sourceUri:("fixture://fix486/lifecycle/v"+($version|tostring)),sourceType:"FIXTURE",mimeType:"application/json",contentHash:""},
       blocks:[{blockId:("source-lifecycle-v"+($version|tostring)),parentBlockId:"",blockType:"BLOCK_TYPE_DOCUMENT",text:("Lifecycle test container version "+($version|tostring)+"."),orderIndex:0},{blockId:("parent-lifecycle-v"+($version|tostring)),parentBlockId:("source-lifecycle-v"+($version|tostring)),blockType:"BLOCK_TYPE_SECTION",text:$anchor,orderIndex:10}],
       chunkingOptions:{profile:"CHUNKING_PROFILE_TECHNICAL",parentTargetTokens:256,parentMaxTokens:512,childTargetTokens:180,childMaxTokens:260,childOverlapTokens:30,minChunkTokens:4,preserveBlockBoundaries:true,allowSplitInsideParagraph:false,allowSplitInsideTable:false,createParentContext:true},
       indexingOptions:{activationPolicy:"ACTIVATION_POLICY_MANUAL",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",publishMode:"PUBLISH_MODE_V005_OUTBOX",replaceExistingVersion:true},metadata:{fix486e_lifecycle_trap:"true"}
@@ -326,7 +327,7 @@ restart_repeat() {
   jq -e '.zone_a_v1_active==1 and .zone_a_v2_indexing==1 and .zone_a_v3_deleted==1 and .zone_a_v4_expired==1 and .legal_hold_bindings>0' "$E/restart/lifecycle-audit.json" >/dev/null
 }
 write_defects() {
-  jq -n --arg source "$SOURCE_SHA" '{schema_version:1,source_sha:$source,unresolved_in_scope_p0:0,unresolved_in_scope_p1:0,defects:[{id:"FIX486E-P1-001",classification:"RUNNER_PROTOBUF_METADATA_TYPE_MISMATCH",status:"RESOLVED",regression_test:"phase_e_lifecycle_metadata_matches_protobuf_string_map",failed_evidence_run:"fix486e-20260718T102746Z"},{id:"FIX486E-P1-002",classification:"DELETE_OUTBOX_OPERATION_VERSION_USED_PAYLOAD_VERSION",status:"RESOLVED",regression_test:"test_e2e_index_logical_document_via_tonic_ingestion_facade_and_activate",failed_evidence_run:"fix486e-20260718T103258Z"}]}' >"$E/defect-register.json"
+  jq -n --arg source "$SOURCE_SHA" '{schema_version:1,source_sha:$source,unresolved_in_scope_p0:0,unresolved_in_scope_p1:0,defects:[{id:"FIX486E-P1-001",classification:"RUNNER_PROTOBUF_METADATA_TYPE_MISMATCH",status:"RESOLVED",regression_test:"phase_e_lifecycle_metadata_matches_protobuf_string_map",failed_evidence_run:"fix486e-20260718T102746Z"},{id:"FIX486E-P1-002",classification:"DELETE_OUTBOX_OPERATION_VERSION_USED_PAYLOAD_VERSION",status:"RESOLVED",regression_test:"test_e2e_index_logical_document_via_tonic_ingestion_facade_and_activate",failed_evidence_run:"fix486e-20260718T103258Z"},{id:"FIX486E-P1-003",classification:"IDENTITY_VALIDATOR_REQUIRED_UNDECLARED_ZONE_CHILD",status:"RESOLVED",regression_test:"phase_e_identity_requirements_come_from_frozen_zone_hierarchy",failed_evidence_run:"fix486e-20260718T104600Z"},{id:"FIX486E-P1-004",classification:"RUNNER_DOCUMENT_ID_NOT_ZONE_SCOPED",status:"RESOLVED",regression_test:"phase_e_ingestion_assigns_zone_scoped_document_ids",failed_evidence_run:"fix486e-20260718T104600Z"}]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
   local required=(query-results.jsonl opposite-zone-results.jsonl lifecycle/probe-summary.json legal-hold/audit.json isolation/hard-gates.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json cleanup/summary.json defect-register.json)

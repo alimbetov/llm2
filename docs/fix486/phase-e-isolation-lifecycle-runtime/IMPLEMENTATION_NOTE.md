@@ -68,3 +68,15 @@ correctly fences deletion on `ttl_generation`. Scheduling now atomically advance
 `ttl_generation`, marks the binding `DELETION_PENDING/DELETE_PENDING`, and writes the
 returned generation to outbox. The existing production-path Testcontainers E2E now
 asserts delete completion and zero outbox/binding generation mismatches.
+
+`FIX486E-P1-003` preserved the following BLOCKED run. The identity validator
+required a Zone B `child-a1-260` that the frozen corpus never declares. Required
+child identities now come from the immutable corpus hierarchy; extra production
+chunks remain auxiliary, and cross-zone collision checks cover only logical IDs
+actually shared by both zones.
+
+`FIX486E-P1-004` was exposed by replaying the failed identity input. The runner
+omitted `documentId`, so the facade's external-ID fallback produced the same raw
+UUID in both zones. Phase E now supplies a deterministic UUIDv5 derived from phase,
+logical zone, and logical document; lifecycle trap versions explicitly reuse the
+Zone A physical document ID.

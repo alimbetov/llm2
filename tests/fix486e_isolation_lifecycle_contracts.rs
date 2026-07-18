@@ -115,11 +115,25 @@ fn phase_e_identity_is_composite_and_rejects_cross_zone_collisions() {
         "CROSS_ZONE_PHYSICAL_ID_COLLISION",
         "zone-a",
         "zone-b",
-        "child-a1-180",
-        "child-a1-260",
     ] {
         assert!(helper.contains(required));
     }
+}
+
+#[test]
+fn phase_e_identity_requirements_come_from_frozen_zone_hierarchy() {
+    let helper = fs::read_to_string("scripts/fix486e_proof.py").unwrap();
+    assert!(helper.contains("frozen_children = frozen_child_lookup(bank)"));
+    assert!(helper.contains("common_logical_ids"));
+    assert!(!helper.contains(r#"for logical in ("parent-a1", "child-a1-180", "child-a1-260")"#));
+}
+
+#[test]
+fn phase_e_ingestion_assigns_zone_scoped_document_ids() {
+    let runner = runner();
+    assert!(runner.contains(r#"f"fix486e:{sys.argv[1]}:{sys.argv[2]}""#));
+    assert!(runner.contains(".request.document.documentId=$document_id"));
+    assert!(runner.contains("documentId:$document_id,documentVersion:$version"));
 }
 
 #[test]

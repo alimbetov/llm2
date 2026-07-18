@@ -75,9 +75,11 @@ def select_frozen_queries(bank: Path) -> list[dict]:
     return selected
 
 
-def validate_identity_map(rows: list[dict]) -> None:
-    needed = {(zone, logical) for zone in ("zone-a", "zone-b")
-              for logical in ("parent-a1", "child-a1-180", "child-a1-260")}
+def validate_identity_map(rows: list[dict], bank: Path) -> None:
+    frozen_children = frozen_child_lookup(bank)
+    needed = {(zone, "parent-a1") for zone in ("zone-a", "zone-b")}
+    needed.update((key[0], logical) for key, logical in frozen_children.items()
+                  if key[1:4] == ("doc-hierarchy", 1, "parent-a1"))
     seen: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
         missing = REQUIRED_IDENTITY_FIELDS - row.keys()
@@ -102,7 +104,9 @@ def validate_identity_map(rows: list[dict]) -> None:
     duplicate = sorted(str(logical) for logical, values in seen.items() if len(values) != 1)
     if duplicate:
         fail("AMBIGUOUS_LOGICAL_CHILD_ID", f"non-unique logical rows {duplicate}")
-    for logical in ("parent-a1", "child-a1-180", "child-a1-260"):
+    common_logical_ids = ({logical for zone, logical in needed if zone == "zone-a"}
+                          & {logical for zone, logical in needed if zone == "zone-b"})
+    for logical in sorted(common_logical_ids):
         a = seen[("zone-a", logical)][0]
         b = seen[("zone-b", logical)][0]
         for field in ("runtime_access_zone_id", "runtime_document_id", "runtime_chunk_id"):
@@ -484,7 +488,9 @@ def main() -> int:
             rows = payload["rows"] if isinstance(payload, dict) else payload
             if args.bank:
                 rows = apply_frozen_child_identities(rows, args.bank)
-            validate_identity_map(rows)
+            if args.bank is None:
+                fail("IDENTITY_MAP_INCOMPLETE", "--bank is required for frozen identity validation")
+            validate_identity_map(rows, args.bank)
             roles: dict[str, int] = {}
             for row in rows:
                 role = row.get("identity_role", "UNCLASSIFIED")
