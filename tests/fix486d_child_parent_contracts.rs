@@ -110,6 +110,68 @@ fn phase_d_identity_validator_classifies_auxiliary_children_without_weakening_pr
 }
 
 #[test]
+fn phase_d_normalizer_accepts_protobuf_json_int64_version_without_weakening_validation() {
+    let directory = std::env::temp_dir().join(format!("fix486d-version-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create temp directory");
+    let query = directory.join("query.json");
+    let qrel = directory.join("qrel.json");
+    let response = directory.join("response.json");
+    let identity = directory.join("identity.json");
+    let output = directory.join("result.json");
+    std::fs::write(
+        &query,
+        r#"{"query_id":"q-child-parent-exact","case_id":"FIX486-01"}"#,
+    )
+    .expect("query");
+    std::fs::write(
+        &qrel,
+        r#"{"expected_parent":"parent-a1","expected_child_any":["child-a1-180"],"required_anchors_in_matched_text":["ORA-00904","content_chunks_v004"],"required_anchors_in_parent_text":["ASTRA_CANONICAL_STATE_A1"],"forbidden_anchors":[]}"#,
+    )
+    .expect("qrel");
+    std::fs::write(
+        &response,
+        r#"{"results":[{"accessZoneId":"zone-runtime-a","documentId":"document-runtime-a","documentVersion":"1","matchedChunkId":"child-runtime-180","parentChunkId":"parent-runtime-a","matchedText":"ORA-00904 content_chunks_v004","parentText":"ASTRA_CANONICAL_STATE_A1"}],"diagnostics":{"rankingTrace":{"candidates":[]}}}"#,
+    )
+    .expect("response");
+    std::fs::write(
+        &identity,
+        r#"{"rows":[{"logical_zone_id":"zone-a","runtime_access_zone_id":"zone-runtime-a","logical_document_id":"doc-hierarchy","runtime_document_id":"document-runtime-a","logical_version":1,"runtime_chunk_id":"parent-runtime-a","chunk_role":"PARENT","granularity":"PARENT","source_block_id":"parent-a1","content_sha256":"parent-hash","logical_chunk_id":"parent-a1"},{"logical_zone_id":"zone-a","runtime_access_zone_id":"zone-runtime-a","logical_document_id":"doc-hierarchy","runtime_document_id":"document-runtime-a","logical_version":1,"runtime_chunk_id":"child-runtime-180","chunk_role":"CHILD","granularity":"SUB_180","source_block_id":"parent-a1","content_sha256":"child-hash","logical_chunk_id":null}]}"#,
+    )
+    .expect("identity");
+    let command = Command::new("python3")
+        .args([
+            HELPER,
+            "normalize",
+            "--query",
+            query.to_str().unwrap(),
+            "--qrel",
+            qrel.to_str().unwrap(),
+            "--entry-point",
+            "Search",
+            "--response",
+            response.to_str().unwrap(),
+            "--identity-map",
+            identity.to_str().unwrap(),
+            "--bank",
+            BANK,
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run normalizer");
+    assert!(
+        command.status.success(),
+        "{}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(&output).expect("result")).expect("result JSON");
+    assert_eq!(result["status"], "PASS");
+    assert_eq!(result["runtime_identity"]["document_version"], 1);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
 fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     let runner =
         std::fs::read_to_string("scripts/fix486d-child-parent-runtime-proof.sh").expect("runner");

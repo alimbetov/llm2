@@ -43,6 +43,21 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def protobuf_positive_int(value, field: str) -> int:
+    """Accept protobuf JSON int64 strings while rejecting lossy/coerced values."""
+    if isinstance(value, bool):
+        fail("CANONICAL_BINDING_INVALID", f"{field} is boolean")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
+        parsed = int(value)
+    else:
+        fail("CANONICAL_BINDING_INVALID", f"{field} is not a positive integer")
+    if parsed <= 0:
+        fail("CANONICAL_BINDING_INVALID", f"{field} is not positive")
+    return parsed
+
+
 def select_frozen_queries(bank: Path) -> list[dict]:
     queries = {q["query_id"]: q for q in read_jsonl(bank / "queries/hierarchical-queries-v1.jsonl")}
     qrels_by_query: dict[str, list[dict]] = {}
@@ -146,10 +161,11 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict, identit
     parent_logical = identity_by_runtime.get(parent, {}).get("logical_chunk_id")
     matched_text = result.get("matchedText", "")
     parent_text = result.get("parentText", "")
+    document_version = protobuf_positive_int(result.get("documentVersion"), "documentVersion")
     failures: list[str] = []
     if result.get("accessZoneId") != identity_by_runtime.get(matched, {}).get("runtime_access_zone_id"):
         failures.append("CANONICAL_BINDING_INVALID")
-    if result.get("documentVersion") != 1:
+    if document_version != 1:
         failures.append("CANONICAL_BINDING_INVALID")
     if parent_logical != qrel.get("expected_parent"):
         failures.append("PARENT_HYDRATION_INVALID")
@@ -192,7 +208,7 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict, identit
         "reason": None if not failures else failures[0],
         "runtime_identity": {
             "access_zone_id": result.get("accessZoneId"), "document_id": result.get("documentId"),
-            "document_version": result.get("documentVersion"), "matched_chunk_id": matched,
+            "document_version": document_version, "matched_chunk_id": matched,
             "parent_chunk_id": parent, "matched_source_block_id": identity_by_runtime.get(matched, {}).get("source_block_id"),
             "parent_source_block_id": identity_by_runtime.get(parent, {}).get("source_block_id"),
         },
