@@ -74,7 +74,13 @@ impl CanonicalTokenizer {
         max_length: usize,
         allow_truncation: bool,
     ) -> Result<usize, AstraError> {
-        let count = self.token_offsets(text)?.len();
+        // Keep this preflight count identical to `encode`. Token offsets exclude
+        // special tokens, while the ONNX input length includes them.
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| AstraError::InvalidArgument(format!("tokenization failed: {e}")))?;
+        let count = encoding.get_ids().len();
         if count > max_length && !allow_truncation {
             return Err(AstraError::OutOfRange(format!(
                 "{count} tokens exceeds max_length={max_length}"

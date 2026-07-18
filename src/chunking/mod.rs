@@ -639,7 +639,13 @@ impl<T: TokenCounter> ChunkingEngine<T> {
                 .unwrap_or(false);
             if last_is_short {
                 if let (Some(last), Some(prev)) = (groups.pop(), groups.pop()) {
-                    groups.push(format!("{prev} {last}"));
+                    let merged = format!("{prev} {last}");
+                    if self.counter.count(&merged) <= p.max {
+                        groups.push(merged);
+                    } else {
+                        groups.push(prev);
+                        groups.push(last);
+                    }
                 }
             }
         }
@@ -755,5 +761,45 @@ mod v007_fix2_trace_tests {
             .as_array()
             .map(|a| !a.is_empty())
             .unwrap_or(false)));
+    }
+
+    #[test]
+    fn short_tail_merge_never_exceeds_profile_maximum() {
+        let engine = ChunkingEngine::new(ConservativeTokenCounter);
+        let profile = ChunkingProfile {
+            version: "test".into(),
+            parent: SizeProfile {
+                target: 4,
+                min: 3,
+                max: 5,
+                overlap: 0,
+            },
+            sub180: SizeProfile {
+                target: 2,
+                min: 1,
+                max: 4,
+                overlap: 0,
+            },
+            sub260: SizeProfile {
+                target: 2,
+                min: 1,
+                max: 4,
+                overlap: 0,
+            },
+        };
+        let chunks = engine
+            .chunk(
+                Uuid::nil(),
+                Uuid::nil(),
+                1,
+                "one two three four. five six.",
+                &profile,
+                SourceChunkStorageMode::FullText,
+            )
+            .expect("chunk text");
+        assert!(chunks
+            .iter()
+            .filter(|chunk| chunk.granularity == Granularity::Parent)
+            .all(|chunk| chunk.token_count <= profile.parent.max));
     }
 }
