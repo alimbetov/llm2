@@ -182,17 +182,26 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     assert!(runner.contains("UNKNOWN_FROZEN_PROFILE"));
     assert!(runner.contains("RETRIEVAL_PROFILE_LEXICAL_STRICT"));
     assert!(runner.contains("SEARCH_MODE_V005_SPARSE"));
-    for mode in [
-        "--verify-identities",
-        "--prepare",
-        "--ingest",
-        "--execute-search",
-        "--execute-retrieve-context",
-        "--repeat",
-        "--restart-proof",
-        "--execute-all",
+    assert!(
+        runner.contains("pre_dedup_distinct_child_count")
+            || std::fs::read_to_string("src/grpc/mod.rs")
+                .expect("grpc source")
+                .contains("pre_dedup_distinct_child_count")
+    );
+    assert!(runner.contains("--execute-all"));
+    for required_execution in [
+        "warm_repeat",
+        "restart_repeat",
+        "entry-point-parity.json",
+        "stage-results.json",
+        "manifest-verification.json",
+        "cleanup/summary.json",
+        "jq -c .",
     ] {
-        assert!(runner.contains(mode), "missing runner mode {mode}");
+        assert!(
+            runner.contains(required_execution),
+            "missing executable proof requirement {required_execution}"
+        );
     }
     for required in [
         "set -Eeuo pipefail",

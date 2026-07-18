@@ -2259,6 +2259,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         // malformed or imported data contains the same chunk UUID in more than one zone.
         let mut groups: Vec<((Uuid, Uuid), QdrantSearchHit)> = Vec::new();
         let mut seen = HashSet::new();
+        let mut pre_dedup_child_ids = HashMap::<(Uuid, Uuid), HashSet<Uuid>>::new();
         for hit in hits.iter() {
             let Some(hit_access_zone_id) = hit
                 .payload
@@ -2295,6 +2296,19 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             };
             if let Some(parent_id) = parent_id {
                 let parent_key = (hit_access_zone_id, parent_id);
+                if matches!(granularity, "SUB_180" | "SUB_260") {
+                    if let Some(chunk_id) = hit
+                        .payload
+                        .get("chunk_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                    {
+                        pre_dedup_child_ids
+                            .entry(parent_key)
+                            .or_default()
+                            .insert(chunk_id);
+                    }
+                }
                 if seen.insert(parent_key) {
                     groups.push((parent_key, hit.clone()));
                 }
@@ -2425,6 +2439,21 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 citation
                     .metadata
                     .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+                let mut child_ids = pre_dedup_child_ids
+                    .get(&(*parent_zone_id, *parent_id))
+                    .into_iter()
+                    .flatten()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>();
+                child_ids.sort();
+                citation.metadata.insert(
+                    "pre_dedup_distinct_child_count".into(),
+                    child_ids.len().to_string(),
+                );
+                citation.metadata.insert(
+                    "pre_dedup_child_ids".into(),
+                    serde_json::to_string(&child_ids).unwrap_or_else(|_| "[]".into()),
+                );
             }
             calibrate_result_score(
                 &mut direct,
@@ -3633,6 +3662,25 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
+        let post_mmr_individual_filtered = if query_plan.mode == QueryProcessingMode::Single {
+            apply_post_mmr_technical_no_answer_filter(
+                &mut results,
+                query,
+                &query_technical_tokens,
+                search_mode,
+                &self.cfg.search.no_answer,
+            )
+        } else {
+            0
+        };
+        if post_mmr_individual_filtered > 0 {
+            warnings.push(pb::DiagnosticWarningV005 {
+                code: "POST_MMR_WEAK_CANDIDATE_FILTERED".into(),
+                message: format!(
+                    "post-MMR evidence policy removed {post_mmr_individual_filtered} weak technical candidates"
+                ),
+            });
+        }
         let post_mmr_no_answer_triggered = if query_plan.mode == QueryProcessingMode::Segmented {
             segmented_final_no_answer_should_trigger(
                 &results,
@@ -12749,6 +12797,45 @@ fn final_no_answer_should_trigger(
         ))
 }
 
+fn apply_post_mmr_technical_no_answer_filter(
+    results: &mut Vec<pb::SearchResultV004>,
+    query: &str,
+    query_technical_tokens: &[String],
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+) -> usize {
+    if !cfg.enabled || query_technical_tokens.is_empty() || results.is_empty() {
+        return 0;
+    }
+    let before = results.len();
+    let query_terms = query_term_count(query);
+    results.retain(|result| {
+        if is_negative_mention_evidence(result) {
+            return false;
+        }
+        let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+        let exact_technical_match =
+            complete_technical_match(query_technical_tokens, &matched_tokens);
+        let sparse_after_boost = result
+            .scores
+            .as_ref()
+            .map(|scores| scores.sparse_score)
+            .unwrap_or_default();
+        no_answer_candidate_passes(
+            result,
+            search_mode,
+            exact_technical_match,
+            sparse_after_boost,
+            matched_term_count(result, query),
+            matched_discriminating_term_count(result, query),
+            leading_discriminating_query_term_matches(result, query),
+            query_terms,
+            cfg,
+        )
+    });
+    before.saturating_sub(results.len())
+}
+
 fn result_identity_key(result: &pb::SearchResultV004) -> String {
     if let Some(source_block_id) = result_source_block_id(result) {
         return format!(
@@ -14013,6 +14100,54 @@ mod v007_fix1_tests {
 
         assert_eq!(filtered, 1);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn post_mmr_technical_filter_removes_weak_sibling_without_dropping_exact_evidence() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Объясни parent_chunk_id и /api/v1/search при canonical validation.";
+        let technical_tokens = strong_technical_query_tokens(query);
+        let mut exact = test_result(
+            "canonical-child",
+            "parent_chunk_id is validated by /api/v1/search against canonical state.",
+            0.03,
+        );
+        let mut weak = test_result(
+            "large-parent",
+            "A large parent appendix remains bounded and independent.",
+            0.03,
+        );
+        for candidate in [&mut exact, &mut weak] {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.47;
+            scores.sparse_score = 0.21;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        let exact_tokens = matched_technical_tokens(&exact, &technical_tokens);
+        apply_no_answer_exact_technical_boost(
+            &mut exact,
+            &technical_tokens,
+            &exact_tokens,
+            &cfg,
+            true,
+        );
+        let mut candidates = vec![exact, weak];
+
+        let filtered = apply_post_mmr_technical_no_answer_filter(
+            &mut candidates,
+            query,
+            &technical_tokens,
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+        );
+
+        assert_eq!(filtered, 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].matched_chunk_id, "canonical-child");
     }
 
     #[test]
