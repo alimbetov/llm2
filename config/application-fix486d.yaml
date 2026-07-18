@@ -39,3 +39,9 @@ index_ttl:
 access_zone_registry:
   auto_create_on_ingestion: true
   auto_create_on_search: false
+search:
+  ranking_trace:
+    enabled: true
+    max_candidates: 100
+    max_stages_per_candidate: 32
+    include_text_preview: false

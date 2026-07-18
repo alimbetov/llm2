@@ -68,6 +68,9 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     assert!(helper.contains("frozen_child_lookup"));
     assert!(helper.contains("expected_hierarchy"));
     assert!(!helper.contains("replace(\"parent-\", \"child-\")"));
+    assert!(runner.contains("UNKNOWN_FROZEN_PROFILE"));
+    assert!(runner.contains("RETRIEVAL_PROFILE_LEXICAL_STRICT"));
+    assert!(runner.contains("SEARCH_MODE_V005_SPARSE"));
     for mode in [
         "--verify-identities",
         "--prepare",
