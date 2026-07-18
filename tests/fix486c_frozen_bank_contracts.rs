@@ -80,3 +80,14 @@ fn verifier_fails_closed_for_byte_mutation_missing_file_and_extra_file() {
     assert!(!run_verifier(&root, false).status.success());
     fs::remove_dir_all(root).expect("remove temporary bank");
 }
+
+#[test]
+fn runtime_runner_uses_portable_json_loading_and_waits_for_activation() {
+    let runner = fs::read_to_string("scripts/fix486c-frozen-bank.sh").expect("read runner");
+    assert!(runner.contains("wait_for_activation"));
+    assert!(runner.contains("OUTBOX_NOT_FINALIZED"));
+    assert!(
+        !runner.contains("--argfile"),
+        "macOS jq does not support --argfile"
+    );
+}
