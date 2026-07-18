@@ -188,6 +188,14 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
         .contains("DOCUMENT_DEADLINE_MS=${ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS:-180000}"));
     assert!(runner.contains("DOCUMENT_DEADLINE_MS >= 1000 && DOCUMENT_DEADLINE_MS <= 600000"));
     assert!(runner.contains("ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS=\"$DOCUMENT_DEADLINE_MS\""));
+    assert!(runner.contains("RUST_LOG=\"${FIX486D_RUST_LOG:-info}\""));
+    assert!(runner.contains("INGESTION_DOCUMENT_DEADLINE_RESOLVED"));
+    assert!(runner.contains(".fields.document_deadline_ms==$expected"));
+    assert!(runner.contains("grpc.health.v1.Health/Check"));
+    assert!(runner.contains(".status==\"SERVING\""));
+    assert!(runner.contains("http://127.0.0.1:$MP/metrics"));
+    assert!(runner.contains("binary_sha256"));
+    assert!(runner.contains("profile_config_sha256"));
     assert!(
         runner.contains("pre_dedup_distinct_child_count")
             || std::fs::read_to_string("src/grpc/mod.rs")

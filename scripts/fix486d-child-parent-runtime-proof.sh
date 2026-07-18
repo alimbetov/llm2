@@ -110,14 +110,29 @@ migrate_and_build() {
   cargo build --locked --release --bin astravector-runtime
 }
 start_runtime() {
-  local label=$1
+  local label=$1 runtime_log="$E/logs/runtime-$1.log"
   ASTRAVECTOR_CONFIG="$ROOT/config/application.yaml" ASTRAVECTOR_PROFILE_CONFIG="$ROOT/config/application-fix486d.yaml" ASTRAVECTOR_PROFILE=fix486d \
   ASTRAVECTOR_DB_URL="$DB" DATABASE_URL="$DB" ASTRAVECTOR_QDRANT_URL="$Q" ASTRAVECTOR_QDRANT_COLLECTION="$COL" \
   ASTRAVECTOR_MODEL_PATH="$MODEL_PATH" ASTRAVECTOR_TOKENIZER_PATH="$TOKENIZER_PATH" \
-  ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS="$DOCUMENT_DEADLINE_MS" RUST_LOG="${RUST_LOG:-info}" \
+  ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS="$DOCUMENT_DEADLINE_MS" RUST_LOG="${FIX486D_RUST_LOG:-info}" \
   ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION=true FIX486D_GRPC_PORT="$GP" FIX486D_METRICS_PORT="$MP" \
-  "$ROOT/target/release/astravector-runtime" >"$E/logs/runtime-$label.log" 2>&1 & PID=$!
-  wait_for grpcurl -plaintext "$ADDR" list && kill -0 "$PID" 2>/dev/null && grpcurl -plaintext "$ADDR" list >"$E/infrastructure/services-$label.txt"
+  "$ROOT/target/release/astravector-runtime" >"$runtime_log" 2>&1 & PID=$!
+  wait_for grpcurl -plaintext "$ADDR" list && kill -0 "$PID" 2>/dev/null &&
+    grpcurl -plaintext "$ADDR" list >"$E/infrastructure/services-$label.txt" &&
+    grpcurl -plaintext -d '{"service":""}' "$ADDR" grpc.health.v1.Health/Check >"$E/infrastructure/health-$label.json" &&
+    jq -e '.status=="SERVING"' "$E/infrastructure/health-$label.json" >/dev/null &&
+    wait_for curl -fsS "http://127.0.0.1:$MP/metrics" &&
+    curl -fsS "http://127.0.0.1:$MP/metrics" >"$E/metrics/$label.prom" &&
+    jq -s -e --argjson expected "$DOCUMENT_DEADLINE_MS" \
+      'any(.[]; .fields.message=="INGESTION_DOCUMENT_DEADLINE_RESOLVED" and .fields.document_deadline_ms==$expected)' \
+      "$runtime_log" >/dev/null &&
+    jq -n --arg label "$label" --argjson pid "$PID" --arg endpoint "$ADDR" \
+      --arg binary_sha "$(shasum -a 256 "$ROOT/target/release/astravector-runtime" | awk '{print $1}')" \
+      --arg base_config_sha "$(shasum -a 256 "$ROOT/config/application.yaml" | awk '{print $1}')" \
+      --arg profile_config_sha "$(shasum -a 256 "$ROOT/config/application-fix486d.yaml" | awk '{print $1}')" \
+      --argjson document_deadline_ms "$DOCUMENT_DEADLINE_MS" \
+      '{status:"PASS",label:$label,pid:$pid,endpoint:$endpoint,binary_sha256:$binary_sha,base_config_sha256:$base_config_sha,profile_config_sha256:$profile_config_sha,document_deadline_ms:$document_deadline_ms}' \
+      >"$E/config/runtime-$label.json"
 }
 ingest() {
   python3 "$ROOT/scripts/fix486c_verify_frozen_bank.py" --root "$BANK" --emit-ingestion-plans --output "$E/ingestion/plans.json" || return 1
