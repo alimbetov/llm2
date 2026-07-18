@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::fs;
 
-const FIXTURE: &str = "benchmarks/hierarchical/fix486/runtime-baseline-control-v1.json";
+const FIXTURE: &str = "benchmarks/runtime/fix486b/runtime-baseline-control-v1.json";
 
 #[test]
 fn control_fixture_has_no_physical_identity_and_exercises_production_hierarchy() {

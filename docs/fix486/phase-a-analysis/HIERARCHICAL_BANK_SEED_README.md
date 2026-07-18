@@ -1,13 +1,15 @@
 # FIX486 hierarchical retrieval bank
 
-This directory contains the versioned evidence bank for AstraVector hierarchical retrieval.
+This file documents the pre-freeze seed bank for AstraVector hierarchical retrieval. The frozen
+payload itself lives in `benchmarks/hierarchical/fix486/` and intentionally contains only its
+manifest plus the five hash-locked payload files.
 
 ## Current status
 
 ```text
 BANK_ID=fix486-hierarchical-bank
 BANK_VERSION=0.1.0-analysis-seed
-STATUS=NOT_FROZEN
+STATUS=HISTORICAL_SEED_DOCUMENTATION
 ```
 
 The seed bank defines logical fixtures and expected behavior. Codex must verify that the identities can be reproduced through the real ingestion path before publishing version `1.0.0`.
@@ -15,13 +17,13 @@ The seed bank defines logical fixtures and expected behavior. Codex must verify 
 ## Contents
 
 ```text
-bank-manifest.json
-corpus/hierarchical-fixture-v1.json
-queries/hierarchical-queries-v1.jsonl
-qrels/hierarchical-qrels-v1.jsonl
-graph-relations/hierarchical-graph-v1.json
-lifecycle/hierarchical-lifecycle-v1.json
-schemas/*.schema.json
+benchmarks/hierarchical/fix486/bank-manifest.json
+benchmarks/hierarchical/fix486/corpus/hierarchical-fixture-v1.json
+benchmarks/hierarchical/fix486/queries/hierarchical-queries-v1.jsonl
+benchmarks/hierarchical/fix486/qrels/hierarchical-qrels-v1.jsonl
+benchmarks/hierarchical/fix486/graph-relations/hierarchical-graph-v1.json
+benchmarks/hierarchical/fix486/lifecycle/hierarchical-lifecycle-v1.json
+docs/fix486/phase-a-analysis/schemas/*.schema.json
 ```
 
 ## Critical proof cases

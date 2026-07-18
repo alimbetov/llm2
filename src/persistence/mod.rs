@@ -609,6 +609,36 @@ FROM binding_state"#,
         })
     }
 
+    pub async fn mark_registered_document_version_failed(
+        &self,
+        access_zone_id: Uuid,
+        document_id: Uuid,
+        document_version: i64,
+        content_hash: &str,
+        failure_code: &str,
+        failure_message: &str,
+    ) -> Result<(), AstraError> {
+        sqlx::query(
+            "UPDATE astravector.document_versions \
+             SET status='FAILED', updated_at=now(), \
+                 metadata=COALESCE(metadata,'{}'::jsonb) || jsonb_build_object( \
+                   'indexing_failure', jsonb_build_object('code',$5,'message',$6,'recorded_at',now()::text) \
+                 ) \
+             WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 \
+               AND content_hash=$4 AND status='REGISTERED'",
+        )
+        .bind(access_zone_id)
+        .bind(document_id)
+        .bind(document_version)
+        .bind(content_hash)
+        .bind(failure_code)
+        .bind(failure_message)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
     pub async fn force_activate_document_version(
         &self,
         access_zone_id: Uuid,

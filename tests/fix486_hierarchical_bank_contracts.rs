@@ -42,8 +42,8 @@ fn fix486_seed_bank_has_complete_query_qrel_structure() {
     let root = bank_root();
     let manifest = read_json(&root.join("bank-manifest.json"));
     assert_eq!(manifest["bank_id"], "fix486-hierarchical-bank");
-    assert_eq!(manifest["bank_version"], "0.1.0-analysis-seed");
-    assert_eq!(manifest["status"], "NOT_FROZEN");
+    assert_eq!(manifest["bank_version"], "1.0.0");
+    assert_eq!(manifest["status"], "FROZEN");
 
     let queries = read_jsonl(&root.join(required_string(&manifest["files"], "queries")));
     let qrels = read_jsonl(&root.join(required_string(&manifest["files"], "qrels")));

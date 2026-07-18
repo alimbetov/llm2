@@ -2,8 +2,8 @@ use crate::{
     access_zone_registry,
     cache::L1Cache,
     chunking::{
-        ChunkingEngine, ChunkingProfile, ConservativeTokenCounter, SizeProfile,
-        SourceChunkStorageMode,
+        AnnotatedTextSegment, ChunkingEngine, ChunkingProfile, ConservativeTokenCounter,
+        SizeProfile, SourceChunkStorageMode,
     },
     config::{AppConfig, NoAnswerConfig},
     contract,
@@ -4147,6 +4147,20 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let engine = ChunkingEngine::new(ConservativeTokenCounter);
         let annotated_segments = annotated_segments_from_metadata(&r.metadata)?;
+        // Every searchable representation is embedded with the same model. A
+        // whitespace counter is useful for shaping chunks but cannot enforce the
+        // model's BPE limit, so split oversized logical blocks before chunking.
+        let annotated_segments = split_annotated_segments_for_model(
+            annotated_segments,
+            profile
+                .parent
+                .max
+                .min(profile.sub180.max)
+                .min(profile.sub260.max)
+                .min(self.cfg.tokenization.child.max_length),
+            |text, max_length| self.engine.count_tokens(text, max_length, false),
+            |text| self.engine.token_offsets(text),
+        )?;
         let generated = if annotated_segments.is_empty() {
             engine
                 .chunk(
@@ -5452,9 +5466,37 @@ impl AstraVectorIngestionFacade for AstraVectorV004ControlService {
         });
         *inner.metadata_mut() = metadata;
         let created =
-            <Self as AstraVectorV004Control>::create_multi_granularity_chunks(self, inner)
-                .await?
-                .into_inner();
+            match <Self as AstraVectorV004Control>::create_multi_granularity_chunks(self, inner)
+                .await
+            {
+                Ok(response) => response.into_inner(),
+                Err(status) => {
+                    // Registration precedes indexing for concurrency fencing. If the
+                    // pre-persistence path fails, leave an explicit retryable FAILED
+                    // state instead of a silent REGISTERED document without chunks.
+                    if let Err(error) = self
+                        .repo()?
+                        .mark_registered_document_version_failed(
+                            access_zone_id,
+                            document_id,
+                            document_version as i64,
+                            &content_hash,
+                            status.code().to_string().as_str(),
+                            status.message(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            access_zone_id = %access_zone_id,
+                            document_id = %document_id,
+                            document_version,
+                            error = %error,
+                            "INGESTION_FAILURE_STATE_RECORD_FAILED"
+                        );
+                    }
+                    return Err(status);
+                }
+            };
         let summary = created.summary.unwrap_or_default();
         // fix4.5.3: document-version TTL/lifecycle metadata is the PostgreSQL source of truth.
         let _ = sqlx::query("UPDATE astravector.document_versions SET indexed_at=COALESCE(indexed_at, now()), ttl_days=$4, expires_at=CASE WHEN $4=0 THEN NULL ELSE COALESCE(indexed_at, now()) + ($4 * interval '1 day') END, lifecycle_status=CASE WHEN status='ACTIVE' THEN 'ACTIVE' ELSE lifecycle_status END, access_zone_code=$5, updated_at=now() WHERE access_zone_id=$1 AND document_id=$2 AND document_version=$3 AND delete_operation_id IS NULL")
@@ -8504,6 +8546,167 @@ fn annotated_segments_from_metadata(
     }
     out.sort_by_key(|s| s.order_index);
     Ok(out)
+}
+
+fn split_annotated_segments_for_model<Count, Offsets>(
+    segments: Vec<AnnotatedTextSegment>,
+    max_model_tokens: usize,
+    count_tokens: Count,
+    token_offsets: Offsets,
+) -> Result<Vec<AnnotatedTextSegment>, Status>
+where
+    Count: Fn(&str, usize) -> Result<usize, AstraError>,
+    Offsets: Fn(&str) -> Result<Vec<crate::tokenizer::TokenOffset>, AstraError>,
+{
+    if max_model_tokens == 0 {
+        return Err(Status::failed_precondition(
+            "tokenization.child.max_length must be greater than zero",
+        ));
+    }
+    let mut output = Vec::with_capacity(segments.len());
+    for segment in segments {
+        match count_tokens(&segment.text, max_model_tokens) {
+            Ok(_) => output.push(segment),
+            Err(AstraError::OutOfRange(_)) => {
+                let offsets = token_offsets(&segment.text).map_err(Status::from)?;
+                if offsets.is_empty() {
+                    return Err(Status::out_of_range(format!(
+                        "logical block {} exceeds model limit but has no token boundaries",
+                        segment.block_id
+                    )));
+                }
+                let mut start = 0_usize;
+                let mut pieces = Vec::new();
+                while start < segment.text.len() {
+                    let mut last_fitting_end = None;
+                    let mut last_natural_end = None;
+                    for offset in offsets.iter().filter(|offset| offset.end_byte > start) {
+                        let candidate = segment.text[start..offset.end_byte].trim();
+                        if candidate.is_empty() {
+                            continue;
+                        }
+                        match count_tokens(candidate, max_model_tokens) {
+                            Ok(_) => {
+                                last_fitting_end = Some(offset.end_byte);
+                                if is_natural_model_split_boundary(&segment.text, offset.end_byte) {
+                                    last_natural_end = Some(offset.end_byte);
+                                }
+                            }
+                            Err(AstraError::OutOfRange(_)) => break,
+                            Err(error) => return Err(Status::from(error)),
+                        }
+                    }
+                    let end = last_natural_end.or(last_fitting_end).ok_or_else(|| {
+                        Status::out_of_range(format!(
+                            "logical block {} contains a token sequence exceeding model limit={max_model_tokens}",
+                            segment.block_id
+                        ))
+                    })?;
+                    let text = segment.text[start..end].trim();
+                    if text.is_empty() {
+                        return Err(Status::internal(
+                            "model-aware logical block splitter made no progress",
+                        ));
+                    }
+                    let mut derived = segment.clone();
+                    derived.text = text.to_string();
+                    pieces.push(derived);
+                    start = end;
+                }
+                let piece_count = pieces.len();
+                for (piece_index, mut piece) in pieces.into_iter().enumerate() {
+                    if !piece.metadata.is_object() {
+                        piece.metadata = serde_json::json!({});
+                    }
+                    if let Some(metadata) = piece.metadata.as_object_mut() {
+                        metadata
+                            .insert("model_segment_index".into(), serde_json::json!(piece_index));
+                        metadata
+                            .insert("model_segment_count".into(), serde_json::json!(piece_count));
+                        metadata.insert(
+                            "model_segmentation_reason".into(),
+                            serde_json::json!("TOKENIZER_LIMIT"),
+                        );
+                    }
+                    output.push(piece);
+                }
+            }
+            Err(error) => return Err(Status::from(error)),
+        }
+    }
+    Ok(output)
+}
+
+fn is_natural_model_split_boundary(text: &str, end: usize) -> bool {
+    text[end..].chars().next().is_none_or(char::is_whitespace)
+        || text[..end]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ';' | ':' | ','))
+}
+
+#[cfg(test)]
+mod model_aware_ingestion_tests {
+    use super::*;
+
+    fn segment(text: &str) -> AnnotatedTextSegment {
+        AnnotatedTextSegment {
+            block_id: "block-a".into(),
+            parent_block_id: None,
+            block_type: "PARAGRAPH".into(),
+            text: text.into(),
+            source_location: serde_json::json!({}),
+            source_links: serde_json::json!([]),
+            metadata: serde_json::json!({}),
+            order_index: 1,
+        }
+    }
+
+    #[test]
+    fn oversized_logical_block_is_split_at_canonical_token_boundaries() {
+        let parts = split_annotated_segments_for_model(
+            vec![segment("aa bb cc dd")],
+            2,
+            |text, max| {
+                let count = text.split_whitespace().count();
+                if count > max {
+                    Err(AstraError::OutOfRange(format!("{count} > {max}")))
+                } else {
+                    Ok(count)
+                }
+            },
+            |text| {
+                Ok(text
+                    .split_whitespace()
+                    .scan(0_usize, |start, word| {
+                        let offset = text[*start..].find(word)? + *start;
+                        *start = offset + word.len();
+                        Some(crate::tokenizer::TokenOffset {
+                            token_index: offset,
+                            start_byte: offset,
+                            end_byte: offset + word.len(),
+                        })
+                    })
+                    .collect())
+            },
+        )
+        .expect("split oversized block");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].text, "aa bb");
+        assert_eq!(parts[1].text, "cc dd");
+        assert!(parts.iter().all(|part| part.block_id == "block-a"));
+        assert_eq!(parts[0].metadata["model_segment_index"], 0);
+        assert_eq!(parts[1].metadata["model_segment_index"], 1);
+        assert_eq!(parts[0].metadata["model_segment_count"], 2);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "aa bb cc dd"
+        );
+    }
 }
 
 fn block_type_name_from_json(value: Option<&serde_json::Value>) -> &'static str {
