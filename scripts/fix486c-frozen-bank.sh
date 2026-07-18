@@ -77,7 +77,7 @@ require_endpoint() {
 ingest() {
   require_endpoint || return 1
   python3 "$VERIFIER" --root "$ROOT/benchmarks/hierarchical/fix486" --emit-ingestion-plans --output "$EVIDENCE/ingestion/plans.json"
-  jq -c '.ingestion_plans[]' "$EVIDENCE/ingestion/plans.json" | while IFS= read -r plan; do
+  while IFS= read -r plan; do
     logical_zone=$(jq -r '.logical_zone_id' <<<"$plan")
     logical_document=$(jq -r '.logical_document_id' <<<"$plan")
     request="$EVIDENCE/ingestion/${logical_zone}-${logical_document}.request.json"
@@ -86,12 +86,26 @@ ingest() {
     grpcurl -plaintext -d @ "$ENDPOINT" astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument <"$request" >"$response"
     zone=$(jq -r '.document.accessZoneId' "$response")
     document=$(jq -r '.document.documentId' "$response")
-    grpcurl -plaintext -d "{\"accessZoneId\":\"$zone\",\"documentId\":\"$document\",\"documentVersion\":1}" "$ENDPOINT" astravector.embedding.v1.AstraVectorV004Control/ActivateDocumentVersion >"$EVIDENCE/ingestion/${logical_zone}-${logical_document}.activate.json"
-    jq -n --arg logical_zone "$logical_zone" --arg logical_document "$logical_document" --argfile response "$response" '{logical_zone_id:$logical_zone,logical_document_id:$logical_document,response:$response}' >"$EVIDENCE/identity-map/${logical_zone}-${logical_document}.json"
-  done
+    [[ "$zone" != "null" && "$document" != "null" ]] || { failure INGESTION_RESPONSE_ID_MISSING; return 1; }
+    wait_for_activation "$zone" "$document" "$EVIDENCE/ingestion/${logical_zone}-${logical_document}.activate.json" || { failure OUTBOX_NOT_FINALIZED; return 1; }
+    jq -n --arg logical_zone "$logical_zone" --arg logical_document "$logical_document" --slurpfile response "$response" '{logical_zone_id:$logical_zone,logical_document_id:$logical_document,response:$response[0]}' >"$EVIDENCE/identity-map/${logical_zone}-${logical_document}.json"
+  done < <(jq -c '.ingestion_plans[]' "$EVIDENCE/ingestion/plans.json")
   jq -s --arg source_sha "$(git -C "$ROOT" rev-parse HEAD)" --arg aggregate "$(jq -r '.hashes.aggregate_sha256' "$MANIFEST")" \
     '{schema_version:1,bank_id:"fix486-hierarchical-bank",bank_version:"1.0.0",bank_aggregate_sha256:$aggregate,source_sha:$source_sha,documents:.,access_zones:(map({key:.logical_zone_id,value:.response.document.accessZoneId})|from_entries)}' \
     "$EVIDENCE"/identity-map/*.json >"$EVIDENCE/identity-map/logical-to-runtime.json"
+}
+
+wait_for_activation() {
+  local zone=$1 document=$2 output=$3
+  local request
+  request="{\"accessZoneId\":\"$zone\",\"documentId\":\"$document\",\"documentVersion\":1}"
+  for _ in $(seq 1 90); do
+    if grpcurl -plaintext -d "$request" "$ENDPOINT" astravector.embedding.v1.AstraVectorV004Control/ActivateDocumentVersion >"$output" 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 execute_all() {
@@ -103,10 +117,10 @@ execute_all() {
     jq -n --arg zone "$zone" --arg question "$(jq -r '.question' <<<"$plan")" --arg correlation "fix486c-$query_id" \
       '{correlationId:$correlation,accessZoneId:$zone,callerAccessLevel:"INTERNAL",query:$question,topK:5,candidateLimit:20,parentLimit:5,timeoutMs:5000,includeDebug:true}' >"$EVIDENCE/execution/$query_id.request.json"
     if grpcurl -plaintext -d @ "$ENDPOINT" astravector.embedding.v1.AstraVectorV004Control/Search <"$EVIDENCE/execution/$query_id.request.json" >"$EVIDENCE/execution/$query_id.response.json"; then
-      jq -n --argfile plan <(printf '%s' "$plan") --argfile response "$EVIDENCE/execution/$query_id.response.json" \
-        '{query_id:$plan.query_id,case_id:$plan.case_id,status:"PASS",runtime_status:"OK",matched_contexts:($response.results // []),warnings:($response.warnings // []),hard_gate_results:{},bank_aggregate_sha256:$plan.bank_aggregate_sha256}' >"$EVIDENCE/execution/$query_id.result.json"
+      jq -n --argjson plan "$plan" --slurpfile response "$EVIDENCE/execution/$query_id.response.json" \
+        '{query_id:$plan.query_id,case_id:$plan.case_id,status:"PASS",runtime_status:"OK",matched_contexts:($response[0].results // []),warnings:($response[0].warnings // []),hard_gate_results:{},bank_aggregate_sha256:$plan.bank_aggregate_sha256}' >"$EVIDENCE/execution/$query_id.result.json"
     else
-      jq -n --argfile plan <(printf '%s' "$plan") '{query_id:$plan.query_id,case_id:$plan.case_id,status:"FAIL",runtime_status:"GRPC_ERROR",matched_contexts:[],warnings:[],hard_gate_results:{},bank_aggregate_sha256:$plan.bank_aggregate_sha256}' >"$EVIDENCE/execution/$query_id.result.json"
+      jq -n --argjson plan "$plan" '{query_id:$plan.query_id,case_id:$plan.case_id,status:"FAIL",runtime_status:"GRPC_ERROR",matched_contexts:[],warnings:[],hard_gate_results:{},bank_aggregate_sha256:$plan.bank_aggregate_sha256}' >"$EVIDENCE/execution/$query_id.result.json"
       return 1
     fi
   done
