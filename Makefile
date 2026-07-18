@@ -364,3 +364,8 @@ verify-fix467: fmt clippy check test quality-fixtures quality-quick
 
 
 verify-fix468: fmt clippy check test quality-fixtures-enriched quality-quick
+
+verify-fix486e-isolation-lifecycle-runtime:
+	./scripts/fix486e-isolation-lifecycle-runtime-proof.sh --execute-all
+
+verify-fix486e-isolation-lifecycle-runtime-proof: verify-fix486e-isolation-lifecycle-runtime
