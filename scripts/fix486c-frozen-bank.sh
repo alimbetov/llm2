@@ -50,7 +50,11 @@ record_blocked() {
 
 finalize() {
   local verdict=$1
-  telemetry "FINALIZED" "finalize" 0 0 "$verdict"
+  local previous_error processed total
+  previous_error=$(jq -r '.last_error_code // empty' "$EVIDENCE/telemetry/ingestion-status.json" 2>/dev/null || true)
+  processed=$(jq -r '.processed_documents // 0' "$EVIDENCE/telemetry/ingestion-status.json" 2>/dev/null || echo 0)
+  total=$(jq -r '.total_documents // 0' "$EVIDENCE/telemetry/ingestion-status.json" 2>/dev/null || echo 0)
+  telemetry "FINALIZED" "finalize" "$processed" "$total" "${previous_error:-$verdict}"
   jq -s --arg run_id "$RUN_ID" --arg verdict "$verdict" --arg source_sha "$(git -C "$ROOT" rev-parse HEAD)" \
     --arg bank_aggregate "$(jq -r '.hashes.aggregate_sha256' "$MANIFEST")" \
     '{schema_version:1,run_id:$run_id,verdict:$verdict,source_sha:$source_sha,bank_aggregate_sha256:$bank_aggregate,stages:.}' \
@@ -98,6 +102,7 @@ ingest() {
     jq '.request' <<<"$plan" >"$request"
     if ! grpcurl -plaintext -d @ "$ENDPOINT" astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument <"$request" >"$response"; then
       telemetry "BLOCKED" "production-ingestion" "$processed" "$total" "INGESTION_FAILED"
+      record_blocked production-ingestion INGESTION_FAILED
       return 1
     fi
     zone=$(jq -r '.document.accessZoneId' "$response")

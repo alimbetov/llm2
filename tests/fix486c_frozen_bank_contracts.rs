@@ -86,6 +86,8 @@ fn runtime_runner_uses_portable_json_loading_and_waits_for_activation() {
     let runner = fs::read_to_string("scripts/fix486c-frozen-bank.sh").expect("read runner");
     assert!(runner.contains("wait_for_activation"));
     assert!(runner.contains("OUTBOX_NOT_FINALIZED"));
+    assert!(runner.contains("telemetry/ingestion-status.json"));
+    assert!(runner.contains("record_blocked production-ingestion INGESTION_FAILED"));
     assert!(
         !runner.contains("--argfile"),
         "macOS jq does not support --argfile"
