@@ -10,10 +10,18 @@ ENDPOINT=${ASTRAVECTOR_FIX486C_ENDPOINT:-}
 VERIFIER="$ROOT/scripts/fix486c_verify_frozen_bank.py"
 MANIFEST="$ROOT/benchmarks/hierarchical/fix486/bank-manifest.json"
 
-mkdir -p "$EVIDENCE"/{source,bank,ingestion,identity-map,query-dry-run,execution,logs}
+mkdir -p "$EVIDENCE"/{source,bank,ingestion,identity-map,query-dry-run,execution,logs,telemetry}
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 failure() { printf 'FIX486C_FAIL=%s\n' "$1" >&2; }
+
+telemetry() {
+  local status=$1 stage=$2 processed=${3:-0} total=${4:-0} error_code=${5:-}
+  jq -n --arg run_id "$RUN_ID" --arg status "$status" --arg stage "$stage" --arg error_code "$error_code" \
+    --arg updated_at_utc "$(timestamp)" --argjson processed_documents "$processed" --argjson total_documents "$total" \
+    '{schema_version:1,run_id:$run_id,status:$status,current_stage:$stage,processed_documents:$processed_documents,total_documents:$total_documents,last_error_code:(if $error_code=="" then null else $error_code end),updated_at_utc:$updated_at_utc}' \
+    >"$EVIDENCE/telemetry/ingestion-status.json"
+}
 
 record() {
   local stage=$1
@@ -42,6 +50,7 @@ record_blocked() {
 
 finalize() {
   local verdict=$1
+  telemetry "FINALIZED" "finalize" 0 0 "$verdict"
   jq -s --arg run_id "$RUN_ID" --arg verdict "$verdict" --arg source_sha "$(git -C "$ROOT" rev-parse HEAD)" \
     --arg bank_aggregate "$(jq -r '.hashes.aggregate_sha256' "$MANIFEST")" \
     '{schema_version:1,run_id:$run_id,verdict:$verdict,source_sha:$source_sha,bank_aggregate_sha256:$bank_aggregate,stages:.}' \
@@ -77,18 +86,27 @@ require_endpoint() {
 ingest() {
   require_endpoint || return 1
   python3 "$VERIFIER" --root "$ROOT/benchmarks/hierarchical/fix486" --emit-ingestion-plans --output "$EVIDENCE/ingestion/plans.json"
+  local total processed
+  total=$(jq '.ingestion_plans|length' "$EVIDENCE/ingestion/plans.json")
+  processed=0
+  telemetry "RUNNING" "production-ingestion" "$processed" "$total"
   while IFS= read -r plan; do
     logical_zone=$(jq -r '.logical_zone_id' <<<"$plan")
     logical_document=$(jq -r '.logical_document_id' <<<"$plan")
     request="$EVIDENCE/ingestion/${logical_zone}-${logical_document}.request.json"
     response="$EVIDENCE/ingestion/${logical_zone}-${logical_document}.response.json"
     jq '.request' <<<"$plan" >"$request"
-    grpcurl -plaintext -d @ "$ENDPOINT" astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument <"$request" >"$response"
+    if ! grpcurl -plaintext -d @ "$ENDPOINT" astravector.embedding.v1.AstraVectorIngestionFacade/IndexLogicalDocument <"$request" >"$response"; then
+      telemetry "BLOCKED" "production-ingestion" "$processed" "$total" "INGESTION_FAILED"
+      return 1
+    fi
     zone=$(jq -r '.document.accessZoneId' "$response")
     document=$(jq -r '.document.documentId' "$response")
-    [[ "$zone" != "null" && "$document" != "null" ]] || { failure INGESTION_RESPONSE_ID_MISSING; return 1; }
-    wait_for_activation "$zone" "$document" "$EVIDENCE/ingestion/${logical_zone}-${logical_document}.activate.json" || { failure OUTBOX_NOT_FINALIZED; return 1; }
+    [[ "$zone" != "null" && "$document" != "null" ]] || { telemetry "BLOCKED" "production-ingestion" "$processed" "$total" "INGESTION_RESPONSE_ID_MISSING"; failure INGESTION_RESPONSE_ID_MISSING; return 1; }
+    wait_for_activation "$zone" "$document" "$EVIDENCE/ingestion/${logical_zone}-${logical_document}.activate.json" || { telemetry "BLOCKED" "activation" "$processed" "$total" "OUTBOX_NOT_FINALIZED"; failure OUTBOX_NOT_FINALIZED; return 1; }
     jq -n --arg logical_zone "$logical_zone" --arg logical_document "$logical_document" --slurpfile response "$response" '{logical_zone_id:$logical_zone,logical_document_id:$logical_document,response:$response[0]}' >"$EVIDENCE/identity-map/${logical_zone}-${logical_document}.json"
+    processed=$((processed + 1))
+    telemetry "RUNNING" "production-ingestion" "$processed" "$total"
   done < <(jq -c '.ingestion_plans[]' "$EVIDENCE/ingestion/plans.json")
   jq -s --arg source_sha "$(git -C "$ROOT" rev-parse HEAD)" --arg aggregate "$(jq -r '.hashes.aggregate_sha256' "$MANIFEST")" \
     '{schema_version:1,bank_id:"fix486-hierarchical-bank",bank_version:"1.0.0",bank_aggregate_sha256:$aggregate,source_sha:$source_sha,documents:.,access_zones:(map({key:.logical_zone_id,value:.response.document.accessZoneId})|from_entries)}' \
@@ -127,14 +145,15 @@ execute_all() {
 }
 
 cd "$ROOT"
+telemetry "RUNNING" "source-verification" 0 0
 git status --porcelain >"$EVIDENCE/source/worktree-status.txt"
 if [[ -s "$EVIDENCE/source/worktree-status.txt" ]]; then failure DIRTY_WORKTREE; finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED; exit 1; fi
 
 case "$MODE" in
-  --verify-only) verify && finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS ;;
-  --dry-run) verify && dry_run && finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS ;;
-  --prepare-runtime) verify && dry_run && require_endpoint && finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS ;;
-  --ingest-only) verify && dry_run && ingest && finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS ;;
-  --execute-all) verify && dry_run && execute_all && finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS ;;
+  --verify-only) if verify; then finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS; else finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED; exit 1; fi ;;
+  --dry-run) if verify && dry_run; then finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS; else finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED; exit 1; fi ;;
+  --prepare-runtime) if verify && dry_run && require_endpoint; then finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS; else finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED; exit 1; fi ;;
+  --ingest-only) if verify && dry_run && ingest; then finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS; else finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED; exit 1; fi ;;
+  --execute-all) if verify && dry_run && execute_all; then finalize FIX486_FROZEN_EXECUTABLE_BANK_PASS; else finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED; exit 1; fi ;;
   *) echo "usage: $0 [--verify-only|--dry-run|--prepare-runtime|--ingest-only|--execute-all]" >&2; exit 64 ;;
 esac

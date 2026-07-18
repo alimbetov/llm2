@@ -90,6 +90,10 @@ fn runtime_runner_uses_portable_json_loading_and_waits_for_activation() {
         !runner.contains("--argfile"),
         "macOS jq does not support --argfile"
     );
+    assert!(
+        runner.contains("finalize FIX486_FROZEN_EXECUTABLE_BANK_BLOCKED"),
+        "a failed mandatory runtime stage must still produce a BLOCKED evidence manifest"
+    );
 }
 
 #[test]
