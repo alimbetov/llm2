@@ -86,6 +86,7 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
         "IndexLogicalDocument",
         "'4862' THEN 'zone-a'",
         "'4863' THEN 'zone-b'",
+        "c.content_hash content_sha256",
     ] {
         assert!(
             runner.contains(required) || helper.contains(required),
