@@ -4,18 +4,25 @@ set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MODE=${1:---execute-all}; shift || true
-RUN_ID=fix486d-$(date -u +%Y%m%dT%H%M%SZ)
+RUN_ID=${FIX486D_RUN_ID:-fix486d-$(date -u +%Y%m%dT%H%M%SZ)}
 EVIDENCE_ROOT=${ASTRAVECTOR_EVIDENCE_ROOT:-/Users/ruslanalimbetov/Documents/llm2/astravector-evidence}
 while (($#)); do case "$1" in --run-id) RUN_ID=$2; shift 2;; --evidence-root) EVIDENCE_ROOT=$2; shift 2;; *) exit 64;; esac; done
 E="$EVIDENCE_ROOT/fix486d/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; H="$ROOT/scripts/fix486d_proof.py"
 PG=${FIX486D_POSTGRES_PORT:-57432}; QP=${FIX486D_QDRANT_HTTP_PORT:-6533}; QG=${FIX486D_QDRANT_GRPC_PORT:-6534}; GP=${FIX486D_GRPC_PORT:-50586}; MP=${FIX486D_METRICS_PORT:-9056}
 DB="postgres://astravector:astravector@127.0.0.1:$PG/astravector"; Q="http://127.0.0.1:$QP"; ADDR="127.0.0.1:$GP"; COL=${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486d}; PID=""; PROJECT="fix486d-$RUN_ID"; PROJECT=$(printf %s "$PROJECT"|tr '[:upper:]_' '[:lower:]-'|tr -cd 'a-z0-9-')
 mkdir -p "$E"/{source,bank,config,model-tokenizer,infrastructure,ingestion,identity-map,canonical-audit,qdrant-audit,search,retrieve-context,comparisons,restart,logs,metrics}
+STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq -n --arg run_id "$RUN_ID" --arg mode "$MODE" --arg started_at "$STARTED_AT" --arg branch "$(git branch --show-current)" --arg source_sha "$(git rev-parse HEAD)" '{run_id:$run_id,mode:$mode,started_at_utc:$started_at,branch:$branch,source_sha:$source_sha,status:"RUNNING"}' >"$E/bootstrap.json"
 fail() { echo "FIX486D_FAIL=$1" >&2; return 1; }
 compose() { FIX486D_POSTGRES_PORT=$PG FIX486D_QDRANT_HTTP_PORT=$QP FIX486D_QDRANT_GRPC_PORT=$QG docker compose -p "$PROJECT" -f "$ROOT/docker-compose.fix486d.yml" "$@"; }
 wait_for() { for _ in $(seq 1 90); do "$@" >/dev/null 2>&1 && return; sleep 1; done; return 1; }
 cleanup() { [[ -n "$PID" ]] && kill -INT "$PID" 2>/dev/null || true; [[ -n "$PID" ]] && wait "$PID" 2>/dev/null || true; compose down -v >"$E/infrastructure/compose-down.log" 2>&1 || true; }
-trap cleanup EXIT
+terminal_result() { rc=$?; jq -n --argjson exit_code "$rc" --arg finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{stage:"runner-terminal",status:(if $exit_code==0 then "PASS" else "FAIL" end),exit_code:$exit_code,signal:null,finished_at_utc:$finished_at}' >"$E/terminal-result.json"; cleanup; exit "$rc"; }
+on_signal() { signal=$1; jq -n --arg signal "$signal" --arg finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{stage:"runner-terminal",status:"BLOCKED",exit_code:null,signal:$signal,finished_at_utc:$finished_at,failure_code:"RUNNER_TERMINATED_BY_SIGNAL"}' >"$E/terminal-result.json"; cleanup; exit 1; }
+trap terminal_result EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
 
 verify() {
   [[ -z $(git status --porcelain) ]] || fail DIRTY_WORKTREE

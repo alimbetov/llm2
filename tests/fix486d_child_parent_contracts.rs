@@ -79,6 +79,8 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     }
     for required in [
         "set -Eeuo pipefail",
+        "bootstrap.json",
+        "terminal-result.json",
         "PREEXISTING_PORT_OWNER",
         "IDENTITY_MAP_INCOMPLETE",
         "CANONICAL_BINDING_INVALID",
@@ -95,4 +97,8 @@ fn phase_d_runner_and_audit_are_phase_owned_and_fail_closed() {
     }
     assert!(Path::new("scripts/fix486d-child-parent-audit.sql").is_file());
     assert!(Path::new("docker-compose.fix486d.yml").is_file());
+    let makefile = std::fs::read_to_string("Makefile").expect("Makefile");
+    assert!(makefile.contains(
+        "verify-fix486d-child-parent-runtime-proof: verify-fix486d-child-parent-runtime"
+    ));
 }
