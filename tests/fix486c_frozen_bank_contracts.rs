@@ -87,6 +87,7 @@ fn runtime_runner_uses_portable_json_loading_and_waits_for_activation() {
     assert!(runner.contains("wait_for_activation"));
     assert!(runner.contains("OUTBOX_NOT_FINALIZED"));
     assert!(runner.contains("telemetry/ingestion-status.json"));
+    assert!(runner.contains("document_deadline_ms"));
     assert!(runner.contains("record_blocked production-ingestion INGESTION_FAILED"));
     assert!(
         !runner.contains("--argfile"),

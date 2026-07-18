@@ -5,6 +5,9 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 use std::{env, path::Path};
 
+pub const MIN_INGESTION_DOCUMENT_DEADLINE_MS: u64 = 1_000;
+pub const MAX_INGESTION_DOCUMENT_DEADLINE_MS: u64 = 600_000;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub service: ServiceConfig,
@@ -2274,6 +2277,11 @@ impl AppConfig {
             "ingestion.max_chunks_per_document must be positive"
         );
         anyhow::ensure!(
+            (MIN_INGESTION_DOCUMENT_DEADLINE_MS..=MAX_INGESTION_DOCUMENT_DEADLINE_MS)
+                .contains(&self.grpc.deadlines.document_batch_ms),
+            "grpc.deadlines.document_batch_ms must be between {MIN_INGESTION_DOCUMENT_DEADLINE_MS} and {MAX_INGESTION_DOCUMENT_DEADLINE_MS} ms"
+        );
+        anyhow::ensure!(
             self.embedding.document_max_in_flight_chunks >= 1,
             "embedding.document_max_in_flight_chunks must be >= 1"
         );
@@ -3055,7 +3063,18 @@ mod query_processing_compatibility_tests {
     fn document_embedding_deadline_is_bounded_and_runtime_overridable() {
         let application = include_str!("../../config/application.yaml");
         assert!(application
-            .contains("document_batch_ms: ${ASTRAVECTOR_GRPC_DOCUMENT_BATCH_DEADLINE_MS:-60000}"));
+            .contains("document_batch_ms: ${ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS:-60000}"));
+        assert!(
+            (MIN_INGESTION_DOCUMENT_DEADLINE_MS..=MAX_INGESTION_DOCUMENT_DEADLINE_MS)
+                .contains(&60_000)
+        );
+        assert!(
+            !(MIN_INGESTION_DOCUMENT_DEADLINE_MS..=MAX_INGESTION_DOCUMENT_DEADLINE_MS).contains(&0)
+        );
+        assert!(
+            !(MIN_INGESTION_DOCUMENT_DEADLINE_MS..=MAX_INGESTION_DOCUMENT_DEADLINE_MS)
+                .contains(&600_001)
+        );
     }
 
     #[test]

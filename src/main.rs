@@ -2,7 +2,7 @@ use astravector_runtime::{
     adaptive::AdaptiveRuntime,
     cache::L1Cache,
     checksum,
-    config::AppConfig,
+    config::{AppConfig, MAX_INGESTION_DOCUMENT_DEADLINE_MS, MIN_INGESTION_DOCUMENT_DEADLINE_MS},
     grpc::{AstraVectorService, AstraVectorV004ControlService},
     health::Readiness,
     inference::{InferenceEngine, OnnxBgeM3Engine},
@@ -41,6 +41,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let cfg = Arc::new(loaded);
     cfg.validate()?;
+    info!(
+        document_deadline_ms = cfg.grpc.deadlines.document_batch_ms,
+        minimum_ms = MIN_INGESTION_DOCUMENT_DEADLINE_MS,
+        maximum_ms = MAX_INGESTION_DOCUMENT_DEADLINE_MS,
+        "INGESTION_DOCUMENT_DEADLINE_RESOLVED"
+    );
     let prod = cfg.service.environment.eq_ignore_ascii_case("production");
     checksum::verify(&cfg.model.path, &cfg.model.checksum, prod).await?;
     checksum::verify(&cfg.tokenizer.path, &cfg.tokenizer.checksum, prod).await?;

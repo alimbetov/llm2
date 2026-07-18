@@ -7,6 +7,7 @@ RUN_ID=${FIX486C_RUN_ID:-fix486c-$(date -u +%Y%m%dT%H%M%SZ)}
 EVIDENCE_ROOT=${ASTRAVECTOR_EVIDENCE_ROOT:-/Users/ruslanalimbetov/Documents/llm2/astravector-evidence}
 EVIDENCE="$EVIDENCE_ROOT/fix486c/$RUN_ID"
 ENDPOINT=${ASTRAVECTOR_FIX486C_ENDPOINT:-}
+DOCUMENT_DEADLINE_MS=${ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS:-60000}
 VERIFIER="$ROOT/scripts/fix486c_verify_frozen_bank.py"
 MANIFEST="$ROOT/benchmarks/hierarchical/fix486/bank-manifest.json"
 
@@ -83,8 +84,9 @@ require_endpoint() {
     return 1
   fi
   jq -n --arg endpoint "$ENDPOINT" --arg source_sha "$(git -C "$ROOT" rev-parse HEAD)" \
+    --argjson document_deadline_ms "$DOCUMENT_DEADLINE_MS" \
     --arg bank_aggregate "$(jq -r '.hashes.aggregate_sha256' "$MANIFEST")" \
-    '{endpoint:$endpoint,source_sha:$source_sha,bank_aggregate_sha256:$bank_aggregate}' >"$EVIDENCE/source/runtime-identity.json"
+    '{endpoint:$endpoint,source_sha:$source_sha,bank_aggregate_sha256:$bank_aggregate,document_deadline_ms:$document_deadline_ms}' >"$EVIDENCE/source/runtime-identity.json"
 }
 
 ingest() {
