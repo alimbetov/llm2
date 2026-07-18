@@ -91,3 +91,26 @@ fn runtime_runner_uses_portable_json_loading_and_waits_for_activation() {
         "macOS jq does not support --argfile"
     );
 }
+
+#[test]
+fn generated_large_parent_plan_is_split_into_chunkable_paragraphs() {
+    let output = Command::new("python3")
+        .arg(VERIFIER)
+        .arg("--emit-ingestion-plans")
+        .output()
+        .expect("emit ingestion plans");
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("ingestion plan JSON");
+    let large = report["ingestion_plans"]
+        .as_array()
+        .expect("plans")
+        .iter()
+        .flat_map(|plan| plan["request"]["blocks"].as_array().expect("blocks"))
+        .find(|block| block["blockId"] == "parent-large")
+        .expect("large parent block");
+    assert!(large["text"]
+        .as_str()
+        .expect("large parent text")
+        .split("\n\n")
+        .all(|paragraph| paragraph.split_whitespace().count() <= 256));
+}
