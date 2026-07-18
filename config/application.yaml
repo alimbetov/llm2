@@ -11,7 +11,10 @@ grpc:
   max_items_per_batch: 32
   deadlines:
     query_ms: ${ASTRAVECTOR_GRPC_QUERY_DEADLINE_MS:-1000}
-    document_batch_ms: 10000
+    # CPU model-backed document embedding may require more than one scheduler
+    # batch. Keep the operation bounded, but do not cancel a healthy second
+    # batch at the former 10-second default.
+    document_batch_ms: ${ASTRAVECTOR_GRPC_DOCUMENT_BATCH_DEADLINE_MS:-60000}
     contract_ms: 1000
     health_ms: 500
   compression:

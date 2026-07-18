@@ -3052,6 +3052,13 @@ mod query_processing_compatibility_tests {
     }
 
     #[test]
+    fn document_embedding_deadline_is_bounded_and_runtime_overridable() {
+        let application = include_str!("../../config/application.yaml");
+        assert!(application
+            .contains("document_batch_ms: ${ASTRAVECTOR_GRPC_DOCUMENT_BATCH_DEADLINE_MS:-60000}"));
+    }
+
+    #[test]
     fn legacy_keys_populate_standard_when_new_tier_is_absent() {
         let mut value: Value = serde_yaml::from_str(
             "search:\n  query_processing:\n    max_segments: 5\n    per_segment_candidate_limit: 9\n    global_candidate_limit: 70\n    long_query_deadline_ms: 2500\n",
