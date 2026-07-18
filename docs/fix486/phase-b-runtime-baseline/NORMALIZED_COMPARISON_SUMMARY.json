@@ -1,0 +1,11 @@
+{
+  "r1_r2": {
+    "snapshot_match": true,
+    "hierarchy_match": true
+  },
+  "r2_r3": {
+    "snapshot_match": true,
+    "search_and_retrieve_probe_match": true
+  },
+  "classification": "DETERMINISTIC_RUNTIME_RESULT"
+}
