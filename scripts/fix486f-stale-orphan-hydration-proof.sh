@@ -30,7 +30,7 @@ stage() {
   status=PASS; [[ $rc -eq 0 ]] || status=FAIL
   jq -n --arg stage "$name" --arg status "$status" --arg started "$started" --arg finished "$(timestamp)" --argjson exit_code "$rc" \
     '{stage:$stage,status:$status,started_at:$started,finished_at:$finished,exit_code:$exit_code,failure_codes:(if $exit_code==0 then [] else ["COMMAND_FAILED"] end),artifacts:[]}' >"$E/logs/$name.stage.json"
-  set -e
+  set +e
   return "$rc"
 }
 record_stage_status() {
@@ -39,7 +39,7 @@ record_stage_status() {
   jq -n --arg stage "$name" --arg status "$status" --arg now "$(timestamp)" --arg code "$code" \
     '{stage:$stage,status:$status,started_at:$now,finished_at:$now,exit_code:(if $status=="PASS" then 0 else 1 end),failure_codes:(if $code=="" then [] else [$code] end),artifacts:[]}' >"$E/logs/$name.stage.json"
   local rc=$?
-  set -e
+  set +e
   return "$rc"
 }
 stop_runtime() {
@@ -455,6 +455,7 @@ if [[ "$MODE" == "--verify-contracts" ]]; then
   exit 0
 fi
 
+set +e
 ok=true
 [[ "$MODE" == --execute-all ]] || ok=false
 stage identity-verification verify_identity || ok=false
