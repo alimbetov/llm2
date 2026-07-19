@@ -28,9 +28,10 @@ fn binding_parent_mismatch_is_rejected_by_canonical_batch_join() {
         &[
             "keys.binding_id",
             "JOIN astravector.vector_bindings_v004 b",
+            "JOIN astravector.access_zones az",
             "b.id=keys.binding_id",
             "b.chunk_id=keys.matched_chunk_id",
-            "m.parent_chunk_id=p.id",
+            "m.parent_chunk_id IS DISTINCT FROM p.id",
             "BINDING_INVALID",
         ],
         "FIX486F-P0-001",
@@ -74,7 +75,7 @@ fn partial_timeout_preserves_survivors_and_reports_degradation() {
             "CoverageClass::Partial",
             "surviving_contexts",
             "dropped_parents",
-            "retryable: true",
+            "dropped.reason.retryable()",
         ],
         "FIX486F-HYDR-001",
     );
@@ -96,7 +97,8 @@ fn total_timeout_uses_transport_failure_without_normal_content() {
         HYDRATION,
         &[
             "total_hydration_timeout_status",
-            "Status::deadline_exceeded",
+            "Code::DeadlineExceeded",
+            "Status::with_details",
             "structured_status_details",
             "normal_response_body_absent",
         ],
@@ -119,6 +121,7 @@ fn rejected_high_ranked_candidate_has_bounded_reserve() {
         &[
             "bounded_hydration_fetch_window",
             "hydration_rejection_reserve",
+            "hydrated_parent_seen",
         ],
         "FIX486F-STALE-002",
     );
@@ -151,11 +154,12 @@ fn failpoint_plan_is_request_scoped_bounded_and_correlation_based() {
 fn whitespace_parent_is_rejected_as_empty_context() {
     require_all(
         HYDRATION,
-        &[
-            "parent_text.trim().is_empty()",
-            "EmptyContext",
-            "EMPTY_CONTEXT",
-        ],
+        &["EmptyContext", "EMPTY_CONTEXT"],
+        "FIX486F-CONTENT-001",
+    );
+    require_all(
+        PERSISTENCE,
+        &["btrim(p.content)=''", "THEN 'EMPTY_CONTEXT'"],
         "FIX486F-CONTENT-001",
     );
 }
@@ -167,6 +171,7 @@ fn hydration_metrics_have_only_bounded_labels() {
         &[
             "parent_hydration_requests_total",
             "candidate_rejections_total",
+            "stale_candidate_rejections_total",
             "degraded_requests_total",
             "entry_point",
             "outcome",
@@ -195,7 +200,8 @@ fn hydration_metrics_have_only_bounded_labels() {
 fn search_and_retrieve_share_hydration_normalization() {
     let grpc = source(GRPC);
     assert!(
-        grpc.matches("normalize_hydration_outcomes").count() >= 2,
+        grpc.contains("normalize_hydration_outcomes(hydration_entry_point")
+            && grpc.contains("RetrievalEntryPoint(\"RetrieveContext\")"),
         "FIX486F-PARITY-001: Search/RetrieveContext do not share hydration normalization"
     );
 }

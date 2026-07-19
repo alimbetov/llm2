@@ -37,6 +37,13 @@ use crate::{
         QueryProcessingMode, QueryProcessingTier,
     },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
+    retrieval::{
+        hydration::{
+            bounded_hydration_fetch_window, normalize_hydration_outcomes,
+            total_hydration_timeout_status, HydrationCandidateIdentity,
+        },
+        hydration_failpoints::HydrationFailpointPlan,
+    },
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
     sparse::{SparseTechnicalEncoder, SparseTokenClass},
 };
@@ -68,6 +75,9 @@ struct AdmissionPermit {
 }
 
 struct RequestCancellationGuard(CancellationToken);
+
+#[derive(Clone, Copy)]
+struct RetrievalEntryPoint(&'static str);
 
 #[derive(Clone, Copy)]
 struct RequestTiming {
@@ -342,6 +352,7 @@ pub struct AstraVectorV004ControlService {
     retrieve_context_semaphore: Arc<Semaphore>,
     graph_expansion_semaphore: Arc<Semaphore>,
     mmr_fetch_semaphore: Arc<Semaphore>,
+    hydration_failpoints: Arc<HydrationFailpointPlan>,
 }
 
 impl AstraVectorV004ControlService {
@@ -362,6 +373,19 @@ impl AstraVectorV004ControlService {
         ));
         let mmr_fetch_semaphore =
             Arc::new(Semaphore::new(cfg.limits.max_concurrent_mmr_fetch.max(1)));
+        let hydration_failpoint_plan = HydrationFailpointPlan::load(
+            cfg.search.hydration_failpoints.non_production_enabled,
+            &cfg.search.hydration_failpoints.plan_path,
+            &cfg.search.hydration_failpoints.run_id,
+        )
+        .unwrap_or_else(|error| panic!("invalid hydration failpoint startup plan: {error}"));
+        tracing::info!(
+            non_production_enabled = hydration_failpoint_plan.non_production_enabled,
+            rule_count = hydration_failpoint_plan.rule_count(),
+            run_id = %cfg.search.hydration_failpoints.run_id,
+            "HYDRATION_FAILPOINT_PLAN_RESOLVED"
+        );
+        let hydration_failpoints = Arc::new(hydration_failpoint_plan);
         Self {
             cfg,
             scheduler,
@@ -372,6 +396,7 @@ impl AstraVectorV004ControlService {
             retrieve_context_semaphore,
             graph_expansion_semaphore,
             mmr_fetch_semaphore,
+            hydration_failpoints,
         }
     }
 
@@ -1943,6 +1968,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         request: Request<pb::SearchRequestV004>,
     ) -> Result<Response<pb::SearchResponseV004>, Status> {
         let started = std::time::Instant::now();
+        let hydration_entry_point = request
+            .extensions()
+            .get::<RetrievalEntryPoint>()
+            .map_or("Search", |value| value.0);
         let request_timing = request
             .extensions()
             .get::<RequestTiming>()
@@ -1967,6 +1996,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             )
             .await?;
         let access_zone_ids: Vec<Uuid> = resolved_zones.iter().map(|z| z.access_zone_id).collect();
+        let access_zone_codes = resolved_zones
+            .iter()
+            .map(|zone| (zone.access_zone_id, zone.access_zone_code.clone()))
+            .collect::<HashMap<_, _>>();
         let caller_access_level = pb::AccessLevel::try_from(r.caller_access_level)
             .ok()
             .filter(|v| *v != pb::AccessLevel::Unspecified)
@@ -2167,6 +2200,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             candidate_limit
         };
+        let candidate_limit = bounded_hydration_fetch_window(
+            parent_limit,
+            candidate_limit,
+            self.cfg.search.hydration_rejection_reserve,
+            self.cfg.search.hydration_rejection_reserve_max,
+            self.cfg.limits.search_candidate_limit_max,
+        );
         tracing::info!(
             correlation_id = %r.correlation_id,
             mode = query_plan_diagnostics.mode_code(),
@@ -2258,7 +2298,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         // content_chunks_v004 is keyed by (access_zone_id, id); using only UUID would mix tenants/zones when
         // malformed or imported data contains the same chunk UUID in more than one zone.
         let mut groups: Vec<((Uuid, Uuid), QdrantSearchHit)> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen_candidates = HashSet::new();
         let mut pre_dedup_child_ids = HashMap::<(Uuid, Uuid), HashSet<Uuid>>::new();
         for hit in hits.iter() {
             let Some(hit_access_zone_id) = hit
@@ -2292,26 +2332,35 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             .and_then(serde_json::Value::as_str)
                             .and_then(|v| Uuid::parse_str(v).ok())
                     }),
-                _ => None,
-            };
-            if let Some(parent_id) = parent_id {
-                let parent_key = (hit_access_zone_id, parent_id);
-                if matches!(granularity, "SUB_180" | "SUB_260") {
-                    if let Some(chunk_id) = hit
-                        .payload
-                        .get("chunk_id")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|value| Uuid::parse_str(value).ok())
-                    {
-                        pre_dedup_child_ids
-                            .entry(parent_key)
-                            .or_default()
-                            .insert(chunk_id);
-                    }
+                _ => hit
+                    .payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|v| Uuid::parse_str(v).ok()),
+            }
+            .unwrap_or_else(Uuid::nil);
+            let parent_key = (hit_access_zone_id, parent_id);
+            if matches!(granularity, "SUB_180" | "SUB_260") {
+                if let Some(chunk_id) = hit
+                    .payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                {
+                    pre_dedup_child_ids
+                        .entry(parent_key)
+                        .or_default()
+                        .insert(chunk_id);
                 }
-                if seen.insert(parent_key) {
-                    groups.push((parent_key, hit.clone()));
-                }
+            }
+            let matched_chunk_id = hit
+                .payload
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .unwrap_or_else(Uuid::nil);
+            if seen_candidates.insert((parent_key, matched_chunk_id)) {
+                groups.push((parent_key, hit.clone()));
             }
             if groups.len() >= candidate_limit as usize {
                 break;
@@ -2319,12 +2368,35 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let hydration_keys = groups
             .iter()
-            .filter_map(|((zone, parent_id), hit)| {
-                hit.payload
+            .enumerate()
+            .map(|(input_ordinal, ((zone, parent_id), hit))| {
+                let matched_chunk_id = hit
+                    .payload
                     .get("chunk_id")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|value| Uuid::parse_str(value).ok())
-                    .map(|matched_id| (*zone, matched_id, *parent_id))
+                    .unwrap_or_else(Uuid::nil);
+                let binding_id = hit
+                    .payload
+                    .get("binding_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .unwrap_or_else(Uuid::nil);
+                let granularity = hit
+                    .payload
+                    .get("chunk_granularity")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                HydrationCandidateIdentity {
+                    access_zone_id: *zone,
+                    binding_id,
+                    matched_chunk_id,
+                    parent_chunk_id: *parent_id,
+                    granularity,
+                    raw_rank: input_ordinal,
+                    input_ordinal,
+                }
             })
             .collect::<Vec<_>>();
         tracing::debug!(
@@ -2350,15 +2422,54 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         })?;
         histogram!("astravector_deadline_remaining_seconds", "stage" => "postgres_parent_fetch")
             .record(remaining_ms as f64 / 1000.0);
-        let hydrated = self
+        let hydration_outcomes = self
             .repo()?
-            .fetch_hydrated_search_contexts_multi(
+            .fetch_hydration_outcomes_batch(
                 &hydration_keys,
                 caller_access_level as i16,
                 statement_timeout_ms,
             )
             .await
             .map_err(Status::from)?;
+        let hydration_outcomes = self
+            .hydration_failpoints
+            .apply(
+                &r.correlation_id,
+                hydration_entry_point,
+                &access_zone_codes,
+                hydration_outcomes,
+            )
+            .await;
+        let normalized_hydration =
+            normalize_hydration_outcomes(hydration_entry_point, hydration_outcomes);
+        let hydration_degradation = normalized_hydration.to_proto();
+        let retrieval_infrastructure_failure =
+            retrieval_infrastructure_failure || hydration_degradation.infrastructure_failure;
+        for dropped in &normalized_hydration.dropped_parents {
+            tracing::warn!(
+                correlation_id = %r.correlation_id,
+                entry_point = hydration_entry_point,
+                binding_id = %dropped.candidate.binding_id,
+                matched_chunk_id = %dropped.candidate.matched_chunk_id,
+                parent_chunk_id = %dropped.candidate.parent_chunk_id,
+                reason = dropped.reason.code(),
+                stage = dropped.stage,
+                "CANONICAL_PARENT_HYDRATION_REJECTED"
+            );
+            if !warnings
+                .iter()
+                .any(|warning| warning.code == dropped.reason.code())
+            {
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: dropped.reason.code().into(),
+                    message: format!("canonical parent candidate rejected at {}", dropped.stage),
+                });
+            }
+        }
+        if normalized_hydration.has_total_timeout() {
+            return Err(total_hydration_timeout_status(&hydration_degradation));
+        }
+        let hydrated = normalized_hydration.surviving_contexts;
         let parent_fetch_ms = parent_fetch_started.elapsed().as_millis() as u64;
         histogram!("astravector_parent_hydration_duration_seconds")
             .record(parent_fetch_ms as f64 / 1000.0);
@@ -2366,7 +2477,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .increment(hydration_keys.len() as u64);
         counter!("astravector_parent_hydration_missing_total")
             .increment(hydration_keys.len().saturating_sub(hydrated.len()) as u64);
-        let fetched_parent_count = hydrated.len();
+        let fetched_parent_count = hydrated
+            .iter()
+            .map(|context| (context.access_zone_id, context.parent_chunk_id))
+            .collect::<HashSet<_>>()
+            .len();
         let by_candidate = hydrated
             .into_iter()
             .map(|context| {
@@ -2381,6 +2496,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             })
             .collect::<HashMap<_, _>>();
         let mut direct_results = Vec::new();
+        let mut hydrated_parent_seen = HashSet::new();
         let mut graph_results = Vec::new();
         let mut seed_scores: HashMap<(Uuid, Uuid), f32> = HashMap::new();
         for ((zone, _), hit) in &groups {
@@ -2408,6 +2524,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let Some(context) = by_candidate.get(&(*parent_zone_id, matched_id, *parent_id)) else {
                 continue;
             };
+            if !hydrated_parent_seen.insert((*parent_zone_id, *parent_id)) {
+                continue;
+            }
             let parent = ParentContextRecord {
                 access_zone_id: context.access_zone_id,
                 id: context.parent_chunk_id,
@@ -3915,7 +4034,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "GRAPH_MERGE_COMPLETED"
         );
         let query_segments_v008 = query_segment_diagnostics(&query_plan, &results);
-        let query_status = if retrieval_status == SegmentRetrievalStatus::PartialFailure
+        let query_status = if hydration_degradation.degraded
+            || retrieval_status == SegmentRetrievalStatus::PartialFailure
             || matches!(
                 coverage_after_visibility.status,
                 QueryEvidenceStatus::Degraded | QueryEvidenceStatus::Unavailable
@@ -3938,6 +4058,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         Ok(Response::new(pb::SearchResponseV004 {
             results,
+            degradation: hydration_degradation
+                .degraded
+                .then_some(hydration_degradation),
             diagnostics: Some(pb::SearchDiagnosticsV004 {
                 query_embedding_ms,
                 qdrant_search_ms,
@@ -6515,16 +6638,20 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
         });
         *inner.metadata_mut() = metadata;
         inner.extensions_mut().insert(request_timing);
+        inner
+            .extensions_mut()
+            .insert(RetrievalEntryPoint("RetrieveContext"));
         let search = <Self as AstraVectorV004Control>::search(self, inner)
             .await?
             .into_inner();
         let diagnostics = search.diagnostics.clone().unwrap_or_default();
+        let typed_degradation = search.degradation.clone();
         let total_candidates = if diagnostics.candidate_count == 0 {
             search.results.len() as u32
         } else {
             diagnostics.candidate_count
         };
-        let degradation_codes = search
+        let mut degradation_codes = search
             .warnings
             .iter()
             .map(|warning| warning.code.clone())
@@ -6543,10 +6670,28 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
                         | "LONG_QUERY_COVERAGE_REDUCED_BY_VISIBILITY_RECHECK"
                         | "QUERY_SEGMENT_SKIPPED_INSUFFICIENT_BUDGET"
                         | "QUERY_SEGMENT_RETRIEVAL_DEGRADED"
+                        | "BINDING_INVALID"
+                        | "VISIBILITY_REJECTED"
+                        | "HYDRATION_MISSING"
+                        | "PARENT_HYDRATION_TIMEOUT"
+                        | "EMPTY_CONTEXT"
                 )
             })
             .collect::<Vec<_>>();
-        let degraded = !degradation_codes.is_empty();
+        if let Some(degradation) = typed_degradation.as_ref() {
+            degradation_codes.extend(
+                degradation
+                    .dropped_parents
+                    .iter()
+                    .map(|dropped| dropped.reason.clone()),
+            );
+        }
+        degradation_codes.sort();
+        degradation_codes.dedup();
+        let degraded = typed_degradation
+            .as_ref()
+            .is_some_and(|degradation| degradation.degraded)
+            || !degradation_codes.is_empty();
         let contexts = search
             .results
             .into_iter()
@@ -6584,6 +6729,7 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
             contexts,
             warnings: search.warnings,
             diagnostics: Some(diagnostics),
+            degradation: search.degradation,
         }))
     }
 

@@ -7,7 +7,12 @@ use crate::{
         RelatedChunk,
     },
     inference::EmbeddingResult,
-    pb, smoke_failpoints,
+    pb,
+    retrieval::hydration::{
+        HydrationBatchOutcomes, HydrationCandidateIdentity, HydrationRejectionReason,
+        HydrationTerminalOutcome, RejectedHydrationCandidate,
+    },
+    smoke_failpoints,
 };
 use chrono::{DateTime, Utc};
 use metrics::counter;
@@ -2816,6 +2821,223 @@ ORDER BY keys.rank"#,
                 parent_metadata: r.get("parent_metadata"),
             })
             .collect())
+    }
+
+    pub async fn fetch_hydration_outcomes_batch(
+        &self,
+        candidates: &[HydrationCandidateIdentity],
+        caller_access_level: i16,
+        statement_timeout_ms: u64,
+    ) -> Result<HydrationBatchOutcomes, AstraError> {
+        if candidates.is_empty() {
+            return Ok(HydrationBatchOutcomes::new(0, Vec::new()));
+        }
+        if statement_timeout_ms == 0 {
+            return Err(AstraError::DeadlineExceeded(
+                "insufficient_postgres_hydration_budget".into(),
+            ));
+        }
+
+        let zones = candidates
+            .iter()
+            .map(|value| value.access_zone_id)
+            .collect::<Vec<_>>();
+        let bindings = candidates
+            .iter()
+            .map(|value| value.binding_id)
+            .collect::<Vec<_>>();
+        let matched = candidates
+            .iter()
+            .map(|value| value.matched_chunk_id)
+            .collect::<Vec<_>>();
+        let parents = candidates
+            .iter()
+            .map(|value| value.parent_chunk_id)
+            .collect::<Vec<_>>();
+        let granularities = candidates
+            .iter()
+            .map(|value| value.granularity.clone())
+            .collect::<Vec<_>>();
+        let raw_ranks = candidates
+            .iter()
+            .map(|value| value.raw_rank as i64)
+            .collect::<Vec<_>>();
+        let input_ordinals = candidates
+            .iter()
+            .map(|value| value.input_ordinal as i64)
+            .collect::<Vec<_>>();
+
+        let query_started = std::time::Instant::now();
+        let mut tx = self.pool.begin().await.map_err(postgres_error)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{statement_timeout_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+        let rows = sqlx::query(
+            r#"WITH candidate_keys AS (
+  SELECT keys.*
+  FROM unnest(
+    $1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[],
+    $5::text[], $6::bigint[], $7::bigint[]
+  ) WITH ORDINALITY AS keys(
+    access_zone_id, binding_id, matched_chunk_id, parent_chunk_id,
+    granularity, raw_rank, input_ordinal, sql_ordinal
+  )
+)
+SELECT keys.*,
+       CASE
+         WHEN b.id IS NULL OR m.id IS NULL
+           OR b.chunk_id<>keys.matched_chunk_id
+           OR b.chunk_granularity<>keys.granularity
+           OR b.document_id<>m.document_id
+           OR b.document_version<>m.document_version
+           OR b.root_chunk_id<>m.root_chunk_id
+           OR b.source_chunk_id<>m.source_chunk_id
+           OR b.representation_type<>m.representation_type
+           OR (keys.granularity IN ('SUB_180','SUB_260')
+               AND b.parent_chunk_id IS DISTINCT FROM keys.parent_chunk_id)
+           OR (keys.granularity='PARENT' AND b.parent_chunk_id IS NOT NULL)
+           OR (keys.granularity IN ('SUB_180','SUB_260')
+               AND m.parent_chunk_id IS DISTINCT FROM keys.parent_chunk_id)
+           OR (keys.granularity='PARENT'
+               AND (m.id<>p.id OR m.parent_chunk_id IS NOT NULL))
+           OR keys.granularity NOT IN ('PARENT','SUB_180','SUB_260')
+           THEN 'BINDING_INVALID'
+         WHEN p.id IS NULL OR d.document_id IS NULL THEN 'HYDRATION_MISSING'
+         WHEN (keys.granularity IN ('SUB_180','SUB_260')
+               AND m.parent_chunk_id IS DISTINCT FROM p.id)
+           OR b.document_id<>p.document_id OR b.document_version<>p.document_version
+           OR b.root_chunk_id<>p.root_chunk_id OR b.source_chunk_id<>p.source_chunk_id
+           OR m.document_id<>p.document_id OR m.document_version<>p.document_version
+           OR m.root_chunk_id<>p.root_chunk_id OR m.source_chunk_id<>p.source_chunk_id
+           THEN 'BINDING_INVALID'
+         WHEN b.lifecycle_status<>'ACTIVE' OR b.qdrant_sync_status<>'SYNCED'
+           OR b.deleted_at IS NOT NULL
+           OR (b.expires_at IS NOT NULL AND b.expires_at<=now())
+           OR b.access_level>$8 OR b.representation_type<>'ORIGINAL'
+           OR m.lifecycle_status<>'ACTIVE' OR m.deleted_at IS NOT NULL
+           OR (m.expires_at IS NOT NULL AND m.expires_at<=now())
+           OR p.lifecycle_status<>'ACTIVE' OR p.deleted_at IS NOT NULL
+           OR (p.expires_at IS NOT NULL AND p.expires_at<=now())
+           OR m.access_level>$8 OR p.access_level>$8
+           OR m.representation_type<>'ORIGINAL'
+           OR p.granularity<>'PARENT' OR p.representation_type<>'ORIGINAL'
+           OR az.access_zone_id IS NULL OR az.status<>'ACTIVE'
+           OR d.status<>'ACTIVE' OR d.lifecycle_status<>'ACTIVE'
+           OR d.delete_operation_id IS NOT NULL
+           OR (d.expires_at IS NOT NULL AND d.expires_at<=now())
+           THEN 'VISIBILITY_REJECTED'
+         WHEN btrim(p.content)='' THEN 'EMPTY_CONTEXT'
+         ELSE 'HYDRATED'
+       END AS hydration_outcome,
+       p.access_zone_id AS canonical_access_zone_id,
+       m.id AS canonical_matched_chunk_id,
+       p.id AS canonical_parent_chunk_id, p.document_id, p.document_version,
+       p.root_chunk_id, p.source_chunk_id, m.content AS matched_text,
+       p.content AS parent_text, p.content_hash AS parent_content_hash,
+       p.actual_token_count AS parent_token_count,
+       p.sequence_no AS parent_sequence_no, p.access_level,
+       COALESCE(m.source_block_id,p.source_block_id) AS source_block_id,
+       COALESCE(m.source_location,'{}'::jsonb) AS source_location,
+       COALESCE(m.source_links,'[]'::jsonb) AS source_links,
+       m.metadata, p.metadata AS parent_metadata
+FROM candidate_keys keys
+LEFT JOIN astravector.vector_bindings_v004 b
+  ON b.access_zone_id=keys.access_zone_id
+ AND b.id=keys.binding_id
+ AND b.chunk_id=keys.matched_chunk_id
+LEFT JOIN astravector.content_chunks_v004 m
+  ON m.access_zone_id=keys.access_zone_id
+ AND m.id=keys.matched_chunk_id
+LEFT JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=keys.access_zone_id
+ AND p.id=keys.parent_chunk_id
+LEFT JOIN astravector.document_versions d
+  ON d.access_zone_id=p.access_zone_id
+ AND d.document_id=p.document_id
+ AND d.document_version=p.document_version
+LEFT JOIN astravector.access_zones az
+  ON az.access_zone_id=keys.access_zone_id
+ORDER BY keys.input_ordinal, keys.sql_ordinal"#,
+        )
+        .bind(zones)
+        .bind(bindings)
+        .bind(matched)
+        .bind(parents)
+        .bind(granularities)
+        .bind(raw_ranks)
+        .bind(input_ordinals)
+        .bind(caller_access_level)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
+
+        let elapsed = query_started.elapsed();
+        let mut outcomes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let candidate = HydrationCandidateIdentity {
+                access_zone_id: row.get("access_zone_id"),
+                binding_id: row.get("binding_id"),
+                matched_chunk_id: row.get("matched_chunk_id"),
+                parent_chunk_id: row.get("parent_chunk_id"),
+                granularity: row.get("granularity"),
+                raw_rank: row.get::<i64, _>("raw_rank") as usize,
+                input_ordinal: row.get::<i64, _>("input_ordinal") as usize,
+            };
+            let outcome: String = row.get("hydration_outcome");
+            let rejected = |reason| RejectedHydrationCandidate {
+                candidate: candidate.clone(),
+                reason,
+                stage: "CANONICAL_PARENT_HYDRATION",
+                elapsed,
+            };
+            outcomes.push(match outcome.as_str() {
+                "HYDRATED" => HydrationTerminalOutcome::Hydrated {
+                    candidate,
+                    elapsed,
+                    context: Box::new(HydratedSearchContext {
+                        access_zone_id: row.get("canonical_access_zone_id"),
+                        matched_chunk_id: row.get("canonical_matched_chunk_id"),
+                        parent_chunk_id: row.get("canonical_parent_chunk_id"),
+                        document_id: row.get("document_id"),
+                        document_version: row.get("document_version"),
+                        root_chunk_id: row.get("root_chunk_id"),
+                        source_chunk_id: row.get("source_chunk_id"),
+                        matched_text: row.get("matched_text"),
+                        parent_text: row.get("parent_text"),
+                        parent_content_hash: row.get("parent_content_hash"),
+                        parent_token_count: row.get("parent_token_count"),
+                        parent_sequence_no: row.get("parent_sequence_no"),
+                        access_level: row.get("access_level"),
+                        source_block_id: row.try_get("source_block_id").ok(),
+                        source_location: row.get("source_location"),
+                        source_links: row.get("source_links"),
+                        metadata: row.get("metadata"),
+                        parent_metadata: row.get("parent_metadata"),
+                    }),
+                },
+                "BINDING_INVALID" => HydrationTerminalOutcome::BindingInvalid(rejected(
+                    HydrationRejectionReason::BindingInvalid,
+                )),
+                "VISIBILITY_REJECTED" => HydrationTerminalOutcome::VisibilityRejected(rejected(
+                    HydrationRejectionReason::VisibilityRejected,
+                )),
+                "HYDRATION_MISSING" => HydrationTerminalOutcome::HydrationMissing(rejected(
+                    HydrationRejectionReason::HydrationMissing,
+                )),
+                "EMPTY_CONTEXT" => HydrationTerminalOutcome::EmptyContext(rejected(
+                    HydrationRejectionReason::EmptyContext,
+                )),
+                other => {
+                    return Err(AstraError::Internal(format!(
+                        "unknown hydration outcome {other}"
+                    )))
+                }
+            });
+        }
+        Ok(HydrationBatchOutcomes::new(candidates.len(), outcomes))
     }
 
     pub async fn search_active_parent_contexts_lexical_multi(
