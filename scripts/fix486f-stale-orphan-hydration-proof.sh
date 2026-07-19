@@ -256,7 +256,9 @@ capture_fault_origin() {
 }
 restart_with_fault_plan() { stop_runtime && start_runtime fault-plan; }
 run_fault_queries() {
-  local kind=$1 entry=$2 request_id=$3 mode=$4 dir="$E/faults/$kind/$entry"; mkdir -p "$dir"
+  local kind=$1 entry=$2 request_id=$3 mode=$4
+  local dir="$E/faults/$kind/$entry"
+  mkdir -p "$dir"
   local zone_id query
   zone_id=$(jq -r '.rows[]|select(.logical_zone_id=="zone-a")|.runtime_access_zone_id' "$E/identity-map/logical-to-runtime.json"|head -1)
   query=$(jq -r '.[]|select(.query.query_id=="q-zone-a")|.query.question' "$E/bank/selected-queries.json")
