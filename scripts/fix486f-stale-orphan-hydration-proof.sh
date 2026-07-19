@@ -259,8 +259,9 @@ run_fault_queries() {
   local kind=$1 entry=$2 request_id=$3 mode=$4
   local dir="$E/faults/$kind/$entry"
   mkdir -p "$dir"
-  local zone_id query
+  local zone_id query target_parent
   zone_id=$(jq -r '.rows[]|select(.logical_zone_id=="zone-a")|.runtime_access_zone_id' "$E/identity-map/logical-to-runtime.json"|head -1)
+  target_parent=$(jq -r '.physical_parent_ids[0]' "$E/fault-plan.json" | head -1)
   query=$(jq -r '.[]|select(.query.query_id=="q-zone-a")|.query.question' "$E/bank/selected-queries.json")
   if [[ "$entry" == Search ]]; then
     jq -n --arg z "$zone_id" --arg q "$query" --arg id "$request_id" '{correlationId:$id,accessZoneId:$z,callerAccessLevel:"INTERNAL",query:$q,topK:5,candidateLimit:20,parentLimit:5,timeoutMs:10000,searchMode:"SEARCH_MODE_V005_SPARSE",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_REQUIRED",includeDebug:true}' >"$dir/request.json"
@@ -271,8 +272,10 @@ run_fault_queries() {
   fi
   local text contexts_count=0; text=$(cat "$dir/response.json" "$dir/transport.stderr" 2>/dev/null || true)
   contexts_count=$(jq '(.results // .contexts // [])|length' "$dir/response.json" 2>/dev/null || echo 0)
-  jq -n --arg scenario "$kind" --arg entry "$entry" --arg request_id "$request_id" --arg mode "$mode" --arg raw "$text" --argjson contexts "$contexts_count" \
-    '{scenario:$scenario,entry_point:$entry,request_id:$request_id,mode:$mode,raw_response:$raw,contexts_count:$contexts,hydration_missing:($raw|contains("HYDRATION_MISSING")),hydration_timeout:($raw|contains("PARENT_HYDRATION_TIMEOUT") or contains("DeadlineExceeded")),stale_final_contexts:0,orphan_final_contexts:0}' >"$dir/result.json"
+  local target_context_count
+  target_context_count=$(jq --arg parent "$target_parent" '[.results[]?, .contexts[]? | select(.parentChunkId==$parent)]|length' "$dir/response.json" 2>/dev/null || echo 0)
+  jq -n --arg scenario "$kind" --arg entry "$entry" --arg request_id "$request_id" --arg mode "$mode" --arg raw "$text" --arg parent "$target_parent" --argjson contexts "$contexts_count" --argjson target_contexts "$target_context_count" \
+    '{scenario:$scenario,entry_point:$entry,request_id:$request_id,mode:$mode,target_parent_id:$parent,raw_response:$raw,contexts_count:$contexts,target_context_count:$target_contexts,hydration_missing:($raw|contains("HYDRATION_MISSING")),hydration_timeout:($raw|contains("PARENT_HYDRATION_TIMEOUT") or contains("DeadlineExceeded")),stale_final_contexts:(if ($scenario=="stale" or $scenario=="orphan") then $target_contexts else 0 end),orphan_final_contexts:(if $scenario=="orphan" then $target_contexts else 0 end)}' >"$dir/result.json"
   jq . "$dir/result.json" >"$dir/trace.json"
   jq -c . "$dir/result.json" >>"$E/fault-query-results.jsonl"
 }
@@ -287,7 +290,7 @@ fault_proof() {
   run_fault_queries total Search fix486f-total-search TIMEOUT_ALL_PARENTS
   run_fault_queries total RetrieveContext fix486f-total-retrieve TIMEOUT_ALL_PARENTS
   jq -n --slurpfile plan "$E/fault-plan.json" --slurpfile rows "$E/fault-query-results.jsonl" \
-    '{run_id:($plan[0][0].run_id),control_channel:"startup_immutable_plan",non_production_enabled:true,rules:($plan[0]|map(. as $r | {request_id:$r.request_id,entry_point:$r.entry_point,mode:$r.mode,max_activations:$r.max_activations,actual_activation_count:([ $rows[0][] | select(.request_id==$r.request_id) | select(.hydration_missing or .hydration_timeout) ]|length)}))}' >"$E/fault-activation.json"
+    '{run_id:($plan[0][0].run_id),control_channel:"startup_immutable_plan",non_production_enabled:true,rules:($plan[0]|map(. as $r | {request_id:$r.request_id,entry_point:$r.entry_point,mode:$r.mode,max_activations:$r.max_activations,actual_activation_count:([ $rows[] | select(.request_id==$r.request_id) | select(.hydration_missing or .hydration_timeout) ]|length)}))}' >"$E/fault-activation.json"
   jq -s '{status:(if all(.[]; ((.scenario=="stale" or .scenario=="orphan") and .hydration_missing and .contexts_count==0) or (.scenario=="partial" and .hydration_timeout and .contexts_count>0) or (.scenario=="total" and .hydration_timeout and .contexts_count==0)) then "PASS" else "FAIL" end),rows:length}' "$E/fault-query-results.jsonl" >"$E/hydration-baseline.json"
   cp "$E/hydration-baseline.json" "$E/hydration-partial-timeout.json"
   cp "$E/hydration-baseline.json" "$E/hydration-total-timeout.json"
