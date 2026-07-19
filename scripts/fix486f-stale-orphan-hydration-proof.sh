@@ -273,7 +273,7 @@ run_fault_queries() {
   local text contexts_count=0; text=$(cat "$dir/response.json" "$dir/transport.stderr" 2>/dev/null || true)
   contexts_count=$(jq '(.results // .contexts // [])|length' "$dir/response.json" 2>/dev/null || echo 0)
   local target_context_count
-  target_context_count=$(jq --arg parent "$target_parent" '[.results[]?, .contexts[]? | select(.parentChunkId==$parent)]|length' "$dir/response.json" 2>/dev/null || echo 0)
+  target_context_count=$(jq --arg parent "$target_parent" '[ ((.results // [])[]?, (.contexts // [])[]?) | select(.parentChunkId==$parent) ]|length' "$dir/response.json" 2>/dev/null || echo 0)
   jq -n --arg scenario "$kind" --arg entry "$entry" --arg request_id "$request_id" --arg mode "$mode" --arg raw "$text" --arg parent "$target_parent" --argjson contexts "$contexts_count" --argjson target_contexts "$target_context_count" \
     '{scenario:$scenario,entry_point:$entry,request_id:$request_id,mode:$mode,target_parent_id:$parent,raw_response:$raw,contexts_count:$contexts,target_context_count:$target_contexts,hydration_missing:($raw|contains("HYDRATION_MISSING")),hydration_timeout:($raw|contains("PARENT_HYDRATION_TIMEOUT") or contains("DeadlineExceeded")),stale_final_contexts:(if ($scenario=="stale" or $scenario=="orphan") then $target_contexts else 0 end),orphan_final_contexts:(if $scenario=="orphan" then $target_contexts else 0 end)}' >"$dir/result.json"
   jq . "$dir/result.json" >"$dir/trace.json"
