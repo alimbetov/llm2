@@ -239,8 +239,12 @@ prepare_fault_plan() {
 capture_fault_origin() {
   curl -fsS -X POST "$Q/collections/$COL/points/scroll" -H 'content-type: application/json' \
     -d '{"limit":1,"with_payload":true,"with_vector":true}' >"$E/qdrant-audit/fault-origin-scroll.json" || return 1
-  jq -e '.result.points|length==1 and .[0].vector != null and .[0].payload.content_hash != null' "$E/qdrant-audit/fault-origin-scroll.json" >/dev/null || return 1
-  jq '(.result.points[0]) as $p | {status:"PASS",point_id:($p.id|tostring),vector_hash:(($p.vector|tojson)|@base64),payload_hash:(($p.payload|tojson)|@base64),content_hash:$p.payload.content_hash,zone:$p.payload.access_zone_id,document:$p.payload.document_id,version:$p.payload.document_version,child_identity:$p.payload.chunk_id,parent_identity:$p.payload.parent_chunk_id,source:"production_qdrant_scroll"}' "$E/qdrant-audit/fault-origin-scroll.json" >"$E/fault-point-origin.json"
+  jq -e '.result.points|length==1 and .[0].vector != null and .[0].payload.chunk_id != null and .[0].payload.binding_id != null' "$E/qdrant-audit/fault-origin-scroll.json" >/dev/null || return 1
+  local chunk_id content_hash
+  chunk_id=$(jq -r '.result.points[0].payload.chunk_id' "$E/qdrant-audit/fault-origin-scroll.json")
+  content_hash=$(psql "$DB" -Atqc "SELECT content_hash FROM astravector.content_chunks_v004 WHERE id='$chunk_id' LIMIT 1")
+  [[ -n "$content_hash" ]] || return 1
+  jq --arg content_hash "$content_hash" '(.result.points[0]) as $p | {status:"PASS",point_id:($p.id|tostring),vector_hash:(($p.vector|tojson)|@base64),payload_hash:(($p.payload|tojson)|@base64),content_hash:$content_hash,zone:$p.payload.access_zone_id,document:$p.payload.document_id,version:$p.payload.document_version,child_identity:$p.payload.chunk_id,parent_identity:$p.payload.parent_chunk_id,source:"production_qdrant_scroll_plus_canonical_postgresql_hash"}' "$E/qdrant-audit/fault-origin-scroll.json" >"$E/fault-point-origin.json"
 }
 restart_with_fault_plan() { stop_runtime && start_runtime fault-plan; }
 run_fault_queries() {
