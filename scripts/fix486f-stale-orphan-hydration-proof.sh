@@ -93,7 +93,7 @@ static_gates() {
   cargo test --locked --test fix486_hierarchical_bank_contracts -- --nocapture &&
   cargo test --locked --test fix486c_frozen_bank_contracts -- --nocapture &&
   cargo test --locked --test fix486d_child_parent_contracts -- --nocapture &&
-  cargo test --locked --test fix486f_isolation_lifecycle_contracts -- --nocapture
+  cargo test --locked --test fix486f_failure_semantics_contracts -- --nocapture
 }
 start_infrastructure() {
   for port in "$PG" "$QP" "$QG" "$GP" "$MP"; do
