@@ -47,7 +47,7 @@ SELECT json_build_object(
   'duplicate_bindings', (SELECT count(*) FROM (SELECT access_zone_id,id FROM phase_bindings GROUP BY 1,2 HAVING count(*)>1) x),
   'orphan_bindings', (SELECT count(*) FROM phase_bindings b LEFT JOIN astravector.content_chunks_v004 c ON c.access_zone_id=b.access_zone_id AND c.id=b.chunk_id WHERE c.id IS NULL),
   'orphan_outbox', (SELECT count(*) FROM astravector.vector_outbox o LEFT JOIN phase_bindings b ON b.access_zone_id=o.binding_access_zone_id AND b.id=o.binding_id WHERE b.id IS NULL),
-  'duplicate_outbox_events', (SELECT count(*) FROM (SELECT binding_access_zone_id,binding_id,operation,coalesce(payload->>'version','') AS version FROM astravector.vector_outbox GROUP BY 1,2,3,4 HAVING count(*)>1) x),
+  'duplicate_outbox_events', (SELECT count(*) FROM (SELECT binding_access_zone_id,binding_id,operation,operation_version FROM astravector.vector_outbox GROUP BY 1,2,3,4 HAVING count(*)>1) x),
   'partial_active_documents', (SELECT count(*) FROM (SELECT b.access_zone_id,b.document_id,b.document_version FROM phase_bindings b GROUP BY 1,2,3 HAVING count(*) FILTER (WHERE b.lifecycle_status='ACTIVE')>0 AND count(*) FILTER (WHERE b.qdrant_sync_status='SYNCED')<>count(*) FILTER (WHERE b.lifecycle_status='ACTIVE')) x),
   'bindings', (SELECT count(*) FROM phase_bindings),
   'synced_bindings', (SELECT count(*) FROM phase_bindings WHERE qdrant_sync_status='SYNCED'),
