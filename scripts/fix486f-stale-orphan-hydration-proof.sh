@@ -35,8 +35,12 @@ stage() {
 }
 record_stage_status() {
   local name=$1 status=$2 code=${3:-}
+  set +e
   jq -n --arg stage "$name" --arg status "$status" --arg now "$(timestamp)" --arg code "$code" \
     '{stage:$stage,status:$status,started_at:$now,finished_at:$now,exit_code:(if $status=="PASS" then 0 else 1 end),failure_codes:(if $code=="" then [] else [$code] end),artifacts:[]}' >"$E/logs/$name.stage.json"
+  local rc=$?
+  set -e
+  return "$rc"
 }
 stop_runtime() {
   local pid=$PID
