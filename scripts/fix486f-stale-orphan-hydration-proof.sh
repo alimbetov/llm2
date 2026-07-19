@@ -23,11 +23,15 @@ compose() { FIX486F_POSTGRES_PORT=$PG FIX486F_QDRANT_HTTP_PORT=$QP FIX486F_QDRAN
 wait_for() { for _ in $(seq 1 90); do "$@" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
 stage() {
   local name=$1; shift; local started rc status
-  started=$(timestamp); set +e; "$@" >"$E/logs/$name.log" 2>&1; rc=$?; set -e
+  started=$(timestamp)
+  set +e
+  "$@" >"$E/logs/$name.log" 2>&1
+  rc=$?
   status=PASS; [[ $rc -eq 0 ]] || status=FAIL
   jq -n --arg stage "$name" --arg status "$status" --arg started "$started" --arg finished "$(timestamp)" --argjson exit_code "$rc" \
     '{stage:$stage,status:$status,started_at:$started,finished_at:$finished,exit_code:$exit_code,failure_codes:(if $exit_code==0 then [] else ["COMMAND_FAILED"] end),artifacts:[]}' >"$E/logs/$name.stage.json"
-  [[ $rc -eq 0 ]]
+  set -e
+  return "$rc"
 }
 record_stage_status() {
   local name=$1 status=$2 code=${3:-}
