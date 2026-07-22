@@ -6,6 +6,7 @@ const GRPC: &str = "src/grpc/mod.rs";
 const PERSISTENCE: &str = "src/persistence/mod.rs";
 const PROTO: &str = "proto/astravector_embedding.proto";
 const CONFIG: &str = "src/config/mod.rs";
+const PROFILE_CONFIG: &str = "config/application-fix486f.yaml";
 const RUNNER: &str = "scripts/fix486f-stale-orphan-hydration-proof.sh";
 
 fn source(path: &str) -> String {
@@ -231,11 +232,19 @@ fn fault_runner_selects_target_from_array_and_uses_equivalent_candidate_windows(
     require_all(
         RUNNER,
         &[
-            ".[] | select(.request_id==\"fix486f-stale-search\") | .physical_parent_ids[0]",
+            ".[] | select(.request_id==$request_id) | .physical_parent_ids[0]",
             "candidateLimit:64",
+            "timeoutMs:15000",
             "target_parent\" =~ ^[0-9a-fA-F-]{36}$",
+            "logical_parent_ids:[\"parent-a3\"]",
+            "ASTRA_CANONICAL_STATE_A1 ASTRA_RECONCILIATION_A3",
         ],
         "FIX486F-RUNNER-PARITY-001",
+    );
+    require_all(
+        PROFILE_CONFIG,
+        &["query_ms: ${FIX486F_QUERY_DEADLINE_MS:-15000}"],
+        "FIX486F-RUNNER-DEADLINE-PARITY-001",
     );
     let runner = source(RUNNER);
     assert!(

@@ -4,6 +4,8 @@ service:
 grpc:
   host: 127.0.0.1
   port: ${FIX486F_GRPC_PORT:-50587}
+  deadlines:
+    query_ms: ${FIX486F_QUERY_DEADLINE_MS:-15000}
 shutdown:
   drain_timeout_seconds: 1
 security:
