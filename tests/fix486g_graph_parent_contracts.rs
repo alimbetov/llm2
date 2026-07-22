@@ -316,22 +316,29 @@ fn graph_seed_identity_survives_parent_context_deduplication() {
         &[
             "pre_parent_dedup_graph_seed_results",
             "matches!(granularity, \"SUB_180\" | \"SUB_260\")",
-            "for result in &pre_parent_dedup_graph_seed_results",
+            "graph_seed_source_results_for_admitted_parents(",
+            "&pre_parent_dedup_graph_seed_results,",
         ],
         "FIX486G-P0-002",
     );
 }
 
 #[test]
-fn graph_seed_selection_prefers_hydrated_child_of_each_admitted_parent_group() {
+fn graph_seed_selection_keeps_all_hydrated_children_of_each_admitted_parent_group() {
     require_all(
         GRPC,
         &[
-            "child_seed_by_parent",
-            "graph_seed_source_results",
-            "let result = child_seed_by_parent",
+            "graph_seed_source_results_for_admitted_parents",
+            "pre_parent_dedup_results",
+            "admitted_parents.contains(&parent_key)",
+            "seen_children.insert(child_key)",
+            "parents_with_children",
         ],
         "FIX486G-P0-002",
+    );
+    assert!(
+        !GRPC.contains("child_seed_by_parent"),
+        "FIX486G-P0-002: one child per parent makes Graph relation discovery depend on a nondeterministic granularity winner"
     );
 }
 

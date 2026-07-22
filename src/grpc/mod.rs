@@ -3138,40 +3138,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_source_block_by_key = HashMap::new();
         let mut graph_seed_parent_by_key = HashMap::new();
         let mut graph_seed_document_by_key = HashMap::new();
-        let mut child_seed_by_parent = HashMap::new();
-        for result in &pre_parent_dedup_graph_seed_results {
-            let parent_key = (
-                result.access_zone_id.clone(),
-                result.parent_chunk_id.clone(),
-            );
-            child_seed_by_parent
-                .entry(parent_key)
-                .and_modify(|existing: &mut &pb::SearchResultV004| {
-                    if graph_seed_score(result) > graph_seed_score(existing) {
-                        *existing = result;
-                    }
-                })
-                .or_insert(result);
-        }
-        let mut graph_seed_source_results = Vec::new();
-        let mut graph_seed_source_seen = HashSet::new();
-        for direct in &direct_results {
-            let parent_key = (
-                direct.access_zone_id.clone(),
-                direct.parent_chunk_id.clone(),
-            );
-            let result = child_seed_by_parent
-                .get(&parent_key)
-                .copied()
-                .unwrap_or(direct);
-            let identity = (
-                result.access_zone_id.clone(),
-                result.matched_chunk_id.clone(),
-            );
-            if graph_seed_source_seen.insert(identity) {
-                graph_seed_source_results.push(result);
-            }
-        }
+        let graph_seed_source_results = graph_seed_source_results_for_admitted_parents(
+            &direct_results,
+            &pre_parent_dedup_graph_seed_results,
+        );
         seed_scores.clear();
         for result in graph_seed_source_results {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
@@ -11974,6 +11944,49 @@ fn graph_seed_score(result: &pb::SearchResultV004) -> f32 {
         .unwrap_or(0.5)
 }
 
+fn graph_seed_source_results_for_admitted_parents<'a>(
+    direct_results: &'a [pb::SearchResultV004],
+    pre_parent_dedup_results: &'a [pb::SearchResultV004],
+) -> Vec<&'a pb::SearchResultV004> {
+    let admitted_parents = direct_results
+        .iter()
+        .map(|result| {
+            (
+                result.access_zone_id.clone(),
+                result.parent_chunk_id.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut parents_with_children = HashSet::new();
+    let mut seen_children = HashSet::new();
+    let mut selected = Vec::new();
+
+    for result in pre_parent_dedup_results {
+        let parent_key = (
+            result.access_zone_id.clone(),
+            result.parent_chunk_id.clone(),
+        );
+        let child_key = (
+            result.access_zone_id.clone(),
+            result.matched_chunk_id.clone(),
+        );
+        if admitted_parents.contains(&parent_key) && seen_children.insert(child_key) {
+            parents_with_children.insert(parent_key);
+            selected.push(result);
+        }
+    }
+    for result in direct_results {
+        let parent_key = (
+            result.access_zone_id.clone(),
+            result.parent_chunk_id.clone(),
+        );
+        if !parents_with_children.contains(&parent_key) {
+            selected.push(result);
+        }
+    }
+    selected
+}
+
 #[derive(Debug, Clone)]
 struct GraphSeedCandidate {
     key: (Uuid, Uuid),
@@ -15234,6 +15247,60 @@ mod v007_fix1_tests {
             ..Default::default()
         };
         assert_eq!(graph_seed_chunk_id(&result_without_matched), Some(parent));
+    }
+
+    #[test]
+    fn graph_seed_sources_keep_all_child_representations_of_admitted_parents() {
+        let admitted_parent = Uuid::from_u128(10).to_string();
+        let fallback_parent = Uuid::from_u128(11).to_string();
+        let excluded_parent = Uuid::from_u128(12).to_string();
+        let zone = Uuid::from_u128(1).to_string();
+        let direct = vec![
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: admitted_parent.clone(),
+                parent_chunk_id: admitted_parent.clone(),
+                ..Default::default()
+            },
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: fallback_parent.clone(),
+                parent_chunk_id: fallback_parent.clone(),
+                ..Default::default()
+            },
+        ];
+        let children = vec![
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: Uuid::from_u128(101).to_string(),
+                parent_chunk_id: admitted_parent.clone(),
+                ..Default::default()
+            },
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: Uuid::from_u128(102).to_string(),
+                parent_chunk_id: admitted_parent,
+                ..Default::default()
+            },
+            pb::SearchResultV004 {
+                access_zone_id: zone,
+                matched_chunk_id: Uuid::from_u128(103).to_string(),
+                parent_chunk_id: excluded_parent,
+                ..Default::default()
+            },
+        ];
+
+        let selected = graph_seed_source_results_for_admitted_parents(&direct, &children);
+        let selected_ids = selected
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected.len(), 3);
+        assert!(selected_ids.contains(Uuid::from_u128(101).to_string().as_str()));
+        assert!(selected_ids.contains(Uuid::from_u128(102).to_string().as_str()));
+        assert!(selected_ids.contains(fallback_parent.as_str()));
+        assert!(!selected_ids.contains(Uuid::from_u128(103).to_string().as_str()));
     }
 
     #[test]

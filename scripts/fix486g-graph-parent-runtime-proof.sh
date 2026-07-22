@@ -621,6 +621,7 @@ write_defects() {
     {id:"FIX486G-P1-003",severity:"P1",category:"FALSE_GRAPH_ATTRIBUTION",root_cause:"self-edge expansion was not explicitly rejected",regression_test:"self_edges_are_rejected_before_graph_attribution",fix_commit:$source,status:"FIXED"},
     {id:"FIX486G-P1-004",severity:"P1",category:"RELATION_ENDPOINT_SCOPE",root_cause:"logical block relations expanded to every child granularity pair instead of the declared physical endpoint granularities",regression_test:"relation_ingestion_honors_declared_child_granularities",fix_commit:$source,status:"FIXED"}
     ,{id:"FIX486G-P0-002",severity:"P0",category:"GRAPH_SEED_IDENTITY",root_cause:"parent-context deduplication and parent-first graph_seed_chunk_id selection discarded canonical hydrated child relation endpoints",regression_test:"graph_seed_identity_survives_parent_context_deduplication; graph_seed_preserves_matched_child_identity_with_parent_fallback",fix_commit:$source,status:"FIXED"}
+    ,{id:"FIX486G-P0-003",severity:"P0",category:"GRAPH_SEED_GRANULARITY_NONDETERMINISM",root_cause:"parent deduplication retained only one equal-score child granularity, so relation discovery depended on whether SUB_180 or SUB_260 won the tie",regression_test:"graph_seed_sources_keep_all_child_representations_of_admitted_parents; graph_seed_selection_keeps_all_hydrated_children_of_each_admitted_parent_group",fix_commit:$source,status:"FIXED"}
   ]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
