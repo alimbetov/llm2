@@ -333,6 +333,9 @@ fn graph_seed_selection_keeps_all_hydrated_children_of_each_admitted_parent_grou
             "admitted_parents.contains(&parent_key)",
             "seen_children.insert(child_key)",
             "parents_with_children",
+            "parent_key: (access_zone_id, parent_chunk_id)",
+            "selected_parent_keys",
+            "candidates_by_parent",
         ],
         "FIX486G-P0-002",
     );

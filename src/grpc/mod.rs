@@ -3150,6 +3150,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let Some(seed_chunk_id) = graph_seed_chunk_id(result) else {
                 continue;
             };
+            let Ok(parent_chunk_id) = Uuid::parse_str(&result.parent_chunk_id) else {
+                continue;
+            };
             let key = (access_zone_id, seed_chunk_id);
             let seed_score = graph_seed_score(result);
             let matched_terms = matched_term_count(result, query);
@@ -3183,6 +3186,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             };
             graph_seed_candidates.push(GraphSeedCandidate {
                 key,
+                parent_key: (access_zone_id, parent_chunk_id),
                 score: seed_score,
                 matched_terms,
                 matched_discriminating_terms,
@@ -3237,7 +3241,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .join(",");
         let graph_seed_trace = if ranking_trace.enabled {
             {
-                direct_results
+                pre_parent_dedup_graph_seed_results
                     .iter()
                     .filter(|result| {
                         graph_seed_chunk_id(result)
@@ -11990,6 +11994,7 @@ fn graph_seed_source_results_for_admitted_parents<'a>(
 #[derive(Debug, Clone)]
 struct GraphSeedCandidate {
     key: (Uuid, Uuid),
+    parent_key: (Uuid, Uuid),
     score: f32,
     matched_terms: usize,
     matched_discriminating_terms: usize,
@@ -12024,24 +12029,37 @@ fn select_graph_seed_candidates(
     }
     let mut ranked = by_key.into_values().collect::<Vec<_>>();
     ranked.sort_by(compare_graph_seed_candidates);
-    let mut selected_keys = HashSet::new();
-    let mut selected = Vec::new();
+    let mut selected_parent_keys = HashSet::new();
+    let mut ordered_parent_keys = Vec::new();
     for intent_id in required_intent_ids {
         if let Some(candidate) = ranked.iter().find(|candidate| {
-            candidate.intent_unit_ids.contains(intent_id) && !selected_keys.contains(&candidate.key)
+            candidate.intent_unit_ids.contains(intent_id)
+                && !selected_parent_keys.contains(&candidate.parent_key)
         }) {
-            selected_keys.insert(candidate.key);
-            selected.push(candidate.clone());
-            if selected.len() == limit {
-                return selected;
-            }
+            selected_parent_keys.insert(candidate.parent_key);
+            ordered_parent_keys.push(candidate.parent_key);
         }
     }
+    for candidate in &ranked {
+        if selected_parent_keys.insert(candidate.parent_key) {
+            ordered_parent_keys.push(candidate.parent_key);
+        }
+    }
+    let mut candidates_by_parent = HashMap::<(Uuid, Uuid), Vec<GraphSeedCandidate>>::new();
     for candidate in ranked {
-        if selected_keys.insert(candidate.key) {
-            selected.push(candidate);
-            if selected.len() == limit {
-                break;
+        candidates_by_parent
+            .entry(candidate.parent_key)
+            .or_default()
+            .push(candidate);
+    }
+    let mut selected = Vec::new();
+    for parent_key in ordered_parent_keys {
+        if let Some(candidates) = candidates_by_parent.remove(&parent_key) {
+            for candidate in candidates {
+                selected.push(candidate);
+                if selected.len() == limit {
+                    return selected;
+                }
             }
         }
     }
@@ -15176,6 +15194,7 @@ mod v007_fix1_tests {
         let zone = Uuid::from_u128(1);
         let weak_high_score = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(30)),
+            parent_key: (zone, Uuid::from_u128(30)),
             score: 0.95,
             matched_terms: 1,
             matched_discriminating_terms: 0,
@@ -15184,6 +15203,7 @@ mod v007_fix1_tests {
         };
         let strong_lower_score = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(20)),
+            parent_key: (zone, Uuid::from_u128(20)),
             score: 0.55,
             matched_terms: 3,
             matched_discriminating_terms: 2,
@@ -15192,6 +15212,7 @@ mod v007_fix1_tests {
         };
         let strong_stable_tie = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(10)),
+            parent_key: (zone, Uuid::from_u128(10)),
             score: 0.55,
             matched_terms: 3,
             matched_discriminating_terms: 2,
@@ -15213,6 +15234,7 @@ mod v007_fix1_tests {
         let candidates = (0..15)
             .map(|index| GraphSeedCandidate {
                 key: (zone, Uuid::from_u128(index + 1)),
+                parent_key: (zone, Uuid::from_u128(index + 1)),
                 score: 1.0 - index as f32 / 100.0,
                 matched_terms: 2,
                 matched_discriminating_terms: 1,
@@ -15228,6 +15250,52 @@ mod v007_fix1_tests {
         assert!(selected
             .iter()
             .any(|candidate| candidate.intent_unit_ids.contains(&2)));
+    }
+
+    #[test]
+    fn graph_seed_cap_keeps_sibling_representations_of_selected_parent_group() {
+        let zone = Uuid::from_u128(1);
+        let target_parent = Uuid::from_u128(100);
+        let target_children = [Uuid::from_u128(101), Uuid::from_u128(102)];
+        let mut candidates = vec![
+            GraphSeedCandidate {
+                key: (zone, target_children[0]),
+                parent_key: (zone, target_parent),
+                score: 1.0,
+                matched_terms: 4,
+                matched_discriminating_terms: 2,
+                strong_lexical_evidence: true,
+                intent_unit_ids: vec![0],
+            },
+            GraphSeedCandidate {
+                key: (zone, target_children[1]),
+                parent_key: (zone, target_parent),
+                score: 0.4,
+                matched_terms: 1,
+                matched_discriminating_terms: 0,
+                strong_lexical_evidence: false,
+                intent_unit_ids: vec![0],
+            },
+        ];
+        candidates.extend((0..12).map(|index| GraphSeedCandidate {
+            key: (zone, Uuid::from_u128(200 + index)),
+            parent_key: (zone, Uuid::from_u128(300 + index)),
+            score: 0.9 - index as f32 / 100.0,
+            matched_terms: 3,
+            matched_discriminating_terms: 1,
+            strong_lexical_evidence: true,
+            intent_unit_ids: vec![0],
+        }));
+
+        let selected = select_graph_seed_candidates(candidates, &[0], 12);
+        let selected_keys = selected
+            .iter()
+            .map(|candidate| candidate.key)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected.len(), 12);
+        assert!(selected_keys.contains(&(zone, target_children[0])));
+        assert!(selected_keys.contains(&(zone, target_children[1])));
     }
 
     #[test]
