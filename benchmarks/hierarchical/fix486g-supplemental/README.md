@@ -4,8 +4,8 @@
 
 ```text
 bank_id: fix486g-graph-parent-supplemental
-version: 0.1.0-analysis-seed
-status: ANALYSIS_SEED
+version: 1.0.0
+status: FROZEN
 ```
 
 This bank supplements, but never modifies, the mandatory frozen FIX486 bank:
@@ -32,9 +32,10 @@ The mandatory frozen case `FIX486-08 / q-graph-repair` proves one canonical Grap
 
 ```text
 positive Graph-required queries: 30
-negative/no-answer queries: 15
+negative/constrained-negative queries: 15
+Graph-disabled controls: 6
 adversarial fault scenarios: 20
-total: 65
+total: 71
 ```
 
 The bank references the frozen corpus and graph baseline. Adversarial scenarios use phase-owned fault overlays generated only inside the FIX486G environment. They do not mutate frozen payloads.
@@ -43,22 +44,17 @@ The bank references the frozen corpus and graph baseline. Adversarial scenarios 
 
 ```text
 bank-manifest.json
-queries/graph-parent-queries-v0.1.jsonl
-qrels/graph-parent-qrels-v0.1.jsonl
-faults/graph-fault-plans-v0.1.json
+queries/graph-parent-queries-v1.jsonl
+qrels/qrel-profiles-v1.json
+qrels/query-qrel-assignments-v1.jsonl
+faults/graph-fault-plans-v1.json
 ```
 
 ## Lifecycle
 
-Before official statistical execution:
-
-1. validate all JSON/JSONL records;
-2. review wording, qrels and fault provenance independently of runtime output;
-3. compute canonical per-file and aggregate SHA-256;
-4. promote to `0.2.0-reviewed-candidate`;
-5. run structural dry-run only;
-6. freeze as `1.0.0 / FROZEN`;
-7. only then use it for official thresholds.
+The reviewed candidate completed structural validation and is frozen at
+`1.0.0`. Every query has one materialized qrel assignment. Canonical hashes are
+stored in `bank-manifest.json` and verified by `scripts/fix486g_proof.py`.
 
 Any change after freeze requires a new bank version. Failed official results must not be repaired by changing qrels in place.
 

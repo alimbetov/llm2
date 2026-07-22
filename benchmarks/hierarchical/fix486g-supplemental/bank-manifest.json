@@ -1,0 +1,41 @@
+{
+  "schema_version": "1",
+  "bank_id": "fix486g-graph-parent-supplemental",
+  "version": "1.0.0",
+  "status": "FROZEN",
+  "query_count": 71,
+  "qrel_assignment_count": 71,
+  "composition": {
+    "positive_graph_required": 30,
+    "negative_or_constrained_negative": 15,
+    "graph_disabled": 6,
+    "adversarial": 20
+  },
+  "source_bank": {
+    "bank_id": "fix486-hierarchical-bank",
+    "version": "1.0.0",
+    "status": "FROZEN",
+    "aggregate_sha256": "cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff"
+  },
+  "files": {
+    "queries": "queries/graph-parent-queries-v1.jsonl",
+    "qrel_profiles": "qrels/qrel-profiles-v1.json",
+    "qrel_assignments": "qrels/query-qrel-assignments-v1.jsonl",
+    "fault_plans": "faults/graph-fault-plans-v1.json"
+  },
+  "hash_algorithm": "SHA-256",
+  "hashes": {
+    "files": {
+      "faults/graph-fault-plans-v1.json": "24a00bcf5bce7d2a559fdd8240371b344bf51dac7f15fc1a6c8f0f588b7f4323",
+      "qrels/qrel-profiles-v1.json": "f392884317bcddc86af1b000a05b76d03cb16fb863ad9d4b4ac7a7f864ee8dd8",
+      "qrels/query-qrel-assignments-v1.jsonl": "51526c25bd26ca357f574b2cf654c348f9f3f37c7b8b36869c2f0a9fedca25fd",
+      "queries/graph-parent-queries-v1.jsonl": "44ff4212ed97d869342cf33b5b946f1396682630244e44f4411c5c12c2fb9330"
+    },
+    "aggregate_sha256": "af4fceb8e424fddecff4284e9cd8d1d68fb4db5c148f9b2aa585bb8497ac1649"
+  },
+  "immutability_policy": {
+    "qrels_are_independent_of_runtime_output": true,
+    "change_requires_new_version": true,
+    "in_place_edit_forbidden": true
+  }
+}

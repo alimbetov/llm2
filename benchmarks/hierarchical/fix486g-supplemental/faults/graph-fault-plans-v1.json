@@ -1,8 +1,8 @@
 {
   "schema_version": "1",
   "bank_id": "fix486g-graph-parent-supplemental",
-  "version": "0.1.0-analysis-seed",
-  "status": "ANALYSIS_SEED",
+  "version": "1.0.0",
+  "status": "FROZEN",
   "frozen_source_bank": {
     "bank_id": "fix486-hierarchical-bank",
     "version": "1.0.0",

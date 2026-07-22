@@ -235,9 +235,14 @@ pub struct RelatedChunk {
     /// Access zone of the seed chunk that produced this expansion edge.
     pub seed_access_zone_id: Uuid,
     pub seed_chunk_id: Uuid,
+    pub edge_id: Uuid,
+    pub relation_identity: String,
     pub relation_type: GraphRelationType,
     pub relation_score: f32,
+    pub relation_source: String,
     pub relation_rank: Option<i32>,
+    pub related_document_id: Uuid,
+    pub related_document_version: i64,
     pub hop_distance: u32,
 }
 

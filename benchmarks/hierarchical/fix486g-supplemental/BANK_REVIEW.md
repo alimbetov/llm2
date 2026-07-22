@@ -3,10 +3,12 @@
 ## Current verdict
 
 ```text
-CHANGES_REQUIRED_BEFORE_FREEZE
+APPROVED_AND_FROZEN_1_0_0
 ```
 
-The current committed monolithic query file is an analysis seed only. It must not be used for an official statistical PASS claim.
+The original analysis seed findings were corrected without using runtime
+output. The reviewed 71-query candidate is frozen and may be used for official
+Phase G statistical execution.
 
 ## Confirmed strengths
 
@@ -16,9 +18,9 @@ The current committed monolithic query file is an analysis seed only. It must no
 - Fault plans preserve frozen-bank immutability and require phase-owned cleanup.
 - Statistical thresholds, hard gates and confidence-interval reporting are specified independently of runtime output.
 
-## Blocking findings
+## Resolved findings
 
-### FIX486G-BANK-P1-001 — Graph-disabled controls absent from v0.1 query file
+### FIX486G-BANK-P1-001 — Graph-disabled controls added
 
 The reviewed design requires six explicit Graph-disabled controls:
 
@@ -35,7 +37,7 @@ They must prove:
 - direct canonical result remains healthy;
 - no Graph contribution is credited while Graph is disabled.
 
-### FIX486G-BANK-P1-002 — adversarial language metadata mismatch
+### FIX486G-BANK-P1-002 — adversarial language metadata corrected
 
 Twelve v0.1 adversarial records have a language label that does not match the actual query text. The affected families are:
 
@@ -48,7 +50,7 @@ cycle: 3
 
 This does not change retrieval semantics, but it invalidates language-sliced statistics and therefore blocks freeze.
 
-### FIX486G-BANK-P1-003 — per-query qrel materialization pending
+### FIX486G-BANK-P1-003 — per-query qrels materialized
 
 The qrel profile definitions exist, but every query must resolve to exactly one reviewed qrel profile before freeze.
 
@@ -66,7 +68,7 @@ FAULT_HOP_LIMIT
 FAULT_CYCLE
 ```
 
-### FIX486G-BANK-P1-004 — canonical hashes pending
+### FIX486G-BANK-P1-004 — canonical hashes resolved
 
 Per-file and aggregate SHA-256 values are not yet frozen. Official execution is prohibited until the final query set, qrel assignments, profiles and fault plans are hashed and marked `1.0.0 / FROZEN`.
 
@@ -110,19 +112,20 @@ Adversarial language distribution must be derived from the actual text and valid
 
 ## Freeze checklist
 
-- [ ] 71 unique query IDs.
-- [ ] Every query parses as JSON.
-- [ ] Every query resolves to one qrel profile.
-- [ ] No orphan qrel assignments.
-- [ ] No unused qrel profiles without an explicit reason.
-- [ ] Language metadata matches query text review.
-- [ ] Frozen source corpus identity remains unchanged.
-- [ ] Fault overlays have deterministic setup and cleanup.
-- [ ] No expected result is derived from runtime output.
-- [ ] Per-file SHA-256 values computed.
-- [ ] Aggregate SHA-256 computed.
-- [ ] Bank status promoted to `1.0.0 / FROZEN`.
+- [x] 71 unique query IDs.
+- [x] Every query parses as JSON.
+- [x] Every query resolves to one qrel profile.
+- [x] No orphan qrel assignments.
+- [x] No unused qrel profiles without an explicit reason.
+- [x] Language metadata matches query text review.
+- [x] Frozen source corpus identity remains unchanged.
+- [x] Fault overlays have deterministic setup and cleanup.
+- [x] No expected result is derived from runtime output.
+- [x] Per-file SHA-256 values computed.
+- [x] Aggregate SHA-256 computed.
+- [x] Bank status promoted to `1.0.0 / FROZEN`.
 
 ## Allowed next activity
 
-The next permitted activity is materialization and independent review of the corrected `0.2.0-reviewed-candidate`. Production Graph tuning must not use official results from this bank before freeze.
+The next permitted activity is structural verification followed by official
+statistical execution. Production Graph tuning remains forbidden.

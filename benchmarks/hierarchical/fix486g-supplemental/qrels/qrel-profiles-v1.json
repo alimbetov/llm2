@@ -1,7 +1,8 @@
 {
   "schema_version": "1",
   "bank_id": "fix486g-graph-parent-supplemental",
-  "version": "0.2.0-reviewed-candidate",
+  "version": "1.0.0",
+  "status": "FROZEN",
   "profiles": {
     "POSITIVE_GRAPH": {
       "expected_zone": "zone-a",

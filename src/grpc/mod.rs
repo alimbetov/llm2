@@ -3127,6 +3127,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_candidates = Vec::new();
         let mut graph_seed_preview_by_key = HashMap::new();
         let mut graph_seed_source_block_by_key = HashMap::new();
+        let mut graph_seed_parent_by_key = HashMap::new();
+        let mut graph_seed_document_by_key = HashMap::new();
         seed_scores.clear();
         for result in &direct_results {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
@@ -3175,6 +3177,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 intent_unit_ids,
             });
             seed_scores.entry(key).or_insert(seed_score);
+            graph_seed_parent_by_key.insert(key, result.parent_chunk_id.clone());
+            graph_seed_document_by_key
+                .insert(key, (result.document_id.clone(), result.document_version));
             let source_block_id = result
                 .citation
                 .as_ref()
@@ -3307,12 +3312,21 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     r.graph_max_related_contexts
                         .min(self.cfg.limits.graph_related_contexts_max as u32)
                 };
+                let hydration_rejection_reserve = self
+                    .cfg
+                    .search
+                    .hydration_rejection_reserve
+                    .min(self.cfg.search.hydration_rejection_reserve_max);
+                let graph_hydration_fetch_limit = max_related
+                    .saturating_add(hydration_rejection_reserve)
+                    .min(self.cfg.limits.graph_related_contexts_max as u32);
                 tracing::debug!(
                     correlation_id = %r.correlation_id,
                     quality_run_id = quality_run_id_filter.as_deref().unwrap_or(""),
                     graph_seed_keys_count = graph_seed_keys.len(),
                     graph_seed_preview = %graph_seed_preview,
                     max_related,
+                    graph_hydration_fetch_limit,
                     max_seed_chunks = query_plan.limits.max_graph_seeds.min(12),
                     max_edges_visited = self.cfg.graph_rag.retrieval.max_edges_visited,
                     allowed_relations = ?self.cfg.graph_rag.retrieval.allowed_relations,
@@ -3321,7 +3335,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 let graph_call = self.repo()?.expand_chunks_1hop_by_seed_keys(
                     &graph_seed_keys,
                     caller_access_level as i16,
-                    max_related,
+                    graph_hydration_fetch_limit,
                     query_plan.limits.max_graph_seeds.min(12),
                     self.cfg.graph_rag.retrieval.max_edges_visited,
                     &self.cfg.graph_rag.retrieval.allowed_relations,
@@ -3436,6 +3450,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 sparse_rank: None,
                                 payload: serde_json::json!({
                                     "access_zone_id": rel.access_zone_id.to_string(),
+                                    "binding_id": ctx.binding_id.to_string(),
                                     "chunk_id": rel.chunk_id.to_string(),
                                     "parent_chunk_id": parent_id,
                                     "source_block_id": ctx.trace.as_ref().and_then(|t| t.source_block_id.clone()).unwrap_or_default(),
@@ -3466,6 +3481,27 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     "graph_seed_chunk_id".into(),
                                     rel.seed_chunk_id.to_string(),
                                 );
+                                if let Some(parent_id) = graph_seed_parent_by_key
+                                    .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "graph_seed_parent_chunk_id".into(),
+                                        parent_id.clone(),
+                                    );
+                                }
+                                if let Some((document_id, document_version)) =
+                                    graph_seed_document_by_key
+                                        .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "graph_seed_document_id".into(),
+                                        document_id.clone(),
+                                    );
+                                    citation.metadata.insert(
+                                        "graph_seed_document_version".into(),
+                                        document_version.to_string(),
+                                    );
+                                }
                                 if let Some(intent_ids) = graph_seed_intents_by_key
                                     .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
                                 {
@@ -3494,9 +3530,43 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     );
                                 }
                                 citation.metadata.insert(
+                                    "graph_relation_id".into(),
+                                    rel.relation_identity.clone(),
+                                );
+                                citation
+                                    .metadata
+                                    .insert("graph_edge_id".into(), rel.edge_id.to_string());
+                                citation.metadata.insert(
+                                    "graph_relation_source".into(),
+                                    rel.relation_source.clone(),
+                                );
+                                citation.metadata.insert(
                                     "graph_relation_type".into(),
                                     rel.relation_type.as_str().into(),
                                 );
+                                citation.metadata.insert(
+                                    "graph_related_access_zone_id".into(),
+                                    rel.access_zone_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_document_id".into(),
+                                    rel.related_document_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_document_version".into(),
+                                    rel.related_document_version.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_chunk_id".into(),
+                                    rel.chunk_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_parent_chunk_id".into(),
+                                    ctx.parent_record.id.to_string(),
+                                );
+                                citation
+                                    .metadata
+                                    .insert("graph_binding_id".into(), ctx.binding_id.to_string());
                                 citation.metadata.insert(
                                     "graph_relation_score".into(),
                                     rel.relation_score.to_string(),

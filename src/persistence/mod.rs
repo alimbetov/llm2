@@ -177,6 +177,7 @@ pub struct DeletableQdrantPoints {
 pub struct GraphChunkContextRecord {
     pub chunk_id: Uuid,
     pub parent_chunk_id: Option<Uuid>,
+    pub binding_id: Uuid,
     pub parent_record: ParentContextRecord,
     pub matched_text: String,
     pub trace: Option<ChunkTraceRecord>,
@@ -1642,6 +1643,25 @@ RETURNING payload_version,qdrant_sync_status"#)
             let Some(to_block_id) = relation.get("to_block_id").and_then(|v| v.as_str()) else {
                 continue;
             };
+            let parse_granularity = |field: &str| -> Result<Option<String>, AstraError> {
+                let value = relation
+                    .get(field)
+                    .and_then(|raw| raw.as_str())
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                    .map(str::to_uppercase);
+                if value
+                    .as_deref()
+                    .is_some_and(|raw| !matches!(raw, "PARENT" | "SUB_180" | "SUB_260"))
+                {
+                    return Err(AstraError::InvalidArgument(format!(
+                        "quality fixture relation {relation_id} has invalid {field}"
+                    )));
+                }
+                Ok(value)
+            };
+            let from_granularity = parse_granularity("from_granularity")?;
+            let to_granularity = parse_granularity("to_granularity")?;
             let weight = relation
                 .get("weight")
                 .and_then(|v| v.as_f64())
@@ -1662,6 +1682,7 @@ JOIN astravector.content_chunks_v004 s_chunk
  AND s_chunk.lifecycle_status='ACTIVE'
  AND s_chunk.deleted_at IS NULL
  AND s_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+ AND ($7::text IS NULL OR s_chunk.granularity=$7)
  AND COALESCE(s_chunk.metadata->>'quality_run_id','')=$6
 JOIN astravector.rag_graph_nodes_chunk s_nodes
   ON s_nodes.access_zone_id=s_map.access_zone_id
@@ -1678,6 +1699,7 @@ JOIN astravector.content_chunks_v004 t_chunk
  AND t_chunk.lifecycle_status='ACTIVE'
  AND t_chunk.deleted_at IS NULL
  AND t_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+ AND ($8::text IS NULL OR t_chunk.granularity=$8)
  AND COALESCE(t_chunk.metadata->>'quality_run_id','')=$6
 JOIN astravector.rag_graph_nodes_chunk t_nodes
   ON t_nodes.access_zone_id=t_map.access_zone_id
@@ -1698,6 +1720,8 @@ LIMIT 64
             .bind(to_document_id)
             .bind(to_block_id)
             .bind(quality_run_id)
+            .bind(from_granularity.as_deref())
+            .bind(to_granularity.as_deref())
             .fetch_all(&mut **tx)
             .await
             .map_err(db)?;
@@ -1741,6 +1765,8 @@ LIMIT 64
                         "from_block_id": from_block_id,
                         "to_document_id": relation.get("to_document_id").and_then(|v| v.as_str()).unwrap_or_default(),
                         "to_block_id": to_block_id,
+                        "from_granularity": from_granularity,
+                        "to_granularity": to_granularity,
                         "source_chunk_id": source_chunk_id,
                         "target_chunk_id": target_chunk_id,
                         "quality_run_id": quality_run_id,
@@ -1804,6 +1830,8 @@ WITH seed_input AS (
            e.source_node_id,
            e.target_node_id,
            e.target_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -1824,6 +1852,8 @@ WITH seed_input AS (
            e.source_node_id,
            e.target_node_id,
            e.source_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -1845,7 +1875,12 @@ WITH seed_input AS (
              relation_rank NULLS LAST
     LIMIT $6
 )
-SELECT n.access_zone_id AS access_zone_id, n.chunk_id, expanded.seed_access_zone_id, expanded.seed_chunk_id, expanded.relation_type, expanded.relation_score, expanded.relation_rank
+SELECT n.access_zone_id AS access_zone_id, n.chunk_id,
+       c.document_id AS related_document_id,
+       c.document_version AS related_document_version,
+       expanded.seed_access_zone_id, expanded.seed_chunk_id,
+       expanded.edge_id, expanded.relation_identity, expanded.relation_type,
+       expanded.relation_score, expanded.relation_source, expanded.relation_rank
 FROM expanded
 JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.related_node_id
 JOIN astravector.content_chunks_v004 c ON c.access_zone_id=n.access_zone_id AND c.id=n.chunk_id
@@ -1864,6 +1899,7 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
+  AND n.chunk_id <> expanded.seed_chunk_id
 ORDER BY expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
@@ -1915,12 +1951,17 @@ LIMIT $4
                 chunk_id: row.get("chunk_id"),
                 seed_access_zone_id: row.get("seed_access_zone_id"),
                 seed_chunk_id: row.get("seed_chunk_id"),
+                edge_id: row.get("edge_id"),
+                relation_identity: row.get("relation_identity"),
                 relation_type: relation,
                 relation_score: row.get::<f32, _>("relation_score"),
+                relation_source: row.get("relation_source"),
                 relation_rank: row
                     .try_get::<Option<i32>, _>("relation_rank")
                     .ok()
                     .flatten(),
+                related_document_id: row.get("related_document_id"),
+                related_document_version: row.get("related_document_version"),
                 hop_distance: 1,
             });
         }
@@ -2005,6 +2046,8 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
            e.source_node_id,
            e.target_node_id,
            e.target_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -2024,6 +2067,8 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
            e.source_node_id,
            e.target_node_id,
            e.source_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -2046,10 +2091,15 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
 )
 SELECT n.access_zone_id AS access_zone_id,
        n.chunk_id,
+       c.document_id AS related_document_id,
+       c.document_version AS related_document_version,
        expanded.seed_access_zone_id,
        expanded.seed_chunk_id,
+       expanded.edge_id,
+       expanded.relation_identity,
        expanded.relation_type,
        expanded.relation_score,
+       expanded.relation_source,
        expanded.relation_rank
 FROM expanded
 JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.related_node_id
@@ -2069,6 +2119,7 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
+  AND n.chunk_id <> expanded.seed_chunk_id
 ORDER BY expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
@@ -2119,12 +2170,17 @@ LIMIT $4
                 chunk_id: row.get("chunk_id"),
                 seed_access_zone_id: row.get("seed_access_zone_id"),
                 seed_chunk_id: row.get("seed_chunk_id"),
+                edge_id: row.get("edge_id"),
+                relation_identity: row.get("relation_identity"),
                 relation_type: relation,
                 relation_score: row.get::<f32, _>("relation_score"),
+                relation_source: row.get("relation_source"),
                 relation_rank: row
                     .try_get::<Option<i32>, _>("relation_rank")
                     .ok()
                     .flatten(),
+                related_document_id: row.get("related_document_id"),
+                related_document_version: row.get("related_document_version"),
                 hop_distance: 1,
             });
         }
@@ -2145,6 +2201,7 @@ LIMIT $4
 SELECT DISTINCT ON (c.access_zone_id, c.id)
   c.id AS chunk_id,
   c.parent_chunk_id,
+  b.id AS binding_id,
   c.content AS matched_text,
   c.source_block_id,
   c.source_location,
@@ -2187,10 +2244,19 @@ JOIN astravector.content_chunks_v004 p
  AND p.access_level <= $3
  AND (p.expires_at IS NULL OR p.expires_at > now())
  AND p.deleted_at IS NULL
-LEFT JOIN astravector.vector_bindings_v004 b
+JOIN astravector.vector_bindings_v004 b
   ON b.access_zone_id=c.access_zone_id
  AND b.chunk_id=c.id
- AND b.lifecycle_status IN ('ACTIVE','LEGAL_HOLD')
+ AND b.document_id=c.document_id
+ AND b.document_version=c.document_version
+ AND b.parent_chunk_id IS NOT DISTINCT FROM c.parent_chunk_id
+ AND b.chunk_granularity=c.granularity
+ AND b.lifecycle_status='ACTIVE'
+ AND b.qdrant_sync_status='SYNCED'
+ AND b.representation_type='ORIGINAL'
+ AND b.qdrant_point_id IS NOT NULL
+ AND b.deleted_at IS NULL
+ AND (b.expires_at IS NULL OR b.expires_at > now())
 LEFT JOIN astravector.embedding_cache_entries ce
   ON ce.id=b.cache_entry_id
 WHERE c.access_zone_id=$1
@@ -2239,6 +2305,7 @@ ORDER BY c.access_zone_id, c.id,
                     .try_get::<Option<Uuid>, _>("parent_chunk_id")
                     .ok()
                     .flatten(),
+                binding_id: r.get("binding_id"),
                 matched_text: r.get("matched_text"),
                 trace: Some(trace),
                 qdrant_point_id: r
@@ -2305,6 +2372,7 @@ ORDER BY c.access_zone_id, c.id,
 SELECT DISTINCT ON (c.access_zone_id, c.id)
   c.id AS chunk_id,
   c.parent_chunk_id,
+  b.id AS binding_id,
   c.content AS matched_text,
   c.source_block_id,
   c.source_location,
@@ -2347,10 +2415,19 @@ JOIN astravector.content_chunks_v004 p
  AND p.access_level <= $3
  AND (p.expires_at IS NULL OR p.expires_at > now())
  AND p.deleted_at IS NULL
-LEFT JOIN astravector.vector_bindings_v004 b
+JOIN astravector.vector_bindings_v004 b
   ON b.access_zone_id=c.access_zone_id
  AND b.chunk_id=c.id
- AND b.lifecycle_status IN ('ACTIVE','LEGAL_HOLD')
+ AND b.document_id=c.document_id
+ AND b.document_version=c.document_version
+ AND b.parent_chunk_id IS NOT DISTINCT FROM c.parent_chunk_id
+ AND b.chunk_granularity=c.granularity
+ AND b.lifecycle_status='ACTIVE'
+ AND b.qdrant_sync_status='SYNCED'
+ AND b.representation_type='ORIGINAL'
+ AND b.qdrant_point_id IS NOT NULL
+ AND b.deleted_at IS NULL
+ AND (b.expires_at IS NULL OR b.expires_at > now())
 LEFT JOIN astravector.embedding_cache_entries ce
   ON ce.id=b.cache_entry_id
 WHERE c.access_zone_id=ANY($1::uuid[])
@@ -2399,6 +2476,7 @@ ORDER BY c.access_zone_id, c.id,
                     .try_get::<Option<Uuid>, _>("parent_chunk_id")
                     .ok()
                     .flatten(),
+                binding_id: r.get("binding_id"),
                 matched_text: r.get("matched_text"),
                 trace: Some(trace),
                 qdrant_point_id: r
