@@ -194,7 +194,12 @@ def context_metadata(context: dict[str, Any]) -> dict[str, Any]:
     return metadata if isinstance(metadata, dict) else {}
 
 
-def response_hop_count(response: dict[str, Any], entry_point: str, diagnostics: dict[str, Any]) -> tuple[int, str]:
+def response_hop_count(
+    response: dict[str, Any],
+    entry_point: str,
+    diagnostics: dict[str, Any],
+    graph_enabled: bool,
+) -> tuple[int, str]:
     value, source = camel_or_snake(diagnostics, "hopCount", "hop_count")
     if source is not None:
         return number(value, source, integer=True), source
@@ -213,6 +218,8 @@ def response_hop_count(response: dict[str, Any], entry_point: str, diagnostics: 
     )
     if graph_source is not None and number(graph_count, graph_source, integer=True) == 0:
         return 0, f"{graph_source} == 0"
+    if not graph_enabled:
+        return 0, "bank query disables graph; proto3 JSON omits zero hop/count scalars"
     fail("DIAGNOSTIC_INCOMPLETE", "hop count is absent from diagnostics and graph context metadata")
 
 
@@ -226,6 +233,12 @@ def telemetry_from_response(
     diagnostics = response.get("diagnostics")
     if not isinstance(diagnostics, dict):
         fail("DIAGNOSTIC_INCOMPLETE", "response.diagnostics object is required")
+    graph_enabled = query.get("enable_graph_expansion")
+    hop_max = query.get("graph_max_hops")
+    if not isinstance(graph_enabled, bool):
+        fail("BANK_QUERY_INVALID", f"{query.get('query_id')}: enable_graph_expansion must be boolean")
+    if isinstance(hop_max, bool) or not isinstance(hop_max, int) or hop_max < 0:
+        fail("BANK_QUERY_INVALID", f"{query.get('query_id')}: graph_max_hops must be non-negative")
     telemetry: dict[str, Any] = {}
     sources: dict[str, str] = {}
     diagnostic_fields = {
@@ -252,19 +265,21 @@ def telemetry_from_response(
     for field, names in diagnostic_fields.items():
         value, source = camel_or_snake(diagnostics, *names)
         if source is None:
+            if field == "graph_expansion_ms" and not graph_enabled:
+                telemetry[field] = 0
+                sources[field] = (
+                    "bank query disables graph; proto3 JSON omits zero graph duration scalars"
+                )
+                continue
             fail("DIAGNOSTIC_INCOMPLETE", f"response diagnostics do not provide {field}")
         telemetry[field] = number(value, source, integer=field.startswith("candidates_"))
         sources[field] = source
 
-    graph_enabled = query.get("enable_graph_expansion")
-    hop_max = query.get("graph_max_hops")
-    if not isinstance(graph_enabled, bool):
-        fail("BANK_QUERY_INVALID", f"{query.get('query_id')}: enable_graph_expansion must be boolean")
-    if isinstance(hop_max, bool) or not isinstance(hop_max, int) or hop_max < 0:
-        fail("BANK_QUERY_INVALID", f"{query.get('query_id')}: graph_max_hops must be non-negative")
     telemetry["candidate_max"] = 64
     sources["candidate_max"] = "Search request.candidateLimit / RetrieveContext bounded profile contract"
-    telemetry["hop_count"], sources["hop_count"] = response_hop_count(response, entry_point, diagnostics)
+    telemetry["hop_count"], sources["hop_count"] = response_hop_count(
+        response, entry_point, diagnostics, graph_enabled
+    )
     telemetry["hop_max"] = hop_max
     sources["hop_max"] = "bank query.graph_max_hops and request.graphMaxHops"
     telemetry["graph_executed"] = graph_enabled

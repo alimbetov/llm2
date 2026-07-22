@@ -31,13 +31,16 @@ with open(os.environ["FIX486G_FAKE_CALL_LOG"], "a", encoding="utf-8") as log:
     log.write(sys.argv[-1] + "\n")
 graph = request.get("enableGraphExpansion", False)
 diagnostics = {
-    "graphExpansionDurationMs": str(2 if graph else 0),
     "postgresHydrationMs": "1",
     "candidateCount": 4,
-    "finalCandidateCount": 2,
-    "graphCandidatesCount": 1 if graph else 0,
-    "hopCount": 1 if graph else 0
+    "finalCandidateCount": 2
 }
+if graph and os.environ.get("FIX486G_FAKE_OMIT_GRAPH_DIAGNOSTICS") != "1":
+    diagnostics.update({
+        "graphExpansionDurationMs": "2",
+        "graphCandidatesCount": 1,
+        "hopCount": 1
+    })
 context = {
     "matchedChunkId": "runtime-child",
     "parentChunkId": "runtime-parent",
@@ -199,6 +202,15 @@ fn fake_grpcurl_full_pass_makes_exactly_142_calls_and_appends_complete_jsonl() {
                 "missing source for {field}"
             );
         }
+        if row["query_id"].as_str().unwrap().starts_with("g-disabled-") {
+            assert_eq!(row["telemetry"]["graph_expansion_ms"], 0);
+            assert_eq!(row["telemetry"]["hop_count"], 0);
+            assert_eq!(row["telemetry"]["graph_executed"], false);
+            assert!(row["telemetry_sources"]["graph_expansion_ms"]
+                .as_str()
+                .unwrap()
+                .contains("proto3 JSON omits zero"));
+        }
     }
     assert_eq!(response_file_count(&temp.path().join("capture.raw")), 142);
 }
@@ -217,6 +229,26 @@ fn missing_resource_evidence_fails_before_any_grpc_call() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("--resource-evidence"));
     assert!(!output.exists());
     assert!(!call_log.exists());
+}
+
+#[test]
+fn graph_enabled_missing_graph_diagnostics_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = fake_grpcurl(temp.path());
+    let (identity, resource) = fixtures(temp.path());
+    let output = temp.path().join("capture.jsonl");
+    let call_log = temp.path().join("calls.log");
+    let result = base_command(&fake, &identity, &output, &call_log)
+        .args(["--query-id", "g-pos-ru-01", "--resource-evidence"])
+        .arg(resource)
+        .env("FIX486G_FAKE_OMIT_GRAPH_DIAGNOSTICS", "1")
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("DIAGNOSTIC_INCOMPLETE: response diagnostics do not provide graph_expansion_ms"));
+    assert!(!output.exists());
 }
 
 #[test]
