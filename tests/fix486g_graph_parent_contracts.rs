@@ -263,6 +263,8 @@ fn runner_is_phase_owned_fail_closed_and_graph_specific() {
         "graphMaxHops:1",
         "cleanup/summary.json",
         "manifest-verification.json",
+        "REMOTE_SHA",
+        "local_remote_equal",
     ] {
         assert!(runner.contains(required), "runner missing {required}");
     }

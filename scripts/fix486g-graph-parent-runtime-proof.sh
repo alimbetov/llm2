@@ -15,6 +15,8 @@ TOKENIZER_PATH=${ASTRAVECTOR_TOKENIZER_PATH:-$WORKSPACE_ROOT/models/bge-m3/token
 DOCUMENT_DEADLINE_MS=${ASTRAVECTOR_INGESTION_DOCUMENT_DEADLINE_MS:-180000}
 PROJECT=$(printf 'fix486g-%s' "$RUN_ID" | tr '[:upper:]_' '[:lower:]-' | tr -cd 'a-z0-9-')
 PID=""; FINALIZED=false; SOURCE_SHA=$(git -C "$ROOT" rev-parse HEAD); BANK_SHA=cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff; SUPPLEMENTAL_SHA=af4fceb8e424fddecff4284e9cd8d1d68fb4db5c148f9b2aa585bb8497ac1649
+BRANCH=$(git -C "$ROOT" branch --show-current)
+REMOTE_SHA=$(git -C "$ROOT" rev-parse '@{upstream}' 2>/dev/null || true)
 
 [[ ! -e "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_ALREADY_EXISTS:$E" >&2; exit 1; }
 mkdir -p "$E"/{source,bank,config,model-tokenizer,infrastructure,ingestion,identity-map,canonical-audit,qdrant-audit,graph-audit,search,retrieve-context,graph-disabled/search,graph-disabled/retrieve-context,faults,comparisons/warm-search,comparisons/warm-retrieve-context,restart/search,restart/retrieve-context,statistical,cleanup,logs,metrics}
@@ -68,7 +70,12 @@ unexpected_exit() {
 }
 trap unexpected_exit EXIT
 
-verify_identity() { [[ -z $(git -C "$ROOT" status --porcelain) ]] && [[ $(git -C "$ROOT" rev-parse HEAD) == "$SOURCE_SHA" ]]; }
+verify_identity() {
+  [[ -n "$BRANCH" && -n "$REMOTE_SHA" ]] &&
+    [[ -z $(git -C "$ROOT" status --porcelain) ]] &&
+    [[ $(git -C "$ROOT" rev-parse HEAD) == "$SOURCE_SHA" ]] &&
+    [[ "$SOURCE_SHA" == "$REMOTE_SHA" ]]
+}
 verify_bank() {
   python3 "$ROOT/scripts/fix486c_verify_frozen_bank.py" --root "$BANK" >"$E/bank/verification.json" &&
   jq -e --arg sha "$BANK_SHA" '.status=="PASS" and .bank_aggregate_sha256==$sha' "$E/bank/verification.json" >/dev/null &&
@@ -342,8 +349,8 @@ evidence_completeness() {
   [[ $(wc -l <"$E/graph-disabled/results.jsonl" | tr -d ' ') -eq 2 ]]
 }
 
-jq -n --arg run_id "$RUN_ID" --arg mode "$MODE" --arg started "$(timestamp)" --arg branch "$(git -C "$ROOT" branch --show-current)" --arg source "$SOURCE_SHA" '{run_id:$run_id,mode:$mode,started_at_utc:$started,branch:$branch,source_sha:$source,status:"RUNNING"}' >"$E/bootstrap.json"
-jq -n --arg branch "$(git -C "$ROOT" branch --show-current)" --arg source "$SOURCE_SHA" '{branch:$branch,source_sha:$source}' >"$E/source/git-identity.json"
+jq -n --arg run_id "$RUN_ID" --arg mode "$MODE" --arg started "$(timestamp)" --arg branch "$BRANCH" --arg source "$SOURCE_SHA" --arg remote "$REMOTE_SHA" '{run_id:$run_id,mode:$mode,started_at_utc:$started,branch:$branch,source_sha:$source,remote_branch_sha:$remote,local_remote_equal:($source==$remote),status:"RUNNING"}' >"$E/bootstrap.json"
+jq -n --arg branch "$BRANCH" --arg source "$SOURCE_SHA" --arg remote "$REMOTE_SHA" '{branch:$branch,source_sha:$source,remote_branch_sha:$remote,local_remote_equal:($source==$remote)}' >"$E/source/git-identity.json"
 
 ok=true
 [[ "$MODE" == --execute-all ]] || ok=false
