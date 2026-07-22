@@ -2443,6 +2443,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let normalized_hydration =
             normalize_hydration_outcomes(hydration_entry_point, hydration_outcomes);
         let hydration_degradation = normalized_hydration.to_proto();
+        let rejected_parent_keys = normalized_hydration.rejected_parent_keys.clone();
         let retrieval_infrastructure_failure =
             retrieval_infrastructure_failure || hydration_degradation.infrastructure_failure;
         for dropped in &normalized_hydration.dropped_parents {
@@ -2741,6 +2742,15 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 for (candidate, segment_index, segment_text, segment_weight) in &lexical_candidates
                 {
                     let parent = &candidate.parent;
+                    if rejected_parent_keys.contains(&(parent.access_zone_id, parent.id)) {
+                        counter!(
+                            "candidate_rejections_total",
+                            "entry_point" => hydration_entry_point,
+                            "reason" => "PARENT_SCOPED_REJECTION"
+                        )
+                        .increment(1);
+                        continue;
+                    }
                     let mut lexical = search_result_from_lexical_parent(parent, segment_text);
                     if let Some(citation) = lexical.citation.as_mut() {
                         citation.metadata.insert(
@@ -3595,6 +3605,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 "GRAPH_EXPANSION_COMPLETED"
             );
         }
+        retain_results_outside_rejected_parents(&mut direct_results, &rejected_parent_keys);
+        retain_results_outside_rejected_parents(&mut graph_results, &rejected_parent_keys);
         ranking_trace.observe(pb::RankingStageV005::GraphExpansion, &graph_results);
         let merge_started = std::time::Instant::now();
         let direct_count = direct_results.len();
@@ -13003,6 +13015,20 @@ fn result_identity_key(result: &pb::SearchResultV004) -> String {
     format!("{}:{}", result.access_zone_id, result.matched_chunk_id)
 }
 
+fn retain_results_outside_rejected_parents(
+    results: &mut Vec<pb::SearchResultV004>,
+    rejected_parent_keys: &HashSet<(Uuid, Uuid)>,
+) -> usize {
+    let before = results.len();
+    results.retain(|result| {
+        Uuid::parse_str(&result.access_zone_id)
+            .ok()
+            .zip(Uuid::parse_str(&result.parent_chunk_id).ok())
+            .is_none_or(|key| !rejected_parent_keys.contains(&key))
+    });
+    before.saturating_sub(results.len())
+}
+
 fn result_source_block_id(result: &pb::SearchResultV004) -> Option<&str> {
     result
         .citation
@@ -15451,5 +15477,32 @@ mod fix463_stabilization_tests {
         assert_eq!(ctx.metadata.get("access_zone_id"), Some(&zone));
         assert!(ctx.metadata.contains_key("document_id"));
         assert!(ctx.metadata.contains_key("matched_chunk_id"));
+    }
+
+    #[test]
+    fn rejected_parent_cannot_reenter_from_another_retrieval_branch() {
+        let zone = Uuid::new_v4();
+        let rejected_parent = Uuid::new_v4();
+        let healthy_parent = Uuid::new_v4();
+        let result = |parent_chunk_id: Uuid| pb::SearchResultV004 {
+            access_zone_id: zone.to_string(),
+            document_id: Uuid::new_v4().to_string(),
+            document_version: 1,
+            matched_chunk_id: Uuid::new_v4().to_string(),
+            parent_chunk_id: parent_chunk_id.to_string(),
+            parent_text: "canonical parent".into(),
+            ..Default::default()
+        };
+        let mut branch_results = vec![result(rejected_parent), result(healthy_parent)];
+        let rejected = HashSet::from([(zone, rejected_parent)]);
+
+        let removed = retain_results_outside_rejected_parents(&mut branch_results, &rejected);
+
+        assert_eq!(removed, 1);
+        assert_eq!(branch_results.len(), 1);
+        assert_eq!(
+            branch_results[0].parent_chunk_id,
+            healthy_parent.to_string()
+        );
     }
 }

@@ -2,6 +2,7 @@ use crate::persistence::HydratedSearchContext;
 use metrics::{counter, histogram};
 use prost::Message;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::{codegen::Bytes, Code, Status};
 use uuid::Uuid;
@@ -39,6 +40,13 @@ impl HydrationRejectionReason {
 
     pub const fn retryable(self) -> bool {
         matches!(self, Self::HydrationMissing | Self::ParentHydrationTimeout)
+    }
+
+    pub const fn is_parent_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::HydrationMissing | Self::ParentHydrationTimeout | Self::EmptyContext
+        )
     }
 }
 
@@ -160,6 +168,7 @@ impl CoverageClass {
 pub struct NormalizedHydration {
     pub surviving_contexts: Vec<HydratedSearchContext>,
     pub dropped_parents: Vec<RejectedHydrationCandidate>,
+    pub rejected_parent_keys: HashSet<(Uuid, Uuid)>,
     pub coverage_class: CoverageClass,
     pub retryable: bool,
 }
@@ -225,17 +234,52 @@ pub fn normalize_hydration_outcomes(
     entry_point: &'static str,
     batch: HydrationBatchOutcomes,
 ) -> NormalizedHydration {
-    let total_timeout = !batch.outcomes.is_empty()
+    let rejected_parent_keys = batch
+        .outcomes
+        .iter()
+        .filter_map(|outcome| {
+            outcome
+                .reason()
+                .filter(|reason| reason.is_parent_scoped())
+                .map(|_| {
+                    let candidate = outcome.candidate();
+                    (candidate.access_zone_id, candidate.parent_chunk_id)
+                })
+        })
+        .collect::<HashSet<_>>();
+    let surviving_parent_exists = batch.outcomes.iter().any(|outcome| {
+        matches!(outcome, HydrationTerminalOutcome::Hydrated { .. }) && {
+            let candidate = outcome.candidate();
+            let key = (candidate.access_zone_id, candidate.parent_chunk_id);
+            !rejected_parent_keys.contains(&key)
+        }
+    });
+    let total_timeout = !surviving_parent_exists
+        && !rejected_parent_keys.is_empty()
         && batch.outcomes.iter().all(|outcome| {
-            outcome.reason() == Some(HydrationRejectionReason::ParentHydrationTimeout)
+            outcome.reason().is_none()
+                || outcome.reason() == Some(HydrationRejectionReason::ParentHydrationTimeout)
         });
     let mut surviving_contexts = Vec::new();
     let mut dropped_parents = Vec::new();
+    let mut recorded_parent_rejections = HashMap::new();
     for outcome in batch.outcomes {
         match outcome {
             HydrationTerminalOutcome::Hydrated {
-                context, elapsed, ..
+                candidate,
+                context,
+                elapsed,
             } => {
+                let parent_key = (candidate.access_zone_id, candidate.parent_chunk_id);
+                if rejected_parent_keys.contains(&parent_key) {
+                    counter!(
+                        "candidate_rejections_total",
+                        "entry_point" => entry_point,
+                        "reason" => "PARENT_SCOPED_REJECTION"
+                    )
+                    .increment(1);
+                    continue;
+                }
                 counter!(
                     "parent_hydration_requests_total",
                     "entry_point" => entry_point,
@@ -260,6 +304,10 @@ pub fn normalize_hydration_outcomes(
                     | HydrationTerminalOutcome::EmptyContext(value) => value,
                     HydrationTerminalOutcome::Hydrated { .. } => unreachable!(),
                 };
+                let parent_key = (
+                    rejected.candidate.access_zone_id,
+                    rejected.candidate.parent_chunk_id,
+                );
                 counter!(
                     "candidate_rejections_total",
                     "entry_point" => entry_point,
@@ -298,7 +346,13 @@ pub fn normalize_hydration_outcomes(
                     "outcome" => reason.code()
                 )
                 .record(rejected.elapsed.as_secs_f64());
-                dropped_parents.push(rejected);
+                if !reason.is_parent_scoped()
+                    || recorded_parent_rejections
+                        .insert(parent_key, reason)
+                        .is_none()
+                {
+                    dropped_parents.push(rejected);
+                }
             }
         }
     }
@@ -332,6 +386,7 @@ pub fn normalize_hydration_outcomes(
     NormalizedHydration {
         surviving_contexts,
         dropped_parents,
+        rejected_parent_keys,
         coverage_class,
         retryable,
     }
@@ -472,6 +527,67 @@ mod tests {
         let status = total_hydration_timeout_status(&normalized.to_proto());
         assert_eq!(status.code(), Code::DeadlineExceeded);
         assert!(!status.details().is_empty());
+    }
+
+    #[test]
+    fn parent_scoped_rejection_suppresses_hydrated_sibling_candidate() {
+        let parent = Uuid::new_v4();
+        let mut first = candidate(0);
+        first.parent_chunk_id = parent;
+        let mut second = candidate(1);
+        second.access_zone_id = first.access_zone_id;
+        second.parent_chunk_id = parent;
+        let batch = HydrationBatchOutcomes::new(
+            2,
+            vec![
+                HydrationTerminalOutcome::Hydrated {
+                    candidate: first.clone(),
+                    context: Box::new(context(&first)),
+                    elapsed: Duration::from_millis(1),
+                },
+                HydrationTerminalOutcome::HydrationMissing(rejected(
+                    second,
+                    HydrationRejectionReason::HydrationMissing,
+                )),
+            ],
+        );
+
+        let normalized = normalize_hydration_outcomes("Search", batch);
+
+        assert!(normalized.surviving_contexts.is_empty());
+        assert_eq!(normalized.dropped_parents.len(), 1);
+        assert!(normalized
+            .rejected_parent_keys
+            .contains(&(first.access_zone_id, parent)));
+    }
+
+    #[test]
+    fn candidate_scoped_rejection_does_not_suppress_healthy_sibling() {
+        let parent = Uuid::new_v4();
+        let mut invalid = candidate(0);
+        invalid.parent_chunk_id = parent;
+        let mut healthy = candidate(1);
+        healthy.access_zone_id = invalid.access_zone_id;
+        healthy.parent_chunk_id = parent;
+        let batch = HydrationBatchOutcomes::new(
+            2,
+            vec![
+                HydrationTerminalOutcome::BindingInvalid(rejected(
+                    invalid,
+                    HydrationRejectionReason::BindingInvalid,
+                )),
+                HydrationTerminalOutcome::Hydrated {
+                    candidate: healthy.clone(),
+                    context: Box::new(context(&healthy)),
+                    elapsed: Duration::from_millis(1),
+                },
+            ],
+        );
+
+        let normalized = normalize_hydration_outcomes("Search", batch);
+
+        assert_eq!(normalized.surviving_contexts.len(), 1);
+        assert!(normalized.rejected_parent_keys.is_empty());
     }
 
     #[test]
