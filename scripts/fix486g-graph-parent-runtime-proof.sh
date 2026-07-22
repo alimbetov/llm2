@@ -345,9 +345,9 @@ prepare_fault_targets() {
   jq -e --arg parent "$parent" '.binding_count==1 and .binding_parent_chunk_id==$parent and .qdrant_sync_status=="SYNCED" and .chunk_count==1 and .lifecycle_status=="ACTIVE" and .deleted_at==null and .expires_at_visible==true' "$E/faults/baseline.json" >/dev/null
 }
 run_control_pair() {
-  local name=$1 expectation=$2 forbidden=${3:-} dir="$E/faults/$1" id q z
+  local name=$1 expectation=$2 forbidden=${3:-} forbidden_scope=${4:-any} dir="$E/faults/$1" id q z
   local validate_args=(--identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation")
-  [[ -n "$forbidden" ]] && validate_args+=(--forbidden-chunk-id "$forbidden")
+  [[ -n "$forbidden" ]] && validate_args+=(--forbidden-chunk-id "$forbidden" --forbidden-scope "$forbidden_scope")
   mkdir -p "$dir/search" "$dir/retrieve-context"
   id=$(jq -r '.[0].query.query_id' "$E/bank/selected-queries.json")
   q=$(jq -r '.[0].query.question' "$E/bank/selected-queries.json")
@@ -436,7 +436,7 @@ hop_limit_fault() {
   edge=$(python3 -c 'import uuid; print(uuid.uuid4())'); source=$(jq -r .child_a3 "$E/faults/targets.json"); target=$(jq -r .child_a2 "$E/faults/targets.json")
   [[ "$target" =~ ^[0-9a-fA-F-]{36}$ ]] || return 1
   insert_fault_edge "$edge" "$source" "$target" REPAIRED_BY || return 1
-  run_control_pair hop-limit present "$target" || rc=$?
+  run_control_pair hop-limit present "$target" graph || rc=$?
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }

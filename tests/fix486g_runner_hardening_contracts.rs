@@ -137,6 +137,20 @@ fn optional_fault_validator_arguments_are_bash_32_nounset_safe() {
 }
 
 #[test]
+fn hop_limit_forbids_only_graph_derived_target_identity() {
+    let runner = source(RUNNER);
+    require_all(
+        &runner,
+        &[
+            "forbidden_scope=${4:-any}",
+            "--forbidden-scope \"$forbidden_scope\"",
+            "run_control_pair hop-limit present \"$target\" graph",
+        ],
+        "FIX486G-RUNNER-HOP-SCOPE-001",
+    );
+}
+
+#[test]
 fn signals_have_explicit_fail_closed_terminal_metadata() {
     let runner = source(RUNNER);
     require_all(

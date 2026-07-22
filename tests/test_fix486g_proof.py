@@ -43,6 +43,7 @@ MANDATORY_PASS_EVIDENCE = {
 def identity(logical_chunk_id: str) -> dict:
     return {
         "logical_chunk_id": logical_chunk_id,
+        "logical_zone_id": "zone-a",
         "runtime_access_zone_id": "runtime-zone-a",
     }
 
@@ -132,6 +133,66 @@ class NormalizeContracts(unittest.TestCase):
         self.assertEqual(result["logical_identity"]["direct_parents"], ["parent-a1"])
         self.assertEqual(result["logical_identity"]["graph_children"], ["child-a3-180"])
         self.assertEqual(result["logical_identity"]["graph_parents"], ["parent-a3"])
+
+    def test_graph_scoped_forbidden_target_allows_independent_direct_hit(self):
+        identities = {
+            "runtime-direct-child": identity("child-a1-180"),
+            "runtime-direct-parent": identity("parent-a1"),
+            "runtime-hop-child": identity("child-a2-180"),
+            "runtime-hop-parent": identity("parent-a2"),
+            "runtime-graph-child": identity("child-a3-180"),
+            "runtime-graph-parent": identity("parent-a3"),
+        }
+        response = {
+            "results": [
+                context("runtime-direct-child", "runtime-direct-parent", {"retrieval_source": "VECTOR_DIRECT"}),
+                context(
+                    "runtime-graph-child",
+                    "runtime-graph-parent",
+                    graph_metadata("runtime-graph-child", "runtime-graph-parent", "edge-good"),
+                ),
+                context("runtime-hop-child", "runtime-hop-parent", {"retrieval_source": "VECTOR_DIRECT"}),
+            ]
+        }
+
+        result = PROOF.validate_control(
+            "Search", response, identities, "present", "runtime-hop-child", "graph"
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertNotIn("FAULT_TARGET_RETURNED", result["failure_codes"])
+
+    def test_graph_scoped_forbidden_target_rejects_graph_provenance(self):
+        identities = {
+            "runtime-direct-child": identity("child-a1-180"),
+            "runtime-direct-parent": identity("parent-a1"),
+            "runtime-hop-child": identity("child-a2-180"),
+            "runtime-hop-parent": identity("parent-a2"),
+            "runtime-graph-child": identity("child-a3-180"),
+            "runtime-graph-parent": identity("parent-a3"),
+        }
+        response = {
+            "results": [
+                context("runtime-direct-child", "runtime-direct-parent", {"retrieval_source": "VECTOR_DIRECT"}),
+                context(
+                    "runtime-graph-child",
+                    "runtime-graph-parent",
+                    graph_metadata("runtime-graph-child", "runtime-graph-parent", "edge-good"),
+                ),
+                context(
+                    "runtime-hop-child",
+                    "runtime-hop-parent",
+                    graph_metadata("runtime-hop-child", "runtime-hop-parent", "edge-second-hop"),
+                ),
+            ]
+        }
+
+        result = PROOF.validate_control(
+            "Search", response, identities, "present", "runtime-hop-child", "graph"
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("FAULT_TARGET_RETURNED", result["failure_codes"])
 
     def test_any_wrong_graph_final_context_fails_the_result(self):
         identities = {

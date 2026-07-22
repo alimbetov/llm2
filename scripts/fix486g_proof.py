@@ -407,7 +407,8 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
 
 
 def validate_control(entry_point: str, response: dict, identity_by_runtime: dict[str, dict],
-                     graph_expectation: str, forbidden_chunk_id: str | None) -> dict:
+                     graph_expectation: str, forbidden_chunk_id: str | None,
+                     forbidden_scope: str = "any") -> dict:
     contexts = response_contexts(response, entry_point)
     normalized = []
     failures = []
@@ -428,10 +429,14 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
             "ASTRA_EXPIRED_PARENT_TRAP",
         ]):
             failures.append("FORBIDDEN_GRAPH_CONTEXT")
-        if forbidden_chunk_id and forbidden_chunk_id in {
+        forbidden_identity_present = forbidden_chunk_id and forbidden_chunk_id in {
             matched,
             metadata.get("graph_related_chunk_id"),
-        }:
+        }
+        forbidden_provenance_present = graph_origin or graph_provenance
+        if forbidden_identity_present and (
+            forbidden_scope == "any" or forbidden_provenance_present
+        ):
             failures.append("FAULT_TARGET_RETURNED")
         normalized.append({
             "matched_chunk_id": matched,
@@ -464,6 +469,7 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
         "graph_parent_a3_present": any(row["parent_logical"] == "parent-a3" for row in graph),
         "graph_context_count": len(graph),
         "forbidden_chunk_id": forbidden_chunk_id,
+        "forbidden_scope": forbidden_scope,
         "contexts": normalized,
         "failure_codes": sorted(set(failures)),
     }
@@ -666,6 +672,7 @@ def main() -> int:
     p_control.add_argument("--bank", type=Path, required=True)
     p_control.add_argument("--graph-expectation", required=True, choices=["present", "absent"])
     p_control.add_argument("--forbidden-chunk-id")
+    p_control.add_argument("--forbidden-scope", choices=["any", "graph"], default="any")
     p_control.add_argument("--output", type=Path, required=True)
     p_agg = sub.add_parser("aggregate")
     p_agg.add_argument("--run", type=Path, required=True)
@@ -717,7 +724,7 @@ def main() -> int:
             by_runtime = {row["runtime_chunk_id"]: row for row in identity}
             payload = validate_control(
                 args.entry_point, read_json(args.response), by_runtime,
-                args.graph_expectation, args.forbidden_chunk_id,
+                args.graph_expectation, args.forbidden_chunk_id, args.forbidden_scope,
             )
         elif args.command == "aggregate":
             payload = aggregate(args.run)
