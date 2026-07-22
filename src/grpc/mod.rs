@@ -11613,6 +11613,41 @@ fn merge_secondary_metadata_with_limit(
         sources.len().saturating_sub(1).to_string(),
     );
 
+    if secondary_source == "GRAPH_EXPANDED" {
+        for key in [
+            "graph_seed_access_zone_id",
+            "graph_seed_document_id",
+            "graph_seed_document_version",
+            "graph_seed_chunk_id",
+            "graph_seed_parent_chunk_id",
+            "graph_seed_source_block_id",
+            "graph_relation_id",
+            "graph_edge_id",
+            "graph_relation_source",
+            "graph_relation_type",
+            "graph_relation_score",
+            "graph_related_access_zone_id",
+            "graph_related_document_id",
+            "graph_related_document_version",
+            "graph_related_chunk_id",
+            "graph_related_parent_chunk_id",
+            "graph_binding_id",
+            "graph_hop_distance",
+        ] {
+            if let Some(value) = secondary_citation.metadata.get(key) {
+                if !value.trim().is_empty() {
+                    primary_citation
+                        .metadata
+                        .entry(key.to_string())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+        primary_citation
+            .metadata
+            .insert("graph_secondary_provenance".into(), "true".into());
+    }
+
     let mut relations = parse_json_array_metadata(primary_citation.metadata.get("graph_relations"));
     if let Some(relation) = secondary_citation.metadata.get("graph_relation_type") {
         relations.push(serde_json::json!({
@@ -14260,6 +14295,18 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .insert("graph_relation_type".into(), "CHUNK_HAS_PARENT".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_edge_id".into(), "edge-direct-parent".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_related_chunk_id".into(), "graph-child".into());
 
         let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
 
@@ -14279,6 +14326,24 @@ mod v007_fix1_tests {
             .iter()
             .any(|source| source == "GRAPH_EXPANDED"));
         assert!(citation.metadata.contains_key("graph_relations"));
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_secondary_provenance")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            citation.metadata.get("graph_edge_id").map(String::as_str),
+            Some("edge-direct-parent")
+        );
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_related_chunk_id")
+                .map(String::as_str),
+            Some("graph-child")
+        );
         assert!(!is_graph_expanded_result(result));
     }
 

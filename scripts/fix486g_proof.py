@@ -256,6 +256,18 @@ def result_metadata(result: dict) -> dict:
     return citation.get("metadata") or result.get("metadata") or {}
 
 
+def is_primary_graph(metadata: dict) -> bool:
+    return metadata.get("retrieval_source") == "GRAPH_EXPANDED"
+
+
+def has_graph_provenance(metadata: dict) -> bool:
+    return is_primary_graph(metadata) or (
+        metadata.get("graph_secondary_provenance") == "true"
+        and bool(metadata.get("graph_edge_id"))
+        and bool(metadata.get("graph_related_chunk_id"))
+    )
+
+
 def stage_is_present(candidate: dict, name: str) -> bool:
     return any(stage.get("stage") == name and stage.get("present") for stage in candidate.get("stages", []))
 
@@ -274,8 +286,8 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
         matched_identity = identity_by_runtime.get(matched, {})
         parent_identity = identity_by_runtime.get(parent, {})
         metadata = result_metadata(result)
-        source = metadata.get("retrieval_source", "")
-        graph_origin = source == "GRAPH_EXPANDED" or "GRAPH_EXPANDED" in metadata.get("retrieval_sources", "")
+        graph_origin = is_primary_graph(metadata)
+        graph_provenance = has_graph_provenance(metadata)
         document_version = protobuf_positive_int(result.get("documentVersion"), "documentVersion")
         if result.get("accessZoneId") != matched_identity.get("runtime_access_zone_id"):
             failures.append("CANONICAL_BINDING_INVALID")
@@ -293,6 +305,7 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
             "matched_logical": matched_identity.get("logical_chunk_id"),
             "parent_logical": parent_identity.get("logical_chunk_id"),
             "graph_origin": graph_origin,
+            "graph_provenance": graph_provenance,
             "metadata": metadata,
             "matched_text": result.get("matchedText", ""),
             "parent_text": result.get("parentText", ""),
@@ -301,7 +314,12 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
     if forbidden:
         failures.append("FORBIDDEN_GRAPH_CONTEXT")
     direct = [row for row in normalized if not row["graph_origin"] and row["parent_logical"] == qrel.get("expected_direct_parent")]
-    graph = [row for row in normalized if row["graph_origin"]]
+    required_relations = set(qrel.get("required_graph_relation_any", []))
+    graph = [
+        row for row in normalized
+        if row["graph_provenance"]
+        and row["metadata"].get("graph_relation_type") in required_relations
+    ]
     if not direct:
         failures.append("DIRECT_PARENT_MISSING")
     if not expect_graph:
@@ -312,20 +330,23 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
         valid_graph = []
         for row in graph:
             context_valid = True
+            metadata = row["metadata"]
             if row["parent_logical"] != qrel.get("expected_graph_parent"):
                 failures.append("GRAPH_WRONG_PARENT")
                 context_valid = False
-            if expected_children and row["matched_logical"] not in expected_children:
+            related_chunk = metadata.get("graph_related_chunk_id")
+            related_parent = metadata.get("graph_related_parent_chunk_id")
+            related_chunk_identity = identity_by_runtime.get(related_chunk, {})
+            if expected_children and related_chunk_identity.get("logical_chunk_id") not in expected_children:
                 failures.append("GRAPH_UNEXPECTED_CHILD")
                 context_valid = False
-            metadata = row["metadata"]
             if any(not metadata.get(field) for field in GRAPH_PROVENANCE_FIELDS):
                 failures.append("GRAPH_PROVENANCE_MISSING")
                 context_valid = False
             if metadata.get("graph_seed_parent_chunk_id") == metadata.get("graph_related_parent_chunk_id"):
                 failures.append("GRAPH_SEED_PARENT_REUSE")
                 context_valid = False
-            if metadata.get("graph_related_chunk_id") != row["matched"] or metadata.get("graph_related_parent_chunk_id") != row["parent"]:
+            if related_parent != row["parent"]:
                 failures.append("GRAPH_WRONG_PARENT")
                 context_valid = False
             if metadata.get("graph_relation_type") not in qrel.get("required_graph_relation_any", []):
@@ -343,7 +364,7 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
             failures.append("GRAPH_PARENT_MISSING")
     trace = trace_candidates(response)
     protected_provenance = [{
-        "matched_chunk_id": row["matched"],
+        "matched_chunk_id": row["metadata"].get("graph_related_chunk_id"),
         "parent_chunk_id": row["parent"],
         **{field: row["metadata"].get(field) for field in GRAPH_PROVENANCE_FIELDS},
     } for row in graph]
@@ -362,7 +383,10 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
         "logical_identity": {
             "zone": "zone-a", "document": "doc-hierarchy", "version": 1,
             "direct_parents": sorted({row["parent_logical"] for row in direct}),
-            "graph_children": sorted({row["matched_logical"] for row in graph}),
+            "graph_children": sorted({
+                identity_by_runtime.get(row["metadata"].get("graph_related_chunk_id"), {}).get("logical_chunk_id")
+                for row in graph
+            }),
             "graph_parents": sorted({row["parent_logical"] for row in graph}),
         },
         "runtime_identity": [{
@@ -393,7 +417,8 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
         matched_identity = identity_by_runtime.get(matched, {})
         parent_identity = identity_by_runtime.get(parent, {})
         metadata = result_metadata(context)
-        graph_origin = metadata.get("retrieval_source") == "GRAPH_EXPANDED" or "GRAPH_EXPANDED" in metadata.get("retrieval_sources", "")
+        graph_origin = is_primary_graph(metadata)
+        graph_provenance = has_graph_provenance(metadata)
         combined = context.get("matchedText", "") + "\n" + context.get("parentText", "")
         if matched_identity.get("logical_zone_id") != "zone-a":
             failures.append("GRAPH_CROSS_ZONE_RESULT")
@@ -403,7 +428,10 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
             "ASTRA_EXPIRED_PARENT_TRAP",
         ]):
             failures.append("FORBIDDEN_GRAPH_CONTEXT")
-        if forbidden_chunk_id and matched == forbidden_chunk_id:
+        if forbidden_chunk_id and forbidden_chunk_id in {
+            matched,
+            metadata.get("graph_related_chunk_id"),
+        }:
             failures.append("FAULT_TARGET_RETURNED")
         normalized.append({
             "matched_chunk_id": matched,
@@ -411,9 +439,15 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
             "matched_logical": matched_identity.get("logical_chunk_id"),
             "parent_logical": parent_identity.get("logical_chunk_id"),
             "graph_origin": graph_origin,
+            "graph_provenance": graph_provenance,
+            "graph_relation_type": metadata.get("graph_relation_type"),
         })
     direct = [row for row in normalized if not row["graph_origin"] and row["parent_logical"] == "parent-a1"]
-    graph = [row for row in normalized if row["graph_origin"]]
+    graph = [
+        row for row in normalized
+        if row["graph_provenance"]
+        and row["graph_relation_type"] in {"REPAIRED_BY", "RELATED_TO"}
+    ]
     if not direct:
         failures.append("VALID_DIRECT_SURVIVOR_LOST")
     if graph_expectation == "present" and not any(row["parent_logical"] == "parent-a3" for row in graph):

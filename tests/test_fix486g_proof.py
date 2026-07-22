@@ -81,6 +81,58 @@ def context(matched: str, parent: str, metadata: dict, parent_text: str = "") ->
 
 
 class NormalizeContracts(unittest.TestCase):
+    def test_direct_primary_preserves_secondary_graph_provenance(self):
+        identities = {
+            "runtime-direct-child": identity("child-a1-180"),
+            "runtime-direct-parent": identity("parent-a1"),
+            "runtime-graph-child": identity("child-a3-180"),
+            "runtime-graph-parent": identity("parent-a3"),
+        }
+        secondary = graph_metadata(
+            "runtime-graph-child", "runtime-graph-parent", "edge-secondary"
+        )
+        secondary.update(
+            {
+                "retrieval_source": "VECTOR_DIRECT",
+                "retrieval_sources": '["VECTOR_DIRECT","GRAPH_EXPANDED"]',
+                "graph_secondary_provenance": "true",
+            }
+        )
+        response = {
+            "results": [
+                context(
+                    "runtime-direct-child",
+                    "runtime-direct-parent",
+                    {"retrieval_source": "VECTOR_DIRECT"},
+                ),
+                context(
+                    "runtime-graph-parent",
+                    "runtime-graph-parent",
+                    secondary,
+                    "ASTRA_RECONCILIATION_A3",
+                ),
+            ]
+        }
+
+        result = PROOF.normalize(
+            {"query_id": "q-graph-repair", "case_id": "FIX486-08"},
+            {
+                "expected_direct_parent": "parent-a1",
+                "expected_graph_parent": "parent-a3",
+                "expected_graph_child_any": ["child-a3-180"],
+                "required_graph_relation_any": ["REPAIRED_BY"],
+            },
+            "Search",
+            response,
+            identities,
+            True,
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["logical_identity"]["direct_parents"], ["parent-a1"])
+        self.assertEqual(result["logical_identity"]["graph_children"], ["child-a3-180"])
+        self.assertEqual(result["logical_identity"]["graph_parents"], ["parent-a3"])
+
     def test_any_wrong_graph_final_context_fails_the_result(self):
         identities = {
             "runtime-direct-child": identity("child-a1-180"),

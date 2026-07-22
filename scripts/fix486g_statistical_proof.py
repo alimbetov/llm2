@@ -440,12 +440,16 @@ def logical_chunk(context: dict[str, Any], runtime_key: str, logical_keys: tuple
     return None
 
 
-def graph_origin(meta: dict[str, Any]) -> bool:
-    source = meta.get("retrieval_source") or meta.get("retrievalSource")
-    sources = meta.get("retrieval_sources") or meta.get("retrievalSources") or []
-    if isinstance(sources, str):
-        sources = [item.strip() for item in sources.split(",")]
-    return source == "GRAPH_EXPANDED" or "GRAPH_EXPANDED" in sources
+def primary_graph_origin(meta: dict[str, Any]) -> bool:
+    return (meta.get("retrieval_source") or meta.get("retrievalSource")) == "GRAPH_EXPANDED"
+
+
+def graph_provenance(meta: dict[str, Any]) -> bool:
+    return primary_graph_origin(meta) or (
+        str(meta.get("graph_secondary_provenance", "")).lower() == "true"
+        and present(meta.get("graph_edge_id"))
+        and present(meta.get("graph_related_chunk_id"))
+    )
 
 
 def normalized_context(context: dict[str, Any], identities: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -455,7 +459,7 @@ def normalized_context(context: dict[str, Any], identities: dict[str, dict[str, 
     # Graph evidence is hydrated as a parent context, so the response-level
     # matched ID may be that parent. The canonical matched child remains in
     # protected Graph provenance and is the identity the qrel evaluates.
-    if graph_origin(meta):
+    if graph_provenance(meta):
         related = meta.get("graph_related_chunk_id") or meta.get("graphRelatedChunkId")
         if isinstance(related, str) and related:
             matched = related
@@ -483,7 +487,8 @@ def normalized_context(context: dict[str, Any], identities: dict[str, dict[str, 
         "matched_logical": matched_logical,
         "parent_logical": parent_logical,
         "zone": zone,
-        "graph_origin": graph_origin(meta),
+        "primary_graph_origin": primary_graph_origin(meta),
+        "graph_provenance": graph_provenance(meta),
         "metadata": meta,
         "parent_text": parent_text,
         "matched_text": matched_text,
@@ -526,8 +531,13 @@ def evaluate_observation(
     profile_name = bank_data["assignments"][row["query_id"]]
     qrel = bank_data["profiles"][profile_name]
     normalized = [normalized_context(item, identities) for item in contexts(row)]
-    graph_rows = [item for item in normalized if item["graph_origin"]]
-    direct_rows = [item for item in normalized if not item["graph_origin"]]
+    required_relations = set(qrel.get("required_graph_relation_any") or [])
+    graph_rows = [
+        item for item in normalized
+        if item["graph_provenance"]
+        and item["metadata"].get("graph_relation_type") in required_relations
+    ]
+    direct_rows = [item for item in normalized if not item["primary_graph_origin"]]
     expected_graph = qrel.get("expected_graph_parent")
     expected_direct = qrel.get("expected_direct_parent")
     forbidden_anchors = qrel.get("forbidden_anchors") or []
@@ -543,7 +553,7 @@ def evaluate_observation(
         if forbidden:
             add_gate(gates, "forbidden_anchor_leaks")
             failures.append("FORBIDDEN_ANCHOR_LEAK")
-        if item["graph_origin"]:
+        if item in graph_rows:
             if item["zone"] != qrel.get("expected_zone"):
                 add_gate(gates, "cross_zone_graph_final_contexts", "graph_cross_zone_results")
                 failures.append("CROSS_ZONE_GRAPH_CONTEXT")
@@ -660,7 +670,7 @@ def evaluate_observation(
     if expected_direct and not any(item["parent_logical"] == expected_direct for item in direct_rows):
         failures.append("DIRECT_PARENT_MISSING")
     graph_rank = next(
-        (index for index, item in enumerate(normalized, 1) if item["graph_origin"] and item["parent_logical"] == expected_graph),
+        (index for index, item in enumerate(normalized, 1) if item in graph_rows and item["parent_logical"] == expected_graph),
         None,
     )
     if expected_graph and graph_rank is None:
@@ -706,7 +716,7 @@ def evaluate_observation(
         {
             (
                 item["parent_logical"] or "UNKNOWN",
-                "GRAPH" if item["graph_origin"] else "DIRECT",
+                "GRAPH" if item in graph_rows else "DIRECT",
                 str(item["metadata"].get("graph_relation_id", "")),
                 str(item["metadata"].get("graph_relation_type", "")),
                 str(item["metadata"].get("graph_hop_distance", "")),
@@ -751,7 +761,7 @@ def evaluate_observation(
             {
                 "matched_logical": item["matched_logical"],
                 "parent_logical": item["parent_logical"],
-                "graph_origin": item["graph_origin"],
+                "graph_origin": item in graph_rows,
                 "relation_type": item["metadata"].get("graph_relation_type"),
                 "hop": item["metadata"].get("graph_hop_distance"),
             }
