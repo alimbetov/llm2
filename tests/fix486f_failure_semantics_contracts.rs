@@ -243,7 +243,10 @@ fn fault_runner_selects_target_from_array_and_uses_equivalent_candidate_windows(
     );
     require_all(
         PROFILE_CONFIG,
-        &["query_ms: ${FIX486F_QUERY_DEADLINE_MS:-15000}"],
+        &[
+            "query_ms: ${FIX486F_QUERY_DEADLINE_MS:-15000}",
+            "long_query_deadline_ms: ${FIX486F_LONG_QUERY_DEADLINE_MS:-22500}",
+        ],
         "FIX486F-RUNNER-DEADLINE-PARITY-001",
     );
     let runner = source(RUNNER);

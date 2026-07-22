@@ -42,6 +42,8 @@ access_zone_registry:
   auto_create_on_ingestion: true
   auto_create_on_search: false
 search:
+  query_processing:
+    long_query_deadline_ms: ${FIX486F_LONG_QUERY_DEADLINE_MS:-22500}
   hydration_rejection_reserve: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE:-4}
   hydration_rejection_reserve_max: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE_MAX:-16}
   hydration_failpoints:
