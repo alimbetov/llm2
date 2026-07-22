@@ -32,6 +32,10 @@ mandatory bank: 1.0.0 / FROZEN / cc699d929226f928eb2e92aa97d51d82d78e20f69440f04
 9. `cargo fmt`, locked all-target check, clippy with denied warnings and the
    complete locked all-target test suite passed, including the 50-concurrent
    Testcontainers retrieval smoke.
+10. The first outside-sandbox runtime attempt reached production ingestion and
+    activation, then preserved BLOCKED evidence when its canonical audit mixed
+    non-CHUNK semantic edges into CHUNK endpoint invariants. The audit was
+    narrowed to typed `CHUNK -> CHUNK` edges without changing runtime behavior.
 
 ## Current implementation stage
 

@@ -292,6 +292,22 @@ fn graph_faults_preserve_an_independent_valid_parent_survivor() {
 }
 
 #[test]
+fn canonical_graph_audit_scopes_chunk_endpoint_invariants_to_chunk_edges() {
+    let audit = source("scripts/fix486g-graph-parent-audit.sql");
+    require_all(
+        "scripts/fix486g-graph-parent-audit.sql",
+        &[
+            "e.source_node_type='CHUNK'",
+            "e.target_node_type='CHUNK'",
+            "orphan_graph_endpoints",
+            "cross_zone_graph_edges",
+        ],
+        "FIX486G-AUDIT-001",
+    );
+    assert_eq!(audit.matches("graph_endpoints AS").count(), 1);
+}
+
+#[test]
 fn make_targets_share_one_official_execute_path() {
     let makefile = source("Makefile");
     assert!(makefile.contains("verify-fix486g-graph-parent-runtime:"));

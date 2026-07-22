@@ -22,6 +22,8 @@ WITH children AS (
     ON source.access_zone_id=e.access_zone_id AND source.node_id=e.source_node_id
   LEFT JOIN astravector.rag_graph_nodes_chunk target
     ON target.access_zone_id=e.access_zone_id AND target.node_id=e.target_node_id
+  WHERE e.source_node_type='CHUNK'
+    AND e.target_node_type='CHUNK'
 )
 SELECT json_build_object(
   'active_documents', (SELECT count(*) FROM astravector.document_versions WHERE status='ACTIVE'),
