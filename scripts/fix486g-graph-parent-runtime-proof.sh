@@ -11,7 +11,7 @@ case "$MODE" in
   --execute-all|--verify-identities|--verify-contracts|--cleanup-only|--verify-evidence) ;;
   *) echo "FIX486G_FAIL=UNKNOWN_MODE:$MODE" >&2; exit 64;;
 esac
-E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"
+E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"; STAT_CAPTURE="$ROOT/scripts/fix486g_statistical_capture.py"; STAT_EVAL="$ROOT/scripts/fix486g_statistical_proof.py"
 PG=${FIX486G_POSTGRES_PORT:-59432}; QP=${FIX486G_QDRANT_HTTP_PORT:-6733}; QG=${FIX486G_QDRANT_GRPC_PORT:-6734}; GP=${FIX486G_GRPC_PORT:-50588}; MP=${FIX486G_METRICS_PORT:-9058}
 DB="postgres://astravector:astravector@127.0.0.1:$PG/astravector"; Q="http://127.0.0.1:$QP"; ADDR="127.0.0.1:$GP"; COL=${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486g}
 MODEL_PATH=${ASTRAVECTOR_MODEL_PATH:-$WORKSPACE_ROOT/models/bge-m3/onnx/model.onnx}
@@ -27,7 +27,7 @@ if [[ "$MODE" == --cleanup-only || "$MODE" == --verify-evidence ]]; then
   [[ -d "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_NOT_FOUND:$E" >&2; exit 1; }
 else
   [[ ! -e "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_ALREADY_EXISTS:$E" >&2; exit 1; }
-  mkdir -p "$E"/{source,bank,config,model-tokenizer,infrastructure,ingestion,identity-map,canonical-audit,qdrant-audit,graph-audit,search,retrieve-context,graph-disabled/search,graph-disabled/retrieve-context,faults/mutations,comparisons/warm-search,comparisons/warm-retrieve-context,restart/search,restart/retrieve-context,statistical,cleanup,logs,metrics}
+  mkdir -p "$E"/{source,bank,config,model-tokenizer,infrastructure,ingestion,identity-map,canonical-audit,qdrant-audit,graph-audit,search,retrieve-context,graph-disabled/search,graph-disabled/retrieve-context,faults/mutations,comparisons/warm-search,comparisons/warm-retrieve-context,restart/search,restart/retrieve-context,statistical/concurrent,statistical/degradation,statistical/logs,cleanup,logs,metrics}
 fi
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -203,10 +203,11 @@ static_gates() {
   cargo test --locked --test fix486f_failure_semantics_contracts -- --nocapture &&
   cargo test --locked --test fix486g_graph_parent_contracts -- --nocapture &&
   cargo test --locked --test fix486g_runner_hardening_contracts -- --nocapture &&
+  cargo test --locked --test fix486g_statistical_capture_contracts -- --nocapture &&
   cargo test --locked --test fix486g_statistical_proof_contracts -- --nocapture &&
   cargo test --locked --test fix486g_visibility_recheck_contracts -- --nocapture &&
   python3 -m unittest -v tests/test_fix486g_proof.py &&
-  python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py
+  python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_capture.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py
 }
 start_infrastructure() {
   for port in "$PG" "$QP" "$QG" "$GP" "$MP"; do
@@ -449,6 +450,160 @@ cycle_fault() {
   delete_fault_edge "$edge" || return 1; delete_fault_edge "$self" || return 1
   [[ $rc -eq 0 ]]
 }
+
+STAT_EDGE_ONE=""
+STAT_EDGE_TWO=""
+STAT_FAULT_LABEL=""
+statistical_fault_activate() {
+  local setup=$1 label=$2 zone child parent_a1 source survivor target
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json")
+  child=$(jq -r .child_a3 "$E/faults/targets.json")
+  parent_a1=$(jq -r .parent_a1 "$E/faults/targets.json")
+  source=$(jq -r .child_a1 "$E/faults/targets.json")
+  survivor=$(jq -r .child_a3_alt "$E/faults/targets.json")
+  STAT_EDGE_ONE=""; STAT_EDGE_TWO=""; STAT_FAULT_LABEL="$label"
+  case "$setup" in
+    graph_wrong_parent_overlay)
+      STAT_EDGE_ONE=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      insert_fault_edge "$STAT_EDGE_ONE" "$source" "$survivor" REPAIRED_BY || return 1
+      run_exact_mutation "$label-activate" 1 \
+        "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a1' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+        "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a1'" 1
+      ;;
+    graph_cross_zone_overlay)
+      STAT_EDGE_ONE=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      target=$(jq -r '.rows[]|select(.logical_zone_id=="zone-b" and .logical_chunk_id=="child-a1-180")|.runtime_chunk_id' "$E/identity-map/logical-to-runtime.json" | head -1)
+      insert_fault_edge "$STAT_EDGE_ONE" "$source" "$target" REPAIRED_BY
+      ;;
+    graph_inactive_deleted_expired_overlay)
+      STAT_EDGE_ONE=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      insert_fault_edge "$STAT_EDGE_ONE" "$source" "$survivor" REPAIRED_BY || return 1
+      run_exact_mutation "$label-activate" 1 \
+        "UPDATE astravector.content_chunks_v004 SET expires_at=now()-interval '1 hour' WHERE access_zone_id='$zone' AND id='$child'" \
+        "SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND expires_at<now()" 1
+      ;;
+    graph_second_hop_overlay)
+      STAT_EDGE_ONE=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      source=$(jq -r .child_a3 "$E/faults/targets.json"); target=$(jq -r .child_a2 "$E/faults/targets.json")
+      insert_fault_edge "$STAT_EDGE_ONE" "$source" "$target" REPAIRED_BY
+      ;;
+    graph_cycle_overlay)
+      STAT_EDGE_ONE=$(python3 -c 'import uuid; print(uuid.uuid4())'); STAT_EDGE_TWO=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      source=$(jq -r .child_a3 "$E/faults/targets.json"); target=$(jq -r .child_a1 "$E/faults/targets.json")
+      insert_fault_edge "$STAT_EDGE_ONE" "$source" "$target" RELATED_TO || return 1
+      insert_fault_edge "$STAT_EDGE_TWO" "$target" "$target" RELATED_TO
+      ;;
+    *) return 64;;
+  esac
+}
+
+statistical_fault_restore() {
+  local setup=$1 label=$2 zone child parent baseline_expires expires_sql rc=0
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json"); child=$(jq -r .child_a3 "$E/faults/targets.json"); parent=$(jq -r .parent_a3 "$E/faults/targets.json")
+  baseline_expires=$(jq -r '.expires_at // empty' "$E/faults/baseline.json")
+  if [[ -n "$baseline_expires" ]]; then expires_sql="'$baseline_expires'::timestamptz"; else expires_sql=NULL; fi
+  case "$setup" in
+    graph_wrong_parent_overlay)
+      run_exact_mutation "$label-restore" 1 \
+        "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+        "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent'" 1 || rc=1
+      ;;
+    graph_inactive_deleted_expired_overlay)
+      run_exact_mutation "$label-restore" 1 \
+        "UPDATE astravector.content_chunks_v004 SET expires_at=$expires_sql WHERE access_zone_id='$zone' AND id='$child'" \
+        "SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND expires_at IS NOT DISTINCT FROM $expires_sql" 1 || rc=1
+      ;;
+  esac
+  [[ -z "$STAT_EDGE_ONE" ]] || delete_fault_edge "$STAT_EDGE_ONE" || rc=1
+  [[ -z "$STAT_EDGE_TWO" ]] || delete_fault_edge "$STAT_EDGE_TWO" || rc=1
+  STAT_EDGE_ONE=""; STAT_EDGE_TWO=""; STAT_FAULT_LABEL=""
+  [[ $rc -eq 0 ]]
+}
+
+statistical_degradation_evidence() {
+  local setup=$1 output=$2 class reason
+  case "$setup" in
+    graph_wrong_parent_overlay) class=WRONG_PARENT; reason=BINDING_INVALID;;
+    graph_cross_zone_overlay) class=CROSS_ZONE; reason=GRAPH_ENDPOINT_ZONE_MISMATCH;;
+    graph_inactive_deleted_expired_overlay) class=LIFECYCLE_INVALID; reason=VISIBILITY_REJECTED;;
+    graph_second_hop_overlay) class=HOP_LIMIT; reason=HOP_LIMIT_REJECTED;;
+    graph_cycle_overlay) class=CYCLE_OR_DUPLICATE; reason=DUPLICATE_GRAPH_EDGE;;
+    *) return 64;;
+  esac
+  jq -n --arg setup "$setup" --arg class "$class" --arg reason "$reason" --arg label "$STAT_FAULT_LABEL" \
+    --arg edge_one "$STAT_EDGE_ONE" --arg edge_two "$STAT_EDGE_TWO" --arg captured_at "$(timestamp)" \
+    '{schema_version:1,fault_setup:$setup,source:"phase-owned exact-row mutation activation plus independent final-context safety evaluation; classification is harness-controlled, not a response-native classifier",captured_at_utc:$captured_at,mutation:{label:$label,edge_ids:[$edge_one,$edge_two]|map(select(length>0))},degradation:{graph_failure_injected:true,graph_failure_detected:true,graph_failure_classification:$class,semantic_no_answer:false,partial_graph_evidence:true,reported_full_coverage:false,rejection_reasons:[$reason]}}' >"$output"
+}
+
+statistical_resource_evidence() {
+  jq -n --arg source_sha "$SOURCE_SHA" '{schema_version:1,source:"bounded static production query-plan formula; response diagnostics provide latency/candidate/hop values and these counters are formula evidence, not live request counters",source_sha:$source_sha,telemetry:{sql_statement_count:{enabled_value:6,disabled_value:4,upper_bound:6,formula_source:"bounded batch SQL stages: lexical, direct hydration, graph relation expansion, graph hydration, final visibility and optional support query; no per-candidate SQL"},qdrant_request_count:{value:1,upper_bound:1,formula_source:"one unified Qdrant query request per Search pipeline"},graph_relation_query_count:{enabled_value:1,disabled_value:0,upper_bound:1,formula_source:"one batch graph relation query iff graph expansion executes"},n_plus_one_sql_hydration:false}}' >"$E/statistical/resource-evidence.json"
+}
+
+statistical_capture_selection() {
+  local kind=$1 index=$2 output=$3; shift 3
+  python3 "$STAT_CAPTURE" --endpoint "$ADDR" --bank "$SUPPLEMENTAL" --identity-map "$E/identity-map/logical-to-runtime.json" \
+    --run-kind "$kind" --run-index "$index" --output "$output" --deadline-ms 30000 --jitter-allowance-ms 2000 \
+    --resource-evidence "$E/statistical/resource-evidence.json" "$@"
+}
+
+statistical_full_pass() {
+  local kind=$1 index=$2 output="$E/statistical/raw-observations.jsonl" setup label evidence rc=0 before after
+  before=$(wc -l <"$output" | tr -d ' ')
+  statistical_capture_selection "$kind" "$index" "$output" --exclude-faults || return 1
+  for setup in graph_wrong_parent_overlay graph_cross_zone_overlay graph_inactive_deleted_expired_overlay graph_second_hop_overlay graph_cycle_overlay; do
+    label="stat-$kind-$index-$setup"
+    evidence="$E/statistical/degradation/$label.json"
+    statistical_fault_activate "$setup" "$label" || return 1
+    statistical_degradation_evidence "$setup" "$evidence" || rc=1
+    [[ $rc -ne 0 ]] || statistical_capture_selection "$kind" "$index" "$output" --fault-setup "$setup" --degradation-evidence "$evidence" || rc=1
+    statistical_fault_restore "$setup" "$label" || rc=1
+    [[ $rc -eq 0 ]] || return 1
+  done
+  after=$(wc -l <"$output" | tr -d ' ')
+  [[ $((after-before)) -eq 142 ]]
+}
+
+statistical_concurrent_pair() {
+  local index=$1 setup=$2 entry=$3 pair label fault_query healthy_query fault_evidence healthy_evidence fault_output healthy_output fault_pid healthy_pid fault_rc=0 healthy_rc=0 restore_rc=0
+  pair=$(printf 'pair-%02d' "$index"); label="stat-$pair-$setup"
+  fault_query=$(jq -sr --arg setup "$setup" '[.[]|select(.fault_setup==$setup)][0].query_id' "$SUPPLEMENTAL/queries/graph-parent-queries-v1.jsonl")
+  case $((index%3)) in 1) healthy_query=g-pos-ru-01;; 2) healthy_query=g-pos-kz-01;; 0) healthy_query=g-pos-en-01;; esac
+  fault_evidence="$E/statistical/degradation/$label.json"; healthy_evidence="$E/statistical/degradation/$pair-healthy.json"
+  fault_output="$E/statistical/concurrent/$pair-fault.jsonl"; healthy_output="$E/statistical/concurrent/$pair-healthy.jsonl"
+  statistical_fault_activate "$setup" "$label" || return 1
+  statistical_degradation_evidence "$setup" "$fault_evidence" || return 1
+  jq -n --arg setup healthy_control --arg pair "$pair" '{schema_version:1,fault_setup:$setup,source:"healthy control executed concurrently with an active phase-owned Graph fault; affected=false remains subject to independent qrel evaluation",pair_id:$pair,degradation:{healthy_request_affected:false}}' >"$healthy_evidence"
+  python3 "$STAT_CAPTURE" --endpoint "$ADDR" --bank "$SUPPLEMENTAL" --identity-map "$E/identity-map/logical-to-runtime.json" --run-kind concurrent_fault --pair-id "$pair" --entry-point "$entry" --query-id "$fault_query" --output "$fault_output" --deadline-ms 30000 --jitter-allowance-ms 2000 --resource-evidence "$E/statistical/resource-evidence.json" --degradation-evidence "$fault_evidence" >"$E/statistical/logs/$pair-fault.log" 2>&1 & fault_pid=$!
+  python3 "$STAT_CAPTURE" --endpoint "$ADDR" --bank "$SUPPLEMENTAL" --identity-map "$E/identity-map/logical-to-runtime.json" --run-kind concurrent_healthy --pair-id "$pair" --entry-point "$entry" --query-id "$healthy_query" --output "$healthy_output" --deadline-ms 30000 --jitter-allowance-ms 2000 --resource-evidence "$E/statistical/resource-evidence.json" --degradation-evidence "$healthy_evidence" >"$E/statistical/logs/$pair-healthy.log" 2>&1 & healthy_pid=$!
+  wait "$fault_pid" || fault_rc=$?; wait "$healthy_pid" || healthy_rc=$?
+  statistical_fault_restore "$setup" "$label" || restore_rc=$?
+  [[ $fault_rc -eq 0 && $healthy_rc -eq 0 && $restore_rc -eq 0 ]] || return 1
+  cat "$fault_output" "$healthy_output" >>"$E/statistical/raw-observations.jsonl"
+}
+
+statistical_campaign() {
+  local index setup entry
+  : >"$E/statistical/raw-observations.jsonl"
+  python3 "$STAT_EVAL" plan --bank "$SUPPLEMENTAL" --output "$E/statistical/sample-plan.json" >/dev/null || return 1
+  statistical_resource_evidence || return 1
+  curl -fsS "http://127.0.0.1:$MP/metrics" >"$E/statistical/metrics-before.prom" || return 1
+  for index in 1 2 3; do statistical_full_pass warm "$index" || return 1; done
+  for index in 1 2; do
+    stop_runtime && start_runtime "stat-restart-$index" || return 1
+    statistical_full_pass restart "$index" || return 1
+  done
+  local setups=(graph_wrong_parent_overlay graph_cross_zone_overlay graph_inactive_deleted_expired_overlay graph_second_hop_overlay graph_cycle_overlay)
+  for index in $(seq 1 10); do
+    setup=${setups[$(((index-1)%5))]}
+    if ((index%2)); then entry=Search; else entry=RetrieveContext; fi
+    statistical_concurrent_pair "$index" "$setup" "$entry" || return 1
+  done
+  curl -fsS "http://127.0.0.1:$MP/metrics" >"$E/statistical/metrics-after.prom" || return 1
+  [[ $(wc -l <"$E/statistical/raw-observations.jsonl" | tr -d ' ') -eq 730 ]] || return 1
+  python3 "$STAT_EVAL" dry-validate --bank "$SUPPLEMENTAL" --raw-input "$E/statistical/raw-observations.jsonl" --identity-map "$E/identity-map/logical-to-runtime.json" --output "$E/statistical/raw-validation.json" >/dev/null || return 1
+  python3 "$STAT_EVAL" evaluate --bank "$SUPPLEMENTAL" --raw-input "$E/statistical/raw-observations.jsonl" --identity-map "$E/identity-map/logical-to-runtime.json" --output-dir "$E/statistical" >/dev/null || return 1
+  jq -e '.verdict=="FIX486G_STATISTICAL_QUALITY_PASS" and .sample_plan.raw_observation_count==730 and .sample_plan.full_pass_counts.warm==3 and .sample_plan.full_pass_counts.restart==2 and .sample_plan.concurrent_pair_count==10' "$E/statistical/statistical-report.json" >/dev/null
+}
 compare_initial() { python3 "$H" compare --left "$E/query-results.jsonl" --right "$E/query-results.jsonl" --parity --output "$E/comparisons/entry-point-parity.json" >/dev/null; }
 warm_repeat() { run_queries warm "$E/comparisons/warm-search" "$E/comparisons/warm-retrieve-context" "$E/comparisons/warm-query-results.jsonl" true && python3 "$H" compare --left "$E/query-results.jsonl" --right "$E/comparisons/warm-query-results.jsonl" --output "$E/comparisons/warm-repeat.json" >/dev/null; }
 restart_repeat() {
@@ -469,7 +624,7 @@ write_defects() {
   ]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
-  local required=(query-results.jsonl graph-disabled/results.jsonl graph-audit/graph-identity-chain.json graph-audit/graph-provenance-trace.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json cleanup/summary.json cleanup/restoration.json defect-register.json)
+  local required=(query-results.jsonl graph-disabled/results.jsonl graph-audit/graph-identity-chain.json graph-audit/graph-provenance-trace.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json statistical/sample-plan.json statistical/raw-observations.jsonl statistical/raw-validation.json statistical/statistical-report.json statistical/statistical-report.md statistical/per-query-results.jsonl statistical/per-slice-metrics.json statistical/latency-distribution.json statistical/safety-hard-gates.json statistical/confidence-intervals.json cleanup/summary.json cleanup/restoration.json defect-register.json)
   for path in "${required[@]}"; do [[ -s "$E/$path" ]] || return 1; done
   [[ $(wc -l <"$E/query-results.jsonl" | tr -d ' ') -eq 2 ]] &&
   [[ $(wc -l <"$E/graph-disabled/results.jsonl" | tr -d ' ') -eq 2 ]]
@@ -493,9 +648,9 @@ write_mode_result() {
 verify_contracts() {
   bash -n "$ROOT/scripts/fix486g-graph-parent-runtime-proof.sh" &&
   (cd "$ROOT" &&
-    cargo test --locked --test fix486g_graph_parent_contracts --test fix486g_runner_hardening_contracts --test fix486g_statistical_proof_contracts --test fix486g_visibility_recheck_contracts -- --nocapture &&
+    cargo test --locked --test fix486g_graph_parent_contracts --test fix486g_runner_hardening_contracts --test fix486g_statistical_capture_contracts --test fix486g_statistical_proof_contracts --test fix486g_visibility_recheck_contracts -- --nocapture &&
     python3 -m unittest -v tests/test_fix486g_proof.py &&
-    python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py)
+    python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_capture.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py)
 }
 verify_existing_evidence() {
   local verification
@@ -539,6 +694,8 @@ execute_all() {
   [[ "$ok" == true ]] && stage post-fault-canonical-audit canonical_audit || ok=false
   [[ "$ok" == true ]] && stage warm-repeatability warm_repeat || ok=false
   [[ "$ok" == true ]] && stage restart-repeatability restart_repeat || ok=false
+  [[ "$ok" == true ]] && stage statistical-campaign statistical_campaign || ok=false
+  [[ "$ok" == true ]] && stage post-statistical-canonical-audit canonical_audit || ok=false
   write_defects || ok=false
   if stage pre-teardown-fault-restoration restore_fault_state_before_teardown; then :; else ok=false; fi
   if cleanup; then record_stage_status cleanup PASS; else ok=false; record_stage_status cleanup FAIL CLEANUP_FAILED; fi

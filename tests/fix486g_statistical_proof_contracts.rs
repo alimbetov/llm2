@@ -139,6 +139,8 @@ fn observation(
         "entry_point": entry_point,
         "run_kind": run_kind,
         "latency_ms": 12.0,
+        "started_at_unix_ns": 1000000000,
+        "finished_at_unix_ns": 1012000000,
         "deadline_ms": 1000.0,
         "jitter_allowance_ms": 25.0,
         "telemetry": {

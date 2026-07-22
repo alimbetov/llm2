@@ -151,6 +151,28 @@ fn hop_limit_forbids_only_graph_derived_target_identity() {
 }
 
 #[test]
+fn official_runner_requires_the_complete_statistical_campaign() {
+    let runner = source(RUNNER);
+    require_all(
+        &runner,
+        &[
+            "statistical_campaign()",
+            "for index in 1 2 3; do statistical_full_pass warm",
+            "for index in 1 2; do",
+            "statistical_full_pass restart",
+            "for index in $(seq 1 10); do",
+            "statistical_concurrent_pair",
+            "-eq 730",
+            "FIX486G_STATISTICAL_QUALITY_PASS",
+            "stage statistical-campaign statistical_campaign",
+            "stage post-statistical-canonical-audit canonical_audit",
+            "statistical/raw-observations.jsonl",
+        ],
+        "FIX486G-RUNNER-STATISTICS-001",
+    );
+}
+
+#[test]
 fn signals_have_explicit_fail_closed_terminal_metadata() {
     let runner = source(RUNNER);
     require_all(

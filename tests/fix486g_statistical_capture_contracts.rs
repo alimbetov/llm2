@@ -101,7 +101,7 @@ fn base_command(fake: &Path, identity: &Path, output: &Path, call_log: &Path) ->
         .args(["--run-kind", "warm", "--run-index", "1"])
         .arg("--output")
         .arg(output)
-        .args(["--deadline-ms", "1000", "--grpcurl-bin"])
+        .args(["--deadline-ms", "10000", "--grpcurl-bin"])
         .arg(fake)
         .env("FIX486G_FAKE_CALL_LOG", call_log);
     command
@@ -217,4 +217,69 @@ fn missing_resource_evidence_fails_before_any_grpc_call() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("--resource-evidence"));
     assert!(!output.exists());
     assert!(!call_log.exists());
+}
+
+#[test]
+fn selected_query_capture_is_append_safe_and_reports_actual_cardinality() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = fake_grpcurl(temp.path());
+    let (identity, resource) = fixtures(temp.path());
+    let output = temp.path().join("capture.jsonl");
+    let call_log = temp.path().join("calls.log");
+
+    for query_id in ["g-pos-ru-01", "g-pos-kz-01"] {
+        let result = base_command(&fake, &identity, &output, &call_log)
+            .args(["--query-id", query_id, "--resource-evidence"])
+            .arg(&resource)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(summary["observations_appended"], 2);
+    }
+
+    let rows = jsonl(&output);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(fs::read_to_string(call_log).unwrap().lines().count(), 4);
+}
+
+#[test]
+fn concurrent_capture_requires_explicit_pair_and_degradation_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = fake_grpcurl(temp.path());
+    let (identity, resource) = fixtures(temp.path());
+    let output = temp.path().join("capture.jsonl");
+    let call_log = temp.path().join("calls.log");
+    let result = Command::new("python3")
+        .arg(SCRIPT)
+        .args(["--endpoint", "127.0.0.1:50588", "--bank", BANK])
+        .arg("--identity-map")
+        .arg(identity)
+        .args([
+            "--run-kind",
+            "concurrent_fault",
+            "--pair-id",
+            "pair-01",
+            "--entry-point",
+            "Search",
+            "--query-id",
+            "g-fault-wrong-parent-01",
+            "--deadline-ms",
+            "1000",
+            "--grpcurl-bin",
+        ])
+        .arg(fake)
+        .arg("--output")
+        .arg(output)
+        .arg("--resource-evidence")
+        .arg(resource)
+        .env("FIX486G_FAKE_CALL_LOG", call_log)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--degradation-evidence"));
 }

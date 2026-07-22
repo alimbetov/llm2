@@ -283,7 +283,14 @@ def telemetry_from_response(
     return telemetry, sources
 
 
-def request_for(query: dict[str, Any], entry_point: str, runtime_zone: str, run_kind: str, run_index: int, deadline_ms: int) -> dict[str, Any]:
+def request_for(
+    query: dict[str, Any],
+    entry_point: str,
+    runtime_zone: str,
+    run_kind: str,
+    run_identity: str,
+    deadline_ms: int,
+) -> dict[str, Any]:
     query_id = query["query_id"]
     question = query.get("question")
     max_contexts = query.get("max_contexts")
@@ -291,7 +298,7 @@ def request_for(query: dict[str, Any], entry_point: str, runtime_zone: str, run_
     graph_hops = query.get("graph_max_hops")
     if not isinstance(question, str) or not question or isinstance(max_contexts, bool) or not isinstance(max_contexts, int) or max_contexts < 1:
         fail("BANK_QUERY_INVALID", f"{query_id}: question and positive max_contexts are required")
-    correlation = f"fix486g-statistical-{run_kind}-{run_index}-{query_id}-{entry_point.lower()}"
+    correlation = f"fix486g-statistical-{run_kind}-{run_identity}-{query_id}-{entry_point.lower()}"
     if entry_point == "Search":
         return {
             "correlationId": correlation,
@@ -352,8 +359,9 @@ def invoke(
     request: dict[str, Any],
     deadline_ms: int,
     jitter_allowance_ms: int,
-) -> tuple[dict[str, Any], str, float]:
+) -> tuple[dict[str, Any], str, float, int, int]:
     encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+    started_unix_ns = time.time_ns()
     started = time.perf_counter_ns()
     try:
         completed = subprocess.run(
@@ -374,6 +382,7 @@ def invoke(
     except OSError as error:
         fail("GRPCURL_EXEC_FAILED", f"{grpcurl_bin}: {error}")
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+    finished_unix_ns = time.time_ns()
     if completed.returncode != 0:
         fail("GRPC_CALL_FAILED", f"{method}: exit={completed.returncode}: {completed.stderr.strip()}")
     try:
@@ -382,7 +391,17 @@ def invoke(
         fail("GRPC_RESPONSE_INVALID", f"{method}: {error}")
     if not isinstance(response, dict):
         fail("GRPC_RESPONSE_INVALID", f"{method}: JSON object required")
-    return response, completed.stderr, elapsed_ms
+    return response, completed.stderr, elapsed_ms, started_unix_ns, finished_unix_ns
+
+
+def observation_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("run_kind"),
+        row.get("run_index"),
+        row.get("pair_id"),
+        row.get("query_id"),
+        row.get("entry_point"),
+    )
 
 
 def append_rows(output: Path, rows: list[dict[str, Any]]) -> None:
@@ -392,9 +411,9 @@ def append_rows(output: Path, rows: list[dict[str, Any]]) -> None:
             existing = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
         except (OSError, json.JSONDecodeError) as error:
             fail("OUTPUT_INVALID", f"cannot validate existing JSONL {output}: {error}")
-        new_keys = {(row["run_kind"], row["run_index"], row["query_id"], row["entry_point"]) for row in rows}
+        new_keys = {observation_key(row) for row in rows}
         for row in existing:
-            key = (row.get("run_kind"), row.get("run_index"), row.get("query_id"), row.get("entry_point"))
+            key = observation_key(row)
             if key in new_keys:
                 fail("OUTPUT_DUPLICATE", f"observation already exists: {key}")
     with output.open("a", encoding="utf-8") as handle:
@@ -402,30 +421,78 @@ def append_rows(output: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-def capture(args: argparse.Namespace) -> None:
-    queries = read_queries(args.bank)
+def select_queries(queries: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    selected = queries
+    if args.query_id:
+        requested = set(args.query_id)
+        known = {query["query_id"] for query in queries}
+        unknown = sorted(requested - known)
+        if unknown:
+            fail("QUERY_SELECTION_INVALID", f"unknown query IDs: {unknown}")
+        selected = [query for query in queries if query["query_id"] in requested]
+    elif args.fault_setup:
+        selected = [query for query in queries if query.get("fault_setup") == args.fault_setup]
+    elif args.exclude_faults:
+        selected = [query for query in queries if not query.get("fault_setup")]
+    if not selected:
+        fail("QUERY_SELECTION_EMPTY", "selection produced no queries")
+    return selected
+
+
+def degradation_evidence(path: Path | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if path is None:
+        return None, None
+    payload = read_json(path, "DEGRADATION_EVIDENCE")
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        fail("DEGRADATION_EVIDENCE_INVALID", "schema_version=1 object required")
+    source = payload.get("source")
+    degradation = payload.get("degradation")
+    if not isinstance(source, str) or not source.strip() or not isinstance(degradation, dict):
+        fail("DEGRADATION_EVIDENCE_INVALID", "source and degradation object are required")
+    identity = {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "source": source.strip(),
+    }
+    return degradation, identity
+
+
+def capture(args: argparse.Namespace) -> int:
+    queries = select_queries(read_queries(args.bank), args)
     zones = identity_zones(args.identity_map)
     evidence, source, evidence_sha256 = load_resource_evidence(args.resource_evidence)
+    degradation, degradation_identity = degradation_evidence(args.degradation_evidence)
+    selected_faults = {query.get("fault_setup") for query in queries if query.get("fault_setup")}
+    if degradation is not None:
+        declared_setup = read_json(args.degradation_evidence, "DEGRADATION_EVIDENCE").get("fault_setup")
+        if selected_faults and selected_faults != {declared_setup}:
+            fail(
+                "DEGRADATION_EVIDENCE_MISMATCH",
+                f"selected fault setups {sorted(selected_faults)} do not match {declared_setup!r}",
+            )
     for query in queries:
         logical_zone = query.get("access_zone")
         if logical_zone not in zones:
             fail("IDENTITY_MAP_INCOMPLETE", f"no runtime access zone for {logical_zone!r}")
 
-    raw_root = args.output.parent / f"{args.output.stem}.raw" / args.run_kind / f"{args.run_index:03d}"
+    concurrent = args.run_kind.startswith("concurrent_")
+    run_identity = args.pair_id if concurrent else f"{args.run_index:03d}"
+    entry_points = (args.entry_point,) if args.entry_point else ENTRY_POINTS
+    raw_root = args.output.parent / f"{args.output.stem}.raw" / args.run_kind / run_identity
     rows: list[dict[str, Any]] = []
     for query in queries:
-        for entry_point in ENTRY_POINTS:
+        for entry_point in entry_points:
             request = request_for(
                 query,
                 entry_point,
                 zones[query["access_zone"]],
                 args.run_kind,
-                args.run_index,
+                run_identity,
                 args.deadline_ms,
             )
             call_dir = raw_root / query["query_id"] / entry_point.lower()
             write_json(call_dir / "request.json", request)
-            response, stderr, latency_ms = invoke(
+            response, stderr, latency_ms, started_unix_ns, finished_unix_ns = invoke(
                 args.grpcurl_bin,
                 args.endpoint,
                 METHODS[entry_point],
@@ -446,8 +513,9 @@ def capture(args: argparse.Namespace) -> None:
                 "query_id": query["query_id"],
                 "entry_point": entry_point,
                 "run_kind": args.run_kind,
-                "run_index": args.run_index,
                 "latency_ms": latency_ms,
+                "started_at_unix_ns": started_unix_ns,
+                "finished_at_unix_ns": finished_unix_ns,
                 "deadline_ms": args.deadline_ms,
                 "jitter_allowance_ms": float(args.jitter_allowance_ms),
                 "telemetry": telemetry,
@@ -462,13 +530,22 @@ def capture(args: argparse.Namespace) -> None:
                 "raw_response_path": str(call_dir / "response.json"),
                 "response": evaluator_response,
             }
-            if isinstance(response.get("degradation"), dict):
+            if concurrent:
+                row["pair_id"] = args.pair_id
+            else:
+                row["run_index"] = args.run_index
+            if degradation is not None:
+                row["degradation"] = degradation
+                row["degradation_evidence"] = degradation_identity
+            elif isinstance(response.get("degradation"), dict):
                 row["degradation"] = response["degradation"]
             rows.append(row)
 
-    if len(rows) != EXPECTED_QUERY_COUNT * len(ENTRY_POINTS):
-        fail("FULL_PASS_INCOMPLETE", f"expected 142 rows, got {len(rows)}")
+    expected = len(queries) * len(entry_points)
+    if len(rows) != expected:
+        fail("CAPTURE_INCOMPLETE", f"expected {expected} rows, got {len(rows)}")
     append_rows(args.output, rows)
+    return len(rows)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -476,30 +553,50 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--endpoint", required=True)
     result.add_argument("--bank", type=Path, required=True)
     result.add_argument("--identity-map", type=Path, required=True)
-    result.add_argument("--run-kind", choices=("warm", "restart"), required=True)
-    result.add_argument("--run-index", type=int, required=True)
+    result.add_argument(
+        "--run-kind",
+        choices=("warm", "restart", "concurrent_fault", "concurrent_healthy"),
+        required=True,
+    )
+    result.add_argument("--run-index", type=int)
+    result.add_argument("--pair-id")
+    result.add_argument("--entry-point", choices=ENTRY_POINTS)
+    selection = result.add_mutually_exclusive_group()
+    selection.add_argument("--query-id", action="append")
+    selection.add_argument("--fault-setup")
+    selection.add_argument("--exclude-faults", action="store_true")
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--deadline-ms", type=int, required=True)
     result.add_argument("--jitter-allowance-ms", type=int, default=1000)
     result.add_argument("--resource-evidence", type=Path, required=True)
+    result.add_argument("--degradation-evidence", type=Path)
     result.add_argument("--grpcurl-bin", default="grpcurl")
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
-    if args.run_index < 1:
-        fail("ARGUMENT_INVALID", "--run-index must be at least 1")
+    concurrent = args.run_kind.startswith("concurrent_")
+    if concurrent:
+        if not args.pair_id or args.run_index is not None or not args.entry_point or not args.query_id or len(args.query_id) != 1:
+            fail(
+                "ARGUMENT_INVALID",
+                "concurrent capture requires --pair-id, --entry-point and exactly one --query-id, without --run-index",
+            )
+        if args.degradation_evidence is None:
+            fail("ARGUMENT_INVALID", "concurrent capture requires --degradation-evidence")
+    elif args.run_index is None or args.run_index < 1 or args.pair_id is not None:
+        fail("ARGUMENT_INVALID", "warm/restart capture requires --run-index >= 1 and no --pair-id")
     if args.deadline_ms < 1:
         fail("ARGUMENT_INVALID", "--deadline-ms must be at least 1")
     if args.jitter_allowance_ms < 0:
         fail("ARGUMENT_INVALID", "--jitter-allowance-ms must be non-negative")
-    capture(args)
+    observation_count = capture(args)
     print(
         json.dumps(
             {
                 "status": "PASS",
-                "observations_appended": EXPECTED_QUERY_COUNT * len(ENTRY_POINTS),
+                "observations_appended": observation_count,
                 "output": str(args.output),
             },
             sort_keys=True,

@@ -252,6 +252,8 @@ def build_plan(bank_data: dict[str, Any], warm: int, restart: int, pairs: int) -
                 "run_kind=warm|restart|concurrent_fault|concurrent_healthy",
                 "run_index (warm/restart) or pair_id (concurrent)",
                 "latency_ms",
+                "started_at_unix_ns",
+                "finished_at_unix_ns",
                 "deadline_ms",
                 "jitter_allowance_ms",
                 "telemetry",
@@ -341,6 +343,10 @@ def validate_rows(rows: list[dict[str, Any]], bank_data: dict[str, Any]) -> dict
         if kind not in FULL_RUN_KINDS + CONCURRENT_KINDS:
             fail("RAW_RUN_KIND_INVALID", f"{source}: {kind}")
         finite_number(row.get("latency_ms"), f"{source}.latency_ms")
+        started_at = integer(row.get("started_at_unix_ns"), f"{source}.started_at_unix_ns", minimum=1)
+        finished_at = integer(row.get("finished_at_unix_ns"), f"{source}.finished_at_unix_ns", minimum=1)
+        if finished_at <= started_at:
+            fail("RAW_TIME_INTERVAL_INVALID", f"{source}: finished_at_unix_ns must be after start")
         finite_number(row.get("deadline_ms"), f"{source}.deadline_ms", minimum=1)
         finite_number(row.get("jitter_allowance_ms"), f"{source}.jitter_allowance_ms")
         if not isinstance(row.get("response"), dict):
@@ -393,6 +399,10 @@ def validate_rows(rows: list[dict[str, Any]], bank_data: dict[str, Any]) -> dict
         entries = {row["entry_point"] for row in pair}
         if len(pair) != 2 or kinds != set(CONCURRENT_KINDS) or len(entries) != 1:
             fail("CONCURRENT_PAIR_INVALID", f"{pair_id}: exactly one fault and one healthy row for one entry point")
+        overlap_start = max(row["started_at_unix_ns"] for row in pair)
+        overlap_end = min(row["finished_at_unix_ns"] for row in pair)
+        if overlap_start >= overlap_end:
+            fail("CONCURRENT_PAIR_NOT_OVERLAPPING", f"{pair_id}: request intervals do not overlap")
         fault = next(row for row in pair if row["run_kind"] == "concurrent_fault")
         if not bank_data["queries"][fault["query_id"]].get("fault_setup"):
             fail("CONCURRENT_PAIR_INVALID", f"{pair_id}: fault row must use an adversarial query")
