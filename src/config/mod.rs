@@ -3100,6 +3100,27 @@ mod query_processing_compatibility_tests {
     }
 
     #[test]
+    fn fix486f_profile_has_valid_bounded_query_deadlines() {
+        let mut merged = read_yaml_value("config/application.yaml").unwrap();
+        let profile = read_yaml_value("config/application-fix486f.yaml").unwrap();
+        merge_yaml(&mut merged, profile);
+        apply_query_processing_compatibility(&mut merged).unwrap();
+        let mut config: AppConfig = serde_yaml::from_value(merged).unwrap();
+        config.model.path = "Cargo.toml".into();
+        config.tokenizer.path = "Cargo.toml".into();
+
+        config.validate().unwrap();
+        assert_eq!(config.grpc.deadlines.query_ms, 15_000);
+        assert_eq!(config.search.query_processing.single_deadline_ms, 15_000);
+        assert_eq!(
+            config.search.query_processing.long_query_deadline_ms,
+            22_500
+        );
+        assert_eq!(config.search.query_processing.standard.deadline_ms, 22_500);
+        assert_eq!(config.search.query_processing.extended.deadline_ms, 33_750);
+    }
+
+    #[test]
     fn document_embedding_deadline_is_bounded_and_runtime_overridable() {
         let application = include_str!("../../config/application.yaml");
         assert!(application

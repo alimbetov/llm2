@@ -44,6 +44,11 @@ access_zone_registry:
 search:
   query_processing:
     long_query_deadline_ms: ${FIX486F_LONG_QUERY_DEADLINE_MS:-22500}
+    single_deadline_ms: ${FIX486F_SINGLE_QUERY_DEADLINE_MS:-15000}
+    standard:
+      deadline_ms: ${FIX486F_STANDARD_QUERY_DEADLINE_MS:-22500}
+    extended:
+      deadline_ms: ${FIX486F_EXTENDED_QUERY_DEADLINE_MS:-33750}
   hydration_rejection_reserve: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE:-4}
   hydration_rejection_reserve_max: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE_MAX:-16}
   hydration_failpoints:

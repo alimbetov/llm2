@@ -246,6 +246,9 @@ fn fault_runner_selects_target_from_array_and_uses_equivalent_candidate_windows(
         &[
             "query_ms: ${FIX486F_QUERY_DEADLINE_MS:-15000}",
             "long_query_deadline_ms: ${FIX486F_LONG_QUERY_DEADLINE_MS:-22500}",
+            "single_deadline_ms: ${FIX486F_SINGLE_QUERY_DEADLINE_MS:-15000}",
+            "deadline_ms: ${FIX486F_STANDARD_QUERY_DEADLINE_MS:-22500}",
+            "deadline_ms: ${FIX486F_EXTENDED_QUERY_DEADLINE_MS:-33750}",
         ],
         "FIX486F-RUNNER-DEADLINE-PARITY-001",
     );
