@@ -1978,13 +1978,25 @@ WITH seed_input AS (
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
       AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
+), ranked_edges AS (
+    SELECT edge_candidates.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY seed_access_zone_id, seed_chunk_id
+               ORDER BY CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+                        relation_score DESC,
+                        relation_rank NULLS LAST,
+                        edge_id
+           ) AS seed_edge_rank
+    FROM edge_candidates
 ), expanded AS (
     SELECT *
-    FROM edge_candidates
-    ORDER BY seed_rank ASC,
+    FROM ranked_edges
+    ORDER BY seed_edge_rank ASC,
+             seed_rank ASC,
              CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
              relation_score DESC,
-             relation_rank NULLS LAST
+             relation_rank NULLS LAST,
+             edge_id
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id, n.chunk_id,
@@ -2012,10 +2024,12 @@ WHERE n.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
   AND n.chunk_id <> expanded.seed_chunk_id
-ORDER BY expanded.seed_rank ASC,
+ORDER BY expanded.seed_edge_rank ASC,
+         expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
-         expanded.relation_rank NULLS LAST
+         expanded.relation_rank NULLS LAST,
+         expanded.edge_id
 LIMIT $4
 "#)
             .bind(access_zone_id)
@@ -2192,13 +2206,25 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
       AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
+), ranked_edges AS (
+    SELECT edge_candidates.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY seed_access_zone_id, seed_chunk_id
+               ORDER BY CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+                        relation_score DESC,
+                        relation_rank NULLS LAST,
+                        edge_id
+           ) AS seed_edge_rank
+    FROM edge_candidates
 ), expanded AS (
     SELECT *
-    FROM edge_candidates
-    ORDER BY seed_rank ASC,
+    FROM ranked_edges
+    ORDER BY seed_edge_rank ASC,
+             seed_rank ASC,
              CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
              relation_score DESC,
-             relation_rank NULLS LAST
+             relation_rank NULLS LAST,
+             edge_id
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id,
@@ -2232,10 +2258,12 @@ WHERE n.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
   AND n.chunk_id <> expanded.seed_chunk_id
-ORDER BY expanded.seed_rank ASC,
+ORDER BY expanded.seed_edge_rank ASC,
+         expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
-         expanded.relation_rank NULLS LAST
+         expanded.relation_rank NULLS LAST,
+         expanded.edge_id
 LIMIT $4
 "#)
             .bind(&seed_zone_ids)

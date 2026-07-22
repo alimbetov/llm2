@@ -346,6 +346,23 @@ fn graph_seed_selection_keeps_all_hydrated_children_of_each_admitted_parent_grou
 }
 
 #[test]
+fn graph_edge_budget_is_fair_across_selected_seed_children() {
+    let persistence = source("src/persistence/mod.rs");
+    for required in [
+        "ROW_NUMBER() OVER (",
+        "PARTITION BY seed_access_zone_id, seed_chunk_id",
+        "AS seed_edge_rank",
+        "ORDER BY seed_edge_rank ASC,",
+        "expanded.seed_edge_rank ASC",
+    ] {
+        assert!(
+            persistence.matches(required).count() >= 2,
+            "FIX486G-P0-005: both Graph expansion queries must contain {required:?}"
+        );
+    }
+}
+
+#[test]
 fn make_targets_share_one_official_execute_path() {
     let makefile = source("Makefile");
     assert!(makefile.contains("verify-fix486g-graph-parent-runtime:"));
