@@ -28,13 +28,16 @@ import sys
 
 request = json.load(sys.stdin)
 with open(os.environ["FIX486G_FAKE_CALL_LOG"], "a", encoding="utf-8") as log:
-    log.write(sys.argv[-1] + "\n")
+    log.write(" ".join(sys.argv[1:]) + "\n")
 graph = request.get("enableGraphExpansion", False)
+correlation = request.get("correlationId", request.get("context", {}).get("correlationId", ""))
+empty = "g-disabled-ru-02" in correlation
 diagnostics = {
     "postgresHydrationMs": "1",
-    "candidateCount": 4,
-    "finalCandidateCount": 2
+    "candidateCount": 4
 }
+if not empty and os.environ.get("FIX486G_FAKE_OMIT_FINAL_CANDIDATE") != "1":
+    diagnostics["finalCandidateCount"] = 2
 if graph and os.environ.get("FIX486G_FAKE_OMIT_GRAPH_DIAGNOSTICS") != "1":
     diagnostics.update({
         "graphExpansionDurationMs": "2",
@@ -46,12 +49,13 @@ context = {
     "parentChunkId": "runtime-parent",
     "metadata": {"graph_hop_distance": "1"} if graph else {}
 }
+contexts = [] if empty else [context]
 if sys.argv[-1].endswith("/Search"):
-    print(json.dumps({"results": [context], "diagnostics": diagnostics}))
+    print(json.dumps({"results": contexts, "diagnostics": diagnostics}))
 else:
     print(json.dumps({
-        "contexts": [context],
-        "summary": {"evidenceStatus": "EVIDENCE_STATUS_FOUND"},
+        "contexts": contexts,
+        "summary": {"evidenceStatus": "EVIDENCE_STATUS_NO_ANSWER" if empty else "EVIDENCE_STATUS_FOUND"},
         "diagnostics": diagnostics
     }))
 "#,
@@ -151,6 +155,7 @@ fn fake_grpcurl_full_pass_makes_exactly_142_calls_and_appends_complete_jsonl() {
 
     let calls = fs::read_to_string(call_log).unwrap();
     assert_eq!(calls.lines().count(), 142);
+    assert!(calls.lines().all(|line| line.contains("-emit-defaults")));
     assert_eq!(
         calls
             .lines()
@@ -211,6 +216,13 @@ fn fake_grpcurl_full_pass_makes_exactly_142_calls_and_appends_complete_jsonl() {
                 .unwrap()
                 .contains("proto3 JSON omits zero"));
         }
+        if row["query_id"] == "g-disabled-ru-02" {
+            assert_eq!(row["telemetry"]["candidates_after_validation"], 0);
+            assert!(row["telemetry_sources"]["candidates_after_validation"]
+                .as_str()
+                .unwrap()
+                .contains("empty response cardinality"));
+        }
     }
     assert_eq!(response_file_count(&temp.path().join("capture.raw")), 142);
 }
@@ -248,6 +260,27 @@ fn graph_enabled_missing_graph_diagnostics_fails_closed() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr)
         .contains("DIAGNOSTIC_INCOMPLETE: response diagnostics do not provide graph_expansion_ms"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn nonempty_response_missing_final_candidate_diagnostics_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = fake_grpcurl(temp.path());
+    let (identity, resource) = fixtures(temp.path());
+    let output = temp.path().join("capture.jsonl");
+    let call_log = temp.path().join("calls.log");
+    let result = base_command(&fake, &identity, &output, &call_log)
+        .args(["--query-id", "g-pos-ru-01", "--resource-evidence"])
+        .arg(resource)
+        .env("FIX486G_FAKE_OMIT_FINAL_CANDIDATE", "1")
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains(
+        "DIAGNOSTIC_INCOMPLETE: response diagnostics do not provide candidates_after_validation"
+    ));
     assert!(!output.exists());
 }
 

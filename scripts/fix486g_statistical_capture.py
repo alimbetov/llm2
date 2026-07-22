@@ -241,6 +241,7 @@ def telemetry_from_response(
         fail("BANK_QUERY_INVALID", f"{query.get('query_id')}: graph_max_hops must be non-negative")
     telemetry: dict[str, Any] = {}
     sources: dict[str, str] = {}
+    returned_context_count = len(response_contexts(response, entry_point))
     diagnostic_fields = {
         "graph_expansion_ms": ("graphExpansionDurationMs", "graph_expansion_duration_ms", "graphMs", "graph_ms"),
         "canonical_graph_hydration_ms": (
@@ -269,6 +270,12 @@ def telemetry_from_response(
                 telemetry[field] = 0
                 sources[field] = (
                     "bank query disables graph; proto3 JSON omits zero graph duration scalars"
+                )
+                continue
+            if field == "candidates_after_validation" and returned_context_count == 0:
+                telemetry[field] = 0
+                sources[field] = (
+                    "empty response cardinality; proto3 JSON omits zero final candidate scalar"
                 )
                 continue
             fail("DIAGNOSTIC_INCOMPLETE", f"response diagnostics do not provide {field}")
@@ -380,7 +387,7 @@ def invoke(
     started = time.perf_counter_ns()
     try:
         completed = subprocess.run(
-            [grpcurl_bin, "-plaintext", "-d", "@", endpoint, method],
+            [grpcurl_bin, "-plaintext", "-emit-defaults", "-d", "@", endpoint, method],
             input=encoded,
             text=True,
             capture_output=True,
