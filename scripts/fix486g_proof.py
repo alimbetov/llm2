@@ -23,6 +23,34 @@ REQUIRED_IDENTITY_FIELDS = {
     "runtime_document_id", "logical_version", "runtime_chunk_id",
     "chunk_role", "granularity", "source_block_id", "content_sha256",
 }
+GRAPH_PROVENANCE_FIELDS = (
+    "graph_seed_access_zone_id", "graph_seed_document_id",
+    "graph_seed_document_version", "graph_seed_chunk_id",
+    "graph_seed_parent_chunk_id", "graph_relation_id", "graph_edge_id",
+    "graph_relation_type", "graph_relation_score",
+    "graph_related_access_zone_id", "graph_related_document_id",
+    "graph_related_document_version", "graph_related_chunk_id",
+    "graph_related_parent_chunk_id", "graph_hop_distance",
+)
+MANDATORY_PASS_EVIDENCE = frozenset({
+    "aggregate.json", "stage-results.json", "query-results.jsonl",
+    "identity-map/logical-to-runtime.json", "graph-disabled/results.jsonl",
+    "graph-audit/graph-identity-chain.json",
+    "graph-audit/graph-provenance-trace.json",
+    "canonical-audit/integrity-summary.json",
+    "qdrant-audit/payload-consistency.json",
+    "comparisons/entry-point-parity.json", "comparisons/warm-repeat.json",
+    "restart/pre-post-restart.json", "cleanup/summary.json",
+    "statistical/statistical-report.json",
+    "statistical/statistical-report.md",
+    "statistical/per-query-results.jsonl",
+    "statistical/per-slice-metrics.json",
+    "statistical/latency-distribution.json",
+    "statistical/safety-hard-gates.json",
+    "statistical/confidence-intervals.json",
+    "defect-register.json",
+})
+MANIFEST_EXCLUDED_NAMES = {"manifest.json", "manifest-verification.json"}
 
 
 def fail(code: str, detail: str) -> None:
@@ -281,37 +309,47 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
             failures.append("GRAPH_DISABLED_FALSE_ATTRIBUTION")
     else:
         expected_children = set(qrel.get("expected_graph_child_any", []))
-        valid_graph = [
-            row for row in graph
-            if row["parent_logical"] == qrel.get("expected_graph_parent")
-            and (not expected_children or row["matched_logical"] in expected_children)
-        ]
-        if not valid_graph:
-            failures.append("GRAPH_PARENT_MISSING")
-        for row in valid_graph:
+        valid_graph = []
+        for row in graph:
+            context_valid = True
+            if row["parent_logical"] != qrel.get("expected_graph_parent"):
+                failures.append("GRAPH_WRONG_PARENT")
+                context_valid = False
+            if expected_children and row["matched_logical"] not in expected_children:
+                failures.append("GRAPH_UNEXPECTED_CHILD")
+                context_valid = False
             metadata = row["metadata"]
-            required_metadata = [
-                "graph_seed_access_zone_id", "graph_seed_document_id",
-                "graph_seed_document_version", "graph_seed_chunk_id",
-                "graph_seed_parent_chunk_id", "graph_relation_id", "graph_edge_id",
-                "graph_relation_type", "graph_relation_score",
-                "graph_related_access_zone_id", "graph_related_document_id",
-                "graph_related_document_version", "graph_related_chunk_id",
-                "graph_related_parent_chunk_id", "graph_hop_distance",
-            ]
-            if any(not metadata.get(field) for field in required_metadata):
+            if any(not metadata.get(field) for field in GRAPH_PROVENANCE_FIELDS):
                 failures.append("GRAPH_PROVENANCE_MISSING")
+                context_valid = False
             if metadata.get("graph_seed_parent_chunk_id") == metadata.get("graph_related_parent_chunk_id"):
                 failures.append("GRAPH_SEED_PARENT_REUSE")
+                context_valid = False
             if metadata.get("graph_related_chunk_id") != row["matched"] or metadata.get("graph_related_parent_chunk_id") != row["parent"]:
                 failures.append("GRAPH_WRONG_PARENT")
+                context_valid = False
             if metadata.get("graph_relation_type") not in qrel.get("required_graph_relation_any", []):
                 failures.append("GRAPH_EDGE_MISSING")
+                context_valid = False
             if metadata.get("graph_hop_distance") != "1":
                 failures.append("GRAPH_HOP_LIMIT_REJECTED")
+                context_valid = False
             if "ASTRA_RECONCILIATION_A3" not in row["parent_text"]:
                 failures.append("GRAPH_PARENT_CONTENT_INVALID")
+                context_valid = False
+            if context_valid:
+                valid_graph.append(row)
+        if not valid_graph:
+            failures.append("GRAPH_PARENT_MISSING")
     trace = trace_candidates(response)
+    protected_provenance = [{
+        "matched_chunk_id": row["matched"],
+        "parent_chunk_id": row["parent"],
+        **{field: row["metadata"].get(field) for field in GRAPH_PROVENANCE_FIELDS},
+    } for row in graph]
+    protected_provenance.sort(
+        key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
     return {
         "schema_version": 1,
         "phase": "fix486g",
@@ -331,6 +369,7 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
             "matched_chunk_id": row["matched"], "parent_chunk_id": row["parent"],
             "graph_origin": row["graph_origin"],
         } for row in normalized],
+        "protected_provenance": protected_provenance,
         "assertions": {
             "direct_parent_present": bool(direct),
             "graph_context_count": len(graph),
@@ -409,6 +448,10 @@ def stable_result(result: dict, include_entry_point: bool = True) -> dict:
             result.get("runtime_identity") or [],
             key=lambda row: (row.get("graph_origin", False), row.get("parent_chunk_id", ""), row.get("matched_chunk_id", "")),
         ),
+        "protected_provenance": sorted(
+            result.get("protected_provenance") or [],
+            key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        ),
         "assertions": assertions,
         "failure_codes": result.get("failure_codes"),
     }
@@ -435,7 +478,7 @@ def compare_result_sets(left_path: Path, right_path: Path, parity: bool) -> dict
 def build_manifest(run: Path) -> dict:
     records = []
     for path in sorted(run.rglob("*")):
-        if not path.is_file() or path.name in {"manifest.json", "manifest-verification.json"}:
+        if not path.is_file() or path.name in MANIFEST_EXCLUDED_NAMES:
             continue
         relative = path.relative_to(run).as_posix()
         records.append({
@@ -443,14 +486,11 @@ def build_manifest(run: Path) -> dict:
             "size_bytes": path.stat().st_size,
             "sha256": sha256(path),
             "artifact_class": relative.split("/", 1)[0],
-            "mandatory": relative in {
-                "aggregate.json", "stage-results.json", "query-results.jsonl",
-                "canonical-audit/integrity-summary.json", "qdrant-audit/payload-consistency.json",
-                "comparisons/entry-point-parity.json", "comparisons/warm-repeat.json",
-                "restart/pre-post-restart.json", "cleanup/summary.json", "defect-register.json",
-            },
+            "mandatory": relative in MANDATORY_PASS_EVIDENCE,
         })
-    canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    canonical = json.dumps(
+        records, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
     return {"schema_version": 1, "records": records,
             "file_count": len(records), "aggregate_sha256": hashlib.sha256(canonical).hexdigest()}
 
@@ -458,8 +498,25 @@ def build_manifest(run: Path) -> dict:
 def verify_manifest(run: Path, manifest: dict) -> dict:
     failures = []
     seen = set()
-    for record in manifest.get("records", []):
+    records = manifest.get("records", [])
+    if not isinstance(records, list):
+        records = []
+        failures.append("MANIFEST_RECORDS_INVALID")
+    if manifest.get("file_count") != len(records):
+        failures.append("MANIFEST_FILE_COUNT_MISMATCH")
+    canonical = json.dumps(
+        records, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    if manifest.get("aggregate_sha256") != hashlib.sha256(canonical).hexdigest():
+        failures.append("MANIFEST_AGGREGATE_MISMATCH")
+    for record in records:
+        if not isinstance(record, dict):
+            failures.append("MANIFEST_RECORD_INVALID")
+            continue
         relative = record.get("path", "")
+        if not isinstance(relative, str) or not relative:
+            failures.append("MANIFEST_PATH_INVALID")
+            continue
         if relative in seen:
             failures.append("DUPLICATE_MANIFEST_PATH")
             continue
@@ -474,21 +531,30 @@ def verify_manifest(run: Path, manifest: dict) -> dict:
             failures.append(f"MISSING:{relative}")
         elif sha256(path) != record.get("sha256") or path.stat().st_size != record.get("size_bytes"):
             failures.append(f"HASH_MISMATCH:{relative}")
-    mandatory = {record["path"] for record in manifest.get("records", []) if record.get("mandatory")}
-    expected = {
-        "aggregate.json", "stage-results.json", "query-results.jsonl",
-        "canonical-audit/integrity-summary.json", "qdrant-audit/payload-consistency.json",
-        "comparisons/entry-point-parity.json", "comparisons/warm-repeat.json",
-        "restart/pre-post-restart.json", "cleanup/summary.json", "defect-register.json",
+    actual_files = {
+        path.relative_to(run).as_posix()
+        for path in run.rglob("*")
+        if path.is_file() and path.name not in MANIFEST_EXCLUDED_NAMES
     }
-    expected_present = expected & seen
+    if seen != actual_files:
+        failures.append("MANIFEST_FILE_SET_MISMATCH")
+    mandatory = {
+        record.get("path") for record in records
+        if isinstance(record, dict) and record.get("mandatory")
+    }
+    expected_present = MANDATORY_PASS_EVIDENCE & seen
     if mandatory != expected_present:
         failures.append("MANDATORY_MANIFEST_SET_INVALID")
     aggregate_path = run / "aggregate.json"
     if aggregate_path.is_file():
         aggregate = read_json(aggregate_path)
-        if aggregate.get("verdict") == "FIX486_GRAPH_PARENT_RUNTIME_PROOF_PASS" and not expected <= seen:
-            failures.append("PASS_MANIFEST_MISSING_MANDATORY_ARTIFACT")
+        if aggregate.get("verdict") == "FIX486_GRAPH_PARENT_RUNTIME_PROOF_PASS":
+            if not MANDATORY_PASS_EVIDENCE <= seen:
+                failures.append("PASS_MANIFEST_MISSING_MANDATORY_ARTIFACT")
+            for relative in sorted(MANDATORY_PASS_EVIDENCE & seen):
+                path = run / relative
+                if path.is_file() and path.stat().st_size == 0:
+                    failures.append(f"EMPTY_MANDATORY_ARTIFACT:{relative}")
     return {"status": "PASS" if not failures else "FAIL", "failure_codes": failures,
             "verified_files": len(seen)}
 

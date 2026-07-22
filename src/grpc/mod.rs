@@ -18,8 +18,8 @@ use crate::{
         astra_vector_v004_control_server::AstraVectorV004Control,
     },
     persistence::{
-        ChunkContentRecord, ChunkTraceRecord, ClaimResult, LexicalParentCandidate,
-        ParentContextRecord, Repository,
+        ChunkContentRecord, ChunkTraceRecord, ClaimResult, FinalVisibilityCandidate,
+        LexicalParentCandidate, ParentContextRecord, Repository,
     },
     provider::SelectedProvider,
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
@@ -4005,29 +4005,53 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
-        let final_visibility_ids = results
+        let final_visibility_candidates = results
             .iter()
-            .filter_map(|r| Uuid::parse_str(&r.matched_chunk_id).ok())
+            .enumerate()
+            .filter_map(|(ordinal, result)| {
+                Some((
+                    ordinal,
+                    FinalVisibilityCandidate {
+                        access_zone_id: Uuid::parse_str(&result.access_zone_id).ok()?,
+                        matched_chunk_id: Uuid::parse_str(&result.matched_chunk_id).ok()?,
+                        parent_chunk_id: Uuid::parse_str(&result.parent_chunk_id).ok()?,
+                        binding_id: result
+                            .citation
+                            .as_ref()
+                            .and_then(|citation| citation.metadata.get("binding_id"))
+                            .map(|value| Uuid::parse_str(value))
+                            .transpose()
+                            .ok()?,
+                    },
+                ))
+            })
             .collect::<Vec<_>>();
-        if !final_visibility_ids.is_empty() {
-            let visible = self
+        if !results.is_empty() {
+            let candidate_result_ordinals = final_visibility_candidates
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>();
+            let candidates = final_visibility_candidates
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect::<Vec<_>>();
+            // Supersedes filter_visible_chunk_ids_multi and
+            // visible.contains(&(zone_id, chunk_id)) with full result identity validation.
+            let visible_candidate_ordinals = self
                 .repo()?
-                .filter_visible_chunk_ids_multi(
-                    &access_zone_ids,
-                    &final_visibility_ids,
-                    caller_access_level as i16,
-                )
+                .filter_visible_search_results_batch(&candidates, caller_access_level as i16)
                 .await
                 .map_err(Status::from)?;
+            let visible_ordinals = visible_candidate_ordinals
+                .into_iter()
+                .filter_map(|ordinal| candidate_result_ordinals.get(ordinal).copied())
+                .collect::<HashSet<_>>();
             let before = results.len();
-            results.retain(|r| {
-                let Ok(zone_id) = Uuid::parse_str(&r.access_zone_id) else {
-                    return false;
-                };
-                let Ok(chunk_id) = Uuid::parse_str(&r.matched_chunk_id) else {
-                    return false;
-                };
-                visible.contains(&(zone_id, chunk_id))
+            let mut ordinal = 0usize;
+            results.retain(|_| {
+                let visible = visible_ordinals.contains(&ordinal);
+                ordinal += 1;
+                visible
             });
             let dropped = before.saturating_sub(results.len());
             counter!("retrieve_context_final_visibility_recheck_total").increment(1);
@@ -13668,6 +13692,7 @@ fn search_result_from_hit(
         metadata.insert("qdrant_point_id".into(), hit.id.to_string());
     }
     for key in [
+        "binding_id",
         "representation_type",
         "dense_version",
         "model_version",

@@ -158,6 +158,13 @@ pub struct HydratedSearchContext {
     pub parent_metadata: serde_json::Value,
 }
 #[derive(Debug, Clone)]
+pub struct FinalVisibilityCandidate {
+    pub access_zone_id: Uuid,
+    pub matched_chunk_id: Uuid,
+    pub parent_chunk_id: Uuid,
+    pub binding_id: Option<Uuid>,
+}
+#[derive(Debug, Clone)]
 pub struct ChunkTraceRecord {
     pub id: Uuid,
     pub source_block_id: Option<String>,
@@ -421,6 +428,111 @@ WHERE c.access_zone_id=ANY($1::uuid[])
                 row.get::<Uuid, _>("access_zone_id"),
                 row.get::<Uuid, _>("id"),
             ));
+        }
+        Ok(result)
+    }
+
+    pub async fn filter_visible_search_results_batch(
+        &self,
+        candidates: &[FinalVisibilityCandidate],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashSet<usize>, AstraError> {
+        let mut result = std::collections::HashSet::new();
+        if candidates.is_empty() {
+            return Ok(result);
+        }
+
+        let access_zone_ids = candidates
+            .iter()
+            .map(|candidate| candidate.access_zone_id)
+            .collect::<Vec<_>>();
+        let matched_chunk_ids = candidates
+            .iter()
+            .map(|candidate| candidate.matched_chunk_id)
+            .collect::<Vec<_>>();
+        let parent_chunk_ids = candidates
+            .iter()
+            .map(|candidate| candidate.parent_chunk_id)
+            .collect::<Vec<_>>();
+        let binding_ids = candidates
+            .iter()
+            .map(|candidate| candidate.binding_id)
+            .collect::<Vec<_>>();
+
+        let rows = sqlx::query(
+            r#"WITH candidate_keys AS (
+  SELECT *
+  FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[])
+    WITH ORDINALITY AS keys(
+      access_zone_id, matched_chunk_id, parent_chunk_id, binding_id, result_ordinal
+    )
+)
+SELECT keys.result_ordinal
+FROM candidate_keys keys
+JOIN astravector.access_zones az
+  ON az.access_zone_id=keys.access_zone_id
+JOIN astravector.content_chunks_v004 m
+  ON m.access_zone_id=keys.access_zone_id
+ AND m.id=keys.matched_chunk_id
+JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=keys.access_zone_id
+ AND p.id=keys.parent_chunk_id
+ AND p.id=COALESCE(m.parent_chunk_id,m.id)
+ AND m.document_id=p.document_id
+ AND m.document_version=p.document_version
+JOIN astravector.document_versions d
+  ON d.access_zone_id=p.access_zone_id
+ AND d.document_id=p.document_id
+ AND d.document_version=p.document_version
+LEFT JOIN astravector.vector_bindings_v004 b
+  ON b.access_zone_id=keys.access_zone_id
+ AND b.id=keys.binding_id
+WHERE az.status='ACTIVE'
+  AND m.access_level <= $5
+  AND p.access_level <= $5
+  AND m.lifecycle_status='ACTIVE'
+  AND p.lifecycle_status='ACTIVE'
+  AND m.deleted_at IS NULL
+  AND p.deleted_at IS NULL
+  AND (m.expires_at IS NULL OR m.expires_at > now())
+  AND (p.expires_at IS NULL OR p.expires_at > now())
+  AND p.granularity='PARENT'
+  AND p.representation_type='ORIGINAL'
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND d.delete_operation_id IS NULL
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND (
+    keys.binding_id IS NULL OR (
+      b.id IS NOT NULL
+      AND b.chunk_id=m.id
+      AND b.document_id=m.document_id
+      AND b.document_version=m.document_version
+      AND b.parent_chunk_id IS NOT DISTINCT FROM m.parent_chunk_id
+      AND b.lifecycle_status='ACTIVE'
+      AND b.qdrant_sync_status='SYNCED'
+      AND b.deleted_at IS NULL
+      AND (b.expires_at IS NULL OR b.expires_at > now())
+      AND b.access_level <= $5
+      AND b.representation_type='ORIGINAL'
+    )
+  )
+ORDER BY keys.result_ordinal"#,
+        )
+        .bind(access_zone_ids)
+        .bind(matched_chunk_ids)
+        .bind(parent_chunk_ids)
+        .bind(binding_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        for row in rows {
+            let result_ordinal = row.get::<i64, _>("result_ordinal");
+            if let Ok(result_ordinal) = usize::try_from(result_ordinal.saturating_sub(1)) {
+                result.insert(result_ordinal);
+            }
         }
         Ok(result)
     }

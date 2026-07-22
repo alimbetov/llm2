@@ -7,6 +7,10 @@ MODE=${1:---execute-all}; shift || true
 RUN_ID=${FIX486G_RUN_ID:-fix486g-$(date -u +%Y%m%dT%H%M%SZ)}
 EVIDENCE_ROOT=${ASTRAVECTOR_EVIDENCE_ROOT:-$WORKSPACE_ROOT/astravector-evidence}
 while (($#)); do case "$1" in --run-id) RUN_ID=$2; shift 2;; --evidence-root) EVIDENCE_ROOT=$2; shift 2;; *) exit 64;; esac; done
+case "$MODE" in
+  --execute-all|--verify-identities|--verify-contracts|--cleanup-only|--verify-evidence) ;;
+  *) echo "FIX486G_FAIL=UNKNOWN_MODE:$MODE" >&2; exit 64;;
+esac
 E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"
 PG=${FIX486G_POSTGRES_PORT:-59432}; QP=${FIX486G_QDRANT_HTTP_PORT:-6733}; QG=${FIX486G_QDRANT_GRPC_PORT:-6734}; GP=${FIX486G_GRPC_PORT:-50588}; MP=${FIX486G_METRICS_PORT:-9058}
 DB="postgres://astravector:astravector@127.0.0.1:$PG/astravector"; Q="http://127.0.0.1:$QP"; ADDR="127.0.0.1:$GP"; COL=${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486g}
@@ -17,9 +21,14 @@ PROJECT=$(printf 'fix486g-%s' "$RUN_ID" | tr '[:upper:]_' '[:lower:]-' | tr -cd 
 PID=""; FINALIZED=false; SOURCE_SHA=$(git -C "$ROOT" rev-parse HEAD); BANK_SHA=cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff; SUPPLEMENTAL_SHA=af4fceb8e424fddecff4284e9cd8d1d68fb4db5c148f9b2aa585bb8497ac1649
 BRANCH=$(git -C "$ROOT" branch --show-current)
 REMOTE_SHA=$(git -C "$ROOT" rev-parse '@{upstream}' 2>/dev/null || true)
+EXPECTED_BRANCH=codex/fix486g-graph-parent-proof
 
-[[ ! -e "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_ALREADY_EXISTS:$E" >&2; exit 1; }
-mkdir -p "$E"/{source,bank,config,model-tokenizer,infrastructure,ingestion,identity-map,canonical-audit,qdrant-audit,graph-audit,search,retrieve-context,graph-disabled/search,graph-disabled/retrieve-context,faults,comparisons/warm-search,comparisons/warm-retrieve-context,restart/search,restart/retrieve-context,statistical,cleanup,logs,metrics}
+if [[ "$MODE" == --cleanup-only || "$MODE" == --verify-evidence ]]; then
+  [[ -d "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_NOT_FOUND:$E" >&2; exit 1; }
+else
+  [[ ! -e "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_ALREADY_EXISTS:$E" >&2; exit 1; }
+  mkdir -p "$E"/{source,bank,config,model-tokenizer,infrastructure,ingestion,identity-map,canonical-audit,qdrant-audit,graph-audit,search,retrieve-context,graph-disabled/search,graph-disabled/retrieve-context,faults/mutations,comparisons/warm-search,comparisons/warm-retrieve-context,restart/search,restart/retrieve-context,statistical,cleanup,logs,metrics}
+fi
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 compose() { FIX486G_POSTGRES_PORT=$PG FIX486G_QDRANT_HTTP_PORT=$QP FIX486G_QDRANT_GRPC_PORT=$QG docker compose -p "$PROJECT" -f "$ROOT/docker-compose.fix486g.yml" "$@"; }
@@ -37,6 +46,34 @@ record_stage_status() {
   jq -n --arg stage "$name" --arg status "$status" --arg now "$(timestamp)" --arg code "$code" \
     '{stage:$stage,status:$status,started_at:$now,finished_at:$now,exit_code:(if $status=="PASS" then 0 else 1 end),failure_codes:(if $code=="" then [] else [$code] end),artifacts:[]}' >"$E/logs/$name.stage.json"
 }
+verify_sql_count() {
+  local sql=$1 actual_rows
+  actual_rows=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM ($sql) verified_rows") || return 1
+  [[ "$actual_rows" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$actual_rows"
+}
+run_exact_mutation() {
+  local label=$1 expected_rows=$2 mutation_sql=$3 verification_sql=$4 expected_activation_rows=$5
+  local actual_rows=-1 activation_rows=-1 status=FAIL failure_code=""
+  mkdir -p "$E/faults/mutations"
+  if ! actual_rows=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "WITH affected AS ($mutation_sql RETURNING 1) SELECT count(*) FROM affected"); then
+    failure_code=FAULT_MUTATION_SQL_FAILED
+  elif [[ ! "$actual_rows" =~ ^[0-9]+$ || "$actual_rows" -ne "$expected_rows" ]]; then
+    failure_code=FAULT_MUTATION_ROW_COUNT_MISMATCH
+  elif ! activation_rows=$(verify_sql_count "$verification_sql"); then
+    failure_code=FAULT_ACTIVATION_QUERY_FAILED
+  elif [[ "$activation_rows" -ne "$expected_activation_rows" ]]; then
+    failure_code=FAULT_ACTIVATION_MISMATCH
+  else
+    status=PASS
+  fi
+  jq -n --arg label "$label" --arg status "$status" --arg failure_code "$failure_code" \
+    --argjson expected_rows "$expected_rows" --argjson actual_rows "$actual_rows" \
+    --argjson expected_activation_rows "$expected_activation_rows" --argjson activation_rows "$activation_rows" \
+    '{label:$label,status:$status,expected_rows:$expected_rows,actual_rows:$actual_rows,expected_activation_rows:$expected_activation_rows,activation_rows:$activation_rows,failure_codes:(if $failure_code=="" then [] else [$failure_code] end)}' \
+    >"$E/faults/mutations/$label.json"
+  [[ "$status" == PASS ]] || { echo "FIX486G_FAIL=$failure_code:$label" >&2; return 1; }
+}
 stop_runtime() {
   local pid=$PID
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -50,28 +87,86 @@ stop_runtime() {
   PID=""
   ! lsof -nP -iTCP:"$GP" -sTCP:LISTEN >/dev/null 2>&1
 }
+load_owned_runtime_pid() {
+  local candidate command
+  [[ -z "$PID" ]] || return 0
+  candidate=$(jq -rs 'map(select(.pid != null)) | last | .pid // empty' "$E"/config/runtime-*.json 2>/dev/null || true)
+  [[ "$candidate" =~ ^[0-9]+$ ]] || return 0
+  command=$(ps -p "$candidate" -o command= 2>/dev/null || true)
+  [[ "$command" == *"$ROOT/target/release/astravector-runtime"* ]] || return 0
+  PID=$candidate
+}
+restore_fault_state_before_teardown() {
+  local zone child parent baseline current purge_rows=-1 active_fault_rows=-1 restoration_matches_baseline=false status=PASS failure_code=""
+  if [[ ! -s "$E/faults/targets.json" || ! -s "$E/faults/baseline.json" ]]; then
+    jq -n '{status:"PASS",applicable:false,active_fault_rows:0,restoration_matches_baseline:true,failure_codes:[]}' >"$E/cleanup/restoration.json"
+    return 0
+  fi
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json"); child=$(jq -r .child_a3 "$E/faults/targets.json"); parent=$(jq -r .parent_a3 "$E/faults/targets.json")
+  if ! run_exact_mutation cleanup-binding-restore 1 \
+    "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent',qdrant_sync_status='SYNCED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent' AND qdrant_sync_status='SYNCED'" 1; then
+    status=FAIL; failure_code=FAULT_RESTORATION_FAILED
+  fi
+  if ! run_exact_mutation cleanup-lifecycle-restore 1 \
+    "UPDATE astravector.content_chunks_v004 SET lifecycle_status='ACTIVE',deleted_at=NULL,expires_at=NULL WHERE access_zone_id='$zone' AND id='$child'" \
+    "SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND lifecycle_status='ACTIVE' AND deleted_at IS NULL AND expires_at IS NULL" 1; then
+    status=FAIL; failure_code=FAULT_RESTORATION_FAILED
+  fi
+  purge_rows=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "WITH affected AS (DELETE FROM astravector.rag_graph_edges WHERE properties->>'quality_run_id'='$RUN_ID' AND properties->>'phase_fault'='true' RETURNING 1) SELECT count(*) FROM affected" 2>/dev/null || echo -1)
+  baseline=$(jq -c . "$E/faults/baseline.json")
+  current=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "SELECT json_build_object('binding_count',(SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'binding_parent_chunk_id',(SELECT parent_chunk_id::text FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'qdrant_sync_status',(SELECT qdrant_sync_status FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'chunk_count',(SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'lifecycle_status',(SELECT lifecycle_status FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'deleted_at',(SELECT deleted_at FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'expires_at',(SELECT expires_at FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'))" 2>/dev/null | jq -c . || echo '{}')
+  active_fault_rows=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "SELECT (SELECT count(*) FROM astravector.rag_graph_edges WHERE properties->>'quality_run_id'='$RUN_ID' AND properties->>'phase_fault'='true') + (SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND (parent_chunk_id IS DISTINCT FROM '$parent'::uuid OR qdrant_sync_status<>'SYNCED')) + (SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND (lifecycle_status<>'ACTIVE' OR deleted_at IS NOT NULL OR expires_at IS NOT NULL))" 2>/dev/null || echo -1)
+  [[ "$baseline" == "$current" ]] && restoration_matches_baseline=true
+  if [[ "$active_fault_rows" -ne 0 || "$restoration_matches_baseline" != true ]]; then status=FAIL; failure_code=FAULT_RESTORATION_FAILED; fi
+  jq -n --arg status "$status" --arg failure_code "$failure_code" --argjson purge_rows "$purge_rows" \
+    --argjson active_fault_rows "$active_fault_rows" --argjson restoration_matches_baseline "$restoration_matches_baseline" \
+    --argjson baseline "$baseline" --argjson current "$current" \
+    '{status:$status,applicable:true,purged_fault_edges:$purge_rows,active_fault_rows:$active_fault_rows,restoration_matches_baseline:$restoration_matches_baseline,baseline:$baseline,current:$current,failure_codes:(if $failure_code=="" then [] else [$failure_code] end)}' >"$E/cleanup/restoration.json"
+  [[ "$status" == PASS ]]
+}
 cleanup() {
-  local runtime_ok=true compose_ok=true
+  local restoration_ok=true runtime_ok=true compose_ok=true
+  restore_fault_state_before_teardown || restoration_ok=false
+  load_owned_runtime_pid
   stop_runtime || runtime_ok=false
   compose down -v >"$E/infrastructure/compose-down.log" 2>&1 || compose_ok=false
   local leaked_ports=0 leaked_processes=0
   for port in "$PG" "$QP" "$QG" "$GP" "$MP"; do lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && leaked_ports=$((leaked_ports+1)); done
   [[ "$runtime_ok" == true && -z "$PID" ]] || leaked_processes=1
-  jq -n --argjson leaked_ports "$leaked_ports" --argjson leaked_processes "$leaked_processes" --argjson runtime_ok "$runtime_ok" --argjson compose_ok "$compose_ok" \
-    '{status:(if $leaked_ports==0 and $leaked_processes==0 and $runtime_ok and $compose_ok then "PASS" else "FAIL" end),leaked_port_owners:$leaked_ports,leaked_runtime_processes:$leaked_processes,evidence_directory_preserved:true,runtime_stop_ok:$runtime_ok,compose_down_ok:$compose_ok}' >"$E/cleanup/summary.json"
+  jq -n --argjson leaked_ports "$leaked_ports" --argjson leaked_processes "$leaked_processes" --argjson restoration_ok "$restoration_ok" --argjson runtime_ok "$runtime_ok" --argjson compose_ok "$compose_ok" \
+    '{status:(if $leaked_ports==0 and $leaked_processes==0 and $restoration_ok and $runtime_ok and $compose_ok then "PASS" else "FAIL" end),leaked_port_owners:$leaked_ports,leaked_runtime_processes:$leaked_processes,evidence_directory_preserved:true,fault_restoration_ok:$restoration_ok,runtime_stop_ok:$runtime_ok,compose_down_ok:$compose_ok}' >"$E/cleanup/summary.json"
   jq -e '.status=="PASS"' "$E/cleanup/summary.json" >/dev/null
 }
 unexpected_exit() {
   local rc=$?
   if [[ "$FINALIZED" != true ]]; then
-    cleanup >/dev/null 2>&1 || true
-    jq -n --argjson exit_code "$rc" --arg finished "$(timestamp)" '{stage:"runner-terminal",status:"FAIL",exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
+    local cleanup_status=PASS
+    cleanup >/dev/null 2>&1 || cleanup_status=FAIL
+    [[ $rc -ne 0 ]] || rc=1
+    jq -n --argjson exit_code "$rc" --arg finished "$(timestamp)" --arg cleanup_status "$cleanup_status" \
+      '{stage:"runner-terminal",status:"FAIL",termination_reason:"UNEXPECTED_EXIT",signal:null,cleanup_attempted:true,cleanup_status:$cleanup_status,exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
   fi
 }
+handle_signal() {
+  local signal=$1 rc=$2 cleanup_status=PASS
+  trap - INT TERM HUP
+  set +e
+  cleanup >/dev/null 2>&1 || cleanup_status=FAIL
+  jq -n --arg signal "$signal" --argjson exit_code "$rc" --arg finished "$(timestamp)" --arg cleanup_status "$cleanup_status" \
+    '{stage:"runner-terminal",status:"FAIL",termination_reason:"SIGNAL",signal:$signal,cleanup_attempted:true,cleanup_status:$cleanup_status,exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
+  [[ ! -s "$E/bootstrap.json" ]] || { jq '.status="BLOCKED"' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"; }
+  FINALIZED=true
+  trap - EXIT
+  exit "$rc"
+}
 trap unexpected_exit EXIT
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+trap 'handle_signal HUP 129' HUP
 
 verify_identity() {
-  [[ -n "$BRANCH" && -n "$REMOTE_SHA" ]] &&
+  [[ "$BRANCH" == "$EXPECTED_BRANCH" && -n "$REMOTE_SHA" ]] &&
     [[ -z $(git -C "$ROOT" status --porcelain) ]] &&
     [[ $(git -C "$ROOT" rev-parse HEAD) == "$SOURCE_SHA" ]] &&
     [[ "$SOURCE_SHA" == "$REMOTE_SHA" ]]
@@ -104,7 +199,12 @@ static_gates() {
   cargo test --locked --test fix486c_frozen_bank_contracts -- --nocapture &&
   cargo test --locked --test fix486d_child_parent_contracts -- --nocapture &&
   cargo test --locked --test fix486f_failure_semantics_contracts -- --nocapture &&
-  cargo test --locked --test fix486g_graph_parent_contracts -- --nocapture
+  cargo test --locked --test fix486g_graph_parent_contracts -- --nocapture &&
+  cargo test --locked --test fix486g_runner_hardening_contracts -- --nocapture &&
+  cargo test --locked --test fix486g_statistical_proof_contracts -- --nocapture &&
+  cargo test --locked --test fix486g_visibility_recheck_contracts -- --nocapture &&
+  python3 -m unittest -v tests/test_fix486g_proof.py &&
+  python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py
 }
 start_infrastructure() {
   for port in "$PG" "$QP" "$QG" "$GP" "$MP"; do
@@ -172,7 +272,7 @@ identity_map() {
 }
 canonical_audit() {
   psql "$DB" -Atqf "$ROOT/scripts/fix486g-graph-parent-audit.sql" | jq . >"$E/canonical-audit/integrity-summary.json" || return 1
-  jq -e '.active_documents==2 and .active_versions==2 and .parent_chunks>0 and .child_chunks>0 and .bindings==.synced_bindings and .completed_outbox>=.synced_bindings and .dead_letters==0 and .quality_fixture_edges>0 and .repaired_by_edges>0 and ([.orphan_children,.cross_document_bindings,.cross_version_bindings,.cross_zone_bindings,.duplicate_chunk_ids,.duplicate_source_provenance_rows,.orphan_graph_endpoints,.cross_zone_graph_edges,.graph_self_edges]|all(.==0))' "$E/canonical-audit/integrity-summary.json" >/dev/null
+  jq -e '.active_documents==2 and .active_versions==2 and .parent_chunks>0 and .child_chunks>0 and .bindings==.synced_bindings and .completed_outbox>=.synced_bindings and .dead_letters==0 and .quality_fixture_edges>0 and .repaired_by_edges>0 and ([.orphan_children,.cross_document_bindings,.cross_version_bindings,.cross_zone_bindings,.duplicate_chunk_ids,.duplicate_source_provenance_rows,.orphan_graph_endpoints,.cross_zone_graph_edges,.duplicate_graph_relations,.duplicate_graph_relation_ids,.cross_document_graph_relations,.cross_version_graph_relations,.graph_self_edges]|all(.==0))' "$E/canonical-audit/integrity-summary.json" >/dev/null
 }
 graph_audit() {
   psql "$DB" -Atqc "SELECT coalesce(json_agg(x),'[]') FROM (SELECT e.edge_id::text,COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) relation_id,e.relation_type,e.relation_score,e.relation_source,e.properties->>'quality_run_id' quality_run_id,s.chunk_id::text seed_chunk_id,sp.id::text seed_parent_chunk_id,t.chunk_id::text related_chunk_id,tp.id::text related_parent_chunk_id,e.access_zone_id::text access_zone_id FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id JOIN astravector.content_chunks_v004 sc ON sc.access_zone_id=s.access_zone_id AND sc.id=s.chunk_id JOIN astravector.content_chunks_v004 sp ON sp.access_zone_id=sc.access_zone_id AND sp.id=COALESCE(sc.parent_chunk_id,sc.id) JOIN astravector.rag_graph_nodes_chunk t ON t.access_zone_id=e.access_zone_id AND t.node_id=e.target_node_id JOIN astravector.content_chunks_v004 tc ON tc.access_zone_id=t.access_zone_id AND tc.id=t.chunk_id JOIN astravector.content_chunks_v004 tp ON tp.access_zone_id=tc.access_zone_id AND tp.id=COALESCE(tc.parent_chunk_id,tc.id) WHERE e.relation_type='REPAIRED_BY' AND e.properties->>'quality_run_id'='$RUN_ID' ORDER BY e.relation_rank NULLS LAST,e.edge_id)x" >"$E/graph-audit/graph-provenance-trace.json" || return 1
@@ -236,7 +336,11 @@ prepare_fault_targets() {
     --arg child_a3_alt "$(jq -r '.rows[]|select(.logical_zone_id=="zone-a" and .logical_chunk_id=="child-a3-260")|.runtime_chunk_id' "$E/identity-map/logical-to-runtime.json" | head -1)" \
     --arg child_a2 "$(jq -r '.rows[]|select(.logical_zone_id=="zone-a" and .logical_chunk_id=="child-a2-180")|.runtime_chunk_id' "$E/identity-map/logical-to-runtime.json" | head -1)" \
     '{access_zone_id:$zone,document_id:$document,parent_a1:$parent_a1,parent_a3:$parent_a3,child_a1:$child_a1,child_a3:$child_a3,child_a3_alt:$child_a3_alt,child_a2:$child_a2}' >"$E/faults/targets.json"
-  jq -e 'all(.access_zone_id,.document_id,.parent_a1,.parent_a3,.child_a1,.child_a3,.child_a3_alt,.child_a2; test("^[0-9a-fA-F-]{36}$"))' "$E/faults/targets.json" >/dev/null
+  jq -e 'all(.access_zone_id,.document_id,.parent_a1,.parent_a3,.child_a1,.child_a3,.child_a3_alt,.child_a2; test("^[0-9a-fA-F-]{36}$"))' "$E/faults/targets.json" >/dev/null || return 1
+  local zone child parent
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json"); child=$(jq -r .child_a3 "$E/faults/targets.json"); parent=$(jq -r .parent_a3 "$E/faults/targets.json")
+  psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "SELECT json_build_object('binding_count',(SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'binding_parent_chunk_id',(SELECT parent_chunk_id::text FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'qdrant_sync_status',(SELECT qdrant_sync_status FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'chunk_count',(SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'lifecycle_status',(SELECT lifecycle_status FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'deleted_at',(SELECT deleted_at FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'expires_at',(SELECT expires_at FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'))" | jq . >"$E/faults/baseline.json" || return 1
+  jq -e --arg parent "$parent" '.binding_count==1 and .binding_parent_chunk_id==$parent and .qdrant_sync_status=="SYNCED" and .chunk_count==1 and .lifecycle_status=="ACTIVE" and .deleted_at==null and .expires_at==null' "$E/faults/baseline.json" >/dev/null
 }
 run_control_pair() {
   local name=$1 expectation=$2 forbidden=${3:-} dir="$E/faults/$1" id q z
@@ -254,49 +358,67 @@ run_control_pair() {
   python3 "$H" validate-control --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" --identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation" "${extra[@]}" --output "$dir/retrieve-context/result.json" >/dev/null
 }
 binding_parent_fault() {
-  local child parent_a1 parent_a3 source survivor edge rc=0
+  local zone child parent_a1 parent_a3 source survivor edge rc=0
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json")
   child=$(jq -r .child_a3 "$E/faults/targets.json"); parent_a1=$(jq -r .parent_a1 "$E/faults/targets.json"); parent_a3=$(jq -r .parent_a3 "$E/faults/targets.json")
   source=$(jq -r .child_a1 "$E/faults/targets.json"); survivor=$(jq -r .child_a3_alt "$E/faults/targets.json"); edge=$(python3 -c 'import uuid; print(uuid.uuid4())')
   insert_fault_edge "$edge" "$source" "$survivor" REPAIRED_BY || return 1
-  psql "$DB" -Atqc "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a1' WHERE chunk_id='$child' AND representation_type='ORIGINAL' RETURNING id,parent_chunk_id" >"$E/faults/wrong-parent-activation.txt" || return 1
+  run_exact_mutation wrong-parent-activate 1 \
+    "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a1' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a1'" 1 || return 1
   run_control_pair wrong-parent present "$child" || rc=$?
-  psql "$DB" -Atqc "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a3' WHERE chunk_id='$child' AND representation_type='ORIGINAL'" || return 1
+  run_exact_mutation wrong-parent-restore 1 \
+    "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a3' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a3'" 1 || return 1
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }
 binding_status_fault() {
-  local child source survivor edge rc=0
+  local zone child source survivor edge rc=0
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json")
   child=$(jq -r .child_a3 "$E/faults/targets.json")
   source=$(jq -r .child_a1 "$E/faults/targets.json"); survivor=$(jq -r .child_a3_alt "$E/faults/targets.json"); edge=$(python3 -c 'import uuid; print(uuid.uuid4())')
   insert_fault_edge "$edge" "$source" "$survivor" REPAIRED_BY || return 1
-  psql "$DB" -Atqc "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='FAILED' WHERE chunk_id='$child' AND representation_type='ORIGINAL' RETURNING id" >"$E/faults/binding-invalid-activation.txt" || return 1
+  run_exact_mutation binding-invalid-activate 1 \
+    "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='FAILED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND qdrant_sync_status='FAILED'" 1 || return 1
   run_control_pair binding-invalid present "$child" || rc=$?
-  psql "$DB" -Atqc "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED' WHERE chunk_id='$child' AND representation_type='ORIGINAL'" || return 1
+  run_exact_mutation binding-invalid-restore 1 \
+    "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND qdrant_sync_status='SYNCED'" 1 || return 1
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }
 lifecycle_fault() {
-  local kind=$1 child zone source survivor edge rc=0 restore=""
+  local kind=$1 child zone source survivor edge rc=0 activate_label="" restore_label="" activate_sql="" activate_verify="" restore_sql="" restore_verify=""
   child=$(jq -r .child_a3 "$E/faults/targets.json")
   zone=$(jq -r .access_zone_id "$E/faults/targets.json")
   source=$(jq -r .child_a1 "$E/faults/targets.json"); survivor=$(jq -r .child_a3_alt "$E/faults/targets.json"); edge=$(python3 -c 'import uuid; print(uuid.uuid4())')
   insert_fault_edge "$edge" "$source" "$survivor" REPAIRED_BY || return 1
   case "$kind" in
-    inactive) psql "$DB" -Atqc "UPDATE astravector.content_chunks_v004 SET lifecycle_status='INACTIVE' WHERE access_zone_id='$zone' AND id='$child' RETURNING id" >"$E/faults/$kind-activation.txt"; restore="lifecycle_status='ACTIVE'";;
-    deleted) psql "$DB" -Atqc "UPDATE astravector.content_chunks_v004 SET deleted_at=now() WHERE access_zone_id='$zone' AND id='$child' RETURNING id" >"$E/faults/$kind-activation.txt"; restore="deleted_at=NULL";;
-    expired) psql "$DB" -Atqc "UPDATE astravector.content_chunks_v004 SET expires_at=now()-interval '1 hour' WHERE access_zone_id='$zone' AND id='$child' RETURNING id" >"$E/faults/$kind-activation.txt"; restore="expires_at=NULL";;
+    inactive) activate_label=inactive-activate; restore_label=inactive-restore; activate_sql="UPDATE astravector.content_chunks_v004 SET lifecycle_status='INACTIVE' WHERE access_zone_id='$zone' AND id='$child'"; activate_verify="SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND lifecycle_status='INACTIVE'"; restore_sql="UPDATE astravector.content_chunks_v004 SET lifecycle_status='ACTIVE' WHERE access_zone_id='$zone' AND id='$child'"; restore_verify="SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND lifecycle_status='ACTIVE'";;
+    deleted) activate_label=deleted-activate; restore_label=deleted-restore; activate_sql="UPDATE astravector.content_chunks_v004 SET deleted_at=now() WHERE access_zone_id='$zone' AND id='$child'"; activate_verify="SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND deleted_at IS NOT NULL"; restore_sql="UPDATE astravector.content_chunks_v004 SET deleted_at=NULL WHERE access_zone_id='$zone' AND id='$child'"; restore_verify="SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND deleted_at IS NULL";;
+    expired) activate_label=expired-activate; restore_label=expired-restore; activate_sql="UPDATE astravector.content_chunks_v004 SET expires_at=now()-interval '1 hour' WHERE access_zone_id='$zone' AND id='$child'"; activate_verify="SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND expires_at<now()"; restore_sql="UPDATE astravector.content_chunks_v004 SET expires_at=NULL WHERE access_zone_id='$zone' AND id='$child'"; restore_verify="SELECT 1 FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND expires_at IS NULL";;
     *) return 64;;
   esac
+  run_exact_mutation "$activate_label" 1 "$activate_sql" "$activate_verify" 1 || return 1
   run_control_pair "$kind-target" present "$child" || rc=$?
-  psql "$DB" -Atqc "UPDATE astravector.content_chunks_v004 SET $restore WHERE access_zone_id='$zone' AND id='$child'" || return 1
+  run_exact_mutation "$restore_label" 1 "$restore_sql" "$restore_verify" 1 || return 1
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }
 insert_fault_edge() {
   local edge_id=$1 source_chunk=$2 target_chunk=$3 relation=$4
-  psql "$DB" -Atqc "INSERT INTO astravector.rag_graph_edges(access_zone_id,edge_id,source_node_type,source_node_id,target_node_type,target_node_id,relation_type,relation_score,relation_source,relation_rank,document_id,document_version,lifecycle_status,quarantined,properties) SELECT s.access_zone_id,'$edge_id','CHUNK',s.node_id,'CHUNK',t.node_id,'$relation',1.0,'PHASE_G_FAULT',0,c.document_id,c.document_version,'ACTIVE',false,jsonb_build_object('quality_run_id','$RUN_ID','phase_fault',true) FROM astravector.rag_graph_nodes_chunk s JOIN astravector.rag_graph_nodes_chunk t ON t.chunk_id='$target_chunk' JOIN astravector.content_chunks_v004 c ON c.access_zone_id=s.access_zone_id AND c.id=s.chunk_id WHERE s.chunk_id='$source_chunk' LIMIT 1 ON CONFLICT DO NOTHING" >/dev/null
+  run_exact_mutation "insert-fault-edge-$edge_id" 1 \
+    "INSERT INTO astravector.rag_graph_edges(access_zone_id,edge_id,source_node_type,source_node_id,target_node_type,target_node_id,relation_type,relation_score,relation_source,relation_rank,document_id,document_version,lifecycle_status,quarantined,properties) SELECT s.access_zone_id,'$edge_id','CHUNK',s.node_id,'CHUNK',t.node_id,'$relation',1.0,'PHASE_G_FAULT',0,c.document_id,c.document_version,'ACTIVE',false,jsonb_build_object('quality_run_id','$RUN_ID','phase_fault',true) FROM astravector.rag_graph_nodes_chunk s JOIN astravector.rag_graph_nodes_chunk t ON t.chunk_id='$target_chunk' JOIN astravector.content_chunks_v004 c ON c.access_zone_id=s.access_zone_id AND c.id=s.chunk_id WHERE s.chunk_id='$source_chunk' LIMIT 1 ON CONFLICT DO NOTHING" \
+    "SELECT 1 FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id WHERE e.edge_id='$edge_id' AND e.relation_type='$relation' AND e.lifecycle_status='ACTIVE' AND e.quarantined=false AND e.properties->>'quality_run_id'='$RUN_ID' AND e.properties->>'phase_fault'='true' AND s.chunk_id='$source_chunk' AND e.target_node_id=(SELECT t.node_id FROM astravector.rag_graph_nodes_chunk t WHERE t.chunk_id='$target_chunk' LIMIT 1)" 1
 }
-delete_fault_edge() { psql "$DB" -Atqc "DELETE FROM astravector.rag_graph_edges WHERE edge_id='$1'" >/dev/null; }
+delete_fault_edge() {
+  local edge_id=$1
+  run_exact_mutation "delete-fault-edge-$edge_id" 1 \
+    "DELETE FROM astravector.rag_graph_edges WHERE edge_id='$edge_id' AND properties->>'quality_run_id'='$RUN_ID' AND properties->>'phase_fault'='true'" \
+    "SELECT 1 FROM astravector.rag_graph_edges WHERE edge_id='$edge_id'" 0
+}
 cross_zone_fault() {
   local edge source target rc=0
   edge=$(python3 -c 'import uuid; print(uuid.uuid4())'); source=$(jq -r .child_a1 "$E/faults/targets.json"); target=$(jq -r '.rows[]|select(.logical_zone_id=="zone-b" and .logical_chunk_id=="child-a1-180")|.runtime_chunk_id' "$E/identity-map/logical-to-runtime.json" | head -1)
@@ -343,67 +465,126 @@ write_defects() {
   ]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
-  local required=(query-results.jsonl graph-disabled/results.jsonl graph-audit/graph-identity-chain.json graph-audit/graph-provenance-trace.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json cleanup/summary.json defect-register.json)
+  local required=(query-results.jsonl graph-disabled/results.jsonl graph-audit/graph-identity-chain.json graph-audit/graph-provenance-trace.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json cleanup/summary.json cleanup/restoration.json defect-register.json)
   for path in "${required[@]}"; do [[ -s "$E/$path" ]] || return 1; done
   [[ $(wc -l <"$E/query-results.jsonl" | tr -d ' ') -eq 2 ]] &&
   [[ $(wc -l <"$E/graph-disabled/results.jsonl" | tr -d ' ') -eq 2 ]]
 }
 
-jq -n --arg run_id "$RUN_ID" --arg mode "$MODE" --arg started "$(timestamp)" --arg branch "$BRANCH" --arg source "$SOURCE_SHA" --arg remote "$REMOTE_SHA" '{run_id:$run_id,mode:$mode,started_at_utc:$started,branch:$branch,source_sha:$source,remote_branch_sha:$remote,local_remote_equal:($source==$remote),status:"RUNNING"}' >"$E/bootstrap.json"
-jq -n --arg branch "$BRANCH" --arg source "$SOURCE_SHA" --arg remote "$REMOTE_SHA" '{branch:$branch,source_sha:$source,remote_branch_sha:$remote,local_remote_equal:($source==$remote)}' >"$E/source/git-identity.json"
+initialize_evidence() {
+  jq -n --arg run_id "$RUN_ID" --arg mode "$MODE" --arg started "$(timestamp)" --arg branch "$BRANCH" --arg source "$SOURCE_SHA" --arg remote "$REMOTE_SHA" '{run_id:$run_id,mode:$mode,started_at_utc:$started,branch:$branch,source_sha:$source,remote_branch_sha:$remote,local_remote_equal:($source==$remote),status:"RUNNING"}' >"$E/bootstrap.json"
+  jq -n --arg branch "$BRANCH" --arg source "$SOURCE_SHA" --arg remote "$REMOTE_SHA" '{branch:$branch,source_sha:$source,remote_branch_sha:$remote,local_remote_equal:($source==$remote)}' >"$E/source/git-identity.json"
+}
+write_mode_result() {
+  local status=$1 reason=$2 cleanup_attempted=${3:-false} cleanup_status=${4:-NOT_REQUIRED} exit_code=1
+  [[ "$status" == PASS ]] && exit_code=0
+  jq -n --arg mode "$MODE" --arg status "$status" --arg reason "$reason" --arg run_id "$RUN_ID" --arg source "$SOURCE_SHA" \
+    '{schema_version:1,phase:"fix486g",run_id:$run_id,mode:$mode,status:$status,reason:$reason,source_sha:$source,official_runtime_proof:false}' >"$E/final-result.json"
+  jq -n --arg status "$status" --arg reason "$reason" --argjson cleanup_attempted "$cleanup_attempted" --arg cleanup_status "$cleanup_status" --argjson exit_code "$exit_code" --arg finished "$(timestamp)" \
+    '{stage:"runner-terminal",status:$status,termination_reason:$reason,signal:null,cleanup_attempted:$cleanup_attempted,cleanup_status:$cleanup_status,exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
+  [[ ! -s "$E/bootstrap.json" ]] || { jq --arg status "$([[ "$status" == PASS ]] && echo COMPLETED || echo BLOCKED)" '.status=$status' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"; }
+  python3 "$H" manifest --run "$E" --output "$E/manifest.json" >/dev/null || return 1
+  python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$E/manifest-verification.json" >/dev/null
+}
+verify_contracts() {
+  bash -n "$ROOT/scripts/fix486g-graph-parent-runtime-proof.sh" &&
+  (cd "$ROOT" &&
+    cargo test --locked --test fix486g_graph_parent_contracts --test fix486g_runner_hardening_contracts --test fix486g_statistical_proof_contracts --test fix486g_visibility_recheck_contracts -- --nocapture &&
+    python3 -m unittest -v tests/test_fix486g_proof.py &&
+    python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py)
+}
+verify_existing_evidence() {
+  local verification
+  verification=$(mktemp "${TMPDIR:-/tmp}/fix486g-evidence-verification.XXXXXX.json") || return 1
+  if evidence_completeness && python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$verification" >/dev/null; then
+    jq -c --arg mode "$MODE" '. + {mode:$mode,official_runtime_proof:false}' "$verification"
+    rm -f "$verification"
+    return 0
+  fi
+  [[ ! -s "$verification" ]] || jq -c --arg mode "$MODE" '. + {mode:$mode,official_runtime_proof:false}' "$verification" >&2
+  rm -f "$verification"
+  return 1
+}
+execute_all() {
+  local ok=true verdict terminal_reason
+  set +e
+  stage identity-verification verify_identity || ok=false
+  [[ "$ok" == true ]] && stage bank-verification verify_bank || ok=false
+  [[ "$ok" == true ]] && stage model-tokenizer-verification verify_model_tokenizer || ok=false
+  [[ "$ok" == true ]] && stage static-gates static_gates || ok=false
+  [[ "$ok" == true ]] && stage infrastructure-start start_infrastructure || ok=false
+  [[ "$ok" == true ]] && stage migrations migrate_and_build || ok=false
+  [[ "$ok" == true ]] && stage runtime-start start_runtime initial || ok=false
+  [[ "$ok" == true ]] && stage production-ingestion ingest || ok=false
+  [[ "$ok" == true ]] && stage identity-map identity_map || ok=false
+  [[ "$ok" == true ]] && stage canonical-audit canonical_audit || ok=false
+  [[ "$ok" == true ]] && stage qdrant-audit qdrant_audit || ok=false
+  [[ "$ok" == true ]] && stage graph-audit graph_audit || ok=false
+  [[ "$ok" == true ]] && stage graph-disabled-control graph_disabled_control || ok=false
+  if [[ "$ok" == true ]] && stage primary-query-proof run_queries initial "$E/search" "$E/retrieve-context" "$E/query-results.jsonl" true; then record_stage_status search-proof PASS; record_stage_status retrieve-context-proof PASS; else ok=false; record_stage_status search-proof FAIL QUERY_PROOF_FAILED; record_stage_status retrieve-context-proof FAIL QUERY_PROOF_FAILED; fi
+  [[ "$ok" == true ]] && stage entry-point-comparison compare_initial || ok=false
+  [[ "$ok" == true ]] && stage fault-target-preparation prepare_fault_targets || ok=false
+  [[ "$ok" == true ]] && stage wrong-parent-fault binding_parent_fault || ok=false
+  [[ "$ok" == true ]] && stage binding-invalid-fault binding_status_fault || ok=false
+  [[ "$ok" == true ]] && stage inactive-target-fault lifecycle_fault inactive || ok=false
+  [[ "$ok" == true ]] && stage deleted-target-fault lifecycle_fault deleted || ok=false
+  [[ "$ok" == true ]] && stage expired-target-fault lifecycle_fault expired || ok=false
+  [[ "$ok" == true ]] && stage cross-zone-fault cross_zone_fault || ok=false
+  [[ "$ok" == true ]] && stage hop-limit-control hop_limit_fault || ok=false
+  [[ "$ok" == true ]] && stage cycle-control cycle_fault || ok=false
+  [[ "$ok" == true ]] && stage post-fault-canonical-audit canonical_audit || ok=false
+  [[ "$ok" == true ]] && stage warm-repeatability warm_repeat || ok=false
+  [[ "$ok" == true ]] && stage restart-repeatability restart_repeat || ok=false
+  write_defects || ok=false
+  if stage pre-teardown-fault-restoration restore_fault_state_before_teardown; then :; else ok=false; fi
+  if cleanup; then record_stage_status cleanup PASS; else ok=false; record_stage_status cleanup FAIL CLEANUP_FAILED; fi
+  if evidence_completeness; then record_stage_status evidence-completeness PASS; else ok=false; record_stage_status evidence-completeness FAIL EVIDENCE_INCOMPLETE; fi
+  record_stage_status final-verdict "$([[ "$ok" == true ]] && echo PASS || echo FAIL)" "$([[ "$ok" == true ]] && echo '' || echo MANDATORY_STAGE_FAILED)"
+  jq -s --arg run_id "$RUN_ID" --arg source "$SOURCE_SHA" --arg bank "$BANK_SHA" --arg verdict "$([[ "$ok" == true ]] && echo FIX486_GRAPH_PARENT_RUNTIME_PROOF_PASS || echo FIX486_GRAPH_PARENT_RUNTIME_PROOF_BLOCKED)" '{schema_version:1,phase:"fix486g",run_id:$run_id,source_sha:$source,bank_version:"1.0.0",bank_aggregate_sha256:$bank,stages:.,verdict:$verdict}' "$E"/logs/*.stage.json >"$E/stage-results.json"
+  python3 "$H" aggregate --run "$E" --output "$E/aggregate.json" >/dev/null || ok=false
+  terminal_reason=$([[ "$ok" == true ]] && echo COMPLETED || echo MANDATORY_STAGE_FAILED)
+  jq -n --argjson exit_code "$([[ "$ok" == true ]] && echo 0 || echo 1)" --arg reason "$terminal_reason" --arg finished "$(timestamp)" '{stage:"runner-terminal",status:(if $exit_code==0 then "PASS" else "FAIL" end),termination_reason:$reason,signal:null,cleanup_attempted:true,cleanup_status:"COMPLETED",exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
+  jq --arg status "$([[ "$ok" == true ]] && echo COMPLETED || echo BLOCKED)" '.status=$status' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"
+  python3 "$H" manifest --run "$E" --output "$E/manifest.json" >/dev/null || ok=false
+  if ! python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$E/manifest-verification.json" >/dev/null; then
+    ok=false
+    record_stage_status final-verdict FAIL MANIFEST_INTEGRITY_FAILED
+    jq -s --arg run_id "$RUN_ID" --arg source "$SOURCE_SHA" --arg bank "$BANK_SHA" \
+      '{schema_version:1,phase:"fix486g",run_id:$run_id,source_sha:$source,bank_version:"1.0.0",bank_aggregate_sha256:$bank,stages:.,verdict:"FIX486_GRAPH_PARENT_RUNTIME_PROOF_BLOCKED"}' \
+      "$E"/logs/*.stage.json >"$E/stage-results.json"
+    python3 "$H" aggregate --run "$E" --output "$E/aggregate.json" >/dev/null || true
+    jq -n --arg finished "$(timestamp)" '{stage:"runner-terminal",status:"FAIL",termination_reason:"MANIFEST_INTEGRITY_FAILED",signal:null,cleanup_attempted:true,cleanup_status:"COMPLETED",exit_code:1,finished_at_utc:$finished}' >"$E/terminal-result.json"
+    jq '.status="BLOCKED"' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"
+    python3 "$H" manifest --run "$E" --output "$E/manifest.json" >/dev/null
+    python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$E/manifest-verification.json" >/dev/null || true
+  fi
+  FINALIZED=true
+  trap - EXIT INT TERM HUP
+  verdict=$(jq -r .verdict "$E/aggregate.json")
+  echo "$verdict"
+  [[ "$ok" == true && "$verdict" == FIX486_GRAPH_PARENT_RUNTIME_PROOF_PASS ]]
+}
 
-ok=true
-[[ "$MODE" == --execute-all ]] || ok=false
-stage identity-verification verify_identity || ok=false
-[[ "$ok" == true ]] && stage bank-verification verify_bank || ok=false
-[[ "$ok" == true ]] && stage model-tokenizer-verification verify_model_tokenizer || ok=false
-[[ "$ok" == true ]] && stage static-gates static_gates || ok=false
-[[ "$ok" == true ]] && stage infrastructure-start start_infrastructure || ok=false
-[[ "$ok" == true ]] && stage migrations migrate_and_build || ok=false
-[[ "$ok" == true ]] && stage runtime-start start_runtime initial || ok=false
-[[ "$ok" == true ]] && stage production-ingestion ingest || ok=false
-[[ "$ok" == true ]] && stage identity-map identity_map || ok=false
-[[ "$ok" == true ]] && stage canonical-audit canonical_audit || ok=false
-[[ "$ok" == true ]] && stage qdrant-audit qdrant_audit || ok=false
-[[ "$ok" == true ]] && stage graph-audit graph_audit || ok=false
-[[ "$ok" == true ]] && stage graph-disabled-control graph_disabled_control || ok=false
-if [[ "$ok" == true ]] && stage primary-query-proof run_queries initial "$E/search" "$E/retrieve-context" "$E/query-results.jsonl" true; then record_stage_status search-proof PASS; record_stage_status retrieve-context-proof PASS; else ok=false; record_stage_status search-proof FAIL QUERY_PROOF_FAILED; record_stage_status retrieve-context-proof FAIL QUERY_PROOF_FAILED; fi
-[[ "$ok" == true ]] && stage entry-point-comparison compare_initial || ok=false
-[[ "$ok" == true ]] && stage fault-target-preparation prepare_fault_targets || ok=false
-[[ "$ok" == true ]] && stage wrong-parent-fault binding_parent_fault || ok=false
-[[ "$ok" == true ]] && stage binding-invalid-fault binding_status_fault || ok=false
-[[ "$ok" == true ]] && stage inactive-target-fault lifecycle_fault inactive || ok=false
-[[ "$ok" == true ]] && stage deleted-target-fault lifecycle_fault deleted || ok=false
-[[ "$ok" == true ]] && stage expired-target-fault lifecycle_fault expired || ok=false
-[[ "$ok" == true ]] && stage cross-zone-fault cross_zone_fault || ok=false
-[[ "$ok" == true ]] && stage hop-limit-control hop_limit_fault || ok=false
-[[ "$ok" == true ]] && stage cycle-control cycle_fault || ok=false
-[[ "$ok" == true ]] && stage post-fault-canonical-audit canonical_audit || ok=false
-[[ "$ok" == true ]] && stage warm-repeatability warm_repeat || ok=false
-[[ "$ok" == true ]] && stage restart-repeatability restart_repeat || ok=false
-write_defects
-if cleanup; then record_stage_status cleanup PASS; else ok=false; record_stage_status cleanup FAIL CLEANUP_FAILED; fi
-if evidence_completeness; then record_stage_status evidence-completeness PASS; else ok=false; record_stage_status evidence-completeness FAIL EVIDENCE_INCOMPLETE; fi
-record_stage_status final-verdict "$([[ "$ok" == true ]] && echo PASS || echo FAIL)" "$([[ "$ok" == true ]] && echo '' || echo MANDATORY_STAGE_FAILED)"
-jq -s --arg run_id "$RUN_ID" --arg source "$SOURCE_SHA" --arg bank "$BANK_SHA" --arg verdict "$([[ "$ok" == true ]] && echo FIX486_GRAPH_PARENT_RUNTIME_PROOF_PASS || echo FIX486_GRAPH_PARENT_RUNTIME_PROOF_BLOCKED)" '{schema_version:1,phase:"fix486g",run_id:$run_id,source_sha:$source,bank_version:"1.0.0",bank_aggregate_sha256:$bank,stages:.,verdict:$verdict}' "$E"/logs/*.stage.json >"$E/stage-results.json"
-python3 "$H" aggregate --run "$E" --output "$E/aggregate.json" >/dev/null || ok=false
-jq -n --argjson exit_code "$([[ "$ok" == true ]] && echo 0 || echo 1)" --arg finished "$(timestamp)" '{stage:"runner-terminal",status:(if $exit_code==0 then "PASS" else "FAIL" end),exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
-jq --arg status "$([[ "$ok" == true ]] && echo COMPLETED || echo BLOCKED)" '.status=$status' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"
-python3 "$H" manifest --run "$E" --output "$E/manifest.json" >/dev/null
-if ! python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$E/manifest-verification.json" >/dev/null; then
-  ok=false
-  record_stage_status final-verdict FAIL MANIFEST_INTEGRITY_FAILED
-  jq -s --arg run_id "$RUN_ID" --arg source "$SOURCE_SHA" --arg bank "$BANK_SHA" \
-    '{schema_version:1,phase:"fix486g",run_id:$run_id,source_sha:$source,bank_version:"1.0.0",bank_aggregate_sha256:$bank,stages:.,verdict:"FIX486_GRAPH_PARENT_RUNTIME_PROOF_BLOCKED"}' \
-    "$E"/logs/*.stage.json >"$E/stage-results.json"
-  python3 "$H" aggregate --run "$E" --output "$E/aggregate.json" >/dev/null || true
-  jq -n --arg finished "$(timestamp)" '{stage:"runner-terminal",status:"FAIL",exit_code:1,finished_at_utc:$finished}' >"$E/terminal-result.json"
-  jq '.status="BLOCKED"' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"
-  python3 "$H" manifest --run "$E" --output "$E/manifest.json" >/dev/null
-  python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$E/manifest-verification.json" >/dev/null || true
-fi
-FINALIZED=true
-trap - EXIT
-verdict=$(jq -r .verdict "$E/aggregate.json")
-echo "$verdict"
-[[ "$ok" == true && "$verdict" == FIX486_GRAPH_PARENT_RUNTIME_PROOF_PASS ]]
+case "$MODE" in
+  --verify-evidence)
+    if verify_existing_evidence; then FINALIZED=true; trap - EXIT INT TERM HUP; exit 0; else FINALIZED=true; trap - EXIT INT TERM HUP; exit 1; fi
+    ;;
+  --cleanup-only)
+    if cleanup; then write_mode_result PASS CLEANUP_ONLY_COMPLETED true PASS; rc=$?; else write_mode_result BLOCKED CLEANUP_ONLY_FAILED true FAIL; rc=1; fi
+    FINALIZED=true; trap - EXIT INT TERM HUP; exit "$rc"
+    ;;
+  --verify-identities)
+    initialize_evidence
+    if stage identity-verification verify_identity && stage bank-verification verify_bank && stage model-tokenizer-verification verify_model_tokenizer; then write_mode_result PASS IDENTITIES_VERIFIED; rc=$?; else write_mode_result BLOCKED IDENTITY_VERIFICATION_FAILED; rc=1; fi
+    FINALIZED=true; trap - EXIT INT TERM HUP; exit "$rc"
+    ;;
+  --verify-contracts)
+    initialize_evidence
+    if stage contract-verification verify_contracts; then write_mode_result PASS CONTRACTS_VERIFIED; rc=$?; else write_mode_result BLOCKED CONTRACT_VERIFICATION_FAILED; rc=1; fi
+    FINALIZED=true; trap - EXIT INT TERM HUP; exit "$rc"
+    ;;
+  --execute-all)
+    initialize_evidence
+    execute_all
+    ;;
+esac
