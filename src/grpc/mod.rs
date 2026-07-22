@@ -11835,9 +11835,9 @@ fn is_strong_lexical_candidate(result: &pb::SearchResultV004) -> bool {
 }
 
 fn graph_seed_chunk_id(result: &pb::SearchResultV004) -> Option<Uuid> {
-    Uuid::parse_str(&result.parent_chunk_id)
+    Uuid::parse_str(&result.matched_chunk_id)
         .ok()
-        .or_else(|| Uuid::parse_str(&result.matched_chunk_id).ok())
+        .or_else(|| Uuid::parse_str(&result.parent_chunk_id).ok())
 }
 
 fn graph_seed_score(result: &pb::SearchResultV004) -> f32 {
@@ -14868,7 +14868,7 @@ mod v007_fix1_tests {
     }
 
     #[test]
-    fn graph_seed_prefers_parent_chunk_identity() {
+    fn graph_seed_preserves_matched_child_identity_with_parent_fallback() {
         let parent = Uuid::from_u128(10);
         let matched_subchunk = Uuid::from_u128(20);
         let result = pb::SearchResultV004 {
@@ -14877,16 +14877,13 @@ mod v007_fix1_tests {
             ..Default::default()
         };
 
-        assert_eq!(graph_seed_chunk_id(&result), Some(parent));
+        assert_eq!(graph_seed_chunk_id(&result), Some(matched_subchunk));
 
-        let result_without_parent = pb::SearchResultV004 {
-            matched_chunk_id: matched_subchunk.to_string(),
+        let result_without_matched = pb::SearchResultV004 {
+            parent_chunk_id: parent.to_string(),
             ..Default::default()
         };
-        assert_eq!(
-            graph_seed_chunk_id(&result_without_parent),
-            Some(matched_subchunk)
-        );
+        assert_eq!(graph_seed_chunk_id(&result_without_matched), Some(parent));
     }
 
     #[test]

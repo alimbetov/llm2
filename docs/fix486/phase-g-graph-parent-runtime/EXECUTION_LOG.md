@@ -44,6 +44,10 @@ mandatory bank: 1.0.0 / FROZEN / cc699d929226f928eb2e92aa97d51d82d78e20f69440f04
     parent representatives for the bounded seed cap. Seed construction now
     chooses the best canonical child of each admitted parent group, preventing
     structural parent edges from displacing relation-bearing child endpoints.
+13. A subsequent replay proved the terminal identity overwrite:
+    `graph_seed_chunk_id` preferred `parent_chunk_id` even for a hydrated child.
+    The generic seed contract now preserves `matched_chunk_id` and uses parent
+    identity only as a malformed/missing matched-ID fallback.
 
 ## Current implementation stage
 

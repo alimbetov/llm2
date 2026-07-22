@@ -339,7 +339,7 @@ write_defects() {
     {id:"FIX486G-P1-002",severity:"P1",category:"CANDIDATE_NON_INTERFERENCE",root_cause:"final Graph limit was applied before canonical hydration without bounded reserve",regression_test:"invalid_graph_candidate_cannot_exhaust_the_final_window",fix_commit:$source,status:"FIXED"},
     {id:"FIX486G-P1-003",severity:"P1",category:"FALSE_GRAPH_ATTRIBUTION",root_cause:"self-edge expansion was not explicitly rejected",regression_test:"self_edges_are_rejected_before_graph_attribution",fix_commit:$source,status:"FIXED"},
     {id:"FIX486G-P1-004",severity:"P1",category:"RELATION_ENDPOINT_SCOPE",root_cause:"logical block relations expanded to every child granularity pair instead of the declared physical endpoint granularities",regression_test:"relation_ingestion_honors_declared_child_granularities",fix_commit:$source,status:"FIXED"}
-    ,{id:"FIX486G-P0-002",severity:"P0",category:"GRAPH_SEED_IDENTITY",root_cause:"parent-context deduplication discarded canonical hydrated child identities before Graph seed selection",regression_test:"graph_seed_identity_survives_parent_context_deduplication",fix_commit:$source,status:"FIXED"}
+    ,{id:"FIX486G-P0-002",severity:"P0",category:"GRAPH_SEED_IDENTITY",root_cause:"parent-context deduplication and parent-first graph_seed_chunk_id selection discarded canonical hydrated child relation endpoints",regression_test:"graph_seed_identity_survives_parent_context_deduplication; graph_seed_preserves_matched_child_identity_with_parent_fallback",fix_commit:$source,status:"FIXED"}
   ]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
