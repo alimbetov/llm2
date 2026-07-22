@@ -3138,11 +3138,42 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_source_block_by_key = HashMap::new();
         let mut graph_seed_parent_by_key = HashMap::new();
         let mut graph_seed_document_by_key = HashMap::new();
+        let mut child_seed_by_parent = HashMap::new();
+        for result in &pre_parent_dedup_graph_seed_results {
+            let parent_key = (
+                result.access_zone_id.clone(),
+                result.parent_chunk_id.clone(),
+            );
+            child_seed_by_parent
+                .entry(parent_key)
+                .and_modify(|existing: &mut &pb::SearchResultV004| {
+                    if graph_seed_score(result) > graph_seed_score(existing) {
+                        *existing = result;
+                    }
+                })
+                .or_insert(result);
+        }
+        let mut graph_seed_source_results = Vec::new();
+        let mut graph_seed_source_seen = HashSet::new();
+        for direct in &direct_results {
+            let parent_key = (
+                direct.access_zone_id.clone(),
+                direct.parent_chunk_id.clone(),
+            );
+            let result = child_seed_by_parent
+                .get(&parent_key)
+                .copied()
+                .unwrap_or(direct);
+            let identity = (
+                result.access_zone_id.clone(),
+                result.matched_chunk_id.clone(),
+            );
+            if graph_seed_source_seen.insert(identity) {
+                graph_seed_source_results.push(result);
+            }
+        }
         seed_scores.clear();
-        for result in direct_results
-            .iter()
-            .chain(pre_parent_dedup_graph_seed_results.iter())
-        {
+        for result in graph_seed_source_results {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
                 continue;
             };

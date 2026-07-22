@@ -40,6 +40,10 @@ mandatory bank: 1.0.0 / FROZEN / cc699d929226f928eb2e92aa97d51d82d78e20f69440f04
     parent deduplication: hydrated child identities were removed before Graph
     seed selection. A red contract and immutable BLOCKED evidence were saved,
     then seed discovery was separated from final parent-context deduplication.
+12. Runtime replay showed the preserved children still competed with their own
+    parent representatives for the bounded seed cap. Seed construction now
+    chooses the best canonical child of each admitted parent group, preventing
+    structural parent edges from displacing relation-bearing child endpoints.
 
 ## Current implementation stage
 

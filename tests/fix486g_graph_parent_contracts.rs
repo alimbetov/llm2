@@ -316,7 +316,20 @@ fn graph_seed_identity_survives_parent_context_deduplication() {
         &[
             "pre_parent_dedup_graph_seed_results",
             "matches!(granularity, \"SUB_180\" | \"SUB_260\")",
-            ".chain(pre_parent_dedup_graph_seed_results.iter())",
+            "for result in &pre_parent_dedup_graph_seed_results",
+        ],
+        "FIX486G-P0-002",
+    );
+}
+
+#[test]
+fn graph_seed_selection_prefers_hydrated_child_of_each_admitted_parent_group() {
+    require_all(
+        GRPC,
+        &[
+            "child_seed_by_parent",
+            "graph_seed_source_results",
+            "let result = child_seed_by_parent",
         ],
         "FIX486G-P0-002",
     );
