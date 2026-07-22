@@ -10848,6 +10848,32 @@ fn dedup_results_by_chunk(
     (out, dedup)
 }
 
+fn absorb_graph_duplicates_into_direct_pool(
+    direct_pool: &mut [pb::SearchResultV004],
+    graph_results: Vec<pb::SearchResultV004>,
+    max_relations: usize,
+) -> (Vec<pb::SearchResultV004>, usize) {
+    let direct_by_identity = direct_pool
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| (result_identity_key(result), idx))
+        .collect::<HashMap<_, _>>();
+    let mut unique_graph = Vec::with_capacity(graph_results.len());
+    let mut deduplicated = 0usize;
+    for graph in graph_results {
+        if let Some(idx) = direct_by_identity
+            .get(&result_identity_key(&graph))
+            .copied()
+        {
+            merge_secondary_metadata_with_limit(&mut direct_pool[idx], &graph, max_relations);
+            deduplicated += 1;
+        } else {
+            unique_graph.push(graph);
+        }
+    }
+    (unique_graph, deduplicated)
+}
+
 fn combine_group_mmr(
     left: SearchMmrResult,
     right: SearchMmrResult,
@@ -10890,8 +10916,13 @@ fn select_direct_first_with_group_mmr(
     mmr_allow_graph_candidates: bool,
     max_graph_relations_debug_per_candidate: usize,
 ) -> SearchSelectionResult {
-    let (direct_pool, direct_dedup) =
+    let (mut direct_pool, direct_dedup) =
         dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
+    let (graph_results, cross_source_dedup) = absorb_graph_duplicates_into_direct_pool(
+        &mut direct_pool,
+        graph_results,
+        max_graph_relations_debug_per_candidate,
+    );
     metrics::counter!("graph_mmr_group_direct_candidates_total")
         .increment(direct_pool.len() as u64);
     metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
@@ -10906,7 +10937,7 @@ fn select_direct_first_with_group_mmr(
         fallback_similarity_source,
     );
     let mut selected = direct_mmr.results.clone();
-    let mut dedup_count = direct_dedup;
+    let mut dedup_count = direct_dedup + cross_source_dedup;
     let mut graph_candidates = Vec::new();
     let selected_by_chunk: HashMap<String, usize> = selected
         .iter()
@@ -10990,6 +11021,11 @@ fn select_graph_append_with_group_mmr(
         .collect::<HashSet<_>>();
     let (mut direct_pool, direct_dedup) =
         dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
+    let (graph_results, cross_source_dedup) = absorb_graph_duplicates_into_direct_pool(
+        &mut direct_pool,
+        graph_results,
+        max_graph_relations_debug_per_candidate,
+    );
     metrics::counter!("graph_mmr_group_direct_candidates_total")
         .increment(direct_pool.len() as u64);
     metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
@@ -11036,7 +11072,7 @@ fn select_graph_append_with_group_mmr(
     direct_selected.extend(remaining_direct_mmr.results.clone());
     let direct_mmr = combine_group_mmr(seed_direct_mmr, remaining_direct_mmr, direct_selected);
     let mut selected = direct_mmr.results.clone();
-    let mut dedup_count = direct_dedup;
+    let mut dedup_count = direct_dedup + cross_source_dedup;
     let selected_by_chunk: HashMap<String, usize> = selected
         .iter()
         .enumerate()
@@ -13297,6 +13333,7 @@ fn reinforce_broad_coverage_results(
     if results.is_empty() || candidates.is_empty() || final_limit == 0 {
         return 0;
     }
+    let (canonical_candidates, _) = dedup_results_by_chunk(candidates.to_vec(), 5);
     let mut selected = results
         .iter()
         .map(result_identity_key)
@@ -13308,7 +13345,7 @@ fn reinforce_broad_coverage_results(
             .or_default() += 1;
     }
     let mut candidate_groups: HashMap<String, Vec<pb::SearchResultV004>> = HashMap::new();
-    for candidate in candidates {
+    for candidate in &canonical_candidates {
         if is_root_container_result(candidate) || is_negative_mention_evidence(candidate) {
             continue;
         }
@@ -14251,6 +14288,101 @@ mod v007_fix1_tests {
             primary_retrieval_source(&deduplicated[0]),
             Some("VECTOR_DIRECT")
         );
+    }
+
+    #[test]
+    fn graph_append_does_not_reintroduce_unselected_direct_duplicate() {
+        let mut selected_direct = test_result("direct-a", "selected direct", 0.9);
+        let mut unselected_direct = test_result("direct-b", "unselected direct", 0.4);
+        let mut graph_duplicate = test_result("graph-b", "duplicate graph", 0.8);
+        let mut unique_graph = test_result("graph-c", "unique graph", 0.7);
+        for (result, source, block) in [
+            (&mut selected_direct, "VECTOR_DIRECT", "block-a"),
+            (&mut unselected_direct, "VECTOR_DIRECT", "block-b"),
+            (&mut graph_duplicate, "GRAPH_EXPANDED", "block-b"),
+            (&mut unique_graph, "GRAPH_EXPANDED", "block-c"),
+        ] {
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("retrieval_source".into(), source.into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("source_block_id".into(), block.into());
+        }
+
+        let selection = select_graph_append_with_group_mmr(
+            vec![selected_direct, unselected_direct],
+            vec![graph_duplicate, unique_graph],
+            2,
+            1,
+            1,
+            false,
+            0.75,
+            0.75,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            5,
+        );
+
+        let ids = selection
+            .results
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["direct-a", "graph-c"]);
+    }
+
+    #[test]
+    fn broad_coverage_reinsertion_prefers_direct_duplicate_origin() {
+        let mut selected_a = test_result("selected-a", "selected A", 0.9);
+        let mut selected_b = test_result("selected-b", "selected B", 0.8);
+        let mut direct = test_result("direct-c", "direct C", 0.4);
+        let mut graph = test_result("graph-c", "graph duplicate C", 0.9);
+        for result in [&mut selected_a, &mut selected_b, &mut direct, &mut graph] {
+            result.document_id = "shared-document".into();
+        }
+        for (result, source) in [
+            (&mut direct, "VECTOR_DIRECT"),
+            (&mut graph, "GRAPH_EXPANDED"),
+        ] {
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("retrieval_source".into(), source.into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("source_block_id".into(), "block-c".into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("sequence_no".into(), "3".into());
+        }
+        let mut results = vec![selected_a, selected_b];
+
+        reinforce_broad_coverage_results(&mut results, &[direct, graph], 3);
+
+        assert!(results
+            .iter()
+            .any(|result| result.matched_chunk_id == "direct-c"));
+        assert!(!results
+            .iter()
+            .any(|result| result.matched_chunk_id == "graph-c"));
     }
 
     #[test]
