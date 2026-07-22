@@ -10513,9 +10513,31 @@ fn apply_token_budget_truncation(
 }
 
 fn is_graph_expanded_result(result: &pb::SearchResultV004) -> bool {
-    extraction_retrieval_sources(result)
-        .iter()
-        .any(|source| source == "GRAPH_EXPANDED")
+    primary_retrieval_source(result) == Some("GRAPH_EXPANDED")
+}
+
+fn primary_retrieval_source(result: &pb::SearchResultV004) -> Option<&str> {
+    result
+        .citation
+        .as_ref()?
+        .metadata
+        .get("retrieval_source")
+        .map(String::as_str)
+}
+
+fn duplicate_candidate_should_replace(
+    existing: &pb::SearchResultV004,
+    candidate: &pb::SearchResultV004,
+) -> bool {
+    match (
+        is_graph_expanded_result(existing),
+        is_graph_expanded_result(candidate),
+    ) {
+        // Graph expansion may enrich direct evidence, but must not relabel it.
+        (false, true) => false,
+        (true, false) => true,
+        _ => score_of(candidate) > score_of(existing),
+    }
 }
 
 fn estimate_graph_results_tokens(
@@ -10592,8 +10614,9 @@ fn merge_score_then_truncate(
         let key = result_identity_key(&result);
         if let Some(existing) = by_chunk.get_mut(&key) {
             dedup_count += 1;
+            let replace = duplicate_candidate_should_replace(existing, &result);
             merge_secondary_metadata(existing, &result);
-            if score_of(&result) > score_of(existing) {
+            if replace {
                 let mut replacement = result;
                 merge_secondary_metadata(&mut replacement, existing);
                 *existing = replacement;
@@ -10809,8 +10832,9 @@ fn dedup_results_by_chunk(
         let key = result_identity_key(&result);
         if let Some(existing) = by_chunk.get_mut(&key) {
             dedup += 1;
+            let replace = duplicate_candidate_should_replace(existing, &result);
             merge_secondary_metadata_with_limit(existing, &result, max_relations);
-            if score_of(&result) > score_of(existing) {
+            if replace {
                 let mut replacement = result;
                 merge_secondary_metadata_with_limit(&mut replacement, existing, max_relations);
                 *existing = replacement;
@@ -14123,6 +14147,110 @@ mod v007_fix1_tests {
             "[\"VECTOR_DIRECT\",\"GRAPH_EXPANDED\"]".into(),
         );
         assert!(has_graph_expanded_evidence(&[graph]));
+    }
+
+    #[test]
+    fn score_merge_preserves_direct_origin_when_graph_duplicate_scores_higher() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        direct.parent_chunk_id = "shared-parent".into();
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        graph.parent_chunk_id = "shared-parent".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "CHUNK_HAS_PARENT".into());
+
+        let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
+
+        assert_eq!(merged.results.len(), 1);
+        let result = &merged.results[0];
+        assert_eq!(result.matched_chunk_id, "direct-child");
+        assert_eq!(score_of(result), 0.4);
+        let citation = result.citation.as_ref().unwrap();
+        assert_eq!(
+            citation
+                .metadata
+                .get("retrieval_source")
+                .map(String::as_str),
+            Some("VECTOR_DIRECT")
+        );
+        assert!(extraction_retrieval_sources(result)
+            .iter()
+            .any(|source| source == "GRAPH_EXPANDED"));
+        assert!(citation.metadata.contains_key("graph_relations"));
+        assert!(!is_graph_expanded_result(result));
+    }
+
+    #[test]
+    fn chunk_dedup_promotes_direct_origin_even_when_graph_is_seen_first() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        for (result, source) in [
+            (&mut direct, "VECTOR_DIRECT"),
+            (&mut graph, "GRAPH_EXPANDED"),
+        ] {
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("retrieval_source".into(), source.into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("source_block_id".into(), "canonical-a1".into());
+        }
+
+        let (deduplicated, count) = dedup_results_by_chunk(vec![direct, graph], 5);
+
+        assert_eq!(count, 1);
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].matched_chunk_id, "direct-child");
+        assert_eq!(
+            primary_retrieval_source(&deduplicated[0]),
+            Some("VECTOR_DIRECT")
+        );
     }
 
     #[test]
