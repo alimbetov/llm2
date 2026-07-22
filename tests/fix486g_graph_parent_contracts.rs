@@ -308,6 +308,19 @@ fn canonical_graph_audit_scopes_chunk_endpoint_invariants_to_chunk_edges() {
 }
 
 #[test]
+fn graph_seed_identity_survives_parent_context_deduplication() {
+    require_all(
+        GRPC,
+        &[
+            "pre_parent_dedup_graph_seed_results",
+            "matches!(granularity, \"SUB_180\" | \"SUB_260\")",
+            ".chain(pre_parent_dedup_graph_seed_results.iter())",
+        ],
+        "FIX486G-P0-002",
+    );
+}
+
+#[test]
 fn make_targets_share_one_official_execute_path() {
     let makefile = source("Makefile");
     assert!(makefile.contains("verify-fix486g-graph-parent-runtime:"));

@@ -2497,6 +2497,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             })
             .collect::<HashMap<_, _>>();
         let mut direct_results = Vec::new();
+        let mut pre_parent_dedup_graph_seed_results = Vec::new();
         let mut hydrated_parent_seen = HashSet::new();
         let mut graph_results = Vec::new();
         let mut seed_scores: HashMap<(Uuid, Uuid), f32> = HashMap::new();
@@ -2525,9 +2526,6 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             let Some(context) = by_candidate.get(&(*parent_zone_id, matched_id, *parent_id)) else {
                 continue;
             };
-            if !hydrated_parent_seen.insert((*parent_zone_id, *parent_id)) {
-                continue;
-            }
             let parent = ParentContextRecord {
                 access_zone_id: context.access_zone_id,
                 id: context.parent_chunk_id,
@@ -2582,6 +2580,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 self.cfg.graph_rag.scoring.graph_score_weight,
                 self.cfg.graph_rag.scoring.graph_score_bias,
             );
+            let granularity = hit
+                .payload
+                .get("chunk_granularity")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(granularity, "SUB_180" | "SUB_260") {
+                pre_parent_dedup_graph_seed_results.push(direct.clone());
+            }
+            if !hydrated_parent_seen.insert((*parent_zone_id, *parent_id)) {
+                continue;
+            }
             direct_results.push(direct);
         }
         let quality_run_id_filter = search_quality_run_id_filter(&r.filters);
@@ -3130,7 +3139,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_parent_by_key = HashMap::new();
         let mut graph_seed_document_by_key = HashMap::new();
         seed_scores.clear();
-        for result in &direct_results {
+        for result in direct_results
+            .iter()
+            .chain(pre_parent_dedup_graph_seed_results.iter())
+        {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
                 continue;
             };

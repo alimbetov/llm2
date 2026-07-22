@@ -203,7 +203,20 @@ run_queries() {
   [[ $(wc -l <"$output" | tr -d ' ') -eq 2 && $failed -eq 0 ]]
 }
 graph_disabled_control() {
-  run_queries graph-disabled "$E/graph-disabled/search" "$E/graph-disabled/retrieve-context" "$E/graph-disabled/results.jsonl" false
+  local query id q z failed=0
+  query=$(jq -sc '[.[]|select(.query_family=="graph-disabled")][0]' "$SUPPLEMENTAL/queries/graph-parent-queries-v1.jsonl")
+  id=$(jq -r .query_id <<<"$query"); q=$(jq -r .question <<<"$query")
+  z=$(jq -r '.rows[]|select(.logical_zone_id=="zone-a")|.runtime_access_zone_id' "$E/identity-map/logical-to-runtime.json" | head -1)
+  : >"$E/graph-disabled/results.jsonl"
+  jq -n --arg z "$z" --arg q "$q" --arg id "$id" '{correlationId:("fix486g-"+$id+"-search"),accessZoneId:$z,callerAccessLevel:"INTERNAL",query:$q,topK:5,candidateLimit:64,parentLimit:5,timeoutMs:30000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true,enableGraphExpansion:false,graphMaxHops:1,graphMaxRelatedContexts:5}' >"$E/graph-disabled/search/$id.request.json"
+  grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorV004Control/Search <"$E/graph-disabled/search/$id.request.json" >"$E/graph-disabled/search/$id.response.json" || return 1
+  python3 "$H" validate-control --entry-point Search --response "$E/graph-disabled/search/$id.response.json" --identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation absent --output "$E/graph-disabled/search/$id.result.json" >/dev/null || failed=1
+  jq -c . "$E/graph-disabled/search/$id.result.json" >>"$E/graph-disabled/results.jsonl"
+  jq -n --arg z "$z" --arg q "$q" --arg id "$id" '{context:{correlationId:("fix486g-"+$id+"-retrieve"),callerService:"fix486g",callerUserId:"fix486g",callerAccessLevel:"INTERNAL"},accessZoneId:$z,question:$q,profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:false,graphMaxHops:1,graphMaxRelatedContexts:5}' >"$E/graph-disabled/retrieve-context/$id.request.json"
+  grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorRetrievalFacade/RetrieveContext <"$E/graph-disabled/retrieve-context/$id.request.json" >"$E/graph-disabled/retrieve-context/$id.response.json" || return 1
+  python3 "$H" validate-control --entry-point RetrieveContext --response "$E/graph-disabled/retrieve-context/$id.response.json" --identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation absent --output "$E/graph-disabled/retrieve-context/$id.result.json" >/dev/null || failed=1
+  jq -c . "$E/graph-disabled/retrieve-context/$id.result.json" >>"$E/graph-disabled/results.jsonl"
+  [[ $(wc -l <"$E/graph-disabled/results.jsonl" | tr -d ' ') -eq 2 && $failed -eq 0 ]]
 }
 prepare_fault_targets() {
   jq -n \
@@ -319,6 +332,7 @@ write_defects() {
     {id:"FIX486G-P1-002",severity:"P1",category:"CANDIDATE_NON_INTERFERENCE",root_cause:"final Graph limit was applied before canonical hydration without bounded reserve",regression_test:"invalid_graph_candidate_cannot_exhaust_the_final_window",fix_commit:$source,status:"FIXED"},
     {id:"FIX486G-P1-003",severity:"P1",category:"FALSE_GRAPH_ATTRIBUTION",root_cause:"self-edge expansion was not explicitly rejected",regression_test:"self_edges_are_rejected_before_graph_attribution",fix_commit:$source,status:"FIXED"},
     {id:"FIX486G-P1-004",severity:"P1",category:"RELATION_ENDPOINT_SCOPE",root_cause:"logical block relations expanded to every child granularity pair instead of the declared physical endpoint granularities",regression_test:"relation_ingestion_honors_declared_child_granularities",fix_commit:$source,status:"FIXED"}
+    ,{id:"FIX486G-P0-002",severity:"P0",category:"GRAPH_SEED_IDENTITY",root_cause:"parent-context deduplication discarded canonical hydrated child identities before Graph seed selection",regression_test:"graph_seed_identity_survives_parent_context_deduplication",fix_commit:$source,status:"FIXED"}
   ]}' >"$E/defect-register.json"
 }
 evidence_completeness() {

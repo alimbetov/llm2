@@ -96,6 +96,17 @@ metadata declared physical child granularities.
 Risk: one logical edge can receive duplicate Graph credit, fault isolation can
 mutate the wrong child and matched-child provenance becomes unstable.
 
+### FIX486G-P0-002 — Parent deduplication removes relation-bearing child seeds
+
+Runtime evidence from `fix486g-20260722T165646Z` showed that Qdrant returned
+the expected A1 parent group, but final parent representative selection removed
+its hydrated `SUB_180`/`SUB_260` identities before Graph seed selection. The
+physical child-to-child `REPAIRED_BY` edge was therefore unreachable.
+
+Risk: valid production relations silently fail whenever a PARENT point wins its
+parent group, even though a canonical searchable child from the same group was
+retrieved and hydrated.
+
 ## Existing correct invariants
 
 - Related child hydration uses its own `parent_chunk_id`; seed parent reuse is
