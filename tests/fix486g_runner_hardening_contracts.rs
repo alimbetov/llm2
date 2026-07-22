@@ -114,6 +114,29 @@ fn fault_cleanup_restores_the_exact_baseline_ttl() {
 }
 
 #[test]
+fn optional_fault_validator_arguments_are_bash_32_nounset_safe() {
+    let runner = source(RUNNER);
+    require_all(
+        &runner,
+        &[
+            "local validate_args=(--identity-map",
+            "validate_args+=(--forbidden-chunk-id",
+            "\"${validate_args[@]}\" --output",
+            "run_control_pair cycle present",
+        ],
+        "FIX486G-RUNNER-BASH32-001",
+    );
+    assert!(
+        !runner.contains("local extra=()"),
+        "FIX486G-RUNNER-BASH32-001: Bash 3.2 with nounset cannot expand an empty optional array"
+    );
+    assert!(
+        !runner.contains("\"${extra[@]}\""),
+        "FIX486G-RUNNER-BASH32-001: optional empty array expansion must not terminate the proof"
+    );
+}
+
+#[test]
 fn signals_have_explicit_fail_closed_terminal_metadata() {
     let runner = source(RUNNER);
     require_all(

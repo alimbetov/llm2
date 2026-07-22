@@ -346,18 +346,18 @@ prepare_fault_targets() {
 }
 run_control_pair() {
   local name=$1 expectation=$2 forbidden=${3:-} dir="$E/faults/$1" id q z
-  local extra=()
-  [[ -n "$forbidden" ]] && extra=(--forbidden-chunk-id "$forbidden")
+  local validate_args=(--identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation")
+  [[ -n "$forbidden" ]] && validate_args+=(--forbidden-chunk-id "$forbidden")
   mkdir -p "$dir/search" "$dir/retrieve-context"
   id=$(jq -r '.[0].query.query_id' "$E/bank/selected-queries.json")
   q=$(jq -r '.[0].query.question' "$E/bank/selected-queries.json")
   z=$(jq -r '.access_zone_id' "$E/faults/targets.json")
   jq -n --arg z "$z" --arg q "$q" --arg id "$name" '{correlationId:("fix486g-control-"+$id),accessZoneId:$z,callerAccessLevel:"INTERNAL",query:$q,topK:5,candidateLimit:64,parentLimit:5,timeoutMs:30000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true,enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:5}' >"$dir/search/request.json"
   grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorV004Control/Search <"$dir/search/request.json" >"$dir/search/response.json" || return 1
-  python3 "$H" validate-control --entry-point Search --response "$dir/search/response.json" --identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation" "${extra[@]}" --output "$dir/search/result.json" >/dev/null || return 1
+  python3 "$H" validate-control --entry-point Search --response "$dir/search/response.json" "${validate_args[@]}" --output "$dir/search/result.json" >/dev/null || return 1
   jq -n --arg z "$z" --arg q "$q" --arg id "$name" '{context:{correlationId:("fix486g-control-"+$id),callerService:"fix486g",callerUserId:"fix486g",callerAccessLevel:"INTERNAL"},accessZoneId:$z,question:$q,profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:5}' >"$dir/retrieve-context/request.json"
   grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorRetrievalFacade/RetrieveContext <"$dir/retrieve-context/request.json" >"$dir/retrieve-context/response.json" || return 1
-  python3 "$H" validate-control --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" --identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation" "${extra[@]}" --output "$dir/retrieve-context/result.json" >/dev/null
+  python3 "$H" validate-control --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" "${validate_args[@]}" --output "$dir/retrieve-context/result.json" >/dev/null
 }
 binding_parent_fault() {
   local zone child parent_a1 parent_a3 source survivor edge rc=0
