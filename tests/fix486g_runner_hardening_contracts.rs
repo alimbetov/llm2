@@ -95,6 +95,25 @@ fn cleanup_proves_restoration_before_database_teardown() {
 }
 
 #[test]
+fn fault_cleanup_restores_the_exact_baseline_ttl() {
+    let runner = source(RUNNER);
+    require_all(
+        &runner,
+        &[
+            "baseline_expires=$(jq -r '.expires_at // empty'",
+            "expires_at=$expires_sql",
+            "expires_at IS NOT DISTINCT FROM $expires_sql",
+            "expires_at_visible",
+        ],
+        "FIX486G-RUNNER-CLEANUP-002",
+    );
+    assert!(
+        !runner.contains("lifecycle_status='ACTIVE',deleted_at=NULL,expires_at=NULL"),
+        "FIX486G-RUNNER-CLEANUP-002: cleanup must not erase a valid baseline TTL"
+    );
+}
+
+#[test]
 fn signals_have_explicit_fail_closed_terminal_metadata() {
     let runner = source(RUNNER);
     require_all(
