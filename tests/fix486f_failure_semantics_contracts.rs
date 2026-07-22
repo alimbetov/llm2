@@ -6,6 +6,7 @@ const GRPC: &str = "src/grpc/mod.rs";
 const PERSISTENCE: &str = "src/persistence/mod.rs";
 const PROTO: &str = "proto/astravector_embedding.proto";
 const CONFIG: &str = "src/config/mod.rs";
+const RUNNER: &str = "scripts/fix486f-stale-orphan-hydration-proof.sh";
 
 fn source(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
@@ -222,5 +223,23 @@ fn hydration_is_one_ordinality_batch_without_n_plus_one() {
     assert!(
         !hydration.contains("for candidate in candidates { repo.fetch_parent"),
         "FIX486F-BATCH-001: per-candidate parent query detected"
+    );
+}
+
+#[test]
+fn fault_runner_selects_target_from_array_and_uses_equivalent_candidate_windows() {
+    require_all(
+        RUNNER,
+        &[
+            ".[] | select(.request_id==\"fix486f-stale-search\") | .physical_parent_ids[0]",
+            "candidateLimit:64",
+            "target_parent\" =~ ^[0-9a-fA-F-]{36}$",
+        ],
+        "FIX486F-RUNNER-PARITY-001",
+    );
+    let runner = source(RUNNER);
+    assert!(
+        !runner.contains("jq -r '.physical_parent_ids[0]'"),
+        "FIX486F-RUNNER-JSON-001: root array is treated as an object"
     );
 }
