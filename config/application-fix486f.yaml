@@ -1,0 +1,62 @@
+service:
+  environment: development
+  instance_id: fix486f-stale-orphan-hydration-runtime
+grpc:
+  host: 127.0.0.1
+  port: ${FIX486F_GRPC_PORT:-50587}
+  deadlines:
+    query_ms: ${FIX486F_QUERY_DEADLINE_MS:-15000}
+shutdown:
+  drain_timeout_seconds: 1
+security:
+  enabled: false
+  protect_health: false
+postgres:
+  url: ${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@127.0.0.1:58432/astravector}
+  auto_migrate: false
+  required_on_startup: true
+  required_for_readiness: true
+qdrant:
+  enabled: true
+  url: ${ASTRAVECTOR_QDRANT_URL:-http://127.0.0.1:6633}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486f}
+  auto_create_collection: true
+  validate_collection_schema: true
+  ensure_payload_indexes: true
+  publisher:
+    enabled: true
+    batch_size: 64
+    poll_interval_ms: 100
+    max_attempts: 10
+metrics:
+  host: 127.0.0.1
+  port: ${FIX486F_METRICS_PORT:-9057}
+recovery:
+  enabled: false
+lifecycle:
+  enabled: false
+index_ttl:
+  cleanup_enabled: false
+  qdrant_reconciliation_enabled: false
+access_zone_registry:
+  auto_create_on_ingestion: true
+  auto_create_on_search: false
+search:
+  query_processing:
+    long_query_deadline_ms: ${FIX486F_LONG_QUERY_DEADLINE_MS:-22500}
+    single_deadline_ms: ${FIX486F_SINGLE_QUERY_DEADLINE_MS:-15000}
+    standard:
+      deadline_ms: ${FIX486F_STANDARD_QUERY_DEADLINE_MS:-22500}
+    extended:
+      deadline_ms: ${FIX486F_EXTENDED_QUERY_DEADLINE_MS:-33750}
+  hydration_rejection_reserve: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE:-4}
+  hydration_rejection_reserve_max: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE_MAX:-16}
+  hydration_failpoints:
+    non_production_enabled: ${ASTRAVECTOR_TEST_HYDRATION_FAILPOINTS_ENABLED:-false}
+    plan_path: "${ASTRAVECTOR_TEST_HYDRATION_FAILPOINT_PLAN_PATH:-}"
+    run_id: "${ASTRAVECTOR_TEST_HYDRATION_FAILPOINT_RUN_ID:-}"
+  ranking_trace:
+    enabled: true
+    max_candidates: 100
+    max_stages_per_candidate: 32
+    include_text_preview: false

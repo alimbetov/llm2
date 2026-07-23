@@ -1,6 +1,9 @@
 #![cfg(feature = "integration-tests")]
 
-use astravector_runtime::persistence::Repository;
+use astravector_runtime::{
+    persistence::Repository,
+    retrieval::hydration::{HydrationCandidateIdentity, HydrationTerminalOutcome},
+};
 use sqlx::PgPool;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -41,7 +44,7 @@ async fn insert_parent(
              document_version,granularity,representation_type,sequence_no,target_token_count,
              actual_token_count,content,content_hash,tokenizer_version,chunking_profile_version,
              access_level,lifecycle_status,deleted_at,source_block_id)
-           VALUES($1,$2,$2,$2,$2,$3,1,'PARENT','ORIGINAL',0,10,10,$4,$5,'test','fix480',
+           VALUES($1,$2,$2,$2,NULL,$3,1,'PARENT','ORIGINAL',0,10,10,$4,$5,'test','fix480',
                   $6,'ACTIVE',CASE WHEN $7 THEN now() END,$8)"#,
     )
     .bind(zone)
@@ -230,4 +233,63 @@ async fn lexical_exact_match_is_found_beyond_recent_parent_window() {
     assert!(!hydrated
         .iter()
         .any(|value| value.document_id == stale_document));
+
+    let cache_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO astravector.embedding_cache_entries(
+             id,tenant_id,workspace_id,cache_key,text_hash,purpose,chunk_type,
+             tokenizer_version,model_version,dense_version,status)
+           VALUES($1,'fix486f','fix486f',$2,$3,'DOCUMENT',1,'test','test','test','COMPLETED')"#,
+    )
+    .bind(cache_id)
+    .bind(format!("{:064x}", 486_u64))
+    .bind("c".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let binding_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO astravector.vector_bindings_v004(
+             access_zone_id,id,document_id,document_version,root_chunk_id,source_chunk_id,
+             parent_chunk_id,chunk_id,chunk_granularity,representation_type,chunk_sequence_no,
+             token_count,cache_entry_id,access_level,qdrant_collection,qdrant_point_id,
+             lifecycle_status,qdrant_sync_status)
+           VALUES($1,$2,$3,1,$4,$4,NULL,$4,'PARENT','ORIGINAL',0,10,$5,1,'fix486f',$6,
+                  'ACTIVE','SYNCED')"#,
+    )
+    .bind(zone)
+    .bind(binding_id)
+    .bind(target_document)
+    .bind(target_chunk)
+    .bind(cache_id)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let candidate = |parent_chunk_id, input_ordinal| HydrationCandidateIdentity {
+        access_zone_id: zone,
+        binding_id,
+        matched_chunk_id: target_chunk,
+        parent_chunk_id,
+        granularity: "PARENT".into(),
+        raw_rank: input_ordinal,
+        input_ordinal,
+    };
+    let outcomes = repo
+        .fetch_hydration_outcomes_batch(
+            &[candidate(target_chunk, 0), candidate(second_chunk, 1)],
+            1,
+            1_000,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcomes.outcomes[0],
+        HydrationTerminalOutcome::Hydrated { .. }
+    ));
+    assert!(matches!(
+        outcomes.outcomes[1],
+        HydrationTerminalOutcome::BindingInvalid(_)
+    ));
 }

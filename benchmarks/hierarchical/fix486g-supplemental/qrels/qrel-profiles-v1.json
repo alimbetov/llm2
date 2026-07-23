@@ -1,0 +1,138 @@
+{
+  "schema_version": "1",
+  "bank_id": "fix486g-graph-parent-supplemental",
+  "version": "1.0.0",
+  "status": "FROZEN",
+  "profiles": {
+    "POSITIVE_GRAPH": {
+      "expected_zone": "zone-a",
+      "expected_document": "doc-hierarchy",
+      "expected_version": 1,
+      "expected_status": "FOUND",
+      "expected_direct_parent": "parent-a1",
+      "expected_graph_parent": "parent-a3",
+      "expected_graph_child_any": ["child-a3-180", "child-a3-260"],
+      "required_graph_relation_any": ["REPAIRED_BY", "RELATED_TO"],
+      "required_graph_origin": true,
+      "required_hop_index": 1,
+      "required_anchors_in_parent_text": ["ASTRA_RECONCILIATION_A3"],
+      "forbidden_anchors": [
+        "ZONE_B_SECRET_PARENT_A1",
+        "ZONE_B_PRIVATE_SOURCE",
+        "ASTRA_INACTIVE_VERSION_TRAP",
+        "ASTRA_DELETED_PARENT_TRAP",
+        "ASTRA_EXPIRED_PARENT_TRAP"
+      ],
+      "graded_relevance": {"parent-a3": 3, "parent-a1": 1, "parent-a2": 0},
+      "hard_gate": {
+        "graph_wrong_parent": 0,
+        "graph_cross_zone_results": 0,
+        "graph_provenance_missing": 0,
+        "inactive_or_deleted_graph_results": 0,
+        "graph_seed_parent_reuse": 0
+      }
+    },
+    "NEGATIVE_NO_ANSWER": {
+      "expected_zone": "zone-a",
+      "expected_status_any": ["INSUFFICIENT", "NO_ANSWER", "DEGRADED"],
+      "expected_final_context_count": 0,
+      "forbidden_graph_parent": "parent-a3",
+      "required_graph_origin": false,
+      "forbidden_anchors": [
+        "ZONE_B_SECRET_PARENT_A1",
+        "ZONE_B_PRIVATE_SOURCE",
+        "ASTRA_INACTIVE_VERSION_TRAP",
+        "ASTRA_DELETED_PARENT_TRAP",
+        "ASTRA_EXPIRED_PARENT_TRAP"
+      ],
+      "graded_relevance": {"parent-a1": 0, "parent-a2": 0, "parent-a3": -1},
+      "hard_gate": {
+        "false_positive_contexts": 0,
+        "false_graph_attribution_events": 0,
+        "forbidden_anchor_leaks": 0
+      }
+    },
+    "NEGATIVE_LEGAL_HOLD": {
+      "expected_zone": "zone-a",
+      "expected_document": "doc-hierarchy",
+      "expected_version": 1,
+      "expected_status_any": ["FOUND", "DEGRADED"],
+      "expected_parent": "parent-a2",
+      "forbidden_graph_parent": "parent-a3",
+      "required_graph_origin": false,
+      "forbidden_anchors": [
+        "ASTRA_RECONCILIATION_A3",
+        "ZONE_B_SECRET_PARENT_A1",
+        "ASTRA_INACTIVE_VERSION_TRAP",
+        "ASTRA_DELETED_PARENT_TRAP",
+        "ASTRA_EXPIRED_PARENT_TRAP"
+      ],
+      "graded_relevance": {"parent-a2": 3, "parent-a1": 0, "parent-a3": -1},
+      "hard_gate": {
+        "false_graph_attribution_events": 0,
+        "forbidden_anchor_leaks": 0
+      }
+    },
+    "GRAPH_DISABLED": {
+      "expected_zone": "zone-a",
+      "expected_document": "doc-hierarchy",
+      "expected_version": 1,
+      "expected_status": "FOUND",
+      "expected_direct_parent": "parent-a1",
+      "forbidden_graph_parent": "parent-a3",
+      "required_graph_origin": false,
+      "expected_graph_execution": false,
+      "required_anchors_in_parent_text": ["ASTRA_CANONICAL_STATE_A1"],
+      "graded_relevance": {"parent-a1": 3, "parent-a2": 0, "parent-a3": 0},
+      "hard_gate": {
+        "graph_disabled_origin_count": 0,
+        "graph_disabled_execution_count": 0
+      }
+    },
+    "FAULT_WRONG_PARENT": {
+      "extends": "POSITIVE_GRAPH",
+      "required_rejection_reason_any": [
+        "GRAPH_BINDING_INVALID",
+        "BINDING_INVALID",
+        "GRAPH_WRONG_PARENT"
+      ],
+      "hard_gate": {
+        "wrong_parent_graph_final_contexts": 0,
+        "graph_seed_parent_reuse": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    "FAULT_CROSS_ZONE": {
+      "extends": "POSITIVE_GRAPH",
+      "hard_gate": {
+        "graph_cross_zone_results": 0,
+        "forbidden_anchor_leaks": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    "FAULT_LIFECYCLE": {
+      "extends": "POSITIVE_GRAPH",
+      "hard_gate": {
+        "inactive_or_deleted_graph_results": 0,
+        "wrong_version_results": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    "FAULT_HOP_LIMIT": {
+      "extends": "POSITIVE_GRAPH",
+      "hard_gate": {
+        "graph_hop_limit_violations": 0,
+        "second_hop_final_contexts": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    "FAULT_CYCLE": {
+      "extends": "POSITIVE_GRAPH",
+      "hard_gate": {
+        "graph_cycle_credit_inflation": 0,
+        "duplicate_graph_credit": 0,
+        "valid_survivor_lost": 0
+      }
+    }
+  }
+}

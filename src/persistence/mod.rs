@@ -7,7 +7,12 @@ use crate::{
         RelatedChunk,
     },
     inference::EmbeddingResult,
-    pb, smoke_failpoints,
+    pb,
+    retrieval::hydration::{
+        HydrationBatchOutcomes, HydrationCandidateIdentity, HydrationRejectionReason,
+        HydrationTerminalOutcome, RejectedHydrationCandidate,
+    },
+    smoke_failpoints,
 };
 use chrono::{DateTime, Utc};
 use metrics::counter;
@@ -153,6 +158,13 @@ pub struct HydratedSearchContext {
     pub parent_metadata: serde_json::Value,
 }
 #[derive(Debug, Clone)]
+pub struct FinalVisibilityCandidate {
+    pub access_zone_id: Uuid,
+    pub matched_chunk_id: Uuid,
+    pub parent_chunk_id: Uuid,
+    pub binding_id: Option<Uuid>,
+}
+#[derive(Debug, Clone)]
 pub struct ChunkTraceRecord {
     pub id: Uuid,
     pub source_block_id: Option<String>,
@@ -172,6 +184,7 @@ pub struct DeletableQdrantPoints {
 pub struct GraphChunkContextRecord {
     pub chunk_id: Uuid,
     pub parent_chunk_id: Option<Uuid>,
+    pub binding_id: Uuid,
     pub parent_record: ParentContextRecord,
     pub matched_text: String,
     pub trace: Option<ChunkTraceRecord>,
@@ -415,6 +428,111 @@ WHERE c.access_zone_id=ANY($1::uuid[])
                 row.get::<Uuid, _>("access_zone_id"),
                 row.get::<Uuid, _>("id"),
             ));
+        }
+        Ok(result)
+    }
+
+    pub async fn filter_visible_search_results_batch(
+        &self,
+        candidates: &[FinalVisibilityCandidate],
+        max_access_level: i16,
+    ) -> Result<std::collections::HashSet<usize>, AstraError> {
+        let mut result = std::collections::HashSet::new();
+        if candidates.is_empty() {
+            return Ok(result);
+        }
+
+        let access_zone_ids = candidates
+            .iter()
+            .map(|candidate| candidate.access_zone_id)
+            .collect::<Vec<_>>();
+        let matched_chunk_ids = candidates
+            .iter()
+            .map(|candidate| candidate.matched_chunk_id)
+            .collect::<Vec<_>>();
+        let parent_chunk_ids = candidates
+            .iter()
+            .map(|candidate| candidate.parent_chunk_id)
+            .collect::<Vec<_>>();
+        let binding_ids = candidates
+            .iter()
+            .map(|candidate| candidate.binding_id)
+            .collect::<Vec<_>>();
+
+        let rows = sqlx::query(
+            r#"WITH candidate_keys AS (
+  SELECT *
+  FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[])
+    WITH ORDINALITY AS keys(
+      access_zone_id, matched_chunk_id, parent_chunk_id, binding_id, result_ordinal
+    )
+)
+SELECT keys.result_ordinal
+FROM candidate_keys keys
+JOIN astravector.access_zones az
+  ON az.access_zone_id=keys.access_zone_id
+JOIN astravector.content_chunks_v004 m
+  ON m.access_zone_id=keys.access_zone_id
+ AND m.id=keys.matched_chunk_id
+JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=keys.access_zone_id
+ AND p.id=keys.parent_chunk_id
+ AND p.id=COALESCE(m.parent_chunk_id,m.id)
+ AND m.document_id=p.document_id
+ AND m.document_version=p.document_version
+JOIN astravector.document_versions d
+  ON d.access_zone_id=p.access_zone_id
+ AND d.document_id=p.document_id
+ AND d.document_version=p.document_version
+LEFT JOIN astravector.vector_bindings_v004 b
+  ON b.access_zone_id=keys.access_zone_id
+ AND b.id=keys.binding_id
+WHERE az.status='ACTIVE'
+  AND m.access_level <= $5
+  AND p.access_level <= $5
+  AND m.lifecycle_status='ACTIVE'
+  AND p.lifecycle_status='ACTIVE'
+  AND m.deleted_at IS NULL
+  AND p.deleted_at IS NULL
+  AND (m.expires_at IS NULL OR m.expires_at > now())
+  AND (p.expires_at IS NULL OR p.expires_at > now())
+  AND p.granularity='PARENT'
+  AND p.representation_type='ORIGINAL'
+  AND d.status='ACTIVE'
+  AND d.lifecycle_status='ACTIVE'
+  AND d.delete_operation_id IS NULL
+  AND (d.expires_at IS NULL OR d.expires_at > now())
+  AND (
+    keys.binding_id IS NULL OR (
+      b.id IS NOT NULL
+      AND b.chunk_id=m.id
+      AND b.document_id=m.document_id
+      AND b.document_version=m.document_version
+      AND b.parent_chunk_id IS NOT DISTINCT FROM m.parent_chunk_id
+      AND b.lifecycle_status='ACTIVE'
+      AND b.qdrant_sync_status='SYNCED'
+      AND b.deleted_at IS NULL
+      AND (b.expires_at IS NULL OR b.expires_at > now())
+      AND b.access_level <= $5
+      AND b.representation_type='ORIGINAL'
+    )
+  )
+ORDER BY keys.result_ordinal"#,
+        )
+        .bind(access_zone_ids)
+        .bind(matched_chunk_ids)
+        .bind(parent_chunk_ids)
+        .bind(binding_ids)
+        .bind(max_access_level)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        for row in rows {
+            let result_ordinal = row.get::<i64, _>("result_ordinal");
+            if let Ok(result_ordinal) = usize::try_from(result_ordinal.saturating_sub(1)) {
+                result.insert(result_ordinal);
+            }
         }
         Ok(result)
     }
@@ -1637,6 +1755,25 @@ RETURNING payload_version,qdrant_sync_status"#)
             let Some(to_block_id) = relation.get("to_block_id").and_then(|v| v.as_str()) else {
                 continue;
             };
+            let parse_granularity = |field: &str| -> Result<Option<String>, AstraError> {
+                let value = relation
+                    .get(field)
+                    .and_then(|raw| raw.as_str())
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                    .map(str::to_uppercase);
+                if value
+                    .as_deref()
+                    .is_some_and(|raw| !matches!(raw, "PARENT" | "SUB_180" | "SUB_260"))
+                {
+                    return Err(AstraError::InvalidArgument(format!(
+                        "quality fixture relation {relation_id} has invalid {field}"
+                    )));
+                }
+                Ok(value)
+            };
+            let from_granularity = parse_granularity("from_granularity")?;
+            let to_granularity = parse_granularity("to_granularity")?;
             let weight = relation
                 .get("weight")
                 .and_then(|v| v.as_f64())
@@ -1657,6 +1794,7 @@ JOIN astravector.content_chunks_v004 s_chunk
  AND s_chunk.lifecycle_status='ACTIVE'
  AND s_chunk.deleted_at IS NULL
  AND s_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+ AND ($7::text IS NULL OR s_chunk.granularity=$7)
  AND COALESCE(s_chunk.metadata->>'quality_run_id','')=$6
 JOIN astravector.rag_graph_nodes_chunk s_nodes
   ON s_nodes.access_zone_id=s_map.access_zone_id
@@ -1673,6 +1811,7 @@ JOIN astravector.content_chunks_v004 t_chunk
  AND t_chunk.lifecycle_status='ACTIVE'
  AND t_chunk.deleted_at IS NULL
  AND t_chunk.granularity IN ('PARENT','SUB_180','SUB_260')
+ AND ($8::text IS NULL OR t_chunk.granularity=$8)
  AND COALESCE(t_chunk.metadata->>'quality_run_id','')=$6
 JOIN astravector.rag_graph_nodes_chunk t_nodes
   ON t_nodes.access_zone_id=t_map.access_zone_id
@@ -1693,6 +1832,8 @@ LIMIT 64
             .bind(to_document_id)
             .bind(to_block_id)
             .bind(quality_run_id)
+            .bind(from_granularity.as_deref())
+            .bind(to_granularity.as_deref())
             .fetch_all(&mut **tx)
             .await
             .map_err(db)?;
@@ -1736,6 +1877,8 @@ LIMIT 64
                         "from_block_id": from_block_id,
                         "to_document_id": relation.get("to_document_id").and_then(|v| v.as_str()).unwrap_or_default(),
                         "to_block_id": to_block_id,
+                        "from_granularity": from_granularity,
+                        "to_granularity": to_granularity,
                         "source_chunk_id": source_chunk_id,
                         "target_chunk_id": target_chunk_id,
                         "quality_run_id": quality_run_id,
@@ -1799,6 +1942,8 @@ WITH seed_input AS (
            e.source_node_id,
            e.target_node_id,
            e.target_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -1819,6 +1964,8 @@ WITH seed_input AS (
            e.source_node_id,
            e.target_node_id,
            e.source_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -1831,16 +1978,33 @@ WITH seed_input AS (
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
       AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
+), ranked_edges AS (
+    SELECT edge_candidates.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY seed_access_zone_id, seed_chunk_id
+               ORDER BY CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+                        relation_score DESC,
+                        relation_rank NULLS LAST,
+                        edge_id
+           ) AS seed_edge_rank
+    FROM edge_candidates
 ), expanded AS (
     SELECT *
-    FROM edge_candidates
-    ORDER BY seed_rank ASC,
+    FROM ranked_edges
+    ORDER BY seed_edge_rank ASC,
+             seed_rank ASC,
              CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
              relation_score DESC,
-             relation_rank NULLS LAST
+             relation_rank NULLS LAST,
+             edge_id
     LIMIT $6
 )
-SELECT n.access_zone_id AS access_zone_id, n.chunk_id, expanded.seed_access_zone_id, expanded.seed_chunk_id, expanded.relation_type, expanded.relation_score, expanded.relation_rank
+SELECT n.access_zone_id AS access_zone_id, n.chunk_id,
+       c.document_id AS related_document_id,
+       c.document_version AS related_document_version,
+       expanded.seed_access_zone_id, expanded.seed_chunk_id,
+       expanded.edge_id, expanded.relation_identity, expanded.relation_type,
+       expanded.relation_score, expanded.relation_source, expanded.relation_rank
 FROM expanded
 JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.related_node_id
 JOIN astravector.content_chunks_v004 c ON c.access_zone_id=n.access_zone_id AND c.id=n.chunk_id
@@ -1859,10 +2023,13 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
-ORDER BY expanded.seed_rank ASC,
+  AND n.chunk_id <> expanded.seed_chunk_id
+ORDER BY expanded.seed_edge_rank ASC,
+         expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
-         expanded.relation_rank NULLS LAST
+         expanded.relation_rank NULLS LAST,
+         expanded.edge_id
 LIMIT $4
 "#)
             .bind(access_zone_id)
@@ -1910,12 +2077,17 @@ LIMIT $4
                 chunk_id: row.get("chunk_id"),
                 seed_access_zone_id: row.get("seed_access_zone_id"),
                 seed_chunk_id: row.get("seed_chunk_id"),
+                edge_id: row.get("edge_id"),
+                relation_identity: row.get("relation_identity"),
                 relation_type: relation,
                 relation_score: row.get::<f32, _>("relation_score"),
+                relation_source: row.get("relation_source"),
                 relation_rank: row
                     .try_get::<Option<i32>, _>("relation_rank")
                     .ok()
                     .flatten(),
+                related_document_id: row.get("related_document_id"),
+                related_document_version: row.get("related_document_version"),
                 hop_distance: 1,
             });
         }
@@ -2000,6 +2172,8 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
            e.source_node_id,
            e.target_node_id,
            e.target_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -2019,6 +2193,8 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
            e.source_node_id,
            e.target_node_id,
            e.source_node_id AS related_node_id,
+           e.edge_id,
+           COALESCE(NULLIF(e.properties->>'relation_id',''),e.edge_id::text) AS relation_identity,
            e.relation_type,
            e.relation_score,
            e.relation_rank,
@@ -2030,21 +2206,38 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
       AND ($7::text IS NULL OR e.properties->>'quality_run_id'=$7)
+), ranked_edges AS (
+    SELECT edge_candidates.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY seed_access_zone_id, seed_chunk_id
+               ORDER BY CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+                        relation_score DESC,
+                        relation_rank NULLS LAST,
+                        edge_id
+           ) AS seed_edge_rank
+    FROM edge_candidates
 ), expanded AS (
     SELECT *
-    FROM edge_candidates
-    ORDER BY seed_rank ASC,
+    FROM ranked_edges
+    ORDER BY seed_edge_rank ASC,
+             seed_rank ASC,
              CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
              relation_score DESC,
-             relation_rank NULLS LAST
+             relation_rank NULLS LAST,
+             edge_id
     LIMIT $6
 )
 SELECT n.access_zone_id AS access_zone_id,
        n.chunk_id,
+       c.document_id AS related_document_id,
+       c.document_version AS related_document_version,
        expanded.seed_access_zone_id,
        expanded.seed_chunk_id,
+       expanded.edge_id,
+       expanded.relation_identity,
        expanded.relation_type,
        expanded.relation_score,
+       expanded.relation_source,
        expanded.relation_rank
 FROM expanded
 JOIN astravector.rag_graph_nodes_chunk n ON n.access_zone_id=expanded.access_zone_id AND n.node_id=expanded.related_node_id
@@ -2064,10 +2257,13 @@ WHERE n.lifecycle_status='ACTIVE'
   AND d.lifecycle_status='ACTIVE'
   AND (d.expires_at IS NULL OR d.expires_at > now())
   AND COALESCE((c.metadata->>'quarantined')::boolean, false) = false
-ORDER BY expanded.seed_rank ASC,
+  AND n.chunk_id <> expanded.seed_chunk_id
+ORDER BY expanded.seed_edge_rank ASC,
+         expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
          expanded.relation_score DESC,
-         expanded.relation_rank NULLS LAST
+         expanded.relation_rank NULLS LAST,
+         expanded.edge_id
 LIMIT $4
 "#)
             .bind(&seed_zone_ids)
@@ -2114,12 +2310,17 @@ LIMIT $4
                 chunk_id: row.get("chunk_id"),
                 seed_access_zone_id: row.get("seed_access_zone_id"),
                 seed_chunk_id: row.get("seed_chunk_id"),
+                edge_id: row.get("edge_id"),
+                relation_identity: row.get("relation_identity"),
                 relation_type: relation,
                 relation_score: row.get::<f32, _>("relation_score"),
+                relation_source: row.get("relation_source"),
                 relation_rank: row
                     .try_get::<Option<i32>, _>("relation_rank")
                     .ok()
                     .flatten(),
+                related_document_id: row.get("related_document_id"),
+                related_document_version: row.get("related_document_version"),
                 hop_distance: 1,
             });
         }
@@ -2140,6 +2341,7 @@ LIMIT $4
 SELECT DISTINCT ON (c.access_zone_id, c.id)
   c.id AS chunk_id,
   c.parent_chunk_id,
+  b.id AS binding_id,
   c.content AS matched_text,
   c.source_block_id,
   c.source_location,
@@ -2182,10 +2384,19 @@ JOIN astravector.content_chunks_v004 p
  AND p.access_level <= $3
  AND (p.expires_at IS NULL OR p.expires_at > now())
  AND p.deleted_at IS NULL
-LEFT JOIN astravector.vector_bindings_v004 b
+JOIN astravector.vector_bindings_v004 b
   ON b.access_zone_id=c.access_zone_id
  AND b.chunk_id=c.id
- AND b.lifecycle_status IN ('ACTIVE','LEGAL_HOLD')
+ AND b.document_id=c.document_id
+ AND b.document_version=c.document_version
+ AND b.parent_chunk_id IS NOT DISTINCT FROM c.parent_chunk_id
+ AND b.chunk_granularity=c.granularity
+ AND b.lifecycle_status='ACTIVE'
+ AND b.qdrant_sync_status='SYNCED'
+ AND b.representation_type='ORIGINAL'
+ AND b.qdrant_point_id IS NOT NULL
+ AND b.deleted_at IS NULL
+ AND (b.expires_at IS NULL OR b.expires_at > now())
 LEFT JOIN astravector.embedding_cache_entries ce
   ON ce.id=b.cache_entry_id
 WHERE c.access_zone_id=$1
@@ -2234,6 +2445,7 @@ ORDER BY c.access_zone_id, c.id,
                     .try_get::<Option<Uuid>, _>("parent_chunk_id")
                     .ok()
                     .flatten(),
+                binding_id: r.get("binding_id"),
                 matched_text: r.get("matched_text"),
                 trace: Some(trace),
                 qdrant_point_id: r
@@ -2300,6 +2512,7 @@ ORDER BY c.access_zone_id, c.id,
 SELECT DISTINCT ON (c.access_zone_id, c.id)
   c.id AS chunk_id,
   c.parent_chunk_id,
+  b.id AS binding_id,
   c.content AS matched_text,
   c.source_block_id,
   c.source_location,
@@ -2342,10 +2555,19 @@ JOIN astravector.content_chunks_v004 p
  AND p.access_level <= $3
  AND (p.expires_at IS NULL OR p.expires_at > now())
  AND p.deleted_at IS NULL
-LEFT JOIN astravector.vector_bindings_v004 b
+JOIN astravector.vector_bindings_v004 b
   ON b.access_zone_id=c.access_zone_id
  AND b.chunk_id=c.id
- AND b.lifecycle_status IN ('ACTIVE','LEGAL_HOLD')
+ AND b.document_id=c.document_id
+ AND b.document_version=c.document_version
+ AND b.parent_chunk_id IS NOT DISTINCT FROM c.parent_chunk_id
+ AND b.chunk_granularity=c.granularity
+ AND b.lifecycle_status='ACTIVE'
+ AND b.qdrant_sync_status='SYNCED'
+ AND b.representation_type='ORIGINAL'
+ AND b.qdrant_point_id IS NOT NULL
+ AND b.deleted_at IS NULL
+ AND (b.expires_at IS NULL OR b.expires_at > now())
 LEFT JOIN astravector.embedding_cache_entries ce
   ON ce.id=b.cache_entry_id
 WHERE c.access_zone_id=ANY($1::uuid[])
@@ -2394,6 +2616,7 @@ ORDER BY c.access_zone_id, c.id,
                     .try_get::<Option<Uuid>, _>("parent_chunk_id")
                     .ok()
                     .flatten(),
+                binding_id: r.get("binding_id"),
                 matched_text: r.get("matched_text"),
                 trace: Some(trace),
                 qdrant_point_id: r
@@ -2816,6 +3039,223 @@ ORDER BY keys.rank"#,
                 parent_metadata: r.get("parent_metadata"),
             })
             .collect())
+    }
+
+    pub async fn fetch_hydration_outcomes_batch(
+        &self,
+        candidates: &[HydrationCandidateIdentity],
+        caller_access_level: i16,
+        statement_timeout_ms: u64,
+    ) -> Result<HydrationBatchOutcomes, AstraError> {
+        if candidates.is_empty() {
+            return Ok(HydrationBatchOutcomes::new(0, Vec::new()));
+        }
+        if statement_timeout_ms == 0 {
+            return Err(AstraError::DeadlineExceeded(
+                "insufficient_postgres_hydration_budget".into(),
+            ));
+        }
+
+        let zones = candidates
+            .iter()
+            .map(|value| value.access_zone_id)
+            .collect::<Vec<_>>();
+        let bindings = candidates
+            .iter()
+            .map(|value| value.binding_id)
+            .collect::<Vec<_>>();
+        let matched = candidates
+            .iter()
+            .map(|value| value.matched_chunk_id)
+            .collect::<Vec<_>>();
+        let parents = candidates
+            .iter()
+            .map(|value| value.parent_chunk_id)
+            .collect::<Vec<_>>();
+        let granularities = candidates
+            .iter()
+            .map(|value| value.granularity.clone())
+            .collect::<Vec<_>>();
+        let raw_ranks = candidates
+            .iter()
+            .map(|value| value.raw_rank as i64)
+            .collect::<Vec<_>>();
+        let input_ordinals = candidates
+            .iter()
+            .map(|value| value.input_ordinal as i64)
+            .collect::<Vec<_>>();
+
+        let query_started = std::time::Instant::now();
+        let mut tx = self.pool.begin().await.map_err(postgres_error)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{statement_timeout_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+        let rows = sqlx::query(
+            r#"WITH candidate_keys AS (
+  SELECT keys.*
+  FROM unnest(
+    $1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[],
+    $5::text[], $6::bigint[], $7::bigint[]
+  ) WITH ORDINALITY AS keys(
+    access_zone_id, binding_id, matched_chunk_id, parent_chunk_id,
+    granularity, raw_rank, input_ordinal, sql_ordinal
+  )
+)
+SELECT keys.*,
+       CASE
+         WHEN b.id IS NULL OR m.id IS NULL
+           OR b.chunk_id<>keys.matched_chunk_id
+           OR b.chunk_granularity<>keys.granularity
+           OR b.document_id<>m.document_id
+           OR b.document_version<>m.document_version
+           OR b.root_chunk_id<>m.root_chunk_id
+           OR b.source_chunk_id<>m.source_chunk_id
+           OR b.representation_type<>m.representation_type
+           OR (keys.granularity IN ('SUB_180','SUB_260')
+               AND b.parent_chunk_id IS DISTINCT FROM keys.parent_chunk_id)
+           OR (keys.granularity='PARENT' AND b.parent_chunk_id IS NOT NULL)
+           OR (keys.granularity IN ('SUB_180','SUB_260')
+               AND m.parent_chunk_id IS DISTINCT FROM keys.parent_chunk_id)
+           OR (keys.granularity='PARENT'
+               AND (m.id<>p.id OR m.parent_chunk_id IS NOT NULL))
+           OR keys.granularity NOT IN ('PARENT','SUB_180','SUB_260')
+           THEN 'BINDING_INVALID'
+         WHEN p.id IS NULL OR d.document_id IS NULL THEN 'HYDRATION_MISSING'
+         WHEN (keys.granularity IN ('SUB_180','SUB_260')
+               AND m.parent_chunk_id IS DISTINCT FROM p.id)
+           OR b.document_id<>p.document_id OR b.document_version<>p.document_version
+           OR b.root_chunk_id<>p.root_chunk_id OR b.source_chunk_id<>p.source_chunk_id
+           OR m.document_id<>p.document_id OR m.document_version<>p.document_version
+           OR m.root_chunk_id<>p.root_chunk_id OR m.source_chunk_id<>p.source_chunk_id
+           THEN 'BINDING_INVALID'
+         WHEN b.lifecycle_status<>'ACTIVE' OR b.qdrant_sync_status<>'SYNCED'
+           OR b.deleted_at IS NOT NULL
+           OR (b.expires_at IS NOT NULL AND b.expires_at<=now())
+           OR b.access_level>$8 OR b.representation_type<>'ORIGINAL'
+           OR m.lifecycle_status<>'ACTIVE' OR m.deleted_at IS NOT NULL
+           OR (m.expires_at IS NOT NULL AND m.expires_at<=now())
+           OR p.lifecycle_status<>'ACTIVE' OR p.deleted_at IS NOT NULL
+           OR (p.expires_at IS NOT NULL AND p.expires_at<=now())
+           OR m.access_level>$8 OR p.access_level>$8
+           OR m.representation_type<>'ORIGINAL'
+           OR p.granularity<>'PARENT' OR p.representation_type<>'ORIGINAL'
+           OR az.access_zone_id IS NULL OR az.status<>'ACTIVE'
+           OR d.status<>'ACTIVE' OR d.lifecycle_status<>'ACTIVE'
+           OR d.delete_operation_id IS NOT NULL
+           OR (d.expires_at IS NOT NULL AND d.expires_at<=now())
+           THEN 'VISIBILITY_REJECTED'
+         WHEN btrim(p.content)='' THEN 'EMPTY_CONTEXT'
+         ELSE 'HYDRATED'
+       END AS hydration_outcome,
+       p.access_zone_id AS canonical_access_zone_id,
+       m.id AS canonical_matched_chunk_id,
+       p.id AS canonical_parent_chunk_id, p.document_id, p.document_version,
+       p.root_chunk_id, p.source_chunk_id, m.content AS matched_text,
+       p.content AS parent_text, p.content_hash AS parent_content_hash,
+       p.actual_token_count AS parent_token_count,
+       p.sequence_no AS parent_sequence_no, p.access_level,
+       COALESCE(m.source_block_id,p.source_block_id) AS source_block_id,
+       COALESCE(m.source_location,'{}'::jsonb) AS source_location,
+       COALESCE(m.source_links,'[]'::jsonb) AS source_links,
+       m.metadata, p.metadata AS parent_metadata
+FROM candidate_keys keys
+LEFT JOIN astravector.vector_bindings_v004 b
+  ON b.access_zone_id=keys.access_zone_id
+ AND b.id=keys.binding_id
+ AND b.chunk_id=keys.matched_chunk_id
+LEFT JOIN astravector.content_chunks_v004 m
+  ON m.access_zone_id=keys.access_zone_id
+ AND m.id=keys.matched_chunk_id
+LEFT JOIN astravector.content_chunks_v004 p
+  ON p.access_zone_id=keys.access_zone_id
+ AND p.id=keys.parent_chunk_id
+LEFT JOIN astravector.document_versions d
+  ON d.access_zone_id=p.access_zone_id
+ AND d.document_id=p.document_id
+ AND d.document_version=p.document_version
+LEFT JOIN astravector.access_zones az
+  ON az.access_zone_id=keys.access_zone_id
+ORDER BY keys.input_ordinal, keys.sql_ordinal"#,
+        )
+        .bind(zones)
+        .bind(bindings)
+        .bind(matched)
+        .bind(parents)
+        .bind(granularities)
+        .bind(raw_ranks)
+        .bind(input_ordinals)
+        .bind(caller_access_level)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
+
+        let elapsed = query_started.elapsed();
+        let mut outcomes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let candidate = HydrationCandidateIdentity {
+                access_zone_id: row.get("access_zone_id"),
+                binding_id: row.get("binding_id"),
+                matched_chunk_id: row.get("matched_chunk_id"),
+                parent_chunk_id: row.get("parent_chunk_id"),
+                granularity: row.get("granularity"),
+                raw_rank: row.get::<i64, _>("raw_rank") as usize,
+                input_ordinal: row.get::<i64, _>("input_ordinal") as usize,
+            };
+            let outcome: String = row.get("hydration_outcome");
+            let rejected = |reason| RejectedHydrationCandidate {
+                candidate: candidate.clone(),
+                reason,
+                stage: "CANONICAL_PARENT_HYDRATION",
+                elapsed,
+            };
+            outcomes.push(match outcome.as_str() {
+                "HYDRATED" => HydrationTerminalOutcome::Hydrated {
+                    candidate,
+                    elapsed,
+                    context: Box::new(HydratedSearchContext {
+                        access_zone_id: row.get("canonical_access_zone_id"),
+                        matched_chunk_id: row.get("canonical_matched_chunk_id"),
+                        parent_chunk_id: row.get("canonical_parent_chunk_id"),
+                        document_id: row.get("document_id"),
+                        document_version: row.get("document_version"),
+                        root_chunk_id: row.get("root_chunk_id"),
+                        source_chunk_id: row.get("source_chunk_id"),
+                        matched_text: row.get("matched_text"),
+                        parent_text: row.get("parent_text"),
+                        parent_content_hash: row.get("parent_content_hash"),
+                        parent_token_count: row.get("parent_token_count"),
+                        parent_sequence_no: row.get("parent_sequence_no"),
+                        access_level: row.get("access_level"),
+                        source_block_id: row.try_get("source_block_id").ok(),
+                        source_location: row.get("source_location"),
+                        source_links: row.get("source_links"),
+                        metadata: row.get("metadata"),
+                        parent_metadata: row.get("parent_metadata"),
+                    }),
+                },
+                "BINDING_INVALID" => HydrationTerminalOutcome::BindingInvalid(rejected(
+                    HydrationRejectionReason::BindingInvalid,
+                )),
+                "VISIBILITY_REJECTED" => HydrationTerminalOutcome::VisibilityRejected(rejected(
+                    HydrationRejectionReason::VisibilityRejected,
+                )),
+                "HYDRATION_MISSING" => HydrationTerminalOutcome::HydrationMissing(rejected(
+                    HydrationRejectionReason::HydrationMissing,
+                )),
+                "EMPTY_CONTEXT" => HydrationTerminalOutcome::EmptyContext(rejected(
+                    HydrationRejectionReason::EmptyContext,
+                )),
+                other => {
+                    return Err(AstraError::Internal(format!(
+                        "unknown hydration outcome {other}"
+                    )))
+                }
+            });
+        }
+        Ok(HydrationBatchOutcomes::new(candidates.len(), outcomes))
     }
 
     pub async fn search_active_parent_contexts_lexical_multi(

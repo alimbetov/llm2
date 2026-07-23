@@ -18,8 +18,8 @@ use crate::{
         astra_vector_v004_control_server::AstraVectorV004Control,
     },
     persistence::{
-        ChunkContentRecord, ChunkTraceRecord, ClaimResult, LexicalParentCandidate,
-        ParentContextRecord, Repository,
+        ChunkContentRecord, ChunkTraceRecord, ClaimResult, FinalVisibilityCandidate,
+        LexicalParentCandidate, ParentContextRecord, Repository,
     },
     provider::SelectedProvider,
     qdrant::{QdrantClient, QdrantSearchHit, QdrantVersionFilters},
@@ -37,6 +37,13 @@ use crate::{
         QueryProcessingMode, QueryProcessingTier,
     },
     reliability::{resolve_optional_stage_budget, OperationBudget, WorkloadKind},
+    retrieval::{
+        hydration::{
+            bounded_hydration_fetch_window, normalize_hydration_outcomes,
+            total_hydration_timeout_status, HydrationCandidateIdentity,
+        },
+        hydration_failpoints::HydrationFailpointPlan,
+    },
     scheduler::{QueueKind, Scheduler, SubmitManyOptions},
     sparse::{SparseTechnicalEncoder, SparseTokenClass},
 };
@@ -68,6 +75,9 @@ struct AdmissionPermit {
 }
 
 struct RequestCancellationGuard(CancellationToken);
+
+#[derive(Clone, Copy)]
+struct RetrievalEntryPoint(&'static str);
 
 #[derive(Clone, Copy)]
 struct RequestTiming {
@@ -342,6 +352,7 @@ pub struct AstraVectorV004ControlService {
     retrieve_context_semaphore: Arc<Semaphore>,
     graph_expansion_semaphore: Arc<Semaphore>,
     mmr_fetch_semaphore: Arc<Semaphore>,
+    hydration_failpoints: Arc<HydrationFailpointPlan>,
 }
 
 impl AstraVectorV004ControlService {
@@ -362,6 +373,19 @@ impl AstraVectorV004ControlService {
         ));
         let mmr_fetch_semaphore =
             Arc::new(Semaphore::new(cfg.limits.max_concurrent_mmr_fetch.max(1)));
+        let hydration_failpoint_plan = HydrationFailpointPlan::load(
+            cfg.search.hydration_failpoints.non_production_enabled,
+            &cfg.search.hydration_failpoints.plan_path,
+            &cfg.search.hydration_failpoints.run_id,
+        )
+        .unwrap_or_else(|error| panic!("invalid hydration failpoint startup plan: {error}"));
+        tracing::info!(
+            non_production_enabled = hydration_failpoint_plan.non_production_enabled,
+            rule_count = hydration_failpoint_plan.rule_count(),
+            run_id = %cfg.search.hydration_failpoints.run_id,
+            "HYDRATION_FAILPOINT_PLAN_RESOLVED"
+        );
+        let hydration_failpoints = Arc::new(hydration_failpoint_plan);
         Self {
             cfg,
             scheduler,
@@ -372,6 +396,7 @@ impl AstraVectorV004ControlService {
             retrieve_context_semaphore,
             graph_expansion_semaphore,
             mmr_fetch_semaphore,
+            hydration_failpoints,
         }
     }
 
@@ -1943,6 +1968,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         request: Request<pb::SearchRequestV004>,
     ) -> Result<Response<pb::SearchResponseV004>, Status> {
         let started = std::time::Instant::now();
+        let hydration_entry_point = request
+            .extensions()
+            .get::<RetrievalEntryPoint>()
+            .map_or("Search", |value| value.0);
         let request_timing = request
             .extensions()
             .get::<RequestTiming>()
@@ -1967,6 +1996,10 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             )
             .await?;
         let access_zone_ids: Vec<Uuid> = resolved_zones.iter().map(|z| z.access_zone_id).collect();
+        let access_zone_codes = resolved_zones
+            .iter()
+            .map(|zone| (zone.access_zone_id, zone.access_zone_code.clone()))
+            .collect::<HashMap<_, _>>();
         let caller_access_level = pb::AccessLevel::try_from(r.caller_access_level)
             .ok()
             .filter(|v| *v != pb::AccessLevel::Unspecified)
@@ -2167,6 +2200,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             candidate_limit
         };
+        let candidate_limit = bounded_hydration_fetch_window(
+            parent_limit,
+            candidate_limit,
+            self.cfg.search.hydration_rejection_reserve,
+            self.cfg.search.hydration_rejection_reserve_max,
+            self.cfg.limits.search_candidate_limit_max,
+        );
         tracing::info!(
             correlation_id = %r.correlation_id,
             mode = query_plan_diagnostics.mode_code(),
@@ -2258,7 +2298,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         // content_chunks_v004 is keyed by (access_zone_id, id); using only UUID would mix tenants/zones when
         // malformed or imported data contains the same chunk UUID in more than one zone.
         let mut groups: Vec<((Uuid, Uuid), QdrantSearchHit)> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen_candidates = HashSet::new();
         let mut pre_dedup_child_ids = HashMap::<(Uuid, Uuid), HashSet<Uuid>>::new();
         for hit in hits.iter() {
             let Some(hit_access_zone_id) = hit
@@ -2292,26 +2332,35 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             .and_then(serde_json::Value::as_str)
                             .and_then(|v| Uuid::parse_str(v).ok())
                     }),
-                _ => None,
-            };
-            if let Some(parent_id) = parent_id {
-                let parent_key = (hit_access_zone_id, parent_id);
-                if matches!(granularity, "SUB_180" | "SUB_260") {
-                    if let Some(chunk_id) = hit
-                        .payload
-                        .get("chunk_id")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|value| Uuid::parse_str(value).ok())
-                    {
-                        pre_dedup_child_ids
-                            .entry(parent_key)
-                            .or_default()
-                            .insert(chunk_id);
-                    }
+                _ => hit
+                    .payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|v| Uuid::parse_str(v).ok()),
+            }
+            .unwrap_or_else(Uuid::nil);
+            let parent_key = (hit_access_zone_id, parent_id);
+            if matches!(granularity, "SUB_180" | "SUB_260") {
+                if let Some(chunk_id) = hit
+                    .payload
+                    .get("chunk_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                {
+                    pre_dedup_child_ids
+                        .entry(parent_key)
+                        .or_default()
+                        .insert(chunk_id);
                 }
-                if seen.insert(parent_key) {
-                    groups.push((parent_key, hit.clone()));
-                }
+            }
+            let matched_chunk_id = hit
+                .payload
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .unwrap_or_else(Uuid::nil);
+            if seen_candidates.insert((parent_key, matched_chunk_id)) {
+                groups.push((parent_key, hit.clone()));
             }
             if groups.len() >= candidate_limit as usize {
                 break;
@@ -2319,12 +2368,35 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         let hydration_keys = groups
             .iter()
-            .filter_map(|((zone, parent_id), hit)| {
-                hit.payload
+            .enumerate()
+            .map(|(input_ordinal, ((zone, parent_id), hit))| {
+                let matched_chunk_id = hit
+                    .payload
                     .get("chunk_id")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|value| Uuid::parse_str(value).ok())
-                    .map(|matched_id| (*zone, matched_id, *parent_id))
+                    .unwrap_or_else(Uuid::nil);
+                let binding_id = hit
+                    .payload
+                    .get("binding_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .unwrap_or_else(Uuid::nil);
+                let granularity = hit
+                    .payload
+                    .get("chunk_granularity")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                HydrationCandidateIdentity {
+                    access_zone_id: *zone,
+                    binding_id,
+                    matched_chunk_id,
+                    parent_chunk_id: *parent_id,
+                    granularity,
+                    raw_rank: input_ordinal,
+                    input_ordinal,
+                }
             })
             .collect::<Vec<_>>();
         tracing::debug!(
@@ -2350,15 +2422,55 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         })?;
         histogram!("astravector_deadline_remaining_seconds", "stage" => "postgres_parent_fetch")
             .record(remaining_ms as f64 / 1000.0);
-        let hydrated = self
+        let hydration_outcomes = self
             .repo()?
-            .fetch_hydrated_search_contexts_multi(
+            .fetch_hydration_outcomes_batch(
                 &hydration_keys,
                 caller_access_level as i16,
                 statement_timeout_ms,
             )
             .await
             .map_err(Status::from)?;
+        let hydration_outcomes = self
+            .hydration_failpoints
+            .apply(
+                &r.correlation_id,
+                hydration_entry_point,
+                &access_zone_codes,
+                hydration_outcomes,
+            )
+            .await;
+        let normalized_hydration =
+            normalize_hydration_outcomes(hydration_entry_point, hydration_outcomes);
+        let hydration_degradation = normalized_hydration.to_proto();
+        let rejected_parent_keys = normalized_hydration.rejected_parent_keys.clone();
+        let retrieval_infrastructure_failure =
+            retrieval_infrastructure_failure || hydration_degradation.infrastructure_failure;
+        for dropped in &normalized_hydration.dropped_parents {
+            tracing::warn!(
+                correlation_id = %r.correlation_id,
+                entry_point = hydration_entry_point,
+                binding_id = %dropped.candidate.binding_id,
+                matched_chunk_id = %dropped.candidate.matched_chunk_id,
+                parent_chunk_id = %dropped.candidate.parent_chunk_id,
+                reason = dropped.reason.code(),
+                stage = dropped.stage,
+                "CANONICAL_PARENT_HYDRATION_REJECTED"
+            );
+            if !warnings
+                .iter()
+                .any(|warning| warning.code == dropped.reason.code())
+            {
+                warnings.push(pb::DiagnosticWarningV005 {
+                    code: dropped.reason.code().into(),
+                    message: format!("canonical parent candidate rejected at {}", dropped.stage),
+                });
+            }
+        }
+        if normalized_hydration.has_total_timeout() {
+            return Err(total_hydration_timeout_status(&hydration_degradation));
+        }
+        let hydrated = normalized_hydration.surviving_contexts;
         let parent_fetch_ms = parent_fetch_started.elapsed().as_millis() as u64;
         histogram!("astravector_parent_hydration_duration_seconds")
             .record(parent_fetch_ms as f64 / 1000.0);
@@ -2366,7 +2478,11 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .increment(hydration_keys.len() as u64);
         counter!("astravector_parent_hydration_missing_total")
             .increment(hydration_keys.len().saturating_sub(hydrated.len()) as u64);
-        let fetched_parent_count = hydrated.len();
+        let fetched_parent_count = hydrated
+            .iter()
+            .map(|context| (context.access_zone_id, context.parent_chunk_id))
+            .collect::<HashSet<_>>()
+            .len();
         let by_candidate = hydrated
             .into_iter()
             .map(|context| {
@@ -2381,6 +2497,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             })
             .collect::<HashMap<_, _>>();
         let mut direct_results = Vec::new();
+        let mut pre_parent_dedup_graph_seed_results = Vec::new();
+        let mut hydrated_parent_seen = HashSet::new();
         let mut graph_results = Vec::new();
         let mut seed_scores: HashMap<(Uuid, Uuid), f32> = HashMap::new();
         for ((zone, _), hit) in &groups {
@@ -2462,6 +2580,17 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 self.cfg.graph_rag.scoring.graph_score_weight,
                 self.cfg.graph_rag.scoring.graph_score_bias,
             );
+            let granularity = hit
+                .payload
+                .get("chunk_granularity")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(granularity, "SUB_180" | "SUB_260") {
+                pre_parent_dedup_graph_seed_results.push(direct.clone());
+            }
+            if !hydrated_parent_seen.insert((*parent_zone_id, *parent_id)) {
+                continue;
+            }
             direct_results.push(direct);
         }
         let quality_run_id_filter = search_quality_run_id_filter(&r.filters);
@@ -2622,6 +2751,15 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 for (candidate, segment_index, segment_text, segment_weight) in &lexical_candidates
                 {
                     let parent = &candidate.parent;
+                    if rejected_parent_keys.contains(&(parent.access_zone_id, parent.id)) {
+                        counter!(
+                            "candidate_rejections_total",
+                            "entry_point" => hydration_entry_point,
+                            "reason" => "PARENT_SCOPED_REJECTION"
+                        )
+                        .increment(1);
+                        continue;
+                    }
                     let mut lexical = search_result_from_lexical_parent(parent, segment_text);
                     if let Some(citation) = lexical.citation.as_mut() {
                         citation.metadata.insert(
@@ -2998,12 +3136,21 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_candidates = Vec::new();
         let mut graph_seed_preview_by_key = HashMap::new();
         let mut graph_seed_source_block_by_key = HashMap::new();
+        let mut graph_seed_parent_by_key = HashMap::new();
+        let mut graph_seed_document_by_key = HashMap::new();
+        let graph_seed_source_results = graph_seed_source_results_for_admitted_parents(
+            &direct_results,
+            &pre_parent_dedup_graph_seed_results,
+        );
         seed_scores.clear();
-        for result in &direct_results {
+        for result in graph_seed_source_results {
             let Ok(access_zone_id) = Uuid::parse_str(&result.access_zone_id) else {
                 continue;
             };
             let Some(seed_chunk_id) = graph_seed_chunk_id(result) else {
+                continue;
+            };
+            let Ok(parent_chunk_id) = Uuid::parse_str(&result.parent_chunk_id) else {
                 continue;
             };
             let key = (access_zone_id, seed_chunk_id);
@@ -3039,6 +3186,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             };
             graph_seed_candidates.push(GraphSeedCandidate {
                 key,
+                parent_key: (access_zone_id, parent_chunk_id),
                 score: seed_score,
                 matched_terms,
                 matched_discriminating_terms,
@@ -3046,6 +3194,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 intent_unit_ids,
             });
             seed_scores.entry(key).or_insert(seed_score);
+            graph_seed_parent_by_key.insert(key, result.parent_chunk_id.clone());
+            graph_seed_document_by_key
+                .insert(key, (result.document_id.clone(), result.document_version));
             let source_block_id = result
                 .citation
                 .as_ref()
@@ -3090,7 +3241,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             .join(",");
         let graph_seed_trace = if ranking_trace.enabled {
             {
-                direct_results
+                pre_parent_dedup_graph_seed_results
                     .iter()
                     .filter(|result| {
                         graph_seed_chunk_id(result)
@@ -3178,12 +3329,21 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     r.graph_max_related_contexts
                         .min(self.cfg.limits.graph_related_contexts_max as u32)
                 };
+                let hydration_rejection_reserve = self
+                    .cfg
+                    .search
+                    .hydration_rejection_reserve
+                    .min(self.cfg.search.hydration_rejection_reserve_max);
+                let graph_hydration_fetch_limit = max_related
+                    .saturating_add(hydration_rejection_reserve)
+                    .min(self.cfg.limits.graph_related_contexts_max as u32);
                 tracing::debug!(
                     correlation_id = %r.correlation_id,
                     quality_run_id = quality_run_id_filter.as_deref().unwrap_or(""),
                     graph_seed_keys_count = graph_seed_keys.len(),
                     graph_seed_preview = %graph_seed_preview,
                     max_related,
+                    graph_hydration_fetch_limit,
                     max_seed_chunks = query_plan.limits.max_graph_seeds.min(12),
                     max_edges_visited = self.cfg.graph_rag.retrieval.max_edges_visited,
                     allowed_relations = ?self.cfg.graph_rag.retrieval.allowed_relations,
@@ -3192,7 +3352,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 let graph_call = self.repo()?.expand_chunks_1hop_by_seed_keys(
                     &graph_seed_keys,
                     caller_access_level as i16,
-                    max_related,
+                    graph_hydration_fetch_limit,
                     query_plan.limits.max_graph_seeds.min(12),
                     self.cfg.graph_rag.retrieval.max_edges_visited,
                     &self.cfg.graph_rag.retrieval.allowed_relations,
@@ -3307,6 +3467,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 sparse_rank: None,
                                 payload: serde_json::json!({
                                     "access_zone_id": rel.access_zone_id.to_string(),
+                                    "binding_id": ctx.binding_id.to_string(),
                                     "chunk_id": rel.chunk_id.to_string(),
                                     "parent_chunk_id": parent_id,
                                     "source_block_id": ctx.trace.as_ref().and_then(|t| t.source_block_id.clone()).unwrap_or_default(),
@@ -3337,6 +3498,27 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     "graph_seed_chunk_id".into(),
                                     rel.seed_chunk_id.to_string(),
                                 );
+                                if let Some(parent_id) = graph_seed_parent_by_key
+                                    .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "graph_seed_parent_chunk_id".into(),
+                                        parent_id.clone(),
+                                    );
+                                }
+                                if let Some((document_id, document_version)) =
+                                    graph_seed_document_by_key
+                                        .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
+                                {
+                                    citation.metadata.insert(
+                                        "graph_seed_document_id".into(),
+                                        document_id.clone(),
+                                    );
+                                    citation.metadata.insert(
+                                        "graph_seed_document_version".into(),
+                                        document_version.to_string(),
+                                    );
+                                }
                                 if let Some(intent_ids) = graph_seed_intents_by_key
                                     .get(&(rel.seed_access_zone_id, rel.seed_chunk_id))
                                 {
@@ -3365,9 +3547,43 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                     );
                                 }
                                 citation.metadata.insert(
+                                    "graph_relation_id".into(),
+                                    rel.relation_identity.clone(),
+                                );
+                                citation
+                                    .metadata
+                                    .insert("graph_edge_id".into(), rel.edge_id.to_string());
+                                citation.metadata.insert(
+                                    "graph_relation_source".into(),
+                                    rel.relation_source.clone(),
+                                );
+                                citation.metadata.insert(
                                     "graph_relation_type".into(),
                                     rel.relation_type.as_str().into(),
                                 );
+                                citation.metadata.insert(
+                                    "graph_related_access_zone_id".into(),
+                                    rel.access_zone_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_document_id".into(),
+                                    rel.related_document_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_document_version".into(),
+                                    rel.related_document_version.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_chunk_id".into(),
+                                    rel.chunk_id.to_string(),
+                                );
+                                citation.metadata.insert(
+                                    "graph_related_parent_chunk_id".into(),
+                                    ctx.parent_record.id.to_string(),
+                                );
+                                citation
+                                    .metadata
+                                    .insert("graph_binding_id".into(), ctx.binding_id.to_string());
                                 citation.metadata.insert(
                                     "graph_relation_score".into(),
                                     rel.relation_score.to_string(),
@@ -3476,6 +3692,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 "GRAPH_EXPANSION_COMPLETED"
             );
         }
+        retain_results_outside_rejected_parents(&mut direct_results, &rejected_parent_keys);
+        retain_results_outside_rejected_parents(&mut graph_results, &rejected_parent_keys);
         ranking_trace.observe(pb::RankingStageV005::GraphExpansion, &graph_results);
         let merge_started = std::time::Instant::now();
         let direct_count = direct_results.len();
@@ -3761,29 +3979,53 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
-        let final_visibility_ids = results
+        let final_visibility_candidates = results
             .iter()
-            .filter_map(|r| Uuid::parse_str(&r.matched_chunk_id).ok())
+            .enumerate()
+            .filter_map(|(ordinal, result)| {
+                Some((
+                    ordinal,
+                    FinalVisibilityCandidate {
+                        access_zone_id: Uuid::parse_str(&result.access_zone_id).ok()?,
+                        matched_chunk_id: Uuid::parse_str(&result.matched_chunk_id).ok()?,
+                        parent_chunk_id: Uuid::parse_str(&result.parent_chunk_id).ok()?,
+                        binding_id: result
+                            .citation
+                            .as_ref()
+                            .and_then(|citation| citation.metadata.get("binding_id"))
+                            .map(|value| Uuid::parse_str(value))
+                            .transpose()
+                            .ok()?,
+                    },
+                ))
+            })
             .collect::<Vec<_>>();
-        if !final_visibility_ids.is_empty() {
-            let visible = self
+        if !results.is_empty() {
+            let candidate_result_ordinals = final_visibility_candidates
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>();
+            let candidates = final_visibility_candidates
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect::<Vec<_>>();
+            // Supersedes filter_visible_chunk_ids_multi and
+            // visible.contains(&(zone_id, chunk_id)) with full result identity validation.
+            let visible_candidate_ordinals = self
                 .repo()?
-                .filter_visible_chunk_ids_multi(
-                    &access_zone_ids,
-                    &final_visibility_ids,
-                    caller_access_level as i16,
-                )
+                .filter_visible_search_results_batch(&candidates, caller_access_level as i16)
                 .await
                 .map_err(Status::from)?;
+            let visible_ordinals = visible_candidate_ordinals
+                .into_iter()
+                .filter_map(|ordinal| candidate_result_ordinals.get(ordinal).copied())
+                .collect::<HashSet<_>>();
             let before = results.len();
-            results.retain(|r| {
-                let Ok(zone_id) = Uuid::parse_str(&r.access_zone_id) else {
-                    return false;
-                };
-                let Ok(chunk_id) = Uuid::parse_str(&r.matched_chunk_id) else {
-                    return false;
-                };
-                visible.contains(&(zone_id, chunk_id))
+            let mut ordinal = 0usize;
+            results.retain(|_| {
+                let visible = visible_ordinals.contains(&ordinal);
+                ordinal += 1;
+                visible
             });
             let dropped = before.saturating_sub(results.len());
             counter!("retrieve_context_final_visibility_recheck_total").increment(1);
@@ -3915,7 +4157,8 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             "GRAPH_MERGE_COMPLETED"
         );
         let query_segments_v008 = query_segment_diagnostics(&query_plan, &results);
-        let query_status = if retrieval_status == SegmentRetrievalStatus::PartialFailure
+        let query_status = if hydration_degradation.degraded
+            || retrieval_status == SegmentRetrievalStatus::PartialFailure
             || matches!(
                 coverage_after_visibility.status,
                 QueryEvidenceStatus::Degraded | QueryEvidenceStatus::Unavailable
@@ -3938,6 +4181,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         Ok(Response::new(pb::SearchResponseV004 {
             results,
+            degradation: hydration_degradation
+                .degraded
+                .then_some(hydration_degradation),
             diagnostics: Some(pb::SearchDiagnosticsV004 {
                 query_embedding_ms,
                 qdrant_search_ms,
@@ -6515,16 +6761,20 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
         });
         *inner.metadata_mut() = metadata;
         inner.extensions_mut().insert(request_timing);
+        inner
+            .extensions_mut()
+            .insert(RetrievalEntryPoint("RetrieveContext"));
         let search = <Self as AstraVectorV004Control>::search(self, inner)
             .await?
             .into_inner();
         let diagnostics = search.diagnostics.clone().unwrap_or_default();
+        let typed_degradation = search.degradation.clone();
         let total_candidates = if diagnostics.candidate_count == 0 {
             search.results.len() as u32
         } else {
             diagnostics.candidate_count
         };
-        let degradation_codes = search
+        let mut degradation_codes = search
             .warnings
             .iter()
             .map(|warning| warning.code.clone())
@@ -6543,10 +6793,28 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
                         | "LONG_QUERY_COVERAGE_REDUCED_BY_VISIBILITY_RECHECK"
                         | "QUERY_SEGMENT_SKIPPED_INSUFFICIENT_BUDGET"
                         | "QUERY_SEGMENT_RETRIEVAL_DEGRADED"
+                        | "BINDING_INVALID"
+                        | "VISIBILITY_REJECTED"
+                        | "HYDRATION_MISSING"
+                        | "PARENT_HYDRATION_TIMEOUT"
+                        | "EMPTY_CONTEXT"
                 )
             })
             .collect::<Vec<_>>();
-        let degraded = !degradation_codes.is_empty();
+        if let Some(degradation) = typed_degradation.as_ref() {
+            degradation_codes.extend(
+                degradation
+                    .dropped_parents
+                    .iter()
+                    .map(|dropped| dropped.reason.clone()),
+            );
+        }
+        degradation_codes.sort();
+        degradation_codes.dedup();
+        let degraded = typed_degradation
+            .as_ref()
+            .is_some_and(|degradation| degradation.degraded)
+            || !degradation_codes.is_empty();
         let contexts = search
             .results
             .into_iter()
@@ -6584,6 +6852,7 @@ impl AstraVectorRetrievalFacade for AstraVectorV004ControlService {
             contexts,
             warnings: search.warnings,
             diagnostics: Some(diagnostics),
+            degradation: search.degradation,
         }))
     }
 
@@ -10242,9 +10511,31 @@ fn apply_token_budget_truncation(
 }
 
 fn is_graph_expanded_result(result: &pb::SearchResultV004) -> bool {
-    extraction_retrieval_sources(result)
-        .iter()
-        .any(|source| source == "GRAPH_EXPANDED")
+    primary_retrieval_source(result) == Some("GRAPH_EXPANDED")
+}
+
+fn primary_retrieval_source(result: &pb::SearchResultV004) -> Option<&str> {
+    result
+        .citation
+        .as_ref()?
+        .metadata
+        .get("retrieval_source")
+        .map(String::as_str)
+}
+
+fn duplicate_candidate_should_replace(
+    existing: &pb::SearchResultV004,
+    candidate: &pb::SearchResultV004,
+) -> bool {
+    match (
+        is_graph_expanded_result(existing),
+        is_graph_expanded_result(candidate),
+    ) {
+        // Graph expansion may enrich direct evidence, but must not relabel it.
+        (false, true) => false,
+        (true, false) => true,
+        _ => score_of(candidate) > score_of(existing),
+    }
 }
 
 fn estimate_graph_results_tokens(
@@ -10321,8 +10612,9 @@ fn merge_score_then_truncate(
         let key = result_identity_key(&result);
         if let Some(existing) = by_chunk.get_mut(&key) {
             dedup_count += 1;
+            let replace = duplicate_candidate_should_replace(existing, &result);
             merge_secondary_metadata(existing, &result);
-            if score_of(&result) > score_of(existing) {
+            if replace {
                 let mut replacement = result;
                 merge_secondary_metadata(&mut replacement, existing);
                 *existing = replacement;
@@ -10538,8 +10830,9 @@ fn dedup_results_by_chunk(
         let key = result_identity_key(&result);
         if let Some(existing) = by_chunk.get_mut(&key) {
             dedup += 1;
+            let replace = duplicate_candidate_should_replace(existing, &result);
             merge_secondary_metadata_with_limit(existing, &result, max_relations);
-            if score_of(&result) > score_of(existing) {
+            if replace {
                 let mut replacement = result;
                 merge_secondary_metadata_with_limit(&mut replacement, existing, max_relations);
                 *existing = replacement;
@@ -10551,6 +10844,32 @@ fn dedup_results_by_chunk(
     let mut out = by_chunk.into_values().collect::<Vec<_>>();
     out.sort_by(stable_result_rank);
     (out, dedup)
+}
+
+fn absorb_graph_duplicates_into_direct_pool(
+    direct_pool: &mut [pb::SearchResultV004],
+    graph_results: Vec<pb::SearchResultV004>,
+    max_relations: usize,
+) -> (Vec<pb::SearchResultV004>, usize) {
+    let direct_by_identity = direct_pool
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| (result_identity_key(result), idx))
+        .collect::<HashMap<_, _>>();
+    let mut unique_graph = Vec::with_capacity(graph_results.len());
+    let mut deduplicated = 0usize;
+    for graph in graph_results {
+        if let Some(idx) = direct_by_identity
+            .get(&result_identity_key(&graph))
+            .copied()
+        {
+            merge_secondary_metadata_with_limit(&mut direct_pool[idx], &graph, max_relations);
+            deduplicated += 1;
+        } else {
+            unique_graph.push(graph);
+        }
+    }
+    (unique_graph, deduplicated)
 }
 
 fn combine_group_mmr(
@@ -10595,8 +10914,13 @@ fn select_direct_first_with_group_mmr(
     mmr_allow_graph_candidates: bool,
     max_graph_relations_debug_per_candidate: usize,
 ) -> SearchSelectionResult {
-    let (direct_pool, direct_dedup) =
+    let (mut direct_pool, direct_dedup) =
         dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
+    let (graph_results, cross_source_dedup) = absorb_graph_duplicates_into_direct_pool(
+        &mut direct_pool,
+        graph_results,
+        max_graph_relations_debug_per_candidate,
+    );
     metrics::counter!("graph_mmr_group_direct_candidates_total")
         .increment(direct_pool.len() as u64);
     metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
@@ -10611,7 +10935,7 @@ fn select_direct_first_with_group_mmr(
         fallback_similarity_source,
     );
     let mut selected = direct_mmr.results.clone();
-    let mut dedup_count = direct_dedup;
+    let mut dedup_count = direct_dedup + cross_source_dedup;
     let mut graph_candidates = Vec::new();
     let selected_by_chunk: HashMap<String, usize> = selected
         .iter()
@@ -10695,6 +11019,11 @@ fn select_graph_append_with_group_mmr(
         .collect::<HashSet<_>>();
     let (mut direct_pool, direct_dedup) =
         dedup_results_by_chunk(direct_results, max_graph_relations_debug_per_candidate);
+    let (graph_results, cross_source_dedup) = absorb_graph_duplicates_into_direct_pool(
+        &mut direct_pool,
+        graph_results,
+        max_graph_relations_debug_per_candidate,
+    );
     metrics::counter!("graph_mmr_group_direct_candidates_total")
         .increment(direct_pool.len() as u64);
     metrics::gauge!("graph_mmr_group_direct_lambda_current").set(mmr_lambda_direct as f64);
@@ -10741,7 +11070,7 @@ fn select_graph_append_with_group_mmr(
     direct_selected.extend(remaining_direct_mmr.results.clone());
     let direct_mmr = combine_group_mmr(seed_direct_mmr, remaining_direct_mmr, direct_selected);
     let mut selected = direct_mmr.results.clone();
-    let mut dedup_count = direct_dedup;
+    let mut dedup_count = direct_dedup + cross_source_dedup;
     let selected_by_chunk: HashMap<String, usize> = selected
         .iter()
         .enumerate()
@@ -11258,6 +11587,41 @@ fn merge_secondary_metadata_with_limit(
         sources.len().saturating_sub(1).to_string(),
     );
 
+    if secondary_source == "GRAPH_EXPANDED" {
+        for key in [
+            "graph_seed_access_zone_id",
+            "graph_seed_document_id",
+            "graph_seed_document_version",
+            "graph_seed_chunk_id",
+            "graph_seed_parent_chunk_id",
+            "graph_seed_source_block_id",
+            "graph_relation_id",
+            "graph_edge_id",
+            "graph_relation_source",
+            "graph_relation_type",
+            "graph_relation_score",
+            "graph_related_access_zone_id",
+            "graph_related_document_id",
+            "graph_related_document_version",
+            "graph_related_chunk_id",
+            "graph_related_parent_chunk_id",
+            "graph_binding_id",
+            "graph_hop_distance",
+        ] {
+            if let Some(value) = secondary_citation.metadata.get(key) {
+                if !value.trim().is_empty() {
+                    primary_citation
+                        .metadata
+                        .entry(key.to_string())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+        primary_citation
+            .metadata
+            .insert("graph_secondary_provenance".into(), "true".into());
+    }
+
     let mut relations = parse_json_array_metadata(primary_citation.metadata.get("graph_relations"));
     if let Some(relation) = secondary_citation.metadata.get("graph_relation_type") {
         relations.push(serde_json::json!({
@@ -11564,9 +11928,9 @@ fn is_strong_lexical_candidate(result: &pb::SearchResultV004) -> bool {
 }
 
 fn graph_seed_chunk_id(result: &pb::SearchResultV004) -> Option<Uuid> {
-    Uuid::parse_str(&result.parent_chunk_id)
+    Uuid::parse_str(&result.matched_chunk_id)
         .ok()
-        .or_else(|| Uuid::parse_str(&result.matched_chunk_id).ok())
+        .or_else(|| Uuid::parse_str(&result.parent_chunk_id).ok())
 }
 
 fn graph_seed_score(result: &pb::SearchResultV004) -> f32 {
@@ -11584,9 +11948,53 @@ fn graph_seed_score(result: &pb::SearchResultV004) -> f32 {
         .unwrap_or(0.5)
 }
 
+fn graph_seed_source_results_for_admitted_parents<'a>(
+    direct_results: &'a [pb::SearchResultV004],
+    pre_parent_dedup_results: &'a [pb::SearchResultV004],
+) -> Vec<&'a pb::SearchResultV004> {
+    let admitted_parents = direct_results
+        .iter()
+        .map(|result| {
+            (
+                result.access_zone_id.clone(),
+                result.parent_chunk_id.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut parents_with_children = HashSet::new();
+    let mut seen_children = HashSet::new();
+    let mut selected = Vec::new();
+
+    for result in pre_parent_dedup_results {
+        let parent_key = (
+            result.access_zone_id.clone(),
+            result.parent_chunk_id.clone(),
+        );
+        let child_key = (
+            result.access_zone_id.clone(),
+            result.matched_chunk_id.clone(),
+        );
+        if admitted_parents.contains(&parent_key) && seen_children.insert(child_key) {
+            parents_with_children.insert(parent_key);
+            selected.push(result);
+        }
+    }
+    for result in direct_results {
+        let parent_key = (
+            result.access_zone_id.clone(),
+            result.parent_chunk_id.clone(),
+        );
+        if !parents_with_children.contains(&parent_key) {
+            selected.push(result);
+        }
+    }
+    selected
+}
+
 #[derive(Debug, Clone)]
 struct GraphSeedCandidate {
     key: (Uuid, Uuid),
+    parent_key: (Uuid, Uuid),
     score: f32,
     matched_terms: usize,
     matched_discriminating_terms: usize,
@@ -11621,24 +12029,37 @@ fn select_graph_seed_candidates(
     }
     let mut ranked = by_key.into_values().collect::<Vec<_>>();
     ranked.sort_by(compare_graph_seed_candidates);
-    let mut selected_keys = HashSet::new();
-    let mut selected = Vec::new();
+    let mut selected_parent_keys = HashSet::new();
+    let mut ordered_parent_keys = Vec::new();
     for intent_id in required_intent_ids {
         if let Some(candidate) = ranked.iter().find(|candidate| {
-            candidate.intent_unit_ids.contains(intent_id) && !selected_keys.contains(&candidate.key)
+            candidate.intent_unit_ids.contains(intent_id)
+                && !selected_parent_keys.contains(&candidate.parent_key)
         }) {
-            selected_keys.insert(candidate.key);
-            selected.push(candidate.clone());
-            if selected.len() == limit {
-                return selected;
-            }
+            selected_parent_keys.insert(candidate.parent_key);
+            ordered_parent_keys.push(candidate.parent_key);
         }
     }
+    for candidate in &ranked {
+        if selected_parent_keys.insert(candidate.parent_key) {
+            ordered_parent_keys.push(candidate.parent_key);
+        }
+    }
+    let mut candidates_by_parent = HashMap::<(Uuid, Uuid), Vec<GraphSeedCandidate>>::new();
     for candidate in ranked {
-        if selected_keys.insert(candidate.key) {
-            selected.push(candidate);
-            if selected.len() == limit {
-                break;
+        candidates_by_parent
+            .entry(candidate.parent_key)
+            .or_default()
+            .push(candidate);
+    }
+    let mut selected = Vec::new();
+    for parent_key in ordered_parent_keys {
+        if let Some(candidates) = candidates_by_parent.remove(&parent_key) {
+            for candidate in candidates {
+                selected.push(candidate);
+                if selected.len() == limit {
+                    return selected;
+                }
             }
         }
     }
@@ -12857,6 +13278,20 @@ fn result_identity_key(result: &pb::SearchResultV004) -> String {
     format!("{}:{}", result.access_zone_id, result.matched_chunk_id)
 }
 
+fn retain_results_outside_rejected_parents(
+    results: &mut Vec<pb::SearchResultV004>,
+    rejected_parent_keys: &HashSet<(Uuid, Uuid)>,
+) -> usize {
+    let before = results.len();
+    results.retain(|result| {
+        Uuid::parse_str(&result.access_zone_id)
+            .ok()
+            .zip(Uuid::parse_str(&result.parent_chunk_id).ok())
+            .is_none_or(|key| !rejected_parent_keys.contains(&key))
+    });
+    before.saturating_sub(results.len())
+}
+
 fn result_source_block_id(result: &pb::SearchResultV004) -> Option<&str> {
     result
         .citation
@@ -12988,6 +13423,7 @@ fn reinforce_broad_coverage_results(
     if results.is_empty() || candidates.is_empty() || final_limit == 0 {
         return 0;
     }
+    let (canonical_candidates, _) = dedup_results_by_chunk(candidates.to_vec(), 5);
     let mut selected = results
         .iter()
         .map(result_identity_key)
@@ -12999,7 +13435,7 @@ fn reinforce_broad_coverage_results(
             .or_default() += 1;
     }
     let mut candidate_groups: HashMap<String, Vec<pb::SearchResultV004>> = HashMap::new();
-    for candidate in candidates {
+    for candidate in &canonical_candidates {
         if is_root_container_result(candidate) || is_negative_mention_evidence(candidate) {
             continue;
         }
@@ -13322,6 +13758,7 @@ fn search_result_from_hit(
         metadata.insert("qdrant_point_id".into(), hit.id.to_string());
     }
     for key in [
+        "binding_id",
         "representation_type",
         "dense_version",
         "model_version",
@@ -13838,6 +14275,235 @@ mod v007_fix1_tests {
             "[\"VECTOR_DIRECT\",\"GRAPH_EXPANDED\"]".into(),
         );
         assert!(has_graph_expanded_evidence(&[graph]));
+    }
+
+    #[test]
+    fn score_merge_preserves_direct_origin_when_graph_duplicate_scores_higher() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        direct.parent_chunk_id = "shared-parent".into();
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        graph.parent_chunk_id = "shared-parent".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "CHUNK_HAS_PARENT".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_edge_id".into(), "edge-direct-parent".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_related_chunk_id".into(), "graph-child".into());
+
+        let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
+
+        assert_eq!(merged.results.len(), 1);
+        let result = &merged.results[0];
+        assert_eq!(result.matched_chunk_id, "direct-child");
+        assert_eq!(score_of(result), 0.4);
+        let citation = result.citation.as_ref().unwrap();
+        assert_eq!(
+            citation
+                .metadata
+                .get("retrieval_source")
+                .map(String::as_str),
+            Some("VECTOR_DIRECT")
+        );
+        assert!(extraction_retrieval_sources(result)
+            .iter()
+            .any(|source| source == "GRAPH_EXPANDED"));
+        assert!(citation.metadata.contains_key("graph_relations"));
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_secondary_provenance")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            citation.metadata.get("graph_edge_id").map(String::as_str),
+            Some("edge-direct-parent")
+        );
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_related_chunk_id")
+                .map(String::as_str),
+            Some("graph-child")
+        );
+        assert!(!is_graph_expanded_result(result));
+    }
+
+    #[test]
+    fn chunk_dedup_promotes_direct_origin_even_when_graph_is_seen_first() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        for (result, source) in [
+            (&mut direct, "VECTOR_DIRECT"),
+            (&mut graph, "GRAPH_EXPANDED"),
+        ] {
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("retrieval_source".into(), source.into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("source_block_id".into(), "canonical-a1".into());
+        }
+
+        let (deduplicated, count) = dedup_results_by_chunk(vec![direct, graph], 5);
+
+        assert_eq!(count, 1);
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].matched_chunk_id, "direct-child");
+        assert_eq!(
+            primary_retrieval_source(&deduplicated[0]),
+            Some("VECTOR_DIRECT")
+        );
+    }
+
+    #[test]
+    fn graph_append_does_not_reintroduce_unselected_direct_duplicate() {
+        let mut selected_direct = test_result("direct-a", "selected direct", 0.9);
+        let mut unselected_direct = test_result("direct-b", "unselected direct", 0.4);
+        let mut graph_duplicate = test_result("graph-b", "duplicate graph", 0.8);
+        let mut unique_graph = test_result("graph-c", "unique graph", 0.7);
+        for (result, source, block) in [
+            (&mut selected_direct, "VECTOR_DIRECT", "block-a"),
+            (&mut unselected_direct, "VECTOR_DIRECT", "block-b"),
+            (&mut graph_duplicate, "GRAPH_EXPANDED", "block-b"),
+            (&mut unique_graph, "GRAPH_EXPANDED", "block-c"),
+        ] {
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("retrieval_source".into(), source.into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("source_block_id".into(), block.into());
+        }
+
+        let selection = select_graph_append_with_group_mmr(
+            vec![selected_direct, unselected_direct],
+            vec![graph_duplicate, unique_graph],
+            2,
+            1,
+            1,
+            false,
+            0.75,
+            0.75,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            5,
+        );
+
+        let ids = selection
+            .results
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["direct-a", "graph-c"]);
+    }
+
+    #[test]
+    fn broad_coverage_reinsertion_prefers_direct_duplicate_origin() {
+        let mut selected_a = test_result("selected-a", "selected A", 0.9);
+        let mut selected_b = test_result("selected-b", "selected B", 0.8);
+        let mut direct = test_result("direct-c", "direct C", 0.4);
+        let mut graph = test_result("graph-c", "graph duplicate C", 0.9);
+        for result in [&mut selected_a, &mut selected_b, &mut direct, &mut graph] {
+            result.document_id = "shared-document".into();
+        }
+        for (result, source) in [
+            (&mut direct, "VECTOR_DIRECT"),
+            (&mut graph, "GRAPH_EXPANDED"),
+        ] {
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("retrieval_source".into(), source.into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("source_block_id".into(), "block-c".into());
+            result
+                .citation
+                .as_mut()
+                .unwrap()
+                .metadata
+                .insert("sequence_no".into(), "3".into());
+        }
+        let mut results = vec![selected_a, selected_b];
+
+        reinforce_broad_coverage_results(&mut results, &[direct, graph], 3);
+
+        assert!(results
+            .iter()
+            .any(|result| result.matched_chunk_id == "direct-c"));
+        assert!(!results
+            .iter()
+            .any(|result| result.matched_chunk_id == "graph-c"));
     }
 
     #[test]
@@ -14528,6 +15194,7 @@ mod v007_fix1_tests {
         let zone = Uuid::from_u128(1);
         let weak_high_score = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(30)),
+            parent_key: (zone, Uuid::from_u128(30)),
             score: 0.95,
             matched_terms: 1,
             matched_discriminating_terms: 0,
@@ -14536,6 +15203,7 @@ mod v007_fix1_tests {
         };
         let strong_lower_score = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(20)),
+            parent_key: (zone, Uuid::from_u128(20)),
             score: 0.55,
             matched_terms: 3,
             matched_discriminating_terms: 2,
@@ -14544,6 +15212,7 @@ mod v007_fix1_tests {
         };
         let strong_stable_tie = GraphSeedCandidate {
             key: (zone, Uuid::from_u128(10)),
+            parent_key: (zone, Uuid::from_u128(10)),
             score: 0.55,
             matched_terms: 3,
             matched_discriminating_terms: 2,
@@ -14565,6 +15234,7 @@ mod v007_fix1_tests {
         let candidates = (0..15)
             .map(|index| GraphSeedCandidate {
                 key: (zone, Uuid::from_u128(index + 1)),
+                parent_key: (zone, Uuid::from_u128(index + 1)),
                 score: 1.0 - index as f32 / 100.0,
                 matched_terms: 2,
                 matched_discriminating_terms: 1,
@@ -14583,7 +15253,53 @@ mod v007_fix1_tests {
     }
 
     #[test]
-    fn graph_seed_prefers_parent_chunk_identity() {
+    fn graph_seed_cap_keeps_sibling_representations_of_selected_parent_group() {
+        let zone = Uuid::from_u128(1);
+        let target_parent = Uuid::from_u128(100);
+        let target_children = [Uuid::from_u128(101), Uuid::from_u128(102)];
+        let mut candidates = vec![
+            GraphSeedCandidate {
+                key: (zone, target_children[0]),
+                parent_key: (zone, target_parent),
+                score: 1.0,
+                matched_terms: 4,
+                matched_discriminating_terms: 2,
+                strong_lexical_evidence: true,
+                intent_unit_ids: vec![0],
+            },
+            GraphSeedCandidate {
+                key: (zone, target_children[1]),
+                parent_key: (zone, target_parent),
+                score: 0.4,
+                matched_terms: 1,
+                matched_discriminating_terms: 0,
+                strong_lexical_evidence: false,
+                intent_unit_ids: vec![0],
+            },
+        ];
+        candidates.extend((0..12).map(|index| GraphSeedCandidate {
+            key: (zone, Uuid::from_u128(200 + index)),
+            parent_key: (zone, Uuid::from_u128(300 + index)),
+            score: 0.9 - index as f32 / 100.0,
+            matched_terms: 3,
+            matched_discriminating_terms: 1,
+            strong_lexical_evidence: true,
+            intent_unit_ids: vec![0],
+        }));
+
+        let selected = select_graph_seed_candidates(candidates, &[0], 12);
+        let selected_keys = selected
+            .iter()
+            .map(|candidate| candidate.key)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected.len(), 12);
+        assert!(selected_keys.contains(&(zone, target_children[0])));
+        assert!(selected_keys.contains(&(zone, target_children[1])));
+    }
+
+    #[test]
+    fn graph_seed_preserves_matched_child_identity_with_parent_fallback() {
         let parent = Uuid::from_u128(10);
         let matched_subchunk = Uuid::from_u128(20);
         let result = pb::SearchResultV004 {
@@ -14592,16 +15308,67 @@ mod v007_fix1_tests {
             ..Default::default()
         };
 
-        assert_eq!(graph_seed_chunk_id(&result), Some(parent));
+        assert_eq!(graph_seed_chunk_id(&result), Some(matched_subchunk));
 
-        let result_without_parent = pb::SearchResultV004 {
-            matched_chunk_id: matched_subchunk.to_string(),
+        let result_without_matched = pb::SearchResultV004 {
+            parent_chunk_id: parent.to_string(),
             ..Default::default()
         };
-        assert_eq!(
-            graph_seed_chunk_id(&result_without_parent),
-            Some(matched_subchunk)
-        );
+        assert_eq!(graph_seed_chunk_id(&result_without_matched), Some(parent));
+    }
+
+    #[test]
+    fn graph_seed_sources_keep_all_child_representations_of_admitted_parents() {
+        let admitted_parent = Uuid::from_u128(10).to_string();
+        let fallback_parent = Uuid::from_u128(11).to_string();
+        let excluded_parent = Uuid::from_u128(12).to_string();
+        let zone = Uuid::from_u128(1).to_string();
+        let direct = vec![
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: admitted_parent.clone(),
+                parent_chunk_id: admitted_parent.clone(),
+                ..Default::default()
+            },
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: fallback_parent.clone(),
+                parent_chunk_id: fallback_parent.clone(),
+                ..Default::default()
+            },
+        ];
+        let children = vec![
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: Uuid::from_u128(101).to_string(),
+                parent_chunk_id: admitted_parent.clone(),
+                ..Default::default()
+            },
+            pb::SearchResultV004 {
+                access_zone_id: zone.clone(),
+                matched_chunk_id: Uuid::from_u128(102).to_string(),
+                parent_chunk_id: admitted_parent,
+                ..Default::default()
+            },
+            pb::SearchResultV004 {
+                access_zone_id: zone,
+                matched_chunk_id: Uuid::from_u128(103).to_string(),
+                parent_chunk_id: excluded_parent,
+                ..Default::default()
+            },
+        ];
+
+        let selected = graph_seed_source_results_for_admitted_parents(&direct, &children);
+        let selected_ids = selected
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected.len(), 3);
+        assert!(selected_ids.contains(Uuid::from_u128(101).to_string().as_str()));
+        assert!(selected_ids.contains(Uuid::from_u128(102).to_string().as_str()));
+        assert!(selected_ids.contains(fallback_parent.as_str()));
+        assert!(!selected_ids.contains(Uuid::from_u128(103).to_string().as_str()));
     }
 
     #[test]
@@ -15305,5 +16072,32 @@ mod fix463_stabilization_tests {
         assert_eq!(ctx.metadata.get("access_zone_id"), Some(&zone));
         assert!(ctx.metadata.contains_key("document_id"));
         assert!(ctx.metadata.contains_key("matched_chunk_id"));
+    }
+
+    #[test]
+    fn rejected_parent_cannot_reenter_from_another_retrieval_branch() {
+        let zone = Uuid::new_v4();
+        let rejected_parent = Uuid::new_v4();
+        let healthy_parent = Uuid::new_v4();
+        let result = |parent_chunk_id: Uuid| pb::SearchResultV004 {
+            access_zone_id: zone.to_string(),
+            document_id: Uuid::new_v4().to_string(),
+            document_version: 1,
+            matched_chunk_id: Uuid::new_v4().to_string(),
+            parent_chunk_id: parent_chunk_id.to_string(),
+            parent_text: "canonical parent".into(),
+            ..Default::default()
+        };
+        let mut branch_results = vec![result(rejected_parent), result(healthy_parent)];
+        let rejected = HashSet::from([(zone, rejected_parent)]);
+
+        let removed = retain_results_outside_rejected_parents(&mut branch_results, &rejected);
+
+        assert_eq!(removed, 1);
+        assert_eq!(branch_results.len(), 1);
+        assert_eq!(
+            branch_results[0].parent_chunk_id,
+            healthy_parent.to_string()
+        );
     }
 }

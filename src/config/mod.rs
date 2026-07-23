@@ -1381,6 +1381,12 @@ fn default_backpressure_acquire_timeout_ms() -> u64 {
 fn default_search_candidate_limit_max() -> u32 {
     200
 }
+fn default_hydration_rejection_reserve() -> u32 {
+    4
+}
+fn default_hydration_rejection_reserve_max() -> u32 {
+    16
+}
 fn default_graph_related_contexts_max() -> usize {
     20
 }
@@ -1934,6 +1940,24 @@ impl AppConfig {
             "hybrid fusion weights must have positive sum"
         );
         anyhow::ensure!(self.search.rrf_k > 0.0, "search.rrf_k must be positive");
+        anyhow::ensure!(
+            self.search.hydration_rejection_reserve <= self.search.hydration_rejection_reserve_max,
+            "search.hydration_rejection_reserve must not exceed hydration_rejection_reserve_max"
+        );
+        anyhow::ensure!(
+            self.search.hydration_rejection_reserve_max <= self.limits.search_candidate_limit_max,
+            "search.hydration_rejection_reserve_max must not exceed search candidate limit max"
+        );
+        anyhow::ensure!(
+            if self.search.hydration_failpoints.non_production_enabled {
+                !self.search.hydration_failpoints.plan_path.trim().is_empty()
+                    && !self.search.hydration_failpoints.run_id.trim().is_empty()
+            } else {
+                self.search.hydration_failpoints.plan_path.trim().is_empty()
+                    && self.search.hydration_failpoints.run_id.trim().is_empty()
+            },
+            "hydration failpoints require enabled + plan_path + run_id together"
+        );
         anyhow::ensure!(
             self.search.lexical.backend == "POSTGRES_FTS",
             "search.lexical.backend must be POSTGRES_FTS"
@@ -2687,6 +2711,12 @@ pub struct SearchConfig {
     pub candidate_limit: u32,
     pub parent_limit: u32,
     pub rrf_k: f32,
+    #[serde(default = "default_hydration_rejection_reserve")]
+    pub hydration_rejection_reserve: u32,
+    #[serde(default = "default_hydration_rejection_reserve_max")]
+    pub hydration_rejection_reserve_max: u32,
+    #[serde(default)]
+    pub hydration_failpoints: HydrationFailpointConfig,
     #[serde(default)]
     pub query_processing: QueryProcessingConfig,
     #[serde(default = "default_hybrid_fusion_method")]
@@ -2703,6 +2733,16 @@ pub struct SearchConfig {
     pub ranking_trace: RankingTraceConfig,
     #[serde(default)]
     pub no_answer: NoAnswerConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HydrationFailpointConfig {
+    #[serde(default)]
+    pub non_production_enabled: bool,
+    #[serde(default)]
+    pub plan_path: String,
+    #[serde(default)]
+    pub run_id: String,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QueryProcessingTierConfig {
@@ -3057,6 +3097,27 @@ mod query_processing_compatibility_tests {
     fn grpc_query_deadline_keeps_default_and_supports_runtime_override() {
         let application = include_str!("../../config/application.yaml");
         assert!(application.contains("query_ms: ${ASTRAVECTOR_GRPC_QUERY_DEADLINE_MS:-1000}"));
+    }
+
+    #[test]
+    fn fix486f_profile_has_valid_bounded_query_deadlines() {
+        let mut merged = read_yaml_value("config/application.yaml").unwrap();
+        let profile = read_yaml_value("config/application-fix486f.yaml").unwrap();
+        merge_yaml(&mut merged, profile);
+        apply_query_processing_compatibility(&mut merged).unwrap();
+        let mut config: AppConfig = serde_yaml::from_value(merged).unwrap();
+        config.model.path = "Cargo.toml".into();
+        config.tokenizer.path = "Cargo.toml".into();
+
+        config.validate().unwrap();
+        assert_eq!(config.grpc.deadlines.query_ms, 15_000);
+        assert_eq!(config.search.query_processing.single_deadline_ms, 15_000);
+        assert_eq!(
+            config.search.query_processing.long_query_deadline_ms,
+            22_500
+        );
+        assert_eq!(config.search.query_processing.standard.deadline_ms, 22_500);
+        assert_eq!(config.search.query_processing.extended.deadline_ms, 33_750);
     }
 
     #[test]

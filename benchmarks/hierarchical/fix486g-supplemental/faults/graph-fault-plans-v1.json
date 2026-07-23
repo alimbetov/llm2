@@ -1,0 +1,92 @@
+{
+  "schema_version": "1",
+  "bank_id": "fix486g-graph-parent-supplemental",
+  "version": "1.0.0",
+  "status": "FROZEN",
+  "frozen_source_bank": {
+    "bank_id": "fix486-hierarchical-bank",
+    "version": "1.0.0",
+    "status": "FROZEN",
+    "aggregate_sha256": "cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff"
+  },
+  "fault_plans": [
+    {
+      "fault_setup": "graph_wrong_parent_overlay",
+      "fault_class": "WRONG_PARENT",
+      "source_provenance": "capture frozen production-created A1 seed edge and A3 related child identities",
+      "mutation": "pair the captured A3 related child with seed parent A1 while preserving binding/edge trace identities",
+      "activation_scope": "phase-owned environment and correlation-id scoped",
+      "expected_rejection_reason_any": ["GRAPH_BINDING_INVALID", "BINDING_INVALID", "GRAPH_WRONG_PARENT"],
+      "required_valid_survivor": true,
+      "hard_gates": {
+        "wrong_parent_graph_final_contexts": 0,
+        "graph_seed_parent_reuse": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    {
+      "fault_setup": "graph_cross_zone_overlay",
+      "fault_class": "CROSS_ZONE",
+      "source_provenance": "use frozen zone-B relation and captured production endpoint identities",
+      "mutation": "increase only phase-owned attraction/order if needed without changing frozen relation payload",
+      "activation_scope": "zone-A request in phase-owned environment",
+      "expected_rejection_reason_any": ["GRAPH_ENDPOINT_ZONE_MISMATCH", "VISIBILITY_REJECTED", "ACCESS_ZONE_REJECTED"],
+      "required_valid_survivor": true,
+      "hard_gates": {
+        "graph_cross_zone_results": 0,
+        "forbidden_anchor_leaks": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    {
+      "fault_setup": "graph_inactive_deleted_expired_overlay",
+      "fault_class": "LIFECYCLE_INVALID",
+      "source_provenance": "derive relation endpoints from production-ingested inactive/deleted/expired versions",
+      "mutation": "create phase-owned relations from the valid seed to lifecycle-invalid related endpoints",
+      "activation_scope": "phase-owned relation rows only",
+      "expected_rejection_reason_any": ["GRAPH_TARGET_VISIBILITY_REJECTED", "VISIBILITY_REJECTED", "WRONG_VERSION", "DELETED_PARENT"],
+      "required_valid_survivor": true,
+      "hard_gates": {
+        "inactive_or_deleted_graph_results": 0,
+        "wrong_version_results": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    {
+      "fault_setup": "graph_second_hop_overlay",
+      "fault_class": "HOP_LIMIT",
+      "source_provenance": "derive A1->A3 first hop from frozen edge and add phase-owned A3->A2 second hop",
+      "mutation": "insert second-hop relation without modifying frozen graph payload",
+      "activation_scope": "request graph_max_hops=1",
+      "expected_rejection_reason_any": ["GRAPH_HOP_LIMIT_REJECTED", "HOP_LIMIT_REJECTED"],
+      "required_valid_survivor": true,
+      "hard_gates": {
+        "graph_hop_limit_violations": 0,
+        "second_hop_final_contexts": 0,
+        "valid_survivor_lost": 0
+      }
+    },
+    {
+      "fault_setup": "graph_cycle_overlay",
+      "fault_class": "CYCLE_OR_DUPLICATE",
+      "source_provenance": "derive valid A1/A3 endpoints and create phase-owned A3->A1, A1->A1 and duplicate A1->A3 edges",
+      "mutation": "introduce cycle and duplicate-edge controls within the phase-owned graph relation set",
+      "activation_scope": "phase-owned relation rows only",
+      "expected_rejection_reason_any": ["GRAPH_CYCLE_REJECTED", "GRAPH_HOP_LIMIT_REJECTED", "DUPLICATE_GRAPH_EDGE"],
+      "required_valid_survivor": true,
+      "hard_gates": {
+        "graph_cycle_credit_inflation": 0,
+        "duplicate_graph_credit": 0,
+        "valid_survivor_lost": 0
+      }
+    }
+  ],
+  "safety": {
+    "no_public_activation_api": true,
+    "no_frozen_payload_mutation": true,
+    "no_global_sleep": true,
+    "no_user_specific_paths": true,
+    "cleanup_required": true,
+    "active_fault_after_cleanup_blocks_pass": true
+  }
+}

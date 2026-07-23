@@ -176,6 +176,12 @@ search:
   candidate_limit: ${ASTRAVECTOR_SEARCH_CANDIDATE_LIMIT:-50}
   parent_limit: ${ASTRAVECTOR_SEARCH_PARENT_LIMIT:-5}
   rrf_k: ${ASTRAVECTOR_SEARCH_RRF_K:-60}
+  hydration_rejection_reserve: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE:-4}
+  hydration_rejection_reserve_max: ${ASTRAVECTOR_HYDRATION_REJECTION_RESERVE_MAX:-16}
+  hydration_failpoints:
+    non_production_enabled: ${ASTRAVECTOR_TEST_HYDRATION_FAILPOINTS_ENABLED:-false}
+    plan_path: "${ASTRAVECTOR_TEST_HYDRATION_FAILPOINT_PLAN_PATH:-}"
+    run_id: "${ASTRAVECTOR_TEST_HYDRATION_FAILPOINT_RUN_ID:-}"
   query_processing:
     enabled: ${ASTRAVECTOR_LONG_QUERY_ENABLED:-true}
     extended_enabled: ${ASTRAVECTOR_LONG_QUERY_EXTENDED_ENABLED:-false}
