@@ -61,6 +61,9 @@ Focused tests prove:
 - structural evidence fails unless it is both observed and `PASS`;
 - statistical fault evaluation does not inherit `POSITIVE_GRAPH` survivor
   requirements for `DIRECT` fault scenarios.
+- one-hop telemetry can be reconstructed from a complete debug ranking trace
+  when final selection contains no Graph context; absent context and absent
+  ranking trace still fail closed.
 
 Production ranking, Graph weights, relation weights, RRF, MMR, token budget,
 frozen queries, qrels and production rejection classifications are unchanged.

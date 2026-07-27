@@ -44,10 +44,19 @@ if graph and os.environ.get("FIX486G_FAKE_OMIT_GRAPH_DIAGNOSTICS") != "1":
         "graphCandidatesCount": 1,
         "hopCount": 1
     })
+if os.environ.get("FIX486G_FAKE_HOP_FROM_TRACE") == "1":
+    diagnostics.pop("hopCount", None)
+    diagnostics["rankingTrace"] = {
+        "candidates": [{"stages": [{"stage": "GRAPH_EXPANSION", "present": True}]}]
+    }
 context = {
     "matchedChunkId": "runtime-child",
     "parentChunkId": "runtime-parent",
-    "metadata": {"graph_hop_distance": "1"} if graph else {}
+    "metadata": (
+        {}
+        if os.environ.get("FIX486G_FAKE_HOP_FROM_TRACE") == "1"
+        else ({"graph_hop_distance": "1"} if graph else {})
+    )
 }
 contexts = [] if empty else [context]
 if sys.argv[-1].endswith("/Search"):
@@ -261,6 +270,34 @@ fn graph_enabled_missing_graph_diagnostics_fails_closed() {
     assert!(String::from_utf8_lossy(&result.stderr)
         .contains("DIAGNOSTIC_INCOMPLETE: response diagnostics do not provide graph_expansion_ms"));
     assert!(!output.exists());
+}
+
+#[test]
+fn one_hop_is_derived_from_complete_ranking_trace_when_no_graph_context_survives() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = fake_grpcurl(temp.path());
+    let (identity, resource) = fixtures(temp.path());
+    let output = temp.path().join("capture.jsonl");
+    let call_log = temp.path().join("calls.log");
+    let result = base_command(&fake, &identity, &output, &call_log)
+        .args(["--query-id", "g-fault-hop-limit-01", "--resource-evidence"])
+        .arg(resource)
+        .env("FIX486G_FAKE_HOP_FROM_TRACE", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let rows = jsonl(&output);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["telemetry"]["hop_count"] == 1));
+    assert!(rows.iter().all(|row| row["telemetry_sources"]["hop_count"]
+        .as_str()
+        .unwrap()
+        .contains("rankingTrace")));
 }
 
 #[test]

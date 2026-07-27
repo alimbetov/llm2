@@ -199,6 +199,7 @@ def response_hop_count(
     entry_point: str,
     diagnostics: dict[str, Any],
     graph_enabled: bool,
+    hop_max: int,
 ) -> tuple[int, str]:
     value, source = camel_or_snake(diagnostics, "hopCount", "hop_count")
     if source is not None:
@@ -218,6 +219,21 @@ def response_hop_count(
     )
     if graph_source is not None and number(graph_count, graph_source, integer=True) == 0:
         return 0, f"{graph_source} == 0"
+    trace, trace_source = camel_or_snake(diagnostics, "rankingTrace", "ranking_trace")
+    if isinstance(trace, dict) and isinstance(trace.get("candidates"), list):
+        graph_expansion_present = any(
+            stage.get("stage") == "GRAPH_EXPANSION" and stage.get("present") is True
+            for candidate in trace["candidates"]
+            if isinstance(candidate, dict)
+            for stage in candidate.get("stages", [])
+            if isinstance(stage, dict)
+        )
+        if graph_expansion_present and hop_max == 1:
+            return 1, f"{trace_source} contains a present GRAPH_EXPANSION stage under the one-hop request contract"
+        if not graph_expansion_present and (
+            graph_source is None or number(graph_count, graph_source, integer=True) == 0
+        ):
+            return 0, f"{trace_source} contains no present GRAPH_EXPANSION stage"
     if not graph_enabled:
         return 0, "bank query disables graph; proto3 JSON omits zero hop/count scalars"
     fail("DIAGNOSTIC_INCOMPLETE", "hop count is absent from diagnostics and graph context metadata")
@@ -285,7 +301,7 @@ def telemetry_from_response(
     telemetry["candidate_max"] = 64
     sources["candidate_max"] = "Search request.candidateLimit / RetrieveContext bounded profile contract"
     telemetry["hop_count"], sources["hop_count"] = response_hop_count(
-        response, entry_point, diagnostics, graph_enabled
+        response, entry_point, diagnostics, graph_enabled, hop_max
     )
     telemetry["hop_max"] = hop_max
     sources["hop_max"] = "bank query.graph_max_hops and request.graphMaxHops"
