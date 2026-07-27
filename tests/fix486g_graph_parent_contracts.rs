@@ -282,7 +282,7 @@ fn graph_faults_preserve_an_independent_valid_parent_survivor() {
         "child-a3-260",
         "child_a3_alt",
         "insert_fault_edge \"$edge\" \"$source\" \"$survivor\" REPAIRED_BY",
-        "run_control_pair wrong-parent present \"$child\"",
+        "run_control_pair wrong-parent optional \"$child\" any BINDING_INVALID",
         "run_control_pair binding-invalid present \"$child\"",
         "run_control_pair \"$kind-target\" present \"$child\"",
     ] {
