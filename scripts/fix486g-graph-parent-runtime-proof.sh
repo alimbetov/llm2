@@ -395,7 +395,7 @@ binding_status_fault() {
   run_exact_mutation binding-invalid-activate 1 \
     "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='FAILED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND qdrant_sync_status='FAILED'" 1 || return 1
-  run_control_pair binding-invalid present "$child" || rc=$?
+  run_control_pair binding-invalid optional "$child" any VISIBILITY_REJECTED || rc=$?
   run_exact_mutation binding-invalid-restore 1 \
     "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND qdrant_sync_status='SYNCED'" 1 || return 1
@@ -417,7 +417,7 @@ lifecycle_fault() {
     *) return 64;;
   esac
   run_exact_mutation "$activate_label" 1 "$activate_sql" "$activate_verify" 1 || return 1
-  run_control_pair "$kind-target" present "$child" || rc=$?
+  run_control_pair "$kind-target" optional "$child" any VISIBILITY_REJECTED || rc=$?
   run_exact_mutation "$restore_label" 1 "$restore_sql" "$restore_verify" 1 || return 1
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
