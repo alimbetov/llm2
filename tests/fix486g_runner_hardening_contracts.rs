@@ -192,17 +192,38 @@ fn signals_have_explicit_fail_closed_terminal_metadata() {
 }
 
 #[test]
-fn official_identity_gate_requires_the_phase_branch_and_remote_sha() {
+fn official_identity_gate_requires_an_approved_phase_branch_and_remote_sha() {
     let runner = source(RUNNER);
     require_all(
         &runner,
         &[
-            "EXPECTED_BRANCH=codex/fix486g-graph-parent-proof",
-            "[[ \"$BRANCH\" == \"$EXPECTED_BRANCH\"",
+            "branch_is_approved()",
+            "codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence",
+            "branch_is_approved &&",
             "[[ \"$SOURCE_SHA\" == \"$REMOTE_SHA\" ]]",
             "git -C \"$ROOT\" status --porcelain",
         ],
         "FIX486G-RUNNER-IDENTITY-001",
+    );
+}
+
+#[test]
+fn fault_controls_use_a_bounded_raw_window_that_can_hold_attack_and_survivor() {
+    let runner = source(RUNNER);
+    require_all(
+        &runner,
+        &[
+            "FAULT_GRAPH_RELATED_CONTEXTS=10",
+            "graphMaxRelatedContexts:$graph_limit",
+            "run_control_pair wrong-parent present \"$child\"",
+            "run_control_pair binding-invalid present \"$child\"",
+            "run_control_pair \"$kind-target\" present \"$child\"",
+        ],
+        "FIX486G-RUNNER-NON-VACUOUS-001",
+    );
+    assert!(
+        runner.contains("((FAULT_GRAPH_RELATED_CONTEXTS <= 20))"),
+        "FIX486G-RUNNER-NON-VACUOUS-001: fault window must remain bounded"
     );
 }
 

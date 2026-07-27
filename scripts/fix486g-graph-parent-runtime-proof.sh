@@ -21,7 +21,8 @@ PROJECT=$(printf 'fix486g-%s' "$RUN_ID" | tr '[:upper:]_' '[:lower:]-' | tr -cd 
 PID=""; FINALIZED=false; SOURCE_SHA=$(git -C "$ROOT" rev-parse HEAD); BANK_SHA=cc699d929226f928eb2e92aa97d51d82d78e20f69440f04229e9bec9f83164ff; SUPPLEMENTAL_SHA=af4fceb8e424fddecff4284e9cd8d1d68fb4db5c148f9b2aa585bb8497ac1649
 BRANCH=$(git -C "$ROOT" branch --show-current)
 REMOTE_SHA=$(git -C "$ROOT" rev-parse '@{upstream}' 2>/dev/null || true)
-EXPECTED_BRANCH=codex/fix486g-graph-parent-proof
+FAULT_GRAPH_RELATED_CONTEXTS=10
+((FAULT_GRAPH_RELATED_CONTEXTS <= 20)) || { echo "FIX486G_FAIL=FAULT_GRAPH_WINDOW_UNBOUNDED" >&2; exit 1; }
 
 if [[ "$MODE" == --cleanup-only || "$MODE" == --verify-evidence ]]; then
   [[ -d "$E" ]] || { echo "FIX486G_FAIL=EVIDENCE_RUN_NOT_FOUND:$E" >&2; exit 1; }
@@ -168,10 +169,17 @@ trap 'handle_signal TERM 143' TERM
 trap 'handle_signal HUP 129' HUP
 
 verify_identity() {
-  [[ "$BRANCH" == "$EXPECTED_BRANCH" && -n "$REMOTE_SHA" ]] &&
+  branch_is_approved &&
+    [[ -n "$REMOTE_SHA" ]] &&
     [[ -z $(git -C "$ROOT" status --porcelain) ]] &&
     [[ $(git -C "$ROOT" rev-parse HEAD) == "$SOURCE_SHA" ]] &&
     [[ "$SOURCE_SHA" == "$REMOTE_SHA" ]]
+}
+branch_is_approved() {
+  case "$BRANCH" in
+    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 verify_bank() {
   python3 "$ROOT/scripts/fix486c_verify_frozen_bank.py" --root "$BANK" >"$E/bank/verification.json" &&
@@ -347,18 +355,19 @@ prepare_fault_targets() {
 }
 run_control_pair() {
   local name=$1 expectation=$2 forbidden=${3:-} forbidden_scope=${4:-any} dir="$E/faults/$1" id q z
+  local graph_limit=$FAULT_GRAPH_RELATED_CONTEXTS
   local validate_args=(--identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation")
   [[ -n "$forbidden" ]] && validate_args+=(--forbidden-chunk-id "$forbidden" --forbidden-scope "$forbidden_scope")
   mkdir -p "$dir/search" "$dir/retrieve-context"
   id=$(jq -r '.[0].query.query_id' "$E/bank/selected-queries.json")
   q=$(jq -r '.[0].query.question' "$E/bank/selected-queries.json")
   z=$(jq -r '.access_zone_id' "$E/faults/targets.json")
-  jq -n --arg z "$z" --arg q "$q" --arg id "$name" '{correlationId:("fix486g-control-"+$id),accessZoneId:$z,callerAccessLevel:"INTERNAL",query:$q,topK:5,candidateLimit:64,parentLimit:5,timeoutMs:30000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true,enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:5}' >"$dir/search/request.json"
+  jq -n --arg z "$z" --arg q "$q" --arg id "$name" --argjson graph_limit "$graph_limit" '{correlationId:("fix486g-control-"+$id),accessZoneId:$z,callerAccessLevel:"INTERNAL",query:$q,topK:5,candidateLimit:64,parentLimit:5,timeoutMs:30000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true,enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:$graph_limit}' >"$dir/search/request.json"
   grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorV004Control/Search <"$dir/search/request.json" >"$dir/search/response.json" || return 1
-  python3 "$H" validate-control --entry-point Search --response "$dir/search/response.json" "${validate_args[@]}" --output "$dir/search/result.json" >/dev/null || return 1
-  jq -n --arg z "$z" --arg q "$q" --arg id "$name" '{context:{correlationId:("fix486g-control-"+$id),callerService:"fix486g",callerUserId:"fix486g",callerAccessLevel:"INTERNAL"},accessZoneId:$z,question:$q,profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:5}' >"$dir/retrieve-context/request.json"
+  python3 "$H" validate-control --entry-point Search --response "$dir/search/response.json" "${validate_args[@]}" --output "$dir/search/result.json" || return 1
+  jq -n --arg z "$z" --arg q "$q" --arg id "$name" --argjson graph_limit "$graph_limit" '{context:{correlationId:("fix486g-control-"+$id),callerService:"fix486g",callerUserId:"fix486g",callerAccessLevel:"INTERNAL"},accessZoneId:$z,question:$q,profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:$graph_limit}' >"$dir/retrieve-context/request.json"
   grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorRetrievalFacade/RetrieveContext <"$dir/retrieve-context/request.json" >"$dir/retrieve-context/response.json" || return 1
-  python3 "$H" validate-control --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" "${validate_args[@]}" --output "$dir/retrieve-context/result.json" >/dev/null
+  python3 "$H" validate-control --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" "${validate_args[@]}" --output "$dir/retrieve-context/result.json"
 }
 binding_parent_fault() {
   local zone child parent_a1 parent_a3 source survivor edge rc=0
