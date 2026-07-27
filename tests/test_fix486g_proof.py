@@ -244,6 +244,209 @@ class NormalizeContracts(unittest.TestCase):
             "REQUIRED_REJECTION_WARNING_MISSING", result["failure_codes"]
         )
 
+    def rejected_response(self, reason: str, include_graph: bool = False) -> tuple[dict, dict]:
+        identities = {
+            "runtime-direct-child": identity("child-a1-180"),
+            "runtime-direct-parent": identity("parent-a1"),
+            "runtime-graph-child": identity("child-a3-180"),
+            "runtime-graph-parent": identity("parent-a3"),
+            "runtime-forbidden": identity("child-a2-180"),
+        }
+        results = [
+            context(
+                "runtime-direct-child",
+                "runtime-direct-parent",
+                {"retrieval_source": "VECTOR_DIRECT"},
+            )
+        ]
+        if include_graph:
+            results.append(
+                context(
+                    "runtime-graph-child",
+                    "runtime-graph-parent",
+                    graph_metadata(
+                        "runtime-graph-child", "runtime-graph-parent", "edge-good"
+                    ),
+                )
+            )
+        return {"results": results, "warnings": [{"code": reason}]}, identities
+
+    def test_all_rejected_target_contracts_accept_only_their_declared_survivor_and_reason(self):
+        for scenario, contract in PROOF.FAULT_VALIDATION_CONTRACTS.items():
+            with self.subTest(scenario=scenario):
+                response, identities = self.rejected_response(
+                    contract["expected_rejection_reason"],
+                    contract["survivor_mode"] == "GRAPH",
+                )
+                result = PROOF.validate_rejected_graph_target(
+                    "Search",
+                    response,
+                    identities,
+                    scenario,
+                    "runtime-forbidden",
+                )
+                self.assertEqual(result["status"], "PASS", result)
+                self.assertEqual(
+                    result["contract"]["survivor_mode"], contract["survivor_mode"]
+                )
+                self.assertTrue(result["assertions"]["relevant_hard_gates_zero"])
+
+                without_reason = copy.deepcopy(response)
+                without_reason["warnings"] = []
+                rejected = PROOF.validate_rejected_graph_target(
+                    "Search",
+                    without_reason,
+                    identities,
+                    scenario,
+                    "runtime-forbidden",
+                )
+                self.assertEqual(rejected["status"], "FAIL")
+                self.assertIn(
+                    "HARD_GATE_NONZERO:rejection_reason_mismatch",
+                    rejected["failure_codes"],
+                )
+
+                forbidden_survives = copy.deepcopy(response)
+                forbidden_survives["results"].append(
+                    context(
+                        "runtime-forbidden",
+                        "runtime-direct-parent",
+                        graph_metadata(
+                            "runtime-forbidden",
+                            "runtime-direct-parent",
+                            "runtime-forbidden",
+                        ),
+                    )
+                )
+                rejected = PROOF.validate_rejected_graph_target(
+                    "Search",
+                    forbidden_survives,
+                    identities,
+                    scenario,
+                    "runtime-forbidden",
+                )
+                self.assertEqual(rejected["status"], "FAIL")
+                self.assertIn(
+                    "HARD_GATE_NONZERO:forbidden_target_final_contexts",
+                    rejected["failure_codes"],
+                )
+
+    def test_old_graph_survivor_only_assumption_rejects_valid_direct_fault_survivor(self):
+        response, identities = self.rejected_response("BINDING_INVALID")
+        old_result = PROOF.validate_control(
+            "Search", response, identities, "present", "runtime-forbidden"
+        )
+        new_result = PROOF.validate_rejected_graph_target(
+            "Search", response, identities, "wrong-parent", "runtime-forbidden"
+        )
+        self.assertEqual(old_result["status"], "FAIL")
+        self.assertIn("VALID_GRAPH_SURVIVOR_LOST", old_result["failure_codes"])
+        self.assertEqual(new_result["status"], "PASS")
+
+    def test_rejected_target_validator_fails_each_shared_invariant_independently(self):
+        response, identities = self.rejected_response("BINDING_INVALID")
+        cases = {}
+
+        forbidden_survives = copy.deepcopy(response)
+        forbidden_survives["results"].append(
+            context(
+                "runtime-forbidden",
+                "runtime-direct-parent",
+                graph_metadata(
+                    "runtime-forbidden", "runtime-direct-parent", "edge-forbidden"
+                ),
+            )
+        )
+        cases["forbidden-target"] = (
+            forbidden_survives,
+            None,
+            "HARD_GATE_NONZERO:forbidden_target_final_contexts",
+        )
+
+        no_survivor = copy.deepcopy(response)
+        no_survivor["results"] = []
+        cases["no-survivor"] = (
+            no_survivor,
+            None,
+            "HARD_GATE_NONZERO:valid_survivor_lost",
+        )
+
+        missing_reason = copy.deepcopy(response)
+        missing_reason["warnings"] = []
+        cases["missing-reason"] = (
+            missing_reason,
+            None,
+            "HARD_GATE_NONZERO:rejection_reason_mismatch",
+        )
+
+        wrong_reason = copy.deepcopy(response)
+        wrong_reason["warnings"] = [{"code": "VISIBILITY_REJECTED"}]
+        cases["wrong-reason"] = (
+            wrong_reason,
+            None,
+            "HARD_GATE_NONZERO:rejection_reason_mismatch",
+        )
+
+        false_credit = copy.deepcopy(response)
+        false_credit["results"][0]["metadata"] = graph_metadata(
+            "runtime-forbidden", "runtime-direct-parent", "edge-false-credit"
+        )
+        cases["false-provenance-credit"] = (
+            false_credit,
+            None,
+            "HARD_GATE_NONZERO:forbidden_graph_provenance_credits",
+        )
+
+        external_gate = copy.deepcopy(response)
+        cases["external-hard-gate"] = (
+            external_gate,
+            {"binding_invalid_graph_final_contexts": 1},
+            "HARD_GATE_NONZERO:binding_invalid_graph_final_contexts",
+        )
+
+        for name, (candidate, gates, expected) in cases.items():
+            with self.subTest(case=name):
+                result = PROOF.validate_rejected_graph_target(
+                    "Search",
+                    candidate,
+                    identities,
+                    "wrong-parent",
+                    "runtime-forbidden",
+                    external_hard_gates=gates,
+                )
+                self.assertEqual(result["status"], "FAIL")
+                self.assertIn(expected, result["failure_codes"])
+
+    def test_structural_rejection_evidence_must_be_observed_and_passed(self):
+        response, identities = self.rejected_response("UNRELATED")
+        response["warnings"] = []
+        evidence = {
+            "status": "PASS",
+            "observed": True,
+            "reason": "GRAPH_ENDPOINT_ZONE_MISMATCH",
+            "source": "verified phase-owned topology audit",
+        }
+        result = PROOF.validate_rejected_graph_target(
+            "Search",
+            response,
+            identities,
+            "cross-zone",
+            "runtime-forbidden",
+            rejection_evidence=evidence,
+        )
+        self.assertEqual(result["status"], "PASS")
+
+        evidence["observed"] = False
+        result = PROOF.validate_rejected_graph_target(
+            "Search",
+            response,
+            identities,
+            "cross-zone",
+            "runtime-forbidden",
+            rejection_evidence=evidence,
+        )
+        self.assertEqual(result["status"], "FAIL")
+
     def test_any_wrong_graph_final_context_fails_the_result(self):
         identities = {
             "runtime-direct-child": identity("child-a1-180"),

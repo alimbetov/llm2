@@ -282,9 +282,9 @@ fn graph_faults_preserve_an_independent_valid_parent_survivor() {
         "child-a3-260",
         "child_a3_alt",
         "insert_fault_edge \"$edge\" \"$source\" \"$survivor\" REPAIRED_BY",
-        "run_control_pair wrong-parent optional \"$child\" any BINDING_INVALID",
-        "run_control_pair binding-invalid optional \"$child\" any VISIBILITY_REJECTED",
-        "run_control_pair \"$kind-target\" optional \"$child\" any VISIBILITY_REJECTED",
+        "run_rejected_target_pair wrong-parent wrong-parent \"$child\"",
+        "run_rejected_target_pair binding-invalid binding-status \"$child\"",
+        "run_rejected_target_pair \"$kind-target\" \"$kind-target\" \"$child\"",
     ] {
         assert!(
             runner.contains(required),

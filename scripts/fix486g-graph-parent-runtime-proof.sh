@@ -353,22 +353,29 @@ prepare_fault_targets() {
   psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "SELECT json_build_object('binding_count',(SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'binding_parent_chunk_id',(SELECT parent_chunk_id::text FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'qdrant_sync_status',(SELECT qdrant_sync_status FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'),'chunk_count',(SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'lifecycle_status',(SELECT lifecycle_status FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'deleted_at',(SELECT deleted_at FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'expires_at',(SELECT expires_at FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'),'expires_at_visible',(SELECT expires_at IS NULL OR expires_at>now() FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child'))" | jq . >"$E/faults/baseline.json" || return 1
   jq -e --arg parent "$parent" '.binding_count==1 and .binding_parent_chunk_id==$parent and .qdrant_sync_status=="SYNCED" and .chunk_count==1 and .lifecycle_status=="ACTIVE" and .deleted_at==null and .expires_at_visible==true' "$E/faults/baseline.json" >/dev/null
 }
-run_control_pair() {
-  local name=$1 expectation=$2 forbidden=${3:-} forbidden_scope=${4:-any} required_warning=${5:-} dir="$E/faults/$1" id q z
+run_rejected_target_pair() {
+  local name=$1 scenario=$2 forbidden=$3 rejection_evidence=${4:-} dir="$E/faults/$1" id q z
   local graph_limit=$FAULT_GRAPH_RELATED_CONTEXTS
-  local validate_args=(--identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation")
-  [[ -n "$forbidden" ]] && validate_args+=(--forbidden-chunk-id "$forbidden" --forbidden-scope "$forbidden_scope")
-  [[ -n "$required_warning" ]] && validate_args+=(--required-warning "$required_warning")
+  local validate_args=(--identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --scenario "$scenario" --forbidden-target "$forbidden")
+  [[ -n "$rejection_evidence" ]] && validate_args+=(--rejection-evidence "$rejection_evidence")
   mkdir -p "$dir/search" "$dir/retrieve-context"
   id=$(jq -r '.[0].query.query_id' "$E/bank/selected-queries.json")
   q=$(jq -r '.[0].query.question' "$E/bank/selected-queries.json")
   z=$(jq -r '.access_zone_id' "$E/faults/targets.json")
   jq -n --arg z "$z" --arg q "$q" --arg id "$name" --argjson graph_limit "$graph_limit" '{correlationId:("fix486g-control-"+$id),accessZoneId:$z,callerAccessLevel:"INTERNAL",query:$q,topK:5,candidateLimit:64,parentLimit:5,timeoutMs:30000,searchMode:"SEARCH_MODE_V005_HYBRID",embeddingMode:"EMBEDDING_MODE_V005_DENSE_SPARSE_IF_AVAILABLE",includeDebug:true,enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:$graph_limit}' >"$dir/search/request.json"
   grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorV004Control/Search <"$dir/search/request.json" >"$dir/search/response.json" || return 1
-  python3 "$H" validate-control --entry-point Search --response "$dir/search/response.json" "${validate_args[@]}" --output "$dir/search/result.json" || return 1
+  python3 "$H" validate-rejected-target --entry-point Search --response "$dir/search/response.json" "${validate_args[@]}" --output "$dir/search/result.json" || return 1
   jq -n --arg z "$z" --arg q "$q" --arg id "$name" --argjson graph_limit "$graph_limit" '{context:{correlationId:("fix486g-control-"+$id),callerService:"fix486g",callerUserId:"fix486g",callerAccessLevel:"INTERNAL"},accessZoneId:$z,question:$q,profile:"RETRIEVAL_PROFILE_BALANCED",maxContexts:5,responseDetail:"RESPONSE_DETAIL_DEBUG",enableGraphExpansion:true,graphMaxHops:1,graphMaxRelatedContexts:$graph_limit}' >"$dir/retrieve-context/request.json"
   grpcurl -plaintext -d @ "$ADDR" astravector.embedding.v1.AstraVectorRetrievalFacade/RetrieveContext <"$dir/retrieve-context/request.json" >"$dir/retrieve-context/response.json" || return 1
-  python3 "$H" validate-control --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" "${validate_args[@]}" --output "$dir/retrieve-context/result.json"
+  python3 "$H" validate-rejected-target --entry-point RetrieveContext --response "$dir/retrieve-context/response.json" "${validate_args[@]}" --output "$dir/retrieve-context/result.json"
+}
+write_structural_rejection_evidence() {
+  local scenario=$1 reason=$2 verify_sql=$3 expected=$4 output=$5 actual
+  actual=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "$verify_sql") || return 1
+  jq -n --arg scenario "$scenario" --arg reason "$reason" --arg source "verified phase-owned topology plus request boundary" \
+    --argjson expected "$expected" --argjson actual "$actual" \
+    '{schema_version:1,status:(if $actual==$expected then "PASS" else "FAIL" end),observed:($actual==$expected),scenario:$scenario,reason:$reason,source:$source,expected_rows:$expected,actual_rows:$actual}' >"$output"
+  [[ "$actual" -eq "$expected" ]]
 }
 binding_parent_fault() {
   local zone child parent_a1 parent_a3 source survivor edge rc=0
@@ -379,7 +386,7 @@ binding_parent_fault() {
   run_exact_mutation wrong-parent-activate 1 \
     "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a1' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a1'" 1 || return 1
-  run_control_pair wrong-parent optional "$child" any BINDING_INVALID || rc=$?
+  run_rejected_target_pair wrong-parent wrong-parent "$child" || rc=$?
   run_exact_mutation wrong-parent-restore 1 \
     "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a3' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a3'" 1 || return 1
@@ -395,10 +402,28 @@ binding_status_fault() {
   run_exact_mutation binding-invalid-activate 1 \
     "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='FAILED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND qdrant_sync_status='FAILED'" 1 || return 1
-  run_control_pair binding-invalid optional "$child" any VISIBILITY_REJECTED || rc=$?
+  run_rejected_target_pair binding-invalid binding-status "$child" || rc=$?
   run_exact_mutation binding-invalid-restore 1 \
     "UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND qdrant_sync_status='SYNCED'" 1 || return 1
+  delete_fault_edge "$edge" || return 1
+  [[ $rc -eq 0 ]]
+}
+missing_parent_fault() {
+  local zone child parent missing source survivor edge rc=0
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json")
+  child=$(jq -r .child_a3 "$E/faults/targets.json")
+  parent=$(jq -r .parent_a3 "$E/faults/targets.json")
+  missing=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  source=$(jq -r .child_a1 "$E/faults/targets.json"); survivor=$(jq -r .child_a3_alt "$E/faults/targets.json"); edge=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  insert_fault_edge "$edge" "$source" "$survivor" REPAIRED_BY || return 1
+  run_exact_mutation missing-parent-activate 1 \
+    "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$missing' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 b WHERE b.access_zone_id='$zone' AND b.chunk_id='$child' AND b.representation_type='ORIGINAL' AND b.parent_chunk_id='$missing' AND NOT EXISTS(SELECT 1 FROM astravector.content_chunks_v004 p WHERE p.access_zone_id=b.access_zone_id AND p.id=b.parent_chunk_id)" 1 || return 1
+  run_rejected_target_pair missing-parent missing-parent "$child" || rc=$?
+  run_exact_mutation missing-parent-restore 1 \
+    "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
+    "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent'" 1 || return 1
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }
@@ -417,7 +442,7 @@ lifecycle_fault() {
     *) return 64;;
   esac
   run_exact_mutation "$activate_label" 1 "$activate_sql" "$activate_verify" 1 || return 1
-  run_control_pair "$kind-target" optional "$child" any VISIBILITY_REJECTED || rc=$?
+  run_rejected_target_pair "$kind-target" "$kind-target" "$child" || rc=$?
   run_exact_mutation "$restore_label" 1 "$restore_sql" "$restore_verify" 1 || return 1
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
@@ -435,28 +460,37 @@ delete_fault_edge() {
     "SELECT 1 FROM astravector.rag_graph_edges WHERE edge_id='$edge_id'" 0
 }
 cross_zone_fault() {
-  local edge source target rc=0
+  local edge source target evidence rc=0
   edge=$(python3 -c 'import uuid; print(uuid.uuid4())'); source=$(jq -r .child_a1 "$E/faults/targets.json"); target=$(jq -r '.rows[]|select(.logical_zone_id=="zone-b" and .logical_chunk_id=="child-a1-180")|.runtime_chunk_id' "$E/identity-map/logical-to-runtime.json" | head -1)
   insert_fault_edge "$edge" "$source" "$target" REPAIRED_BY || return 1
-  run_control_pair cross-zone present "$target" || rc=$?
+  evidence="$E/faults/cross-zone/rejection-evidence.json"; mkdir -p "$(dirname "$evidence")"
+  write_structural_rejection_evidence cross-zone GRAPH_ENDPOINT_ZONE_MISMATCH \
+    "SELECT count(*) FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id JOIN astravector.rag_graph_nodes_chunk t ON t.node_id=e.target_node_id WHERE e.edge_id='$edge' AND s.access_zone_id<>t.access_zone_id" 1 "$evidence" || rc=$?
+  [[ $rc -ne 0 ]] || run_rejected_target_pair cross-zone cross-zone "$target" "$evidence" || rc=$?
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }
 hop_limit_fault() {
-  local edge source target rc=0
+  local edge source target evidence rc=0
   edge=$(python3 -c 'import uuid; print(uuid.uuid4())'); source=$(jq -r .child_a3 "$E/faults/targets.json"); target=$(jq -r .child_a2 "$E/faults/targets.json")
   [[ "$target" =~ ^[0-9a-fA-F-]{36}$ ]] || return 1
   insert_fault_edge "$edge" "$source" "$target" REPAIRED_BY || return 1
-  run_control_pair hop-limit present "$target" graph || rc=$?
+  evidence="$E/faults/hop-limit/rejection-evidence.json"; mkdir -p "$(dirname "$evidence")"
+  write_structural_rejection_evidence hop-limit HOP_LIMIT_REJECTED \
+    "SELECT count(*) FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id WHERE e.edge_id='$edge' AND s.chunk_id='$source' AND e.properties->>'phase_fault'='true'" 1 "$evidence" || rc=$?
+  [[ $rc -ne 0 ]] || run_rejected_target_pair hop-limit hop-limit "$target" "$evidence" || rc=$?
   delete_fault_edge "$edge" || return 1
   [[ $rc -eq 0 ]]
 }
 cycle_fault() {
-  local edge reverse self source target rc=0
+  local edge self source target evidence rc=0
   edge=$(python3 -c 'import uuid; print(uuid.uuid4())'); self=$(python3 -c 'import uuid; print(uuid.uuid4())'); source=$(jq -r .child_a3 "$E/faults/targets.json"); target=$(jq -r .child_a1 "$E/faults/targets.json")
   insert_fault_edge "$edge" "$source" "$target" RELATED_TO || return 1
   insert_fault_edge "$self" "$target" "$target" RELATED_TO || { delete_fault_edge "$edge"; return 1; }
-  run_control_pair cycle present || rc=$?
+  evidence="$E/faults/cycle/rejection-evidence.json"; mkdir -p "$(dirname "$evidence")"
+  write_structural_rejection_evidence cycle GRAPH_CYCLE_REJECTED \
+    "SELECT count(*) FROM astravector.rag_graph_edges e WHERE e.edge_id='$self' AND e.source_node_id=e.target_node_id AND e.properties->>'phase_fault'='true'" 1 "$evidence" || rc=$?
+  [[ $rc -ne 0 ]] || run_rejected_target_pair cycle cycle "$self" "$evidence" || rc=$?
   delete_fault_edge "$edge" || return 1; delete_fault_edge "$self" || return 1
   [[ $rc -eq 0 ]]
 }
@@ -531,18 +565,39 @@ statistical_fault_restore() {
 }
 
 statistical_degradation_evidence() {
-  local setup=$1 output=$2 class reason
+  local setup=$1 output=$2 class reason zone child parent_a1 source verify_sql actual
+  zone=$(jq -r .access_zone_id "$E/faults/targets.json")
+  child=$(jq -r .child_a3 "$E/faults/targets.json")
+  parent_a1=$(jq -r .parent_a1 "$E/faults/targets.json")
+  source=$(jq -r .child_a3 "$E/faults/targets.json")
   case "$setup" in
-    graph_wrong_parent_overlay) class=WRONG_PARENT; reason=BINDING_INVALID;;
-    graph_cross_zone_overlay) class=CROSS_ZONE; reason=GRAPH_ENDPOINT_ZONE_MISMATCH;;
-    graph_inactive_deleted_expired_overlay) class=LIFECYCLE_INVALID; reason=VISIBILITY_REJECTED;;
-    graph_second_hop_overlay) class=HOP_LIMIT; reason=HOP_LIMIT_REJECTED;;
-    graph_cycle_overlay) class=CYCLE_OR_DUPLICATE; reason=DUPLICATE_GRAPH_EDGE;;
+    graph_wrong_parent_overlay)
+      class=WRONG_PARENT; reason=BINDING_INVALID
+      verify_sql="SELECT count(*) FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a1'"
+      ;;
+    graph_cross_zone_overlay)
+      class=CROSS_ZONE; reason=GRAPH_ENDPOINT_ZONE_MISMATCH
+      verify_sql="SELECT count(*) FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id JOIN astravector.rag_graph_nodes_chunk t ON t.node_id=e.target_node_id WHERE e.edge_id='$STAT_EDGE_ONE' AND s.access_zone_id<>t.access_zone_id"
+      ;;
+    graph_inactive_deleted_expired_overlay)
+      class=LIFECYCLE_INVALID; reason=VISIBILITY_REJECTED
+      verify_sql="SELECT count(*) FROM astravector.content_chunks_v004 WHERE access_zone_id='$zone' AND id='$child' AND expires_at<now()"
+      ;;
+    graph_second_hop_overlay)
+      class=HOP_LIMIT; reason=HOP_LIMIT_REJECTED
+      verify_sql="SELECT count(*) FROM astravector.rag_graph_edges e JOIN astravector.rag_graph_nodes_chunk s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.source_node_id WHERE e.edge_id='$STAT_EDGE_ONE' AND s.chunk_id='$source' AND e.properties->>'phase_fault'='true'"
+      ;;
+    graph_cycle_overlay)
+      class=CYCLE_OR_DUPLICATE; reason=GRAPH_CYCLE_REJECTED
+      verify_sql="SELECT count(*) FROM astravector.rag_graph_edges e WHERE e.edge_id='$STAT_EDGE_TWO' AND e.source_node_id=e.target_node_id AND e.properties->>'phase_fault'='true'"
+      ;;
     *) return 64;;
   esac
+  actual=$(psql "$DB" -X -v ON_ERROR_STOP=1 -Atqc "$verify_sql") || return 1
+  [[ "$actual" -eq 1 ]] || return 1
   jq -n --arg setup "$setup" --arg class "$class" --arg reason "$reason" --arg label "$STAT_FAULT_LABEL" \
-    --arg edge_one "$STAT_EDGE_ONE" --arg edge_two "$STAT_EDGE_TWO" --arg captured_at "$(timestamp)" \
-    '{schema_version:1,fault_setup:$setup,source:"phase-owned exact-row mutation activation plus independent final-context safety evaluation; classification is harness-controlled, not a response-native classifier",captured_at_utc:$captured_at,mutation:{label:$label,edge_ids:[$edge_one,$edge_two]|map(select(length>0))},degradation:{graph_failure_injected:true,graph_failure_detected:true,graph_failure_classification:$class,semantic_no_answer:false,partial_graph_evidence:true,reported_full_coverage:false,rejection_reasons:[$reason]}}' >"$output"
+    --arg edge_one "$STAT_EDGE_ONE" --arg edge_two "$STAT_EDGE_TWO" --arg captured_at "$(timestamp)" --argjson actual "$actual" \
+    '{schema_version:1,fault_setup:$setup,source:"phase-owned exact-row mutation activation plus independent final-context safety evaluation",captured_at_utc:$captured_at,mutation:{label:$label,edge_ids:[$edge_one,$edge_two]|map(select(length>0))},degradation:{graph_failure_injected:true,graph_failure_detected:true,graph_failure_classification:$class,semantic_no_answer:false,partial_graph_evidence:true,reported_full_coverage:false,rejection_reasons:[$reason],rejection_observation:{status:"PASS",observed:true,reason:$reason,source:"verified phase-owned fault topology and exact mutation evidence",expected_rows:1,actual_rows:$actual}}}' >"$output"
 }
 
 statistical_resource_evidence() {
@@ -637,10 +692,11 @@ write_defects() {
     ,{id:"FIX486G-P1-007",severity:"P1",category:"PROTOBUF_DEFAULT_EVIDENCE_CAPTURE",root_cause:"official grpcurl capture did not request emission of proto3 default scalar values",regression_test:"fake_grpcurl_full_pass_makes_exactly_142_calls_and_appends_complete_jsonl",failed_evidence_runs:["fix486g-20260722T200601Z","fix486g-20260722T202249Z"],fix_commit:$source,status:"FIXED"}
     ,{id:"FIX486G-P0-004",severity:"P0",category:"GRAPH_SEED_PARENT_GROUP_CAP",root_cause:"the global Graph seed cap ranked sibling child representations independently, allowing one granularity of a relevant parent to evict the sibling that owns the canonical relation endpoint",regression_test:"graph_seed_cap_keeps_sibling_representations_of_selected_parent_group",failed_evidence_run:"fix486g-20260722T203512Z",fix_commit:$source,status:"FIXED"}
     ,{id:"FIX486G-P0-005",severity:"P0",category:"GRAPH_SEED_EDGE_FANOUT_STARVATION",root_cause:"Graph SQL consumed the bounded edge window by seed rank, so structural fan-out from the first child could starve a canonical relation on its selected sibling child",regression_test:"graph_edge_budget_is_fair_across_selected_seed_children",failed_evidence_run:"fix486g-20260722T205152Z",fix_commit:$source,status:"FIXED"}
+    ,{id:"FIX486G-P1-008",severity:"P1",category:"FAULT_VALIDATOR_SURVIVOR_CONTRACT",root_cause:"scenario-specific proof assertions globally required a Graph survivor even after the scenario intentionally invalidated the only Graph target",regression_test:"test_all_rejected_target_contracts_accept_only_their_declared_survivor_and_reason; test_old_graph_survivor_only_assumption_rejects_valid_direct_fault_survivor; direct_survivor_is_sufficient_for_faults_that_invalidate_the_graph_target",failed_evidence_runs:["fix486g-20260727T181630Z","fix486g-20260727T183227Z"],fix_commit:$source,status:"FIXED"}
   ]}' >"$E/defect-register.json"
 }
 evidence_completeness() {
-  local required=(query-results.jsonl graph-disabled/results.jsonl graph-audit/graph-identity-chain.json graph-audit/graph-provenance-trace.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json statistical/sample-plan.json statistical/raw-observations.jsonl statistical/raw-validation.json statistical/statistical-report.json statistical/statistical-report.md statistical/per-query-results.jsonl statistical/per-slice-metrics.json statistical/latency-distribution.json statistical/safety-hard-gates.json statistical/confidence-intervals.json cleanup/summary.json cleanup/restoration.json defect-register.json)
+  local required=(query-results.jsonl graph-disabled/results.jsonl graph-audit/graph-identity-chain.json graph-audit/graph-provenance-trace.json comparisons/entry-point-parity.json comparisons/warm-repeat.json restart/pre-post-restart.json canonical-audit/integrity-summary.json qdrant-audit/payload-consistency.json faults/wrong-parent/search/result.json faults/wrong-parent/retrieve-context/result.json faults/binding-invalid/search/result.json faults/binding-invalid/retrieve-context/result.json faults/missing-parent/search/result.json faults/missing-parent/retrieve-context/result.json faults/inactive-target/search/result.json faults/inactive-target/retrieve-context/result.json faults/deleted-target/search/result.json faults/deleted-target/retrieve-context/result.json faults/expired-target/search/result.json faults/expired-target/retrieve-context/result.json faults/cross-zone/search/result.json faults/cross-zone/retrieve-context/result.json faults/cross-zone/rejection-evidence.json faults/hop-limit/search/result.json faults/hop-limit/retrieve-context/result.json faults/hop-limit/rejection-evidence.json faults/cycle/search/result.json faults/cycle/retrieve-context/result.json faults/cycle/rejection-evidence.json statistical/sample-plan.json statistical/raw-observations.jsonl statistical/raw-validation.json statistical/statistical-report.json statistical/statistical-report.md statistical/per-query-results.jsonl statistical/per-slice-metrics.json statistical/latency-distribution.json statistical/safety-hard-gates.json statistical/confidence-intervals.json cleanup/summary.json cleanup/restoration.json defect-register.json)
   for path in "${required[@]}"; do [[ -s "$E/$path" ]] || return 1; done
   [[ $(wc -l <"$E/query-results.jsonl" | tr -d ' ') -eq 2 ]] &&
   [[ $(wc -l <"$E/graph-disabled/results.jsonl" | tr -d ' ') -eq 2 ]]
@@ -701,6 +757,7 @@ execute_all() {
   [[ "$ok" == true ]] && stage fault-target-preparation prepare_fault_targets || ok=false
   [[ "$ok" == true ]] && stage wrong-parent-fault binding_parent_fault || ok=false
   [[ "$ok" == true ]] && stage binding-invalid-fault binding_status_fault || ok=false
+  [[ "$ok" == true ]] && stage missing-parent-fault missing_parent_fault || ok=false
   [[ "$ok" == true ]] && stage inactive-target-fault lifecycle_fault inactive || ok=false
   [[ "$ok" == true ]] && stage deleted-target-fault lifecycle_fault deleted || ok=false
   [[ "$ok" == true ]] && stage expired-target-fault lifecycle_fault expired || ok=false

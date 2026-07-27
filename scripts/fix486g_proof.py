@@ -13,6 +13,10 @@ import json
 import sys
 from pathlib import Path
 
+try:
+    from scripts.fix486g_fault_contract import FAULT_VALIDATION_CONTRACTS
+except ModuleNotFoundError:
+    from fix486g_fault_contract import FAULT_VALIDATION_CONTRACTS
 
 REQUIRED_QUERIES = {
     "q-graph-repair": "FIX486-08",
@@ -266,6 +270,187 @@ def has_graph_provenance(metadata: dict) -> bool:
         and bool(metadata.get("graph_edge_id"))
         and bool(metadata.get("graph_related_chunk_id"))
     )
+
+
+def observed_rejection_reasons(response: dict, rejection_evidence: dict | None) -> list[str]:
+    reasons = {
+        warning.get("code")
+        for warning in response.get("warnings", [])
+        if isinstance(warning, dict) and isinstance(warning.get("code"), str)
+    }
+    for candidate in trace_candidates(response):
+        for stage in candidate.get("stages", []):
+            reason = stage.get("reasonCode") or stage.get("rejectionReason")
+            if isinstance(reason, str) and reason:
+                reasons.add(reason)
+    if rejection_evidence:
+        evidence_valid = (
+            rejection_evidence.get("status") == "PASS"
+            and rejection_evidence.get("observed") is True
+        )
+        if not evidence_valid:
+            reasons.add("INVALID_REJECTION_EVIDENCE")
+        else:
+            reason = rejection_evidence.get("reason")
+            if isinstance(reason, str) and reason:
+                reasons.add(reason)
+    return sorted(reasons)
+
+
+def validate_rejected_graph_target(
+    entry_point: str,
+    response: dict,
+    identity_by_runtime: dict[str, dict],
+    scenario: str,
+    forbidden_target: str,
+    rejection_evidence: dict | None = None,
+    external_hard_gates: dict | None = None,
+) -> dict:
+    contract = FAULT_VALIDATION_CONTRACTS.get(scenario)
+    if contract is None:
+        fail("FAULT_SCENARIO_UNKNOWN", scenario)
+    if not forbidden_target:
+        fail("FORBIDDEN_TARGET_REQUIRED", scenario)
+
+    normalized = []
+    forbidden_final_count = 0
+    forbidden_graph_credit_count = 0
+    cross_zone_count = 0
+    forbidden_anchor_count = 0
+    graph_keys: set[tuple[str, str, str, str]] = set()
+    duplicate_graph_credit = 0
+    forbidden_anchors = (
+        "ZONE_B_SECRET_PARENT_A1",
+        "ZONE_B_PRIVATE_SOURCE",
+        "ASTRA_INACTIVE_VERSION_TRAP",
+        "ASTRA_DELETED_PARENT_TRAP",
+        "ASTRA_EXPIRED_PARENT_TRAP",
+    )
+
+    for context in response_contexts(response, entry_point):
+        matched = context.get("matchedChunkId", "")
+        parent = context.get("parentChunkId", "")
+        metadata = result_metadata(context)
+        graph_origin = is_primary_graph(metadata)
+        graph_provenance = has_graph_provenance(metadata)
+        matched_identity = identity_by_runtime.get(matched, {})
+        parent_identity = identity_by_runtime.get(parent, {})
+        identities = {
+            matched,
+            parent,
+            metadata.get("graph_related_chunk_id"),
+            metadata.get("graph_related_parent_chunk_id"),
+            metadata.get("graph_edge_id"),
+            metadata.get("graph_relation_id"),
+        }
+        target_present = forbidden_target in identities and (
+            contract["forbidden_scope"] == "ANY" or graph_provenance
+        )
+        if target_present:
+            forbidden_final_count += 1
+            if graph_provenance:
+                forbidden_graph_credit_count += 1
+        if matched_identity.get("logical_zone_id") not in {None, "zone-a"}:
+            cross_zone_count += 1
+        combined = f"{context.get('matchedText', '')}\n{context.get('parentText', '')}"
+        forbidden_anchor_count += sum(anchor in combined for anchor in forbidden_anchors)
+        row = {
+            "matched_chunk_id": matched,
+            "parent_chunk_id": parent,
+            "matched_logical": matched_identity.get("logical_chunk_id"),
+            "parent_logical": parent_identity.get("logical_chunk_id"),
+            "graph_origin": graph_origin,
+            "graph_provenance": graph_provenance,
+            "graph_relation_type": metadata.get("graph_relation_type"),
+            "graph_edge_id": metadata.get("graph_edge_id"),
+        }
+        normalized.append(row)
+        if graph_provenance:
+            key = (
+                matched,
+                parent,
+                str(metadata.get("graph_edge_id") or ""),
+                str(metadata.get("graph_relation_id") or ""),
+            )
+            if key in graph_keys:
+                duplicate_graph_credit += 1
+            graph_keys.add(key)
+
+    direct_survivor = any(
+        not row["graph_origin"] and row["parent_logical"] == "parent-a1"
+        for row in normalized
+    )
+    graph_survivor = any(
+        row["graph_provenance"]
+        and row["parent_logical"] == "parent-a3"
+        and row["graph_relation_type"] in {"REPAIRED_BY", "RELATED_TO"}
+        for row in normalized
+    )
+    survivor_mode = contract["survivor_mode"]
+    survivor_present = direct_survivor and (survivor_mode != "GRAPH" or graph_survivor)
+
+    expected_reason = contract["expected_rejection_reason"]
+    observed_reasons = observed_rejection_reasons(response, rejection_evidence)
+    exact_reason_observed = expected_reason in observed_reasons
+    hard_gates = {
+        "forbidden_target_final_contexts": forbidden_final_count,
+        "forbidden_graph_provenance_credits": forbidden_graph_credit_count,
+        "valid_survivor_lost": 0 if survivor_present else 1,
+        "rejection_reason_mismatch": 0 if exact_reason_observed else 1,
+        "cross_zone_graph_final_contexts": cross_zone_count,
+        "forbidden_anchor_leaks": forbidden_anchor_count,
+        "duplicate_graph_credit": duplicate_graph_credit,
+        "cycle_credit_inflation_events": duplicate_graph_credit,
+        "binding_invalid_graph_final_contexts": forbidden_graph_credit_count,
+        "inactive_deleted_expired_graph_final_contexts": forbidden_graph_credit_count,
+        "hop_limit_violation_final_contexts": forbidden_graph_credit_count,
+        "second_hop_final_contexts": forbidden_graph_credit_count,
+    }
+    if external_hard_gates:
+        for name, value in external_hard_gates.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                fail("HARD_GATE_COUNTER_INVALID", f"{name}={value!r}")
+            hard_gates[name] = hard_gates.get(name, 0) + value
+    relevant_gate_names = (
+        "forbidden_target_final_contexts",
+        "forbidden_graph_provenance_credits",
+        "valid_survivor_lost",
+        "rejection_reason_mismatch",
+        *contract["hard_gate_names"],
+    )
+    failures = [
+        f"HARD_GATE_NONZERO:{name}"
+        for name in relevant_gate_names
+        if hard_gates.get(name, 0) != 0
+    ]
+    return {
+        "schema_version": 1,
+        "status": "PASS" if not failures else "FAIL",
+        "entry_point": entry_point,
+        "scenario": scenario,
+        "contract": {
+            "forbidden_target": forbidden_target,
+            "canonical_direct_survivor": "parent-a1",
+            "canonical_graph_survivor": "parent-a3" if survivor_mode == "GRAPH" else None,
+            "survivor_mode": survivor_mode,
+            "forbidden_scope": contract["forbidden_scope"],
+            "expected_rejection_reason": expected_reason,
+            "provenance_behavior": contract["provenance_behavior"],
+            "relevant_hard_gates": list(relevant_gate_names),
+        },
+        "assertions": {
+            "forbidden_target_absent": forbidden_final_count == 0,
+            "canonical_direct_survivor_present": direct_survivor,
+            "required_graph_survivor_present": survivor_mode != "GRAPH" or graph_survivor,
+            "exact_rejection_reason_observed": exact_reason_observed,
+            "forbidden_graph_provenance_not_credited": forbidden_graph_credit_count == 0,
+            "relevant_hard_gates_zero": not failures,
+        },
+        "observed_rejection_reasons": observed_reasons,
+        "hard_gate_counters": hard_gates,
+        "contexts": normalized,
+        "failure_codes": failures,
+    }
 
 
 def stage_is_present(candidate: dict, name: str) -> bool:
@@ -685,6 +870,16 @@ def main() -> int:
     p_control.add_argument("--forbidden-scope", choices=["any", "graph"], default="any")
     p_control.add_argument("--required-warning")
     p_control.add_argument("--output", type=Path, required=True)
+    p_rejected = sub.add_parser("validate-rejected-target")
+    p_rejected.add_argument("--entry-point", required=True, choices=REQUIRED_ENTRY_POINTS)
+    p_rejected.add_argument("--response", type=Path, required=True)
+    p_rejected.add_argument("--identity-map", type=Path, required=True)
+    p_rejected.add_argument("--bank", type=Path, required=True)
+    p_rejected.add_argument("--scenario", required=True, choices=sorted(FAULT_VALIDATION_CONTRACTS))
+    p_rejected.add_argument("--forbidden-target", required=True)
+    p_rejected.add_argument("--rejection-evidence", type=Path)
+    p_rejected.add_argument("--hard-gates", type=Path)
+    p_rejected.add_argument("--output", type=Path, required=True)
     p_agg = sub.add_parser("aggregate")
     p_agg.add_argument("--run", type=Path, required=True)
     p_agg.add_argument("--output", type=Path, required=True)
@@ -737,6 +932,18 @@ def main() -> int:
                 args.entry_point, read_json(args.response), by_runtime,
                 args.graph_expectation, args.forbidden_chunk_id, args.forbidden_scope,
                 args.required_warning,
+            )
+        elif args.command == "validate-rejected-target":
+            identity = apply_frozen_child_identities(read_json(args.identity_map)["rows"], args.bank)
+            by_runtime = {row["runtime_chunk_id"]: row for row in identity}
+            payload = validate_rejected_graph_target(
+                args.entry_point,
+                read_json(args.response),
+                by_runtime,
+                args.scenario,
+                args.forbidden_target,
+                read_json(args.rejection_evidence) if args.rejection_evidence else None,
+                read_json(args.hard_gates) if args.hard_gates else None,
             )
         elif args.command == "aggregate":
             payload = aggregate(args.run)

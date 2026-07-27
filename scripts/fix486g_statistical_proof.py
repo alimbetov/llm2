@@ -16,6 +16,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from scripts.fix486g_fault_contract import FAULT_CONTRACT_BY_SETUP
+except ModuleNotFoundError:
+    from fix486g_fault_contract import FAULT_CONTRACT_BY_SETUP
 
 PASS = "FIX486G_STATISTICAL_QUALITY_PASS"
 BLOCKED = "FIX486G_STATISTICAL_QUALITY_BLOCKED"
@@ -550,6 +554,13 @@ def evaluate_observation(
     direct_rows = [item for item in normalized if not item["primary_graph_origin"]]
     expected_graph = qrel.get("expected_graph_parent")
     expected_direct = qrel.get("expected_direct_parent")
+    fault_setup = query.get("fault_setup")
+    fault_contract = FAULT_CONTRACT_BY_SETUP.get(fault_setup) if fault_setup else None
+    if fault_setup and fault_contract is None:
+        fail("FAULT_VALIDATION_CONTRACT_UNKNOWN", fault_setup)
+    graph_survivor_required = (
+        not fault_contract or fault_contract["survivor_mode"] == "GRAPH"
+    )
     forbidden_anchors = qrel.get("forbidden_anchors") or []
     failures: list[str] = []
     valid_graph_contexts = 0
@@ -674,7 +685,11 @@ def evaluate_observation(
     expected_parent = qrel.get("expected_parent")
     if expected_parent and not any(item["parent_logical"] == expected_parent for item in direct_rows):
         failures.append("EXPECTED_PARENT_MISSING")
-    required_anchors = qrel.get("required_anchors_in_parent_text") or []
+    required_anchors = (
+        qrel.get("required_anchors_in_parent_text") or []
+        if not fault_contract or fault_contract["survivor_mode"] == "GRAPH"
+        else []
+    )
     if required_anchors and not any(all(anchor in item["parent_text"] for anchor in required_anchors) for item in normalized):
         failures.append("REQUIRED_PARENT_ANCHOR_MISSING")
     if expected_direct and not any(item["parent_logical"] == expected_direct for item in direct_rows):
@@ -683,18 +698,24 @@ def evaluate_observation(
         (index for index, item in enumerate(normalized, 1) if item in graph_rows and item["parent_logical"] == expected_graph),
         None,
     )
-    if expected_graph and graph_rank is None:
+    if expected_graph and graph_rank is None and graph_survivor_required:
         failures.append("GRAPH_PARENT_MISSING")
-    if fault_setup := query.get("fault_setup"):
+    if fault_setup:
+        direct_survivor_present = bool(
+            expected_direct
+            and any(item["parent_logical"] == expected_direct for item in direct_rows)
+        )
+        graph_survivor_present = graph_rank is not None
+        survivor_present = direct_survivor_present and (
+            fault_contract["survivor_mode"] != "GRAPH" or graph_survivor_present
+        )
         if qrel.get("hard_gate", {}).get("valid_survivor_lost") == 0 and (
-            not expected_direct
-            or not any(item["parent_logical"] == expected_direct for item in direct_rows)
-            or graph_rank is None
+            not survivor_present
         ):
             add_gate(gates, "valid_survivor_lost")
+            failures.append("VALID_SURVIVOR_LOST")
 
     degradation = row.get("degradation")
-    fault_setup = query.get("fault_setup")
     fault_class = "NONE"
     if fault_setup:
         fault_plan = bank_data["fault_by_setup"].get(fault_setup)
@@ -708,14 +729,28 @@ def evaluate_observation(
             "semantic_no_answer",
             "partial_graph_evidence",
             "reported_full_coverage",
+            "rejection_observation",
         )
         if not isinstance(degradation, dict) or any(field not in degradation for field in required_degradation):
             fail("DEGRADATION_EVIDENCE_INCOMPLETE", f"{row['_source']}: {required_degradation}")
         if degradation["graph_failure_injected"] is not True:
             failures.append("FAULT_NOT_INJECTED")
         reasons = degradation.get("rejection_reasons") or []
+        expected_reason = fault_contract["expected_rejection_reason"]
         allowed_reasons = fault_plan.get("expected_rejection_reason_any") or []
-        if allowed_reasons and not set(reasons).intersection(allowed_reasons):
+        if expected_reason not in allowed_reasons:
+            fail(
+                "FAULT_CONTRACT_REASON_NOT_APPROVED",
+                f"{fault_setup}: {expected_reason}",
+            )
+        observation = degradation["rejection_observation"]
+        if (
+            reasons != [expected_reason]
+            or not isinstance(observation, dict)
+            or observation.get("status") != "PASS"
+            or observation.get("observed") is not True
+            or observation.get("reason") != expected_reason
+        ):
             failures.append("FAULT_REJECTION_NOT_EVIDENCED")
 
     graded = qrel.get("graded_relevance") or {}

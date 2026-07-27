@@ -90,10 +90,10 @@ fn graph_context(parent: &str) -> Value {
 fn fault_evidence(setup: &str) -> Value {
     let (class, reason) = match setup {
         "graph_wrong_parent_overlay" => ("WRONG_PARENT", "BINDING_INVALID"),
-        "graph_cross_zone_overlay" => ("CROSS_ZONE", "VISIBILITY_REJECTED"),
+        "graph_cross_zone_overlay" => ("CROSS_ZONE", "GRAPH_ENDPOINT_ZONE_MISMATCH"),
         "graph_inactive_deleted_expired_overlay" => ("LIFECYCLE_INVALID", "VISIBILITY_REJECTED"),
         "graph_second_hop_overlay" => ("HOP_LIMIT", "HOP_LIMIT_REJECTED"),
-        "graph_cycle_overlay" => ("CYCLE_OR_DUPLICATE", "DUPLICATE_GRAPH_EDGE"),
+        "graph_cycle_overlay" => ("CYCLE_OR_DUPLICATE", "GRAPH_CYCLE_REJECTED"),
         _ => panic!("unknown fault setup"),
     };
     json!({
@@ -103,7 +103,13 @@ fn fault_evidence(setup: &str) -> Value {
         "semantic_no_answer": false,
         "partial_graph_evidence": true,
         "reported_full_coverage": false,
-        "rejection_reasons": [reason]
+        "rejection_reasons": [reason],
+        "rejection_observation": {
+            "status": "PASS",
+            "observed": true,
+            "reason": reason,
+            "source": "focused verified topology"
+        }
     })
 }
 
@@ -329,6 +335,36 @@ fn synthetic_complete_campaign_passes_and_writes_every_artifact() {
         .unwrap()
         .iter()
         .all(|row| row["failure_probability_upper"].as_f64().unwrap() > 0.0));
+}
+
+#[test]
+fn direct_survivor_is_sufficient_for_faults_that_invalidate_the_graph_target() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let mut rows = synthetic_campaign();
+    for row in &mut rows {
+        if row["degradation"]["graph_failure_classification"] == "WRONG_PARENT" {
+            let key = if row["entry_point"] == "Search" {
+                "results"
+            } else {
+                "contexts"
+            };
+            row["response"][key] = json!([direct_context("parent-a1")]);
+        }
+    }
+    write_rows(input.path(), &rows);
+
+    let status = Command::new("python3")
+        .args([SCRIPT, "evaluate", "--bank", BANK, "--raw-input"])
+        .arg(input.path())
+        .args(["--output-dir"])
+        .arg(output.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let result = report(&output.path().join("statistical-report.json"));
+    assert_eq!(result["verdict"], "FIX486G_STATISTICAL_QUALITY_PASS");
+    assert_eq!(result["hard_gates"]["valid_survivor_lost"], 0);
 }
 
 #[test]

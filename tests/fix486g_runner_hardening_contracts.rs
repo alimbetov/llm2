@@ -120,9 +120,9 @@ fn optional_fault_validator_arguments_are_bash_32_nounset_safe() {
         &runner,
         &[
             "local validate_args=(--identity-map",
-            "validate_args+=(--forbidden-chunk-id",
+            "validate_args+=(--rejection-evidence",
             "\"${validate_args[@]}\" --output",
-            "run_control_pair cycle present",
+            "run_rejected_target_pair cycle cycle \"$self\"",
         ],
         "FIX486G-RUNNER-BASH32-001",
     );
@@ -137,14 +137,25 @@ fn optional_fault_validator_arguments_are_bash_32_nounset_safe() {
 }
 
 #[test]
-fn hop_limit_forbids_only_graph_derived_target_identity() {
+fn fault_validation_is_table_driven_and_hop_scope_is_declared_centrally() {
     let runner = source(RUNNER);
+    let contract = source("scripts/fix486g_fault_contract.py");
     require_all(
         &runner,
         &[
-            "forbidden_scope=${4:-any}",
-            "--forbidden-scope \"$forbidden_scope\"",
-            "run_control_pair hop-limit present \"$target\" graph",
+            "run_rejected_target_pair()",
+            "validate-rejected-target",
+            "run_rejected_target_pair hop-limit hop-limit \"$target\"",
+        ],
+        "FIX486G-RUNNER-HOP-SCOPE-001",
+    );
+    require_all(
+        &contract,
+        &[
+            "\"hop-limit\"",
+            "\"survivor_mode\": \"GRAPH\"",
+            "\"forbidden_scope\": \"GRAPH\"",
+            "\"expected_rejection_reason\": \"HOP_LIMIT_REJECTED\"",
         ],
         "FIX486G-RUNNER-HOP-SCOPE-001",
     );
@@ -215,16 +226,51 @@ fn fault_controls_use_a_bounded_raw_window_that_can_hold_attack_and_survivor() {
         &[
             "FAULT_GRAPH_RELATED_CONTEXTS=10",
             "graphMaxRelatedContexts:$graph_limit",
-            "run_control_pair wrong-parent optional \"$child\" any BINDING_INVALID",
-            "run_control_pair binding-invalid optional \"$child\" any VISIBILITY_REJECTED",
-            "run_control_pair \"$kind-target\" optional \"$child\" any VISIBILITY_REJECTED",
-            "validate_args+=(--required-warning",
+            "run_rejected_target_pair wrong-parent wrong-parent \"$child\"",
+            "run_rejected_target_pair binding-invalid binding-status \"$child\"",
+            "run_rejected_target_pair \"$kind-target\" \"$kind-target\" \"$child\"",
+            "run_rejected_target_pair missing-parent missing-parent \"$child\"",
         ],
         "FIX486G-RUNNER-NON-VACUOUS-001",
     );
     assert!(
         runner.contains("((FAULT_GRAPH_RELATED_CONTEXTS <= 20))"),
         "FIX486G-RUNNER-NON-VACUOUS-001: fault window must remain bounded"
+    );
+}
+
+#[test]
+fn every_rejected_graph_target_uses_one_shared_contract_matrix() {
+    let contract = source("scripts/fix486g_fault_contract.py");
+    let proof = source("scripts/fix486g_proof.py");
+    for scenario in [
+        "wrong-parent",
+        "binding-status",
+        "inactive-target",
+        "deleted-target",
+        "expired-target",
+        "missing-parent",
+        "cross-zone",
+        "hop-limit",
+        "cycle",
+        "candidate-non-interference",
+    ] {
+        assert!(
+            contract.contains(&format!("\"{scenario}\"")),
+            "missing fault contract for {scenario}"
+        );
+    }
+    require_all(
+        &proof,
+        &[
+            "validate_rejected_graph_target(",
+            "forbidden_target_final_contexts",
+            "forbidden_graph_provenance_credits",
+            "valid_survivor_lost",
+            "rejection_reason_mismatch",
+            "relevant_hard_gates_zero",
+        ],
+        "FIX486G-RUNNER-SHARED-VALIDATOR-001",
     );
 }
 
