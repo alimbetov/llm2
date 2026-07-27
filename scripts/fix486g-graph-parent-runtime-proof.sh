@@ -354,10 +354,11 @@ prepare_fault_targets() {
   jq -e --arg parent "$parent" '.binding_count==1 and .binding_parent_chunk_id==$parent and .qdrant_sync_status=="SYNCED" and .chunk_count==1 and .lifecycle_status=="ACTIVE" and .deleted_at==null and .expires_at_visible==true' "$E/faults/baseline.json" >/dev/null
 }
 run_control_pair() {
-  local name=$1 expectation=$2 forbidden=${3:-} forbidden_scope=${4:-any} dir="$E/faults/$1" id q z
+  local name=$1 expectation=$2 forbidden=${3:-} forbidden_scope=${4:-any} required_warning=${5:-} dir="$E/faults/$1" id q z
   local graph_limit=$FAULT_GRAPH_RELATED_CONTEXTS
   local validate_args=(--identity-map "$E/identity-map/logical-to-runtime.json" --bank "$BANK" --graph-expectation "$expectation")
   [[ -n "$forbidden" ]] && validate_args+=(--forbidden-chunk-id "$forbidden" --forbidden-scope "$forbidden_scope")
+  [[ -n "$required_warning" ]] && validate_args+=(--required-warning "$required_warning")
   mkdir -p "$dir/search" "$dir/retrieve-context"
   id=$(jq -r '.[0].query.query_id' "$E/bank/selected-queries.json")
   q=$(jq -r '.[0].query.question' "$E/bank/selected-queries.json")
@@ -378,7 +379,7 @@ binding_parent_fault() {
   run_exact_mutation wrong-parent-activate 1 \
     "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a1' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a1'" 1 || return 1
-  run_control_pair wrong-parent present "$child" || rc=$?
+  run_control_pair wrong-parent optional "$child" any BINDING_INVALID || rc=$?
   run_exact_mutation wrong-parent-restore 1 \
     "UPDATE astravector.vector_bindings_v004 SET parent_chunk_id='$parent_a3' WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL'" \
     "SELECT 1 FROM astravector.vector_bindings_v004 WHERE access_zone_id='$zone' AND chunk_id='$child' AND representation_type='ORIGINAL' AND parent_chunk_id='$parent_a3'" 1 || return 1

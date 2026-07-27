@@ -194,6 +194,56 @@ class NormalizeContracts(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertIn("FAULT_TARGET_RETURNED", result["failure_codes"])
 
+    def test_wrong_parent_fault_accepts_direct_survivor_only_with_rejection_warning(self):
+        identities = {
+            "runtime-direct-child": identity("child-a1-180"),
+            "runtime-direct-parent": identity("parent-a1"),
+            "runtime-graph-child": identity("child-a3-180"),
+            "runtime-graph-parent": identity("parent-a3"),
+        }
+        response = {
+            "results": [
+                context(
+                    "runtime-direct-child",
+                    "runtime-direct-parent",
+                    {"retrieval_source": "VECTOR_DIRECT"},
+                ),
+                context(
+                    "runtime-graph-parent",
+                    "runtime-graph-parent",
+                    {"retrieval_source": "VECTOR_DIRECT"},
+                ),
+            ],
+            "warnings": [{"code": "BINDING_INVALID"}],
+        }
+
+        result = PROOF.validate_control(
+            "Search",
+            response,
+            identities,
+            "optional",
+            "runtime-graph-child",
+            "any",
+            "BINDING_INVALID",
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["warning_codes"], ["BINDING_INVALID"])
+        response["warnings"] = []
+        result = PROOF.validate_control(
+            "Search",
+            response,
+            identities,
+            "optional",
+            "runtime-graph-child",
+            "any",
+            "BINDING_INVALID",
+        )
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "REQUIRED_REJECTION_WARNING_MISSING", result["failure_codes"]
+        )
+
     def test_any_wrong_graph_final_context_fails_the_result(self):
         identities = {
             "runtime-direct-child": identity("child-a1-180"),

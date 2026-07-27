@@ -215,9 +215,10 @@ fn fault_controls_use_a_bounded_raw_window_that_can_hold_attack_and_survivor() {
         &[
             "FAULT_GRAPH_RELATED_CONTEXTS=10",
             "graphMaxRelatedContexts:$graph_limit",
-            "run_control_pair wrong-parent present \"$child\"",
+            "run_control_pair wrong-parent optional \"$child\" any BINDING_INVALID",
             "run_control_pair binding-invalid present \"$child\"",
             "run_control_pair \"$kind-target\" present \"$child\"",
+            "validate_args+=(--required-warning",
         ],
         "FIX486G-RUNNER-NON-VACUOUS-001",
     );

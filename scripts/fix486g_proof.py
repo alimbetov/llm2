@@ -408,7 +408,8 @@ def normalize(query: dict, qrel: dict, entry_point: str, response: dict,
 
 def validate_control(entry_point: str, response: dict, identity_by_runtime: dict[str, dict],
                      graph_expectation: str, forbidden_chunk_id: str | None,
-                     forbidden_scope: str = "any") -> dict:
+                     forbidden_scope: str = "any",
+                     required_warning: str | None = None) -> dict:
     contexts = response_contexts(response, entry_point)
     normalized = []
     failures = []
@@ -459,6 +460,13 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
         failures.append("VALID_GRAPH_SURVIVOR_LOST")
     if graph_expectation == "absent" and graph:
         failures.append("INVALID_GRAPH_CONTEXT_RETURNED")
+    warning_codes = sorted({
+        warning.get("code")
+        for warning in response.get("warnings", [])
+        if isinstance(warning, dict) and isinstance(warning.get("code"), str)
+    })
+    if required_warning and required_warning not in warning_codes:
+        failures.append("REQUIRED_REJECTION_WARNING_MISSING")
     if len({(row["matched_chunk_id"], row["parent_chunk_id"]) for row in graph}) != len(graph):
         failures.append("DUPLICATE_GRAPH_CREDIT")
     return {
@@ -470,6 +478,8 @@ def validate_control(entry_point: str, response: dict, identity_by_runtime: dict
         "graph_context_count": len(graph),
         "forbidden_chunk_id": forbidden_chunk_id,
         "forbidden_scope": forbidden_scope,
+        "required_warning": required_warning,
+        "warning_codes": warning_codes,
         "contexts": normalized,
         "failure_codes": sorted(set(failures)),
     }
@@ -670,9 +680,10 @@ def main() -> int:
     p_control.add_argument("--response", type=Path, required=True)
     p_control.add_argument("--identity-map", type=Path, required=True)
     p_control.add_argument("--bank", type=Path, required=True)
-    p_control.add_argument("--graph-expectation", required=True, choices=["present", "absent"])
+    p_control.add_argument("--graph-expectation", required=True, choices=["present", "absent", "optional"])
     p_control.add_argument("--forbidden-chunk-id")
     p_control.add_argument("--forbidden-scope", choices=["any", "graph"], default="any")
+    p_control.add_argument("--required-warning")
     p_control.add_argument("--output", type=Path, required=True)
     p_agg = sub.add_parser("aggregate")
     p_agg.add_argument("--run", type=Path, required=True)
@@ -725,6 +736,7 @@ def main() -> int:
             payload = validate_control(
                 args.entry_point, read_json(args.response), by_runtime,
                 args.graph_expectation, args.forbidden_chunk_id, args.forbidden_scope,
+                args.required_warning,
             )
         elif args.command == "aggregate":
             payload = aggregate(args.run)
