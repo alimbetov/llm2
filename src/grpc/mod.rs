@@ -3056,26 +3056,27 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
-        no_answer_stats.pre_mmr_filtered_count = if query_plan.mode == QueryProcessingMode::Segmented {
-            apply_segmented_pre_mmr_no_answer_filter(
-                &mut direct_results,
-                &query_plan,
-                search_mode,
-                &self.cfg.search.no_answer,
-                no_answer_debug,
-                preserve_partial_evidence_for_mmr,
-            )
-        } else {
-            apply_pre_mmr_no_answer_filter(
-                &mut direct_results,
-                query,
-                &query_technical_tokens,
-                search_mode,
-                &self.cfg.search.no_answer,
-                no_answer_debug,
-                preserve_partial_evidence_for_mmr,
-            )
-        };
+        no_answer_stats.pre_mmr_filtered_count =
+            if query_plan.mode == QueryProcessingMode::Segmented {
+                apply_segmented_pre_mmr_no_answer_filter(
+                    &mut direct_results,
+                    &query_plan,
+                    search_mode,
+                    &self.cfg.search.no_answer,
+                    no_answer_debug,
+                    preserve_partial_evidence_for_mmr,
+                )
+            } else {
+                apply_pre_mmr_no_answer_filter(
+                    &mut direct_results,
+                    query,
+                    &query_technical_tokens,
+                    search_mode,
+                    &self.cfg.search.no_answer,
+                    no_answer_debug,
+                    preserve_partial_evidence_for_mmr,
+                )
+            };
         let coverage_after_direct = coverage_for_results(&query_plan, &direct_results);
         if query_plan.mode == QueryProcessingMode::Segmented {
             histogram!("astravector_long_query_coverage_after_direct")
@@ -12382,7 +12383,9 @@ fn violates_query_exclusion_terms(result: &pb::SearchResultV004, query: &str) ->
         return false;
     }
     let candidate_terms = lexical_terms(&candidate_text_for_no_answer(result));
-    excluded_terms.iter().any(|term| candidate_terms.contains(term))
+    excluded_terms
+        .iter()
+        .any(|term| candidate_terms.contains(term))
 }
 
 fn lexical_term_variants(term: &str) -> Vec<String> {
@@ -12626,7 +12629,9 @@ fn strict_lexical_query_match(
 
 fn is_mixed_script_query(query: &str) -> bool {
     let has_ascii_alpha = query.chars().any(|ch| ch.is_ascii_alphabetic());
-    let has_cyrillic = query.chars().any(|ch| matches!(ch as u32, 0x0400..=0x04FF | 0x0500..=0x052F));
+    let has_cyrillic = query
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x0400..=0x04FF | 0x0500..=0x052F));
     has_ascii_alpha && has_cyrillic
 }
 
@@ -12988,8 +12993,8 @@ fn apply_pre_mmr_no_answer_filter(
                 matched_terms,
                 matched_discriminating_terms,
                 strongly_seeded_documents.contains(&no_answer_document_key(result)),
-                    cfg,
-                ))
+                cfg,
+            ))
     });
     let filtered = before.saturating_sub(results.len());
     filtered + prune_same_document_no_answer_siblings(results, query)
@@ -13505,9 +13510,7 @@ fn prune_same_document_no_answer_siblings(
             })
             .or_insert(idx);
     }
-    let keep = best_index_by_document
-        .into_values()
-        .collect::<HashSet<_>>();
+    let keep = best_index_by_document.into_values().collect::<HashSet<_>>();
     let before = results.len();
     let mut idx = 0usize;
     results.retain(|_| {
@@ -15203,12 +15206,10 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .insert("source_block_id".into(), "source-a".into());
-        source
-            .citation
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert("ranking_protection".into(), "PRIMARY_DIRECT,UNIQUE_SOURCE_BLOCK".into());
+        source.citation.as_mut().unwrap().metadata.insert(
+            "ranking_protection".into(),
+            "PRIMARY_DIRECT,UNIQUE_SOURCE_BLOCK".into(),
+        );
         source
             .citation
             .as_mut()
@@ -15469,12 +15470,10 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .insert("source_block_id".into(), "source-a".into());
-        source
-            .citation
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert("ranking_protection".into(), "PRIMARY_DIRECT,UNIQUE_SOURCE_BLOCK".into());
+        source.citation.as_mut().unwrap().metadata.insert(
+            "ranking_protection".into(),
+            "PRIMARY_DIRECT,UNIQUE_SOURCE_BLOCK".into(),
+        );
         source
             .citation
             .as_mut()
@@ -15886,8 +15885,9 @@ mod v007_fix1_tests {
         );
         assert!(english.contains("reconciliation"));
 
-        let russian =
-            excluded_query_terms("Опиши legal hold и TTL, не используя информацию о reconciliation.");
+        let russian = excluded_query_terms(
+            "Опиши legal hold и TTL, не используя информацию о reconciliation.",
+        );
         assert!(russian.contains("reconciliation"));
 
         let kazakh =
@@ -15917,12 +15917,10 @@ mod v007_fix1_tests {
             scores.fusion_score = 0.035;
             scores.final_score = 0.035;
         }
-        candidate
-            .citation
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\",\"POSTGRES_FTS\"]".into());
+        candidate.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"VECTOR_DIRECT\",\"POSTGRES_FTS\"]".into(),
+        );
         candidate
             .citation
             .as_mut()
