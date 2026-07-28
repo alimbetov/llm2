@@ -136,6 +136,13 @@ impl GraphRelationType {
         self.relation_class() == GraphRelationClass::SemanticDomain
     }
 
+    pub fn allows_reverse_traversal(self) -> bool {
+        matches!(
+            self,
+            Self::ChunkSameTable | Self::ChunkSemanticSimilar | Self::RelatedTo
+        )
+    }
+
     pub fn boost(self) -> f32 {
         match self {
             Self::ChunkHasParent => 0.90,
@@ -1461,6 +1468,29 @@ mod tests {
             &scoring,
         );
         assert!(score < scoring.graph_min_score);
+    }
+
+    #[test]
+    fn reverse_traversal_is_limited_to_symmetric_relations() {
+        assert!(GraphRelationType::RelatedTo.allows_reverse_traversal());
+        assert!(GraphRelationType::ChunkSemanticSimilar.allows_reverse_traversal());
+        assert!(GraphRelationType::ChunkSameTable.allows_reverse_traversal());
+
+        for relation in [
+            GraphRelationType::RepairedBy,
+            GraphRelationType::Explains,
+            GraphRelationType::ObservedBy,
+            GraphRelationType::ProtectedBy,
+            GraphRelationType::Requires,
+            GraphRelationType::ChunkHasParent,
+            GraphRelationType::ChunkPreviousSibling,
+            GraphRelationType::ChunkNextSibling,
+        ] {
+            assert!(
+                !relation.allows_reverse_traversal(),
+                "{relation:?} must remain directional"
+            );
+        }
     }
 
     #[test]

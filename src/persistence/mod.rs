@@ -28,6 +28,20 @@ use uuid::Uuid;
 pub struct Repository {
     pub pool: PgPool,
 }
+
+fn reverse_traversable_allowed_relations(allowed_relations: &[String]) -> Vec<String> {
+    allowed_relations
+        .iter()
+        .filter_map(|relation| {
+            relation
+                .parse::<GraphRelationType>()
+                .ok()
+                .filter(|relation_type| relation_type.allows_reverse_traversal())
+                .map(|relation_type| relation_type.as_str().to_string())
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub enum ClaimResult {
     Acquired {
@@ -1922,6 +1936,7 @@ LIMIT 64
             .iter()
             .map(|r| r.to_uppercase())
             .collect::<Vec<_>>();
+        let reverse_allowed_relations = reverse_traversable_allowed_relations(&allowed_relations);
         let rows = sqlx::query(r#"
 WITH seed_input AS (
     SELECT input.chunk_id, input.seed_rank
@@ -1973,7 +1988,7 @@ WITH seed_input AS (
     FROM astravector.rag_graph_edges e
     JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.target_node_id
     WHERE e.access_zone_id=$1
-      AND e.relation_type = ANY($5::text[])
+      AND e.relation_type = ANY($8::text[])
       AND e.lifecycle_status='ACTIVE'
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
@@ -2039,6 +2054,7 @@ LIMIT $4
             .bind(&allowed_relations)
             .bind(max_edges_visited.max(max_related_chunks as usize) as i64)
             .bind(quality_run_id)
+            .bind(&reverse_allowed_relations)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
@@ -2047,6 +2063,7 @@ LIMIT $4
             rows_count = rows.len(),
             quality_run_id = quality_run_id.unwrap_or(""),
             allowed_relations = ?allowed_relations,
+            reverse_allowed_relations = ?reverse_allowed_relations,
             max_related_chunks,
             max_edges_visited,
             "GRAPH_EXPANSION_SQL_ROWS"
@@ -2151,6 +2168,7 @@ LIMIT $4
             .iter()
             .map(|r| r.to_uppercase())
             .collect::<Vec<_>>();
+        let reverse_allowed_relations = reverse_traversable_allowed_relations(&allowed_relations);
         let rows = sqlx::query(r#"
 WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
     SELECT input.access_zone_id, input.chunk_id, input.seed_rank
@@ -2201,7 +2219,7 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
            e.relation_source
     FROM astravector.rag_graph_edges e
     JOIN seed_node_ids s ON s.access_zone_id=e.access_zone_id AND s.node_id=e.target_node_id
-    WHERE e.relation_type = ANY($5::text[])
+    WHERE e.relation_type = ANY($8::text[])
       AND e.lifecycle_status='ACTIVE'
       AND e.quarantined=false
       AND (e.expires_at IS NULL OR e.expires_at > now())
@@ -2273,6 +2291,7 @@ LIMIT $4
             .bind(&allowed_relations)
             .bind(max_edges_visited.max(max_related_chunks as usize) as i64)
             .bind(quality_run_id)
+            .bind(&reverse_allowed_relations)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
@@ -2281,6 +2300,7 @@ LIMIT $4
             rows_count = rows.len(),
             quality_run_id = quality_run_id.unwrap_or(""),
             allowed_relations = ?allowed_relations,
+            reverse_allowed_relations = ?reverse_allowed_relations,
             max_related_chunks,
             max_edges_visited,
             "GRAPH_EXPANSION_SQL_ROWS"

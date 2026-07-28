@@ -74,6 +74,7 @@ fn graph_expansion_preserves_stable_edge_and_endpoint_identity() {
             "pub relation_source: String",
             "pub related_document_id: Uuid",
             "pub related_document_version: i64",
+            "pub fn allows_reverse_traversal(self) -> bool",
         ],
         "FIX486G-P1-001",
     );
@@ -86,6 +87,27 @@ fn graph_expansion_preserves_stable_edge_and_endpoint_identity() {
             "n.document_version",
         ],
         "FIX486G-P1-001",
+    );
+}
+
+#[test]
+fn directed_relations_do_not_reverse_expand_like_symmetric_edges() {
+    require_all(
+        GRAPH,
+        &[
+            "Self::ChunkSameTable | Self::ChunkSemanticSimilar | Self::RelatedTo",
+            "Self::RepairedBy",
+        ],
+        "FIX486G-DIRECTION-001",
+    );
+    require_all(
+        PERSISTENCE,
+        &[
+            "reverse_traversable_allowed_relations",
+            "e.relation_type = ANY($8::text[])",
+            "reverse_allowed_relations = ?reverse_allowed_relations",
+        ],
+        "FIX486G-DIRECTION-001",
     );
 }
 
