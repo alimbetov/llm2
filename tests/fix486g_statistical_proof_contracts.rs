@@ -241,6 +241,33 @@ fn report(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
+fn write_identity_map(path: &Path) {
+    let rows = ["parent-a1", "parent-a3"]
+        .into_iter()
+        .map(|parent| {
+            json!({
+                "runtime_chunk_id": parent,
+                "logical_chunk_id": parent,
+                "source_block_id": parent,
+                "runtime_parent_chunk_id": Value::Null
+            })
+        })
+        .chain(
+            [("child-a1-180", "parent-a1"), ("child-a3-180", "parent-a3")]
+                .into_iter()
+                .map(|(child, parent)| {
+                    json!({
+                        "runtime_chunk_id": child,
+                        "logical_chunk_id": child,
+                        "source_block_id": parent,
+                        "runtime_parent_chunk_id": parent
+                    })
+                }),
+        )
+        .collect::<Vec<_>>();
+    fs::write(path, serde_json::to_string(&json!({"rows": rows})).unwrap()).unwrap();
+}
+
 #[test]
 fn plan_is_offline_and_requires_142_results_per_full_pass() {
     let source = fs::read_to_string(SCRIPT).unwrap();
@@ -365,6 +392,121 @@ fn direct_survivor_is_sufficient_for_faults_that_invalidate_the_graph_target() {
     let result = report(&output.path().join("statistical-report.json"));
     assert_eq!(result["verdict"], "FIX486G_STATISTICAL_QUALITY_PASS");
     assert_eq!(result["hard_gates"]["valid_survivor_lost"], 0);
+}
+
+#[test]
+fn multi_relation_provenance_uses_the_matching_relation_seed_and_accepts_verified_degradation() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let identity_map = tempfile::NamedTempFile::new().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let mut rows = synthetic_campaign();
+    for row in &mut rows {
+        let key = if row["entry_point"] == "Search" {
+            "results"
+        } else {
+            "contexts"
+        };
+        if let Some(contexts) = row["response"][key].as_array_mut() {
+            for context in contexts {
+                let metadata = &mut context["metadata"];
+                if metadata["retrieval_source"] != "GRAPH_EXPANDED" {
+                    continue;
+                }
+                metadata["graph_relation_type"] = json!("CHUNK_SEMANTIC_SIMILAR");
+                metadata["graph_relation_score"] = json!("1.0");
+                metadata["graph_seed_chunk_id"] = json!("child-a3-180");
+                metadata["graph_seed_parent_chunk_id"] = json!("parent-a3");
+                metadata["graph_relations"] = json!(serde_json::to_string(&json!([
+                    {
+                        "relation_type": "CHUNK_SEMANTIC_SIMILAR",
+                        "relation_score": 1.0,
+                        "seed_chunk_id": "child-a3-180",
+                        "hop_distance": 1
+                    },
+                    {
+                        "relation_type": "REPAIRED_BY",
+                        "relation_score": 0.95,
+                        "seed_chunk_id": "child-a1-180",
+                        "hop_distance": 1
+                    }
+                ]))
+                .unwrap());
+            }
+        }
+        if row["entry_point"] == "RetrieveContext"
+            && row["degradation"]["graph_failure_injected"] == true
+        {
+            row["response"]["status"] = json!("DEGRADED");
+            row["response"]["degradation"] = json!({
+                "degraded": true,
+                "degradationClass": "PARTIAL"
+            });
+        }
+    }
+    write_rows(input.path(), &rows);
+    write_identity_map(identity_map.path());
+
+    let status = Command::new("python3")
+        .args([SCRIPT, "evaluate", "--bank", BANK, "--raw-input"])
+        .arg(input.path())
+        .args(["--identity-map"])
+        .arg(identity_map.path())
+        .args(["--output-dir"])
+        .arg(output.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let result = report(&output.path().join("statistical-report.json"));
+    assert_eq!(result["verdict"], "FIX486G_STATISTICAL_QUALITY_PASS");
+    assert_eq!(result["hard_gates"]["graph_seed_parent_reuse"], 0);
+    assert_eq!(result["hard_gates"]["seed_parent_reuse_final_contexts"], 0);
+}
+
+#[test]
+fn unresolved_matching_relation_seed_fails_closed() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let identity_map = tempfile::NamedTempFile::new().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let mut rows = synthetic_campaign();
+    let context = &mut rows[0]["response"]["results"][0];
+    context["metadata"]["graph_relation_type"] = json!("CHUNK_SEMANTIC_SIMILAR");
+    context["metadata"]["graph_seed_chunk_id"] = json!("child-a3-180");
+    context["metadata"]["graph_seed_parent_chunk_id"] = json!("parent-a3");
+    context["metadata"]["graph_relations"] = json!(serde_json::to_string(&json!([{
+        "relation_type": "REPAIRED_BY",
+        "relation_score": 0.95,
+        "seed_chunk_id": "unknown-runtime-child",
+        "hop_distance": 1
+    }]))
+    .unwrap());
+    write_rows(input.path(), &rows);
+    write_identity_map(identity_map.path());
+
+    let status = Command::new("python3")
+        .args([SCRIPT, "evaluate", "--bank", BANK, "--raw-input"])
+        .arg(input.path())
+        .args(["--identity-map"])
+        .arg(identity_map.path())
+        .args(["--output-dir"])
+        .arg(output.path())
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    let result = report(&output.path().join("statistical-report.json"));
+    assert!(
+        result["hard_gates"]["graph_provenance_missing"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let rows = jsonl(output.path().join("per-query-results.jsonl"));
+    assert!(rows.iter().any(|row| {
+        row["failure_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "GRAPH_SEED_PARENT_IDENTITY_MISSING")
+    }));
 }
 
 #[test]

@@ -466,6 +466,52 @@ def graph_provenance(meta: dict[str, Any]) -> bool:
     )
 
 
+def graph_relation_evidence(meta: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence = [{
+        "relation_type": meta.get("graph_relation_type"),
+        "relation_score": meta.get("graph_relation_score"),
+        "relation_id": meta.get("graph_relation_id") or meta.get("graph_edge_id"),
+        "seed_chunk_id": meta.get("graph_seed_chunk_id"),
+        "hop_distance": meta.get("graph_hop_distance"),
+        "_primary": True,
+    }]
+    raw = meta.get("graph_relations")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list):
+            evidence.extend({**item, "_primary": False} for item in parsed if isinstance(item, dict))
+    return evidence
+
+
+def matching_graph_relation(meta: dict[str, Any], required: set[str]) -> dict[str, Any] | None:
+    for relation in graph_relation_evidence(meta):
+        relation_type = relation.get("relation_type")
+        if isinstance(relation_type, str) and (not required or relation_type in required):
+            return relation
+    return None
+
+
+def graph_relation_seed_parent(
+    relation: dict[str, Any], meta: dict[str, Any], identities: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    seed_chunk = relation.get("seed_chunk_id")
+    seed_identity = identities.get(seed_chunk, {}) if isinstance(seed_chunk, str) else {}
+    runtime_parent = seed_identity.get("runtime_parent_chunk_id")
+    parent_identity = identities.get(runtime_parent, {}) if isinstance(runtime_parent, str) else {}
+    logical_parent = parent_identity.get("logical_chunk_id") or seed_identity.get("source_block_id")
+    if relation.get("_primary") is True and not present(runtime_parent):
+        runtime_parent = meta.get("graph_seed_parent_chunk_id")
+        if isinstance(runtime_parent, str):
+            logical_parent = identities.get(runtime_parent, {}).get("logical_chunk_id") or runtime_parent
+    return (
+        runtime_parent if isinstance(runtime_parent, str) else None,
+        logical_parent if isinstance(logical_parent, str) else None,
+    )
+
+
 def normalized_context(context: dict[str, Any], identities: dict[str, dict[str, Any]]) -> dict[str, Any]:
     meta = metadata(context)
     matched = context.get("matchedChunkId") or context.get("matched_chunk_id")
@@ -546,13 +592,18 @@ def evaluate_observation(
     qrel = bank_data["profiles"][profile_name]
     normalized = [normalized_context(item, identities) for item in contexts(row)]
     required_relations = set(qrel.get("required_graph_relation_any") or [])
+    expected_graph = qrel.get("expected_graph_parent")
     graph_rows = [
-        item for item in normalized
+        item
+        for item in normalized
         if item["graph_provenance"]
-        and item["metadata"].get("graph_relation_type") in required_relations
+        and matching_graph_relation(item["metadata"], required_relations)
+        and (
+            item["primary_graph_origin"]
+            or (expected_graph and item["parent_logical"] == expected_graph)
+        )
     ]
     direct_rows = [item for item in normalized if not item["primary_graph_origin"]]
-    expected_graph = qrel.get("expected_graph_parent")
     expected_direct = qrel.get("expected_direct_parent")
     fault_setup = query.get("fault_setup")
     fault_contract = FAULT_CONTRACT_BY_SETUP.get(fault_setup) if fault_setup else None
@@ -581,9 +632,20 @@ def evaluate_observation(
             if expected_graph and item["parent_logical"] != expected_graph:
                 add_gate(gates, "wrong_parent_graph_final_contexts", "graph_wrong_parent")
                 failures.append("WRONG_GRAPH_PARENT")
-            seed_parent = meta.get("graph_seed_parent_chunk_id")
-            related_parent = meta.get("graph_related_parent_chunk_id")
-            if present(seed_parent) and seed_parent == related_parent:
+            relation = matching_graph_relation(meta, required_relations)
+            seed_parent_runtime, seed_parent_logical = graph_relation_seed_parent(
+                relation or {}, meta, identities
+            )
+            if not present(seed_parent_runtime) and not present(seed_parent_logical):
+                add_gate(gates, "graph_provenance_missing")
+                failures.append("GRAPH_SEED_PARENT_IDENTITY_MISSING")
+            elif (
+                present(seed_parent_runtime)
+                and seed_parent_runtime == item["parent_runtime"]
+            ) or (
+                present(seed_parent_logical)
+                and seed_parent_logical == item["parent_logical"]
+            ):
                 add_gate(gates, "seed_parent_reuse_final_contexts", "graph_seed_parent_reuse")
                 failures.append("GRAPH_SEED_PARENT_REUSE")
             lifecycle = str(meta.get("lifecycle_status", "ACTIVE")).upper()
@@ -621,9 +683,19 @@ def evaluate_observation(
             else:
                 add_gate(gates, "graph_provenance_missing")
                 failures.append("GRAPH_PROVENANCE_MISSING")
-            relation_type = meta.get("graph_relation_type")
+            relation_type = relation.get("relation_type") if relation else None
+            relation_hop = as_int(relation.get("hop_distance")) if relation else None
+            stable_relation_tuple = bool(
+                relation
+                and present(relation_type)
+                and present(relation.get("relation_score"))
+                and present(relation.get("seed_chunk_id"))
+                and present(meta.get("graph_related_chunk_id"))
+                and present(meta.get("graph_related_parent_chunk_id"))
+                and relation_hop is not None
+            )
             edge_valid = relation_type in (qrel.get("required_graph_relation_any") or [relation_type])
-            if edge_valid and complete and hop == qrel.get("required_hop_index", 1):
+            if edge_valid and (complete or stable_relation_tuple) and relation_hop == qrel.get("required_hop_index", 1):
                 edge_valid_contexts += 1
             else:
                 failures.append("GRAPH_EDGE_INVALID")
@@ -653,7 +725,7 @@ def evaluate_observation(
     if profile_name == "NEGATIVE_NO_ANSWER" and normalized:
         add_gate(gates, "false_positive_contexts")
     forbidden_parent = qrel.get("forbidden_graph_parent")
-    if forbidden_parent and any(item["parent_logical"] == forbidden_parent for item in normalized):
+    if forbidden_parent and any(item["parent_logical"] == forbidden_parent for item in graph_rows):
         add_gate(gates, "false_graph_attribution_events")
         failures.append("FORBIDDEN_PARENT_RETURNED")
     telemetry = row["telemetry"]
@@ -678,8 +750,7 @@ def evaluate_observation(
     response_status = row["response"].get("status")
     expected_status = qrel.get("expected_status")
     expected_statuses = qrel.get("expected_status_any") or ([expected_status] if expected_status else [])
-    if expected_statuses and response_status not in expected_statuses:
-        failures.append("RESPONSE_STATUS_INVALID")
+    response_degradation = row["response"].get("degradation")
     if "expected_final_context_count" in qrel and len(normalized) != qrel["expected_final_context_count"]:
         failures.append("FINAL_CONTEXT_COUNT_INVALID")
     expected_parent = qrel.get("expected_parent")
@@ -700,6 +771,7 @@ def evaluate_observation(
     )
     if expected_graph and graph_rank is None and graph_survivor_required:
         failures.append("GRAPH_PARENT_MISSING")
+    survivor_present = False
     if fault_setup:
         direct_survivor_present = bool(
             expected_direct
@@ -717,6 +789,7 @@ def evaluate_observation(
 
     degradation = row.get("degradation")
     fault_class = "NONE"
+    exact_rejection_evidenced = False
     if fault_setup:
         fault_plan = bank_data["fault_by_setup"].get(fault_setup)
         if not fault_plan:
@@ -752,11 +825,31 @@ def evaluate_observation(
             or observation.get("reason") != expected_reason
         ):
             failures.append("FAULT_REJECTION_NOT_EVIDENCED")
+        else:
+            exact_rejection_evidenced = True
+
+    verified_partial_degradation = bool(
+        fault_contract
+        and survivor_present
+        and exact_rejection_evidenced
+        and row["entry_point"] == "RetrieveContext"
+        and response_status == "DEGRADED"
+        and isinstance(response_degradation, dict)
+        and response_degradation.get("degraded") is True
+        and response_degradation.get("degradationClass") == "PARTIAL"
+    )
+    if expected_statuses and response_status not in expected_statuses and not verified_partial_degradation:
+        failures.append("RESPONSE_STATUS_INVALID")
 
     graded = qrel.get("graded_relevance") or {}
     grades = [int(graded.get(item["parent_logical"], 0)) for item in normalized]
     ideal_grades = [int(value) for value in graded.values() if int(value) > 0]
-    relation_types = sorted({item["metadata"].get("graph_relation_type") for item in graph_rows if present(item["metadata"].get("graph_relation_type"))})
+    relation_types = sorted({
+        relation["relation_type"]
+        for item in graph_rows
+        for relation in graph_relation_evidence(item["metadata"])
+        if present(relation.get("relation_type"))
+    })
     stable_set = sorted(
         {
             (

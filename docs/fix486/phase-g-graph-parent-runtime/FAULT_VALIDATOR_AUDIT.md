@@ -1,6 +1,6 @@
 # FIX486G Fault Validator Audit
 
-Status: `IMPLEMENTED / FOCUSED_VALIDATION_REQUIRED`
+Status: `IMPLEMENTED / FOCUSED_VALIDATION_PASS`
 
 This audit covers every rejected-Graph-target validator before the next
 official runtime proof. The executable source of truth is
@@ -64,6 +64,27 @@ Focused tests prove:
 - one-hop telemetry can be reconstructed from a complete debug ranking trace
   when final selection contains no Graph context; absent context and absent
   ranking trace still fail closed.
+- multi-relation provenance is evaluated against the relation selected by the
+  qrel, including that relation's seed identity, rather than unrelated
+  top-level provenance;
+- a `DEGRADED` RetrieveContext fault response is accepted only when the
+  canonical survivor remains and the exact rejection evidence is present;
+- unresolved relation seed identity fails closed as incomplete provenance.
+
+## Preserved quality blockers
+
+Offline replay of all 730 observations from
+`fix486g-20260727T193019Z` confirms that the validator repair removes false
+Graph safety violations without changing retrieval output. The following are
+runtime quality failures, not validator defects:
+
+- all 12 `NEGATIVE_NO_ANSWER` queries return five contexts instead of no
+  answer;
+- all three `NEGATIVE_LEGAL_HOLD` queries include forbidden reconciliation
+  evidence;
+- the three `GRAPH_DISABLED` `*-02` queries lose the required direct parent;
+- `g-fault-hop-limit-03` loses the required canonical survivor;
+- positive Graph rank thresholds remain below the frozen release contract.
 
 Production ranking, Graph weights, relation weights, RRF, MMR, token budget,
 frozen queries, qrels and production rejection classifications are unchanged.
