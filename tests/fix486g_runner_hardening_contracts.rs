@@ -209,7 +209,7 @@ fn official_identity_gate_requires_an_approved_phase_branch_and_remote_sha() {
         &runner,
         &[
             "branch_is_approved()",
-            "codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence",
+            "codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence|codex/fix486g-post-merge-recovery",
             "branch_is_approved &&",
             "[[ \"$SOURCE_SHA\" == \"$REMOTE_SHA\" ]]",
             "git -C \"$ROOT\" status --porcelain",

@@ -177,7 +177,7 @@ verify_identity() {
 }
 branch_is_approved() {
   case "$BRANCH" in
-    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence) return 0 ;;
+    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence|codex/fix486g-post-merge-recovery) return 0 ;;
     *) return 1 ;;
   esac
 }
