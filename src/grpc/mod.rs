@@ -12353,15 +12353,13 @@ fn excluded_query_terms(query: &str) -> HashSet<String> {
         while let Some(index) = lowered[offset..].find(marker) {
             let start = offset + index + marker.len();
             let tail = &lowered[start..];
-            let end = tail
-                .find(|ch: char| matches!(ch, ',' | ';' | '.' | '?' | '!'))
-                .unwrap_or(tail.len());
+            let end = tail.find([',', ';', '.', '?', '!']).unwrap_or(tail.len());
             clauses.push(tail[..end].trim().to_string());
             offset = start;
         }
     }
     for marker in ["айтпай", "қолданбай"] {
-        for clause in lowered.split(|ch: char| matches!(ch, ',' | ';' | '.' | '?' | '!')) {
+        for clause in lowered.split([',', ';', '.', '?', '!']) {
             if let Some(index) = clause.find(marker) {
                 let head = clause[..index].trim();
                 if !head.is_empty() {
@@ -12629,9 +12627,7 @@ fn strict_lexical_query_match(
 
 fn is_mixed_script_query(query: &str) -> bool {
     let has_ascii_alpha = query.chars().any(|ch| ch.is_ascii_alphabetic());
-    let has_cyrillic = query
-        .chars()
-        .any(|ch| matches!(ch as u32, 0x0400..=0x04FF | 0x0500..=0x052F));
+    let has_cyrillic = query.chars().any(|ch| matches!(ch as u32, 0x0400..=0x052F));
     has_ascii_alpha && has_cyrillic
 }
 
@@ -14632,7 +14628,7 @@ mod v007_fix1_tests {
     #[test]
     fn graph_secondary_provenance_does_not_cross_parent_scope_into_direct_duplicate() {
         let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
-        direct.parent_chunk_id = "parent-a1".into();
+        direct.parent_chunk_id = "canonical-parent".into();
         direct
             .citation
             .as_mut()
@@ -14653,7 +14649,7 @@ mod v007_fix1_tests {
             .insert("source_block_id".into(), "canonical-a1".into());
 
         let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
-        graph.parent_chunk_id = "parent-a1".into();
+        graph.parent_chunk_id = "canonical-parent".into();
         graph
             .citation
             .as_mut()
@@ -14678,18 +14674,14 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .insert("graph_relation_type".into(), "REPAIRED_BY".into());
-        graph
-            .citation
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert("graph_seed_parent_chunk_id".into(), "parent-a3".into());
-        graph
-            .citation
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert("graph_related_parent_chunk_id".into(), "parent-a1".into());
+        graph.citation.as_mut().unwrap().metadata.insert(
+            "graph_seed_parent_chunk_id".into(),
+            "secondary-parent".into(),
+        );
+        graph.citation.as_mut().unwrap().metadata.insert(
+            "graph_related_parent_chunk_id".into(),
+            "canonical-parent".into(),
+        );
         graph
             .citation
             .as_mut()
@@ -15222,7 +15214,7 @@ mod v007_fix1_tests {
             "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for the Qdrant projection.",
             0.034,
         );
-        canonical.parent_chunk_id = "parent-a1".into();
+        canonical.parent_chunk_id = "canonical-parent".into();
         canonical.matched_chunk_id = "child-a1-260".into();
         {
             let scores = canonical.scores.as_mut().unwrap();
@@ -15240,7 +15232,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a1".into());
+            .insert("source_block_id".into(), "canonical-parent".into());
         canonical
             .citation
             .as_mut()
@@ -15253,7 +15245,7 @@ mod v007_fix1_tests {
             "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
             0.033,
         );
-        reconciliation.parent_chunk_id = "parent-a3".into();
+        reconciliation.parent_chunk_id = "secondary-parent".into();
         reconciliation.matched_chunk_id = "child-a3-180".into();
         {
             let scores = reconciliation.scores.as_mut().unwrap();
@@ -15271,7 +15263,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a3".into());
+            .insert("source_block_id".into(), "secondary-parent".into());
         reconciliation
             .citation
             .as_mut()
@@ -15323,7 +15315,7 @@ mod v007_fix1_tests {
 
         assert_eq!(filtered, 3);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].parent_chunk_id, "parent-a1");
+        assert_eq!(candidates[0].parent_chunk_id, "canonical-parent");
         assert!(!final_no_answer_should_trigger(
             &candidates,
             query,
@@ -15486,7 +15478,7 @@ mod v007_fix1_tests {
             "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
             0.031,
         );
-        reconciliation.parent_chunk_id = "parent-a3".into();
+        reconciliation.parent_chunk_id = "secondary-parent".into();
         reconciliation.matched_chunk_id = "child-a3-180".into();
         {
             let scores = reconciliation.scores.as_mut().unwrap();
@@ -15504,7 +15496,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a3".into());
+            .insert("source_block_id".into(), "secondary-parent".into());
         reconciliation
             .citation
             .as_mut()
@@ -15535,7 +15527,7 @@ mod v007_fix1_tests {
             "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for the Qdrant projection.",
             0.031,
         );
-        canonical.parent_chunk_id = "parent-a1".into();
+        canonical.parent_chunk_id = "canonical-parent".into();
         canonical.matched_chunk_id = "child-a1-260".into();
         {
             let scores = canonical.scores.as_mut().unwrap();
@@ -15555,7 +15547,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a1".into());
+            .insert("source_block_id".into(), "canonical-parent".into());
         canonical
             .citation
             .as_mut()
@@ -15574,7 +15566,7 @@ mod v007_fix1_tests {
             "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
             0.030,
         );
-        reconciliation.parent_chunk_id = "parent-a3".into();
+        reconciliation.parent_chunk_id = "secondary-parent".into();
         reconciliation.matched_chunk_id = "child-a3-180".into();
         {
             let scores = reconciliation.scores.as_mut().unwrap();
@@ -15594,7 +15586,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a3".into());
+            .insert("source_block_id".into(), "secondary-parent".into());
         reconciliation
             .citation
             .as_mut()
@@ -15666,7 +15658,7 @@ mod v007_fix1_tests {
             panic!("filtered={filtered} remaining={remaining:?}");
         }
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].parent_chunk_id, "parent-a1");
+        assert_eq!(candidates[0].parent_chunk_id, "canonical-parent");
     }
 
     #[test]
@@ -15682,7 +15674,7 @@ mod v007_fix1_tests {
             "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for the Qdrant projection.",
             0.032,
         );
-        canonical.parent_chunk_id = "parent-a1".into();
+        canonical.parent_chunk_id = "canonical-parent".into();
         canonical.matched_chunk_id = "child-a1-260".into();
         {
             let scores = canonical.scores.as_mut().unwrap();
@@ -15702,7 +15694,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a1".into());
+            .insert("source_block_id".into(), "canonical-parent".into());
         canonical
             .citation
             .as_mut()
@@ -15768,7 +15760,7 @@ mod v007_fix1_tests {
 
         assert_eq!(filtered, 1);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].parent_chunk_id, "parent-a1");
+        assert_eq!(candidates[0].parent_chunk_id, "canonical-parent");
     }
 
     #[test]
@@ -15784,7 +15776,7 @@ mod v007_fix1_tests {
             "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
             0.031,
         );
-        graph.parent_chunk_id = "parent-a3".into();
+        graph.parent_chunk_id = "secondary-parent".into();
         graph.matched_chunk_id = "child-a3-180".into();
         {
             let scores = graph.scores.as_mut().unwrap();
@@ -15810,7 +15802,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a3".into());
+            .insert("source_block_id".into(), "secondary-parent".into());
         graph
             .citation
             .as_mut()
@@ -15842,7 +15834,7 @@ mod v007_fix1_tests {
             "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for document versions, content chunks, lifecycle and access visibility.",
             0.031,
         );
-        candidate.parent_chunk_id = "parent-a1".into();
+        candidate.parent_chunk_id = "canonical-parent".into();
         candidate.matched_chunk_id = "child-a1-180".into();
         {
             let scores = candidate.scores.as_mut().unwrap();
@@ -15860,7 +15852,7 @@ mod v007_fix1_tests {
             .as_mut()
             .unwrap()
             .metadata
-            .insert("source_block_id".into(), "parent-a1".into());
+            .insert("source_block_id".into(), "canonical-parent".into());
         candidate
             .citation
             .as_mut()
