@@ -2778,13 +2778,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                         matched_discriminating_term_count(&lexical, segment_text);
                     let leading_discriminating_match =
                         leading_discriminating_query_term_matches(&lexical, segment_text);
-                    let strong_coverage =
-                        query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
                     let strict_lexical_evidence = exact_phrase_match
-                        || (matched_terms >= 2
-                            && matched_discriminating_terms >= 1
-                            && leading_discriminating_match
-                            && strong_coverage);
+                        || strict_lexical_query_match(
+                            matched_terms,
+                            matched_discriminating_terms,
+                            leading_discriminating_match,
+                            query_terms,
+                        );
                     let document_overview_seed = self.cfg.graph_rag.rerank.mmr_enabled
                         && parent.source_block_id.as_deref() == Some("doc-root")
                         && matched_terms >= 2
@@ -2837,6 +2837,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                             }
                             let mut lexical =
                                 search_result_from_lexical_parent(parent, sibling_query);
+                            if is_root_container_result(&lexical) {
+                                continue;
+                            }
                             if let Some(citation) = lexical.citation.as_mut() {
                                 citation.metadata.insert(
                                     "query_processing_mode".into(),
@@ -2859,6 +2862,19 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                                 matched_discriminating_term_count(&lexical, sibling_query);
                             let leading_discriminating_match =
                                 leading_discriminating_query_term_matches(&lexical, sibling_query);
+                            if !strict_lexical_query_match(
+                                matched_terms,
+                                matched_discriminating_terms,
+                                leading_discriminating_match,
+                                query_term_count(sibling_query),
+                            ) {
+                                continue;
+                            }
+                            if let Some(citation) = lexical.citation.as_mut() {
+                                citation
+                                    .metadata
+                                    .insert("strong_lexical_evidence".into(), "true".into());
+                            }
                             lexical_results.push((
                                 lexical,
                                 sibling_score,
@@ -3034,37 +3050,32 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             Vec::new()
         };
         let preserve_partial_evidence_for_mmr = self.cfg.graph_rag.rerank.mmr_enabled;
-        let skip_pre_mmr_no_answer_for_graph =
-            r.enable_graph_expansion && self.cfg.graph_rag.enabled;
         let pre_mmr_no_answer_started = Instant::now();
         let pre_mmr_before = if ranking_trace.enabled {
             direct_results.clone()
         } else {
             Vec::new()
         };
-        if !skip_pre_mmr_no_answer_for_graph {
-            no_answer_stats.pre_mmr_filtered_count =
-                if query_plan.mode == QueryProcessingMode::Segmented {
-                    apply_segmented_pre_mmr_no_answer_filter(
-                        &mut direct_results,
-                        &query_plan,
-                        search_mode,
-                        &self.cfg.search.no_answer,
-                        no_answer_debug,
-                        preserve_partial_evidence_for_mmr,
-                    )
-                } else {
-                    apply_pre_mmr_no_answer_filter(
-                        &mut direct_results,
-                        query,
-                        &query_technical_tokens,
-                        search_mode,
-                        &self.cfg.search.no_answer,
-                        no_answer_debug,
-                        preserve_partial_evidence_for_mmr,
-                    )
-                };
-        }
+        no_answer_stats.pre_mmr_filtered_count = if query_plan.mode == QueryProcessingMode::Segmented {
+            apply_segmented_pre_mmr_no_answer_filter(
+                &mut direct_results,
+                &query_plan,
+                search_mode,
+                &self.cfg.search.no_answer,
+                no_answer_debug,
+                preserve_partial_evidence_for_mmr,
+            )
+        } else {
+            apply_pre_mmr_no_answer_filter(
+                &mut direct_results,
+                query,
+                &query_technical_tokens,
+                search_mode,
+                &self.cfg.search.no_answer,
+                no_answer_debug,
+                preserve_partial_evidence_for_mmr,
+            )
+        };
         let coverage_after_direct = coverage_for_results(&query_plan, &direct_results);
         if query_plan.mode == QueryProcessingMode::Segmented {
             histogram!("astravector_long_query_coverage_after_direct")
@@ -3872,8 +3883,6 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         if let Some(candidates) = broad_coverage_candidates.as_deref() {
             reinforce_broad_coverage_results(&mut results, candidates, final_limit);
         }
-        let final_graph_evidence_present =
-            r.enable_graph_expansion && has_graph_expanded_evidence(&results);
         let post_mmr_no_answer_started = Instant::now();
         let post_mmr_before = if ranking_trace.enabled {
             results.clone()
@@ -3899,23 +3908,15 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                 ),
             });
         }
-        let post_mmr_no_answer_triggered = if query_plan.mode == QueryProcessingMode::Segmented {
-            segmented_final_no_answer_should_trigger(
-                &results,
-                &query_plan,
-                search_mode,
-                &self.cfg.search.no_answer,
-            )
-        } else {
-            final_no_answer_should_trigger(
-                &results,
-                query,
-                &query_technical_tokens,
-                search_mode,
-                &self.cfg.search.no_answer,
-            )
-        };
-        if !final_graph_evidence_present && post_mmr_no_answer_triggered {
+        let post_mmr_no_answer_triggered = should_clear_post_mmr_results(
+            &results,
+            Some(&query_plan),
+            query,
+            &query_technical_tokens,
+            search_mode,
+            &self.cfg.search.no_answer,
+        );
+        if post_mmr_no_answer_triggered {
             no_answer_stats.post_mmr_triggered_count = 1;
             counter!("retrieval_no_answer_post_mmr_triggered_total").increment(1);
             warnings.push(pb::DiagnosticWarningV005 {
@@ -11552,6 +11553,7 @@ fn merge_secondary_metadata_with_limit(
     secondary: &pb::SearchResultV004,
     max_relations: usize,
 ) {
+    let primary_is_graph_expanded = primary_retrieval_source(primary) == Some("GRAPH_EXPANDED");
     let Some(primary_citation) = primary.citation.as_mut() else {
         return;
     };
@@ -11568,13 +11570,32 @@ fn merge_secondary_metadata_with_limit(
         .get("retrieval_source")
         .cloned()
         .unwrap_or_else(|| "UNKNOWN".into());
+    let primary_parent = primary.parent_chunk_id.trim();
+    let secondary_graph_seed_parent = secondary_citation
+        .metadata
+        .get("graph_seed_parent_chunk_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let secondary_graph_related_parent = secondary_citation
+        .metadata
+        .get("graph_related_parent_chunk_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let allow_graph_secondary_provenance = secondary_source != "GRAPH_EXPANDED"
+        || primary_is_graph_expanded
+        || (secondary_graph_seed_parent.is_none_or(|value| value == primary_parent)
+            && secondary_graph_related_parent.is_none_or(|value| value == primary_parent));
 
     let mut sources =
         parse_string_array_metadata(primary_citation.metadata.get("retrieval_sources"));
     if sources.is_empty() {
         sources.push(primary_source.clone());
     }
-    if !sources.iter().any(|s| s == &secondary_source) {
+    if (secondary_source != "GRAPH_EXPANDED" || allow_graph_secondary_provenance)
+        && !sources.iter().any(|s| s == &secondary_source)
+    {
         sources.push(secondary_source.clone());
     }
     if let Ok(json) = serde_json::to_string(&sources) {
@@ -11587,7 +11608,7 @@ fn merge_secondary_metadata_with_limit(
         sources.len().saturating_sub(1).to_string(),
     );
 
-    if secondary_source == "GRAPH_EXPANDED" {
+    if secondary_source == "GRAPH_EXPANDED" && allow_graph_secondary_provenance {
         for key in [
             "graph_seed_access_zone_id",
             "graph_seed_document_id",
@@ -11623,14 +11644,16 @@ fn merge_secondary_metadata_with_limit(
     }
 
     let mut relations = parse_json_array_metadata(primary_citation.metadata.get("graph_relations"));
-    if let Some(relation) = secondary_citation.metadata.get("graph_relation_type") {
-        relations.push(serde_json::json!({
-            "relation_type": relation,
-            "relation_score": secondary_citation.metadata.get("graph_relation_score").and_then(|v| v.parse::<f32>().ok()).unwrap_or_default(),
-            "graph_score": secondary_citation.metadata.get("graph_score").and_then(|v| v.parse::<f32>().ok()).unwrap_or_default(),
-            "seed_chunk_id": secondary_citation.metadata.get("graph_seed_chunk_id").cloned().unwrap_or_default(),
-            "hop_distance": secondary_citation.metadata.get("graph_hop_distance").and_then(|v| v.parse::<u32>().ok()).unwrap_or_default(),
-        }));
+    if allow_graph_secondary_provenance {
+        if let Some(relation) = secondary_citation.metadata.get("graph_relation_type") {
+            relations.push(serde_json::json!({
+                "relation_type": relation,
+                "relation_score": secondary_citation.metadata.get("graph_relation_score").and_then(|v| v.parse::<f32>().ok()).unwrap_or_default(),
+                "graph_score": secondary_citation.metadata.get("graph_score").and_then(|v| v.parse::<f32>().ok()).unwrap_or_default(),
+                "seed_chunk_id": secondary_citation.metadata.get("graph_seed_chunk_id").cloned().unwrap_or_default(),
+                "hop_distance": secondary_citation.metadata.get("graph_hop_distance").and_then(|v| v.parse::<u32>().ok()).unwrap_or_default(),
+            }));
+        }
     }
     if !relations.is_empty() {
         let mut seen = HashSet::new();
@@ -12246,7 +12269,7 @@ fn trace_exact_technical_match(citation: Option<&pb::SearchCitationV004>) -> boo
 fn matched_term_count(result: &pb::SearchResultV004, query: &str) -> usize {
     let candidate_text = candidate_text_for_no_answer(result);
     let candidate_terms = lexical_terms(&candidate_text);
-    lexical_terms(query)
+    positive_query_terms(query)
         .into_iter()
         .filter(|term| candidate_terms.contains(term))
         .count()
@@ -12255,7 +12278,7 @@ fn matched_term_count(result: &pb::SearchResultV004, query: &str) -> usize {
 fn matched_discriminating_term_count(result: &pb::SearchResultV004, query: &str) -> usize {
     let candidate_text = candidate_text_for_no_answer(result);
     let candidate_terms = lexical_terms(&candidate_text);
-    lexical_terms(query)
+    positive_query_terms(query)
         .into_iter()
         .filter(|term| !is_common_retrieval_overlap_term(term))
         .filter(|term| candidate_terms.contains(term))
@@ -12263,7 +12286,7 @@ fn matched_discriminating_term_count(result: &pb::SearchResultV004, query: &str)
 }
 
 fn leading_discriminating_query_term_matches(result: &pb::SearchResultV004, query: &str) -> bool {
-    let Some(leading) = ordered_lexical_terms(query)
+    let Some(leading) = ordered_positive_query_terms(query)
         .into_iter()
         .find(|term| !is_common_retrieval_overlap_term(term))
     else {
@@ -12273,7 +12296,7 @@ fn leading_discriminating_query_term_matches(result: &pb::SearchResultV004, quer
 }
 
 fn query_term_count(query: &str) -> usize {
-    lexical_terms(query).len()
+    positive_query_terms(query).len()
 }
 
 fn lexical_terms(text: &str) -> HashSet<String> {
@@ -12281,6 +12304,26 @@ fn lexical_terms(text: &str) -> HashSet<String> {
 }
 
 fn ordered_lexical_terms(text: &str) -> Vec<String> {
+    let excluded = excluded_query_terms(text);
+    ordered_lexical_terms_raw(text)
+        .into_iter()
+        .filter(|term| !excluded.contains(term))
+        .collect()
+}
+
+fn positive_query_terms(query: &str) -> HashSet<String> {
+    ordered_positive_query_terms(query).into_iter().collect()
+}
+
+fn ordered_positive_query_terms(query: &str) -> Vec<String> {
+    let excluded = excluded_query_terms(query);
+    ordered_lexical_terms_raw(query)
+        .into_iter()
+        .filter(|term| !excluded.contains(term))
+        .collect()
+}
+
+fn ordered_lexical_terms_raw(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut terms = Vec::new();
     for term in text.split_whitespace().filter_map(normalized_lexical_term) {
@@ -12291,6 +12334,55 @@ fn ordered_lexical_terms(text: &str) -> Vec<String> {
         }
     }
     terms
+}
+
+fn excluded_query_terms(query: &str) -> HashSet<String> {
+    let lowered = query.to_lowercase();
+    let mut clauses = Vec::new();
+    for marker in [
+        "without using",
+        "without",
+        "excluding",
+        "except",
+        "не используя",
+        "без",
+        "кроме",
+    ] {
+        let mut offset = 0;
+        while let Some(index) = lowered[offset..].find(marker) {
+            let start = offset + index + marker.len();
+            let tail = &lowered[start..];
+            let end = tail
+                .find(|ch: char| matches!(ch, ',' | ';' | '.' | '?' | '!'))
+                .unwrap_or(tail.len());
+            clauses.push(tail[..end].trim().to_string());
+            offset = start;
+        }
+    }
+    for marker in ["айтпай", "қолданбай"] {
+        for clause in lowered.split(|ch: char| matches!(ch, ',' | ';' | '.' | '?' | '!')) {
+            if let Some(index) = clause.find(marker) {
+                let head = clause[..index].trim();
+                if !head.is_empty() {
+                    clauses.push(head.to_string());
+                }
+            }
+        }
+    }
+    clauses
+        .into_iter()
+        .flat_map(|clause| ordered_lexical_terms_raw(&clause))
+        .filter(|term| !matches!(term.as_str(), "without" | "using" | "excluding" | "except"))
+        .collect()
+}
+
+fn violates_query_exclusion_terms(result: &pb::SearchResultV004, query: &str) -> bool {
+    let excluded_terms = excluded_query_terms(query);
+    if excluded_terms.is_empty() {
+        return false;
+    }
+    let candidate_terms = lexical_terms(&candidate_text_for_no_answer(result));
+    excluded_terms.iter().any(|term| candidate_terms.contains(term))
 }
 
 fn lexical_term_variants(term: &str) -> Vec<String> {
@@ -12472,6 +12564,8 @@ fn is_common_retrieval_overlap_term(term: &str) -> bool {
             | "claim"
             | "claims"
             | "dead-letter"
+            | "document"
+            | "documents"
             | "event"
             | "events"
             | "filter"
@@ -12502,6 +12596,38 @@ fn lexical_score_for_no_answer(result: &pb::SearchResultV004) -> f32 {
         .and_then(|citation| citation.metadata.get("lexical_score"))
         .and_then(|score| score.parse::<f32>().ok())
         .unwrap_or(0.0)
+}
+
+fn retrieval_sources_contains(result: &pb::SearchResultV004, needle: &str) -> bool {
+    result.citation.as_ref().is_some_and(|citation| {
+        citation
+            .metadata
+            .get("retrieval_source")
+            .is_some_and(|value| value == needle)
+            || citation
+                .metadata
+                .get("retrieval_sources")
+                .is_some_and(|value| value.contains(needle))
+    })
+}
+
+fn strict_lexical_query_match(
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    leading_discriminating_match: bool,
+    query_terms: usize,
+) -> bool {
+    let strong_coverage = query_terms == 0 || matched_terms.saturating_mul(2) >= query_terms;
+    matched_terms >= 2
+        && matched_discriminating_terms >= 1
+        && leading_discriminating_match
+        && strong_coverage
+}
+
+fn is_mixed_script_query(query: &str) -> bool {
+    let has_ascii_alpha = query.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_cyrillic = query.chars().any(|ch| matches!(ch as u32, 0x0400..=0x04FF | 0x0500..=0x052F));
+    has_ascii_alpha && has_cyrillic
 }
 
 fn apply_no_answer_exact_technical_boost(
@@ -12571,6 +12697,7 @@ fn no_answer_candidate_passes(
     matched_discriminating_terms: usize,
     leading_discriminating_match: bool,
     query_terms: usize,
+    mixed_script_query: bool,
     cfg: &NoAnswerConfig,
 ) -> bool {
     let Some(scores) = result.scores.as_ref() else {
@@ -12581,14 +12708,19 @@ fn no_answer_candidate_passes(
         exact_technical_match && sparse_after_boost >= cfg.min_sparse_score * 2.0;
     let exact_hybrid_allow = exact_sparse_allow && matched_discriminating_terms >= 1;
     let strong_lexical_match = strong_lexical_match(matched_terms, query_terms, cfg);
+    let lexical_signal = lexical_score_for_no_answer(result);
+    let has_indexed_lexical_support = retrieval_sources_contains(result, "POSTGRES_FTS")
+        || is_strong_lexical_candidate(result)
+        || lexical_signal >= cfg.min_sparse_score * 0.75;
     let branch_confidence = scores
         .dense_score
         .max(sparse_after_boost)
-        .max(lexical_score_for_no_answer(result));
+        .max(lexical_signal);
     let strong_branch_source = scores.dense_score >= cfg.min_dense_score
         || is_strong_lexical_candidate(result)
         || (sparse_after_boost >= cfg.min_sparse_score && strong_lexical_match)
-        || (lexical_score_for_no_answer(result) >= cfg.min_sparse_score && strong_lexical_match);
+        || (lexical_signal >= cfg.min_sparse_score && strong_lexical_match);
+    let non_container_direct = result.matched_chunk_id != result.parent_chunk_id;
     let branch_confidence_allow = branch_confidence >= cfg.min_sparse_score
         && strong_branch_source
         && matched_terms >= cfg.sparse_only_min_matched_terms.max(2)
@@ -12597,6 +12729,32 @@ fn no_answer_candidate_passes(
         && (leading_discriminating_match
             || strong_lexical_match
             || is_strong_lexical_candidate(result));
+    let semantic_anchor_allow = if has_indexed_lexical_support {
+        non_container_direct
+            && strong_branch_source
+            && matched_terms >= 1
+            && matched_discriminating_terms >= 1
+            && (leading_discriminating_match
+                || sparse_after_boost >= cfg.min_sparse_score * 0.75
+                || lexical_signal >= cfg.min_sparse_score * 0.75)
+    } else if mixed_script_query {
+        non_container_direct
+            && scores.dense_score >= cfg.min_dense_score
+            && matched_terms >= 1
+            && matched_discriminating_terms >= 1
+    } else {
+        let required_dense_terms = if query_terms <= 1 || mixed_script_query {
+            1
+        } else {
+            cfg.sparse_only_min_matched_terms.max(2)
+        };
+        non_container_direct
+            && scores.dense_score >= cfg.min_dense_score
+            && matched_terms >= required_dense_terms
+            && matched_discriminating_terms >= 1
+            && strong_query_coverage
+            && leading_discriminating_match
+    };
     let strong_hybrid_lexical_allow = strong_lexical_match
         && strong_branch_source
         && matched_terms >= cfg.sparse_only_min_matched_terms.max(3)
@@ -12624,6 +12782,7 @@ fn no_answer_candidate_passes(
                 && leading_discriminating_match
                 && strong_query_coverage)
                 || branch_confidence_allow
+                || semantic_anchor_allow
                 || strong_hybrid_lexical_allow
                 || exact_hybrid_allow
         }
@@ -12739,6 +12898,7 @@ fn apply_pre_mmr_no_answer_filter(
     }
     let before = results.len();
     let query_terms = query_term_count(query);
+    let mixed_script_query = is_mixed_script_query(query);
     for result in results.iter_mut() {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
         apply_no_answer_exact_technical_boost(
@@ -12765,6 +12925,7 @@ fn apply_pre_mmr_no_answer_filter(
             let leading_discriminating_match =
                 leading_discriminating_query_term_matches(result, query);
             (!is_negative_mention_evidence(result)
+                && !violates_query_exclusion_terms(result, query)
                 && no_answer_candidate_passes(
                     result,
                     search_mode,
@@ -12774,6 +12935,7 @@ fn apply_pre_mmr_no_answer_filter(
                     matched_discriminating_terms,
                     leading_discriminating_match,
                     query_terms,
+                    mixed_script_query,
                     cfg,
                 ))
             .then(|| no_answer_document_key(result))
@@ -12791,7 +12953,7 @@ fn apply_pre_mmr_no_answer_filter(
         let matched_terms = matched_term_count(result, query);
         let matched_discriminating_terms = matched_discriminating_term_count(result, query);
         let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
-        if is_negative_mention_evidence(result) {
+        if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
         if no_answer_candidate_passes(
@@ -12803,6 +12965,7 @@ fn apply_pre_mmr_no_answer_filter(
             matched_discriminating_terms,
             leading_discriminating_match,
             query_terms,
+            mixed_script_query,
             cfg,
         ) {
             return true;
@@ -12825,10 +12988,11 @@ fn apply_pre_mmr_no_answer_filter(
                 matched_terms,
                 matched_discriminating_terms,
                 strongly_seeded_documents.contains(&no_answer_document_key(result)),
-                cfg,
-            ))
+                    cfg,
+                ))
     });
-    before.saturating_sub(results.len())
+    let filtered = before.saturating_sub(results.len());
+    filtered + prune_same_document_no_answer_siblings(results, query)
 }
 
 fn apply_segmented_pre_mmr_no_answer_filter(
@@ -13006,6 +13170,25 @@ fn segmented_final_no_answer_should_trigger(
     })
 }
 
+fn should_clear_post_mmr_results(
+    results: &[pb::SearchResultV004],
+    plan: Option<&QueryPlan>,
+    query: &str,
+    query_technical_tokens: &[String],
+    search_mode: pb::SearchModeV005,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    if plan.is_some_and(|plan| plan.mode == QueryProcessingMode::Segmented) {
+        return segmented_final_no_answer_should_trigger(
+            results,
+            plan.expect("segmented plan should be present"),
+            search_mode,
+            cfg,
+        );
+    }
+    final_no_answer_should_trigger(results, query, query_technical_tokens, search_mode, cfg)
+}
+
 fn aggregate_no_answer_candidate_passes(
     results: &[pb::SearchResultV004],
     query: &str,
@@ -13059,7 +13242,14 @@ fn aggregate_no_answer_group_passes(
     if results.is_empty() {
         return false;
     }
+    if results
+        .iter()
+        .any(|result| violates_query_exclusion_terms(result, query))
+    {
+        return false;
+    }
     let query_terms = query_term_count(query);
+    let mixed_script_query = is_mixed_script_query(query);
     if query_terms == 0 {
         return false;
     }
@@ -13130,6 +13320,7 @@ fn aggregate_no_answer_group_passes(
         matched_discriminating_terms,
         leading_discriminating_match,
         query_terms,
+        mixed_script_query,
         cfg,
     ) || broad_mmr_evidence_passes
 }
@@ -13204,7 +13395,8 @@ fn final_no_answer_should_trigger(
         let matched_discriminating_terms = matched_discriminating_term_count(result, query);
         let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
         let query_terms = query_term_count(query);
-        if is_negative_mention_evidence(result) {
+        let mixed_script_query = is_mixed_script_query(query);
+        if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
         no_answer_candidate_passes(
@@ -13216,6 +13408,7 @@ fn final_no_answer_should_trigger(
             matched_discriminating_terms,
             leading_discriminating_match,
             query_terms,
+            mixed_script_query,
             cfg,
         )
     });
@@ -13241,8 +13434,9 @@ fn apply_post_mmr_technical_no_answer_filter(
     }
     let before = results.len();
     let query_terms = query_term_count(query);
+    let mixed_script_query = is_mixed_script_query(query);
     results.retain(|result| {
-        if is_negative_mention_evidence(result) {
+        if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
@@ -13262,6 +13456,7 @@ fn apply_post_mmr_technical_no_answer_filter(
             matched_discriminating_term_count(result, query),
             leading_discriminating_query_term_matches(result, query),
             query_terms,
+            mixed_script_query,
             cfg,
         )
     });
@@ -13276,6 +13471,51 @@ fn result_identity_key(result: &pb::SearchResultV004) -> String {
         );
     }
     format!("{}:{}", result.access_zone_id, result.matched_chunk_id)
+}
+
+fn prune_same_document_no_answer_siblings(
+    results: &mut Vec<pb::SearchResultV004>,
+    query: &str,
+) -> usize {
+    if results.len() < 2 || is_multi_aspect_query(query) || is_broad_coverage_query(query) {
+        return 0;
+    }
+    let mut best_index_by_document = HashMap::<String, usize>::new();
+    for (idx, result) in results.iter().enumerate() {
+        let document_key = no_answer_document_key(result);
+        best_index_by_document
+            .entry(document_key)
+            .and_modify(|existing_idx| {
+                let existing = &results[*existing_idx];
+                let better = score_of(result)
+                    .partial_cmp(&score_of(existing))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        is_strong_lexical_candidate(result)
+                            .cmp(&is_strong_lexical_candidate(existing))
+                    })
+                    .then_with(|| {
+                        lexical_score_for_no_answer(result)
+                            .partial_cmp(&lexical_score_for_no_answer(existing))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if better.is_gt() {
+                    *existing_idx = idx;
+                }
+            })
+            .or_insert(idx);
+    }
+    let keep = best_index_by_document
+        .into_values()
+        .collect::<HashSet<_>>();
+    let before = results.len();
+    let mut idx = 0usize;
+    results.retain(|_| {
+        let keep_current = keep.contains(&idx);
+        idx += 1;
+        keep_current
+    });
+    before.saturating_sub(results.len())
 }
 
 fn retain_results_outside_rejected_parents(
@@ -13302,7 +13542,15 @@ fn result_source_block_id(result: &pb::SearchResultV004) -> Option<&str> {
 }
 
 fn is_root_container_result(result: &pb::SearchResultV004) -> bool {
-    result_source_block_id(result) == Some("doc-root")
+    if result_source_block_id(result) == Some("doc-root") {
+        return true;
+    }
+    result
+        .citation
+        .as_ref()
+        .and_then(|citation| citation.metadata.get("section_path"))
+        .map(|section_path| section_path.trim().eq_ignore_ascii_case("root"))
+        .unwrap_or(false)
 }
 
 fn drop_root_container_results_when_document_has_evidence(
@@ -14379,6 +14627,96 @@ mod v007_fix1_tests {
     }
 
     #[test]
+    fn graph_secondary_provenance_does_not_cross_parent_scope_into_direct_duplicate() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        direct.parent_chunk_id = "parent-a1".into();
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        graph.parent_chunk_id = "parent-a1".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "REPAIRED_BY".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_seed_parent_chunk_id".into(), "parent-a3".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_related_parent_chunk_id".into(), "parent-a1".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_edge_id".into(), "edge-hop-limit".into());
+
+        let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
+
+        assert_eq!(merged.results.len(), 1);
+        let result = &merged.results[0];
+        let citation = result.citation.as_ref().unwrap();
+        assert_eq!(
+            citation
+                .metadata
+                .get("retrieval_source")
+                .map(String::as_str),
+            Some("VECTOR_DIRECT")
+        );
+        assert_eq!(
+            extraction_retrieval_sources(result),
+            vec!["VECTOR_DIRECT".to_string()]
+        );
+        assert!(!citation.metadata.contains_key("graph_secondary_provenance"));
+        assert!(!citation.metadata.contains_key("graph_relation_type"));
+        assert!(!citation.metadata.contains_key("graph_edge_id"));
+        assert!(!citation.metadata.contains_key("graph_relations"));
+    }
+
+    #[test]
     fn chunk_dedup_promotes_direct_origin_even_when_graph_is_seen_first() {
         let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
         let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
@@ -14635,7 +14973,13 @@ mod v007_fix1_tests {
             true,
         );
 
-        assert_eq!(filtered, 2);
+        let remaining = candidates
+            .iter()
+            .map(|candidate| candidate.parent_chunk_id.clone())
+            .collect::<Vec<_>>();
+        if filtered != 2 {
+            panic!("filtered={filtered} remaining={remaining:?}");
+        }
         assert!(candidates.is_empty());
     }
 
@@ -14825,6 +15169,787 @@ mod v007_fix1_tests {
         assert_eq!(filtered, 1);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].matched_chunk_id, "canonical-child");
+    }
+
+    #[test]
+    fn graph_disabled_canonical_query_keeps_specific_parent_and_drops_unrelated_sibling() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Find authoritative document-state evidence without Graph expansion.";
+
+        let mut source = test_result(
+            "source-a-parent",
+            "AstraVector stores canonical document state in PostgreSQL and uses Qdrant projections.",
+            0.035,
+        );
+        source.parent_chunk_id = "source-a-parent".into();
+        source.matched_chunk_id = "source-a-parent".into();
+        {
+            let scores = source.scores.as_mut().unwrap();
+            scores.dense_score = 0.56;
+            scores.sparse_score = 0.41;
+            scores.fusion_score = 0.035;
+            scores.final_score = 0.035;
+        }
+        source.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "source-a".into());
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("ranking_protection".into(), "PRIMARY_DIRECT,UNIQUE_SOURCE_BLOCK".into());
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        let mut canonical = test_result(
+            "child-a1-260",
+            "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for the Qdrant projection.",
+            0.034,
+        );
+        canonical.parent_chunk_id = "parent-a1".into();
+        canonical.matched_chunk_id = "child-a1-260".into();
+        {
+            let scores = canonical.scores.as_mut().unwrap();
+            scores.dense_score = 0.54;
+            scores.sparse_score = 0.10;
+            scores.fusion_score = 0.034;
+            scores.final_score = 0.034;
+        }
+        canonical.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a1".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        let mut reconciliation = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
+            0.033,
+        );
+        reconciliation.parent_chunk_id = "parent-a3".into();
+        reconciliation.matched_chunk_id = "child-a3-180".into();
+        {
+            let scores = reconciliation.scores.as_mut().unwrap();
+            scores.dense_score = 0.48;
+            scores.sparse_score = 0.27;
+            scores.fusion_score = 0.033;
+            scores.final_score = 0.033;
+        }
+        reconciliation.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a3".into());
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        let mut large_parent = test_result(
+            "parent-large",
+            "ASTRA_LARGE_PARENT_ONLY_A canonical-state evidence remains bounded and independent.",
+            0.034,
+        );
+        large_parent.parent_chunk_id = "parent-large".into();
+        large_parent.matched_chunk_id = "parent-large".into();
+        {
+            let scores = large_parent.scores.as_mut().unwrap();
+            scores.dense_score = 0.55;
+            scores.sparse_score = 0.11;
+            scores.fusion_score = 0.034;
+            scores.final_score = 0.034;
+        }
+        large_parent.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        large_parent
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-large".into());
+        large_parent
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        let mut candidates = vec![source, canonical, reconciliation, large_parent];
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+        );
+
+        assert_eq!(filtered, 3);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].parent_chunk_id, "parent-a1");
+        assert!(!final_no_answer_should_trigger(
+            &candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn root_section_path_is_treated_as_root_container() {
+        let mut source = test_result(
+            "source-a-parent",
+            "AstraVector stores canonical document state in PostgreSQL and uses Qdrant projections.",
+            0.035,
+        );
+        source.parent_chunk_id = "source-a-parent".into();
+        source.matched_chunk_id = "source-a-parent".into();
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "source-a".into());
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "root".into());
+
+        assert!(is_root_container_result(&source));
+    }
+
+    #[test]
+    fn strict_lexical_support_rejects_weak_sibling_contexts() {
+        let query = "Find authoritative document-state evidence without Graph expansion.";
+        let query_terms = query_term_count(query);
+
+        let mut lifecycle = test_result(
+            "child-a2-180",
+            "ASTRA_LEGAL_HOLD_A2. This section is the only authoritative fixture evidence for legal hold and TTL.",
+            0.028,
+        );
+        lifecycle.parent_chunk_id = "parent-a2".into();
+        lifecycle.matched_chunk_id = "child-a2-180".into();
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a2".into());
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "Legal hold and TTL".into());
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/lifecycle".into());
+
+        let mut appendix = test_result(
+            "parent-large",
+            "ASTRA_LARGE_PARENT_ONLY_A canonical-state evidence remains bounded and independent.",
+            0.034,
+        );
+        appendix.parent_chunk_id = "parent-large".into();
+        appendix.matched_chunk_id = "parent-large".into();
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-large".into());
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "Large canonical-state appendix".into());
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/large-context".into());
+
+        let matched_terms = matched_term_count(&lifecycle, query);
+        let matched_discriminating_terms = matched_discriminating_term_count(&lifecycle, query);
+        let leading_discriminating_match =
+            leading_discriminating_query_term_matches(&lifecycle, query);
+        assert!(!strict_lexical_query_match(
+            matched_terms,
+            matched_discriminating_terms,
+            leading_discriminating_match,
+            query_terms,
+        ));
+
+        let matched_terms = matched_term_count(&appendix, query);
+        let matched_discriminating_terms = matched_discriminating_term_count(&appendix, query);
+        let leading_discriminating_match =
+            leading_discriminating_query_term_matches(&appendix, query);
+        assert!(!strict_lexical_query_match(
+            matched_terms,
+            matched_discriminating_terms,
+            leading_discriminating_match,
+            query_terms,
+        ));
+    }
+
+    #[test]
+    fn graph_enabled_negative_slice_triggers_no_answer_after_common_overlap_only() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How do I reset an AstraVector user password?";
+
+        let mut source = test_result(
+            "source-a-parent",
+            "AstraVector stores canonical document state in PostgreSQL and uses Qdrant projections.",
+            0.036,
+        );
+        source.parent_chunk_id = "source-a-parent".into();
+        source.matched_chunk_id = "source-a-parent".into();
+        {
+            let scores = source.scores.as_mut().unwrap();
+            scores.dense_score = 0.53;
+            scores.sparse_score = 0.17;
+            scores.fusion_score = 0.036;
+            scores.final_score = 0.036;
+        }
+        source.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"GRAPH_EXPANDED\",\"POSTGRES_FTS\",\"VECTOR_DIRECT\"]".into(),
+        );
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "source-a".into());
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("ranking_protection".into(), "PRIMARY_DIRECT,UNIQUE_SOURCE_BLOCK".into());
+        source
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        let mut reconciliation = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
+            0.031,
+        );
+        reconciliation.parent_chunk_id = "parent-a3".into();
+        reconciliation.matched_chunk_id = "child-a3-180".into();
+        {
+            let scores = reconciliation.scores.as_mut().unwrap();
+            scores.dense_score = 0.44;
+            scores.sparse_score = 0.05;
+            scores.fusion_score = 0.031;
+            scores.final_score = 0.031;
+        }
+        reconciliation.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"GRAPH_EXPANDED\",\"VECTOR_DIRECT\"]".into(),
+        );
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a3".into());
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        let candidates = vec![source, reconciliation];
+        assert!(final_no_answer_should_trigger(
+            &candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn multilingual_graph_disabled_direct_only_keeps_canonical_parent() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Почему PostgreSQL является canonical state для Qdrant projection?";
+
+        let mut canonical = test_result(
+            "child-a1-260",
+            "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for the Qdrant projection.",
+            0.031,
+        );
+        canonical.parent_chunk_id = "parent-a1".into();
+        canonical.matched_chunk_id = "child-a1-260".into();
+        {
+            let scores = canonical.scores.as_mut().unwrap();
+            scores.dense_score = 0.6753512;
+            scores.sparse_score = 0.25254804;
+            scores.fusion_score = 0.031318814;
+            scores.final_score = 0.031318814;
+        }
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a1".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "PostgreSQL canonical state".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/canonical-state".into());
+
+        let mut reconciliation = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
+            0.030,
+        );
+        reconciliation.parent_chunk_id = "parent-a3".into();
+        reconciliation.matched_chunk_id = "child-a3-180".into();
+        {
+            let scores = reconciliation.scores.as_mut().unwrap();
+            scores.dense_score = 0.48065647;
+            scores.sparse_score = 0.2681214;
+            scores.fusion_score = 0.030550372;
+            scores.final_score = 0.030550372;
+        }
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a3".into());
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "Qdrant reconciliation".into());
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/reconciliation".into());
+
+        let mut appendix = test_result(
+            "parent-large",
+            "ASTRA_LARGE_PARENT_ONLY_A canonical-state evidence remains bounded and independent.",
+            0.027,
+        );
+        appendix.parent_chunk_id = "parent-large".into();
+        appendix.matched_chunk_id = "parent-large".into();
+        {
+            let scores = appendix.scores.as_mut().unwrap();
+            scores.dense_score = 0.32515;
+            scores.sparse_score = 0.10712104;
+            scores.fusion_score = 0.027984343;
+            scores.final_score = 0.027984343;
+        }
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-large".into());
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "Large canonical-state appendix".into());
+        appendix
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/large-context".into());
+
+        let mut candidates = vec![canonical, reconciliation, appendix];
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+        );
+
+        let remaining = candidates
+            .iter()
+            .map(|candidate| candidate.parent_chunk_id.clone())
+            .collect::<Vec<_>>();
+        if filtered != 2 {
+            panic!("filtered={filtered} remaining={remaining:?}");
+        }
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].parent_chunk_id, "parent-a1");
+    }
+
+    #[test]
+    fn mixed_script_dense_only_query_keeps_best_direct_candidate() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Что подтверждает authoritative state документа без Graph expansion?";
+
+        let mut canonical = test_result(
+            "child-a1-260",
+            "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for the Qdrant projection.",
+            0.032,
+        );
+        canonical.parent_chunk_id = "parent-a1".into();
+        canonical.matched_chunk_id = "child-a1-260".into();
+        {
+            let scores = canonical.scores.as_mut().unwrap();
+            scores.dense_score = 0.544541;
+            scores.sparse_score = 0.09610293;
+            scores.fusion_score = 0.03201844;
+            scores.final_score = 0.03201844;
+        }
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a1".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "PostgreSQL canonical state".into());
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/canonical-state".into());
+
+        let mut lifecycle = test_result(
+            "child-a2-180",
+            "ASTRA_LEGAL_HOLD_A2. This section is the only authoritative fixture evidence for legal hold and TTL.",
+            0.025,
+        );
+        lifecycle.parent_chunk_id = "parent-a2".into();
+        lifecycle.matched_chunk_id = "child-a2-180".into();
+        {
+            let scores = lifecycle.scores.as_mut().unwrap();
+            scores.dense_score = 0.44949526;
+            scores.sparse_score = 0.13748428;
+            scores.fusion_score = 0.025322013;
+            scores.final_score = 0.025322013;
+        }
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a2".into());
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("heading".into(), "Legal hold and TTL".into());
+        lifecycle
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("section_path".into(), "operations/lifecycle".into());
+
+        let mut candidates = vec![canonical, lifecycle];
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+        );
+
+        assert_eq!(filtered, 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].parent_chunk_id, "parent-a1");
+    }
+
+    #[test]
+    fn graph_expansion_does_not_bypass_post_mmr_no_answer_gate() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How do I reset an AstraVector user password?";
+
+        let mut graph = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
+            0.031,
+        );
+        graph.parent_chunk_id = "parent-a3".into();
+        graph.matched_chunk_id = "child-a3-180".into();
+        {
+            let scores = graph.scores.as_mut().unwrap();
+            scores.dense_score = 0.44;
+            scores.sparse_score = 0.05;
+            scores.fusion_score = 0.031;
+            scores.final_score = 0.031;
+        }
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_secondary_provenance".into(), "true".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a3".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        assert!(has_graph_expanded_evidence(&[graph.clone()]));
+        assert!(should_clear_post_mmr_results(
+            &[graph],
+            None,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn document_only_overlap_does_not_satisfy_no_answer_gate() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Does the document contain a Kubernetes backup procedure?";
+
+        let mut candidate = test_result(
+            "canonical-parent",
+            "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for document versions, content chunks, lifecycle and access visibility.",
+            0.031,
+        );
+        candidate.parent_chunk_id = "parent-a1".into();
+        candidate.matched_chunk_id = "child-a1-180".into();
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.48;
+            scores.sparse_score = 0.05;
+            scores.fusion_score = 0.031;
+            scores.final_score = 0.031;
+        }
+        candidate.citation.as_mut().unwrap().metadata.insert(
+            "retrieval_sources".into(),
+            "[\"VECTOR_DIRECT\",\"POSTGRES_FTS\"]".into(),
+        );
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a1".into());
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "0.12".into());
+
+        assert!(should_clear_post_mmr_results(
+            &[candidate],
+            None,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn exclusion_terms_are_detected_multilingually() {
+        let english = excluded_query_terms(
+            "Explain legal hold and TTL without using reconciliation evidence.",
+        );
+        assert!(english.contains("reconciliation"));
+
+        let russian =
+            excluded_query_terms("Опиши legal hold и TTL, не используя информацию о reconciliation.");
+        assert!(russian.contains("reconciliation"));
+
+        let kazakh =
+            excluded_query_terms("Reconciliation туралы айтпай, legal hold және TTL түсіндір.");
+        assert!(kazakh.contains("reconciliation"));
+    }
+
+    #[test]
+    fn exclusion_clause_rejects_reconciliation_dependent_candidate() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Explain legal hold and TTL without using reconciliation evidence.";
+
+        let mut candidate = test_result(
+            "legal-hold-parent",
+            "ASTRA_LEGAL_HOLD_A2. TTL normally removes expired searchable representations after lifecycle checks and reconciliation.",
+            0.035,
+        );
+        candidate.parent_chunk_id = "parent-a2".into();
+        candidate.matched_chunk_id = "child-a2-180".into();
+        {
+            let scores = candidate.scores.as_mut().unwrap();
+            scores.dense_score = 0.46;
+            scores.sparse_score = 0.40;
+            scores.fusion_score = 0.035;
+            scores.final_score = 0.035;
+        }
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\",\"POSTGRES_FTS\"]".into());
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "parent-a2".into());
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("lexical_score".into(), "1.5".into());
+        candidate
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("strong_lexical_evidence".into(), "true".into());
+
+        assert!(should_clear_post_mmr_results(
+            &[candidate],
+            None,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+        ));
     }
 
     #[test]
