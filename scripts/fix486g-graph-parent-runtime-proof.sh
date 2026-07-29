@@ -8,10 +8,10 @@ RUN_ID=${FIX486G_RUN_ID:-fix486g-$(date -u +%Y%m%dT%H%M%SZ)}
 EVIDENCE_ROOT=${ASTRAVECTOR_EVIDENCE_ROOT:-$WORKSPACE_ROOT/astravector-evidence}
 while (($#)); do case "$1" in --run-id) RUN_ID=$2; shift 2;; --evidence-root) EVIDENCE_ROOT=$2; shift 2;; *) exit 64;; esac; done
 case "$MODE" in
-  --execute-all|--verify-identities|--verify-contracts|--cleanup-only|--verify-evidence) ;;
+  --execute-all|--verify-identities|--verify-contracts|--cleanup-only|--verify-evidence|--current-sha-focused) ;;
   *) echo "FIX486G_FAIL=UNKNOWN_MODE:$MODE" >&2; exit 64;;
 esac
-E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"; STAT_CAPTURE="$ROOT/scripts/fix486g_statistical_capture.py"; STAT_EVAL="$ROOT/scripts/fix486g_statistical_proof.py"
+E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"; STAT_CAPTURE="$ROOT/scripts/fix486g_statistical_capture.py"; STAT_EVAL="$ROOT/scripts/fix486g_statistical_proof.py"; CURRENT_SHA_ANALYZE="$ROOT/scripts/fix486g_current_sha_analyze.py"
 PG=${FIX486G_POSTGRES_PORT:-59432}; QP=${FIX486G_QDRANT_HTTP_PORT:-6733}; QG=${FIX486G_QDRANT_GRPC_PORT:-6734}; GP=${FIX486G_GRPC_PORT:-50588}; MP=${FIX486G_METRICS_PORT:-9058}
 DB="postgres://astravector:astravector@127.0.0.1:$PG/astravector"; Q="http://127.0.0.1:$QP"; ADDR="127.0.0.1:$GP"; COL=${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486g}
 MODEL_PATH=${ASTRAVECTOR_MODEL_PATH:-$WORKSPACE_ROOT/models/bge-m3/onnx/model.onnx}
@@ -177,7 +177,7 @@ verify_identity() {
 }
 branch_is_approved() {
   case "$BRANCH" in
-    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence|codex/fix486g-post-merge-recovery) return 0 ;;
+    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence|codex/fix486g-post-merge-recovery|agent/fix486g-current-sha-graph-parent-repair) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -669,6 +669,57 @@ statistical_campaign() {
   python3 "$STAT_EVAL" evaluate --bank "$SUPPLEMENTAL" --raw-input "$E/statistical/raw-observations.jsonl" --identity-map "$E/identity-map/logical-to-runtime.json" --output-dir "$E/statistical" >/dev/null || return 1
   jq -e '.verdict=="FIX486G_STATISTICAL_QUALITY_PASS" and .sample_plan.raw_observation_count==730 and .sample_plan.full_pass_counts.warm==3 and .sample_plan.full_pass_counts.restart==2 and .sample_plan.concurrent_pair_count==10' "$E/statistical/statistical-report.json" >/dev/null
 }
+
+current_sha_focused_capture() {
+  local output="$E/current-sha-focused/raw-observations.jsonl" query setup label evidence rc=0
+  mkdir -p "$E/current-sha-focused" "$E/current-sha-focused/degradation"
+  : >"$output"
+  statistical_resource_evidence || return 1
+  while IFS= read -r query; do
+    [[ -n "$query" ]] || continue
+    statistical_capture_selection warm 1 "$output" --query-id "$query" || return 1
+  done < <(jq -r 'select(.profile=="POSITIVE_GRAPH") | .query_id' "$SUPPLEMENTAL/qrels/query-qrel-assignments-v1.jsonl")
+  prepare_fault_targets || return 1
+  for setup in graph_wrong_parent_overlay graph_cross_zone_overlay graph_inactive_deleted_expired_overlay graph_second_hop_overlay graph_cycle_overlay; do
+    label="current-sha-focused-$setup"
+    evidence="$E/current-sha-focused/degradation/$label.json"
+    statistical_fault_activate "$setup" "$label" || return 1
+    statistical_degradation_evidence "$setup" "$evidence" || rc=1
+    [[ $rc -ne 0 ]] || statistical_capture_selection warm 1 "$output" --fault-setup "$setup" --degradation-evidence "$evidence" || rc=1
+    statistical_fault_restore "$setup" "$label" || rc=1
+    [[ $rc -eq 0 ]] || return 1
+  done
+  python3 "$CURRENT_SHA_ANALYZE" --bank "$SUPPLEMENTAL" --raw-input "$output" --identity-map "$E/identity-map/logical-to-runtime.json" --output "$E/current-sha-focused/analysis.json"
+}
+
+current_sha_focused() {
+  local ok=true terminal_reason
+  set +e
+  stage identity-verification verify_identity || ok=false
+  [[ "$ok" == true ]] && stage bank-verification verify_bank || ok=false
+  [[ "$ok" == true ]] && stage model-tokenizer-verification verify_model_tokenizer || ok=false
+  [[ "$ok" == true ]] && stage infrastructure-start start_infrastructure || ok=false
+  [[ "$ok" == true ]] && stage migrations migrate_and_build || ok=false
+  [[ "$ok" == true ]] && stage runtime-start start_runtime initial || ok=false
+  [[ "$ok" == true ]] && stage production-ingestion ingest || ok=false
+  [[ "$ok" == true ]] && stage identity-map identity_map || ok=false
+  [[ "$ok" == true ]] && stage canonical-audit canonical_audit || ok=false
+  [[ "$ok" == true ]] && stage qdrant-audit qdrant_audit || ok=false
+  [[ "$ok" == true ]] && stage current-sha-focused current_sha_focused_capture || ok=false
+  if stage pre-teardown-fault-restoration restore_fault_state_before_teardown; then :; else ok=false; fi
+  if cleanup; then record_stage_status cleanup PASS; else ok=false; record_stage_status cleanup FAIL CLEANUP_FAILED; fi
+  record_stage_status final-verdict "$([[ "$ok" == true ]] && echo PASS || echo FAIL)" "$([[ "$ok" == true ]] && echo '' || echo CURRENT_SHA_FOCUSED_BLOCKED)"
+  jq -s --arg run_id "$RUN_ID" --arg source "$SOURCE_SHA" --arg bank "$BANK_SHA" --arg verdict "$([[ "$ok" == true ]] && echo CURRENT_SHA_FOCUSED_PASS || echo CURRENT_SHA_FOCUSED_BLOCKED)" '{schema_version:1,phase:"fix486g-current-sha-focused",run_id:$run_id,source_sha:$source,bank_version:"1.0.0",bank_aggregate_sha256:$bank,stages:.,verdict:$verdict}' "$E"/logs/*.stage.json >"$E/stage-results.json"
+  terminal_reason=$([[ "$ok" == true ]] && echo COMPLETED || echo CURRENT_SHA_FOCUSED_BLOCKED)
+  jq -n --argjson exit_code "$([[ "$ok" == true ]] && echo 0 || echo 1)" --arg reason "$terminal_reason" --arg finished "$(timestamp)" '{stage:"runner-terminal",status:(if $exit_code==0 then "PASS" else "FAIL" end),termination_reason:$reason,signal:null,cleanup_attempted:true,cleanup_status:"COMPLETED",exit_code:$exit_code,finished_at_utc:$finished}' >"$E/terminal-result.json"
+  jq --arg status "$([[ "$ok" == true ]] && echo COMPLETED || echo BLOCKED)" '.status=$status' "$E/bootstrap.json" >"$E/bootstrap.tmp" && mv "$E/bootstrap.tmp" "$E/bootstrap.json"
+  python3 "$H" manifest --run "$E" --output "$E/manifest.json" >/dev/null || ok=false
+  python3 "$H" verify-manifest --run "$E" --manifest "$E/manifest.json" --output "$E/manifest-verification.json" >/dev/null || ok=false
+  FINALIZED=true
+  trap - EXIT INT TERM HUP
+  jq -r .verdict "$E/stage-results.json"
+  [[ "$ok" == true ]]
+}
 compare_initial() { python3 "$H" compare --left "$E/query-results.jsonl" --right "$E/query-results.jsonl" --parity --output "$E/comparisons/entry-point-parity.json" >/dev/null; }
 warm_repeat() { run_queries warm "$E/comparisons/warm-search" "$E/comparisons/warm-retrieve-context" "$E/comparisons/warm-query-results.jsonl" true && python3 "$H" compare --left "$E/query-results.jsonl" --right "$E/comparisons/warm-query-results.jsonl" --output "$E/comparisons/warm-repeat.json" >/dev/null; }
 restart_repeat() {
@@ -818,6 +869,10 @@ case "$MODE" in
     initialize_evidence
     if stage contract-verification verify_contracts; then write_mode_result PASS CONTRACTS_VERIFIED; rc=$?; else write_mode_result BLOCKED CONTRACT_VERIFICATION_FAILED; rc=1; fi
     FINALIZED=true; trap - EXIT INT TERM HUP; exit "$rc"
+    ;;
+  --current-sha-focused)
+    initialize_evidence
+    current_sha_focused
     ;;
   --execute-all)
     initialize_evidence
