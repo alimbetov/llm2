@@ -11595,8 +11595,10 @@ fn merge_secondary_metadata_with_limit(
         .filter(|value| !value.is_empty());
     let allow_graph_secondary_provenance = secondary_source != "GRAPH_EXPANDED"
         || primary_is_graph_expanded
-        || (secondary_graph_seed_parent.is_none_or(|value| value == primary_parent)
-            && secondary_graph_related_parent.is_none_or(|value| value == primary_parent));
+        || match secondary_graph_related_parent {
+            Some(related_parent) => related_parent == primary_parent,
+            None => secondary_graph_seed_parent.is_none_or(|value| value == primary_parent),
+        };
 
     let mut sources =
         parse_string_array_metadata(primary_citation.metadata.get("retrieval_sources"));
@@ -11619,6 +11621,10 @@ fn merge_secondary_metadata_with_limit(
     );
 
     if secondary_source == "GRAPH_EXPANDED" && allow_graph_secondary_provenance {
+        let replace_graph_metadata = secondary_graph_provenance_should_replace(
+            &primary_citation.metadata,
+            &secondary_citation.metadata,
+        );
         for key in [
             "graph_seed_access_zone_id",
             "graph_seed_document_id",
@@ -11641,10 +11647,16 @@ fn merge_secondary_metadata_with_limit(
         ] {
             if let Some(value) = secondary_citation.metadata.get(key) {
                 if !value.trim().is_empty() {
-                    primary_citation
-                        .metadata
-                        .entry(key.to_string())
-                        .or_insert_with(|| value.clone());
+                    if replace_graph_metadata {
+                        primary_citation
+                            .metadata
+                            .insert(key.to_string(), value.clone());
+                    } else {
+                        primary_citation
+                            .metadata
+                            .entry(key.to_string())
+                            .or_insert_with(|| value.clone());
+                    }
                 }
             }
         }
@@ -11668,6 +11680,7 @@ fn merge_secondary_metadata_with_limit(
     if !relations.is_empty() {
         let mut seen = HashSet::new();
         relations.retain(|value| seen.insert(value.to_string()));
+        relations.sort_by(compare_graph_relation_debug_values);
         let limit = max_relations.max(1);
         let truncated = relations.len() > limit;
         relations.truncate(limit);
@@ -11712,8 +11725,10 @@ fn graph_secondary_provenance_can_merge(
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    secondary_graph_seed_parent.is_none_or(|value| value == primary_parent)
-        && secondary_graph_related_parent.is_none_or(|value| value == primary_parent)
+    match secondary_graph_related_parent {
+        Some(related_parent) => related_parent == primary_parent,
+        None => secondary_graph_seed_parent.is_none_or(|value| value == primary_parent),
+    }
 }
 
 fn parse_string_array_metadata(value: Option<&String>) -> Vec<String> {
@@ -11762,6 +11777,77 @@ fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
     value
         .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
         .unwrap_or_default()
+}
+
+fn graph_relation_type_priority(relation_type: &str) -> u8 {
+    match relation_type {
+        "EXPLAINS" | "RELATED_TO" | "REPAIRED_BY" | "OBSERVED_BY" | "CONSTRAINED_BY"
+        | "PRODUCES" | "CONSTRAINS" | "PROTECTED_BY" | "REQUIRES" | "PUBLISHES_TO" => 0,
+        "CHUNK_SEMANTIC_SIMILAR" => 2,
+        _ => 1,
+    }
+}
+
+fn graph_relation_priority_from_metadata(metadata: &HashMap<String, String>) -> u8 {
+    metadata
+        .get("graph_relation_type")
+        .map(String::as_str)
+        .map(graph_relation_type_priority)
+        .unwrap_or(3)
+}
+
+fn secondary_graph_provenance_should_replace(
+    primary_metadata: &HashMap<String, String>,
+    secondary_metadata: &HashMap<String, String>,
+) -> bool {
+    let secondary_priority = graph_relation_priority_from_metadata(secondary_metadata);
+    let primary_priority = graph_relation_priority_from_metadata(primary_metadata);
+    if secondary_priority != primary_priority {
+        return secondary_priority < primary_priority;
+    }
+    let secondary_score = secondary_metadata
+        .get("graph_relation_score")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or_default();
+    let primary_score = primary_metadata
+        .get("graph_relation_score")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or_default();
+    secondary_score > primary_score
+}
+
+fn compare_graph_relation_debug_values(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> std::cmp::Ordering {
+    let score = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+    };
+    let left_relation_type = graph_relation_debug_type(left);
+    let right_relation_type = graph_relation_debug_type(right);
+    graph_relation_type_priority(left_relation_type)
+        .cmp(&graph_relation_type_priority(right_relation_type))
+        .then_with(|| {
+            score(right, "relation_score")
+                .partial_cmp(&score(left, "relation_score"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            score(right, "graph_score")
+                .partial_cmp(&score(left, "graph_score"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| left_relation_type.cmp(right_relation_type))
+}
+
+fn graph_relation_debug_type(value: &serde_json::Value) -> &str {
+    value
+        .get("relation_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 fn score_of(result: &pb::SearchResultV004) -> f32 {
@@ -14721,7 +14807,7 @@ mod v007_fix1_tests {
     }
 
     #[test]
-    fn graph_secondary_provenance_does_not_cross_parent_scope_into_direct_duplicate() {
+    fn graph_secondary_provenance_merges_when_related_parent_matches_direct_duplicate() {
         let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
         direct.parent_chunk_id = "canonical-parent".into();
         direct
@@ -14783,6 +14869,12 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .insert("graph_edge_id".into(), "edge-hop-limit".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_score".into(), "0.95".into());
 
         let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
 
@@ -14798,16 +14890,100 @@ mod v007_fix1_tests {
         );
         assert_eq!(
             extraction_retrieval_sources(result),
+            vec!["GRAPH_EXPANDED".to_string(), "VECTOR_DIRECT".to_string()]
+        );
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_secondary_provenance")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_relation_type")
+                .map(String::as_str),
+            Some("REPAIRED_BY")
+        );
+        assert_eq!(
+            citation.metadata.get("graph_edge_id").map(String::as_str),
+            Some("edge-hop-limit")
+        );
+        assert!(citation
+            .metadata
+            .get("graph_relations")
+            .is_some_and(|value| value.contains("REPAIRED_BY")));
+    }
+
+    #[test]
+    fn graph_secondary_provenance_rejects_unrelated_parent_scope() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        direct.parent_chunk_id = "canonical-parent".into();
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        graph.parent_chunk_id = "other-parent".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+        graph.citation.as_mut().unwrap().metadata.insert(
+            "graph_related_parent_chunk_id".into(),
+            "other-parent".into(),
+        );
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "REPAIRED_BY".into());
+
+        let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
+
+        assert_eq!(merged.results.len(), 1);
+        let citation = merged.results[0].citation.as_ref().unwrap();
+        assert_eq!(
+            extraction_retrieval_sources(&merged.results[0]),
             vec!["VECTOR_DIRECT".to_string()]
         );
         assert!(!citation.metadata.contains_key("graph_secondary_provenance"));
         assert!(!citation.metadata.contains_key("graph_relation_type"));
-        assert!(!citation.metadata.contains_key("graph_edge_id"));
-        assert!(!citation.metadata.contains_key("graph_relations"));
     }
 
     #[test]
-    fn cross_parent_graph_duplicate_survives_as_primary_graph_candidate() {
+    fn cross_parent_graph_duplicate_merges_when_related_parent_matches_direct_scope() {
         let mut direct = test_result("direct-child", "direct related evidence", 0.8);
         direct.parent_chunk_id = "related-parent".into();
         direct
@@ -14883,15 +15059,19 @@ mod v007_fix1_tests {
             5,
         );
 
-        assert_eq!(selection.results.len(), 2);
+        assert_eq!(selection.results.len(), 1);
         assert!(selection.results.iter().any(|result| {
             result.matched_chunk_id == "direct-child"
                 && primary_retrieval_source(result) == Some("VECTOR_DIRECT")
         }));
-        assert!(selection.results.iter().any(|result| {
-            result.matched_chunk_id == "graph-child"
-                && primary_retrieval_source(result) == Some("GRAPH_EXPANDED")
-        }));
+        let citation = selection.results[0].citation.as_ref().unwrap();
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_relation_type")
+                .map(String::as_str),
+            Some("REPAIRED_BY")
+        );
     }
 
     #[test]
