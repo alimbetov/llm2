@@ -1998,6 +1998,11 @@ WITH seed_input AS (
            ROW_NUMBER() OVER (
                PARTITION BY seed_access_zone_id, seed_chunk_id
                ORDER BY CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+                        CASE
+                          WHEN relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY','OBSERVED_BY','CONSTRAINED_BY','PRODUCES','CONSTRAINS','PROTECTED_BY','REQUIRES','PUBLISHES_TO') THEN 0
+                          WHEN relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2
+                          ELSE 1
+                        END,
                         relation_score DESC,
                         relation_rank NULLS LAST,
                         edge_id
@@ -2009,6 +2014,11 @@ WITH seed_input AS (
     ORDER BY seed_edge_rank ASC,
              seed_rank ASC,
              CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+             CASE
+               WHEN relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY','OBSERVED_BY','CONSTRAINED_BY','PRODUCES','CONSTRAINS','PROTECTED_BY','REQUIRES','PUBLISHES_TO') THEN 0
+               WHEN relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2
+               ELSE 1
+             END,
              relation_score DESC,
              relation_rank NULLS LAST,
              edge_id
@@ -2042,6 +2052,11 @@ WHERE n.lifecycle_status='ACTIVE'
 ORDER BY expanded.seed_edge_rank ASC,
          expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+         CASE
+           WHEN expanded.relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY','OBSERVED_BY','CONSTRAINED_BY','PRODUCES','CONSTRAINS','PROTECTED_BY','REQUIRES','PUBLISHES_TO') THEN 0
+           WHEN expanded.relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2
+           ELSE 1
+         END,
          expanded.relation_score DESC,
          expanded.relation_rank NULLS LAST,
          expanded.edge_id
@@ -2229,6 +2244,11 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
            ROW_NUMBER() OVER (
                PARTITION BY seed_access_zone_id, seed_chunk_id
                ORDER BY CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+                        CASE
+                          WHEN relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY','OBSERVED_BY','CONSTRAINED_BY','PRODUCES','CONSTRAINS','PROTECTED_BY','REQUIRES','PUBLISHES_TO') THEN 0
+                          WHEN relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2
+                          ELSE 1
+                        END,
                         relation_score DESC,
                         relation_rank NULLS LAST,
                         edge_id
@@ -2240,6 +2260,11 @@ WITH seed_keys(access_zone_id, chunk_id, seed_rank) AS (
     ORDER BY seed_edge_rank ASC,
              seed_rank ASC,
              CASE WHEN relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+             CASE
+               WHEN relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY','OBSERVED_BY','CONSTRAINED_BY','PRODUCES','CONSTRAINS','PROTECTED_BY','REQUIRES','PUBLISHES_TO') THEN 0
+               WHEN relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2
+               ELSE 1
+             END,
              relation_score DESC,
              relation_rank NULLS LAST,
              edge_id
@@ -2279,6 +2304,11 @@ WHERE n.lifecycle_status='ACTIVE'
 ORDER BY expanded.seed_edge_rank ASC,
          expanded.seed_rank ASC,
          CASE WHEN expanded.relation_source='QUALITY_FIXTURE' THEN 0 ELSE 1 END,
+         CASE
+           WHEN expanded.relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY','OBSERVED_BY','CONSTRAINED_BY','PRODUCES','CONSTRAINS','PROTECTED_BY','REQUIRES','PUBLISHES_TO') THEN 0
+           WHEN expanded.relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2
+           ELSE 1
+         END,
          expanded.relation_score DESC,
          expanded.relation_rank NULLS LAST,
          expanded.edge_id

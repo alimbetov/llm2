@@ -112,6 +112,32 @@ fn directed_relations_do_not_reverse_expand_like_symmetric_edges() {
 }
 
 #[test]
+fn domain_graph_relations_are_ranked_before_structural_similarity_noise() {
+    let persistence = source(PERSISTENCE);
+    for required in [
+        "WHEN relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY'",
+        "WHEN relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2",
+        "WHEN expanded.relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY'",
+        "WHEN expanded.relation_type='CHUNK_SEMANTIC_SIMILAR' THEN 2",
+    ] {
+        assert!(
+            persistence.contains(required),
+            "FIX486G-RELATION-PRIORITY: persistence missing {required}"
+        );
+    }
+    let first_domain_priority = persistence
+        .find("WHEN relation_type IN ('EXPLAINS','RELATED_TO','REPAIRED_BY'")
+        .expect("domain priority missing");
+    let first_relation_score = persistence
+        .find("relation_score DESC")
+        .expect("relation_score ordering missing");
+    assert!(
+        first_domain_priority < first_relation_score,
+        "FIX486G-RELATION-PRIORITY: domain relation class must be ordered before score"
+    );
+}
+
+#[test]
 fn graph_result_exposes_complete_protected_provenance() {
     require_all(
         GRPC,

@@ -3075,6 +3075,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
                     &self.cfg.search.no_answer,
                     no_answer_debug,
                     preserve_partial_evidence_for_mmr,
+                    r.enable_graph_expansion && self.cfg.graph_rag.enabled,
                 )
             };
         let coverage_after_direct = coverage_for_results(&query_plan, &direct_results);
@@ -10865,8 +10866,12 @@ fn absorb_graph_duplicates_into_direct_pool(
             .get(&result_identity_key(&graph))
             .copied()
         {
-            merge_secondary_metadata_with_limit(&mut direct_pool[idx], &graph, max_relations);
-            deduplicated += 1;
+            if graph_secondary_provenance_can_merge(&direct_pool[idx], &graph) {
+                merge_secondary_metadata_with_limit(&mut direct_pool[idx], &graph, max_relations);
+                deduplicated += 1;
+            } else {
+                unique_graph.push(graph);
+            }
         } else {
             unique_graph.push(graph);
         }
@@ -11081,12 +11086,16 @@ fn select_graph_append_with_group_mmr(
     let mut graph_filtered = Vec::new();
     for graph in graph_results {
         if let Some(idx) = selected_by_chunk.get(&result_identity_key(&graph)).copied() {
-            dedup_count += 1;
-            merge_secondary_metadata_with_limit(
-                &mut selected[idx],
-                &graph,
-                max_graph_relations_debug_per_candidate,
-            );
+            if graph_secondary_provenance_can_merge(&selected[idx], &graph) {
+                dedup_count += 1;
+                merge_secondary_metadata_with_limit(
+                    &mut selected[idx],
+                    &graph,
+                    max_graph_relations_debug_per_candidate,
+                );
+            } else {
+                graph_filtered.push(graph);
+            }
         } else {
             graph_filtered.push(graph);
         }
@@ -11586,8 +11595,10 @@ fn merge_secondary_metadata_with_limit(
         .filter(|value| !value.is_empty());
     let allow_graph_secondary_provenance = secondary_source != "GRAPH_EXPANDED"
         || primary_is_graph_expanded
-        || (secondary_graph_seed_parent.is_none_or(|value| value == primary_parent)
-            && secondary_graph_related_parent.is_none_or(|value| value == primary_parent));
+        || match secondary_graph_related_parent {
+            Some(related_parent) => related_parent == primary_parent,
+            None => secondary_graph_seed_parent.is_none_or(|value| value == primary_parent),
+        };
 
     let mut sources =
         parse_string_array_metadata(primary_citation.metadata.get("retrieval_sources"));
@@ -11610,6 +11621,10 @@ fn merge_secondary_metadata_with_limit(
     );
 
     if secondary_source == "GRAPH_EXPANDED" && allow_graph_secondary_provenance {
+        let replace_graph_metadata = secondary_graph_provenance_should_replace(
+            &primary_citation.metadata,
+            &secondary_citation.metadata,
+        );
         for key in [
             "graph_seed_access_zone_id",
             "graph_seed_document_id",
@@ -11632,10 +11647,16 @@ fn merge_secondary_metadata_with_limit(
         ] {
             if let Some(value) = secondary_citation.metadata.get(key) {
                 if !value.trim().is_empty() {
-                    primary_citation
-                        .metadata
-                        .entry(key.to_string())
-                        .or_insert_with(|| value.clone());
+                    if replace_graph_metadata {
+                        primary_citation
+                            .metadata
+                            .insert(key.to_string(), value.clone());
+                    } else {
+                        primary_citation
+                            .metadata
+                            .entry(key.to_string())
+                            .or_insert_with(|| value.clone());
+                    }
                 }
             }
         }
@@ -11659,6 +11680,7 @@ fn merge_secondary_metadata_with_limit(
     if !relations.is_empty() {
         let mut seen = HashSet::new();
         relations.retain(|value| seen.insert(value.to_string()));
+        relations.sort_by(compare_graph_relation_debug_values);
         let limit = max_relations.max(1);
         let truncated = relations.len() > limit;
         relations.truncate(limit);
@@ -11674,6 +11696,39 @@ fn merge_secondary_metadata_with_limit(
         }
     }
     metrics::counter!("graph_secondary_sources_merged_total").increment(1);
+}
+
+fn graph_secondary_provenance_can_merge(
+    primary: &pb::SearchResultV004,
+    secondary: &pb::SearchResultV004,
+) -> bool {
+    let secondary_source = primary_retrieval_source(secondary).unwrap_or("UNKNOWN");
+    if secondary_source != "GRAPH_EXPANDED" {
+        return true;
+    }
+    if primary_retrieval_source(primary) == Some("GRAPH_EXPANDED") {
+        return true;
+    }
+    let Some(secondary_citation) = secondary.citation.as_ref() else {
+        return false;
+    };
+    let primary_parent = primary.parent_chunk_id.trim();
+    let secondary_graph_seed_parent = secondary_citation
+        .metadata
+        .get("graph_seed_parent_chunk_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let secondary_graph_related_parent = secondary_citation
+        .metadata
+        .get("graph_related_parent_chunk_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match secondary_graph_related_parent {
+        Some(related_parent) => related_parent == primary_parent,
+        None => secondary_graph_seed_parent.is_none_or(|value| value == primary_parent),
+    }
 }
 
 fn parse_string_array_metadata(value: Option<&String>) -> Vec<String> {
@@ -11722,6 +11777,77 @@ fn parse_json_array_metadata(value: Option<&String>) -> Vec<serde_json::Value> {
     value
         .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
         .unwrap_or_default()
+}
+
+fn graph_relation_type_priority(relation_type: &str) -> u8 {
+    match relation_type {
+        "EXPLAINS" | "RELATED_TO" | "REPAIRED_BY" | "OBSERVED_BY" | "CONSTRAINED_BY"
+        | "PRODUCES" | "CONSTRAINS" | "PROTECTED_BY" | "REQUIRES" | "PUBLISHES_TO" => 0,
+        "CHUNK_SEMANTIC_SIMILAR" => 2,
+        _ => 1,
+    }
+}
+
+fn graph_relation_priority_from_metadata(metadata: &HashMap<String, String>) -> u8 {
+    metadata
+        .get("graph_relation_type")
+        .map(String::as_str)
+        .map(graph_relation_type_priority)
+        .unwrap_or(3)
+}
+
+fn secondary_graph_provenance_should_replace(
+    primary_metadata: &HashMap<String, String>,
+    secondary_metadata: &HashMap<String, String>,
+) -> bool {
+    let secondary_priority = graph_relation_priority_from_metadata(secondary_metadata);
+    let primary_priority = graph_relation_priority_from_metadata(primary_metadata);
+    if secondary_priority != primary_priority {
+        return secondary_priority < primary_priority;
+    }
+    let secondary_score = secondary_metadata
+        .get("graph_relation_score")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or_default();
+    let primary_score = primary_metadata
+        .get("graph_relation_score")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or_default();
+    secondary_score > primary_score
+}
+
+fn compare_graph_relation_debug_values(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> std::cmp::Ordering {
+    let score = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+    };
+    let left_relation_type = graph_relation_debug_type(left);
+    let right_relation_type = graph_relation_debug_type(right);
+    graph_relation_type_priority(left_relation_type)
+        .cmp(&graph_relation_type_priority(right_relation_type))
+        .then_with(|| {
+            score(right, "relation_score")
+                .partial_cmp(&score(left, "relation_score"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            score(right, "graph_score")
+                .partial_cmp(&score(left, "graph_score"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| left_relation_type.cmp(right_relation_type))
+}
+
+fn graph_relation_debug_type(value: &serde_json::Value) -> &str {
+    value
+        .get("relation_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 fn score_of(result: &pb::SearchResultV004) -> f32 {
@@ -12823,6 +12949,59 @@ fn no_answer_partial_mmr_evidence_passes(
         && (matched_discriminating_terms >= 1 || exact_technical_match)
 }
 
+fn graph_supporting_direct_evidence_passes(
+    result: &pb::SearchResultV004,
+    search_mode: pb::SearchModeV005,
+    exact_technical_match: bool,
+    sparse_after_boost: f32,
+    matched_terms: usize,
+    matched_discriminating_terms: usize,
+    strongest_document_signal: Option<f32>,
+    cfg: &NoAnswerConfig,
+) -> bool {
+    if is_root_container_result(result)
+        || matched_terms == 0
+        || (matched_discriminating_terms == 0 && !exact_technical_match)
+    {
+        return false;
+    }
+    let Some(scores) = result.scores.as_ref() else {
+        return false;
+    };
+    let lexical_signal = lexical_score_for_no_answer(result);
+    let supporting_dense_floor = cfg.min_dense_score * 0.75;
+    let supporting_sparse_floor = cfg.min_sparse_score * 0.75;
+    let candidate_signal = scores
+        .dense_score
+        .max(sparse_after_boost)
+        .max(lexical_signal)
+        .max(scores.fusion_score)
+        .max(scores.final_score);
+    let relative_document_support = strongest_document_signal
+        .filter(|signal| signal.is_finite() && *signal > 0.0)
+        .is_some_and(|signal| candidate_signal >= signal * 0.70);
+    match search_mode {
+        pb::SearchModeV005::Dense => {
+            scores.dense_score >= supporting_dense_floor
+                || scores.final_score >= supporting_dense_floor
+                || relative_document_support
+        }
+        pb::SearchModeV005::Sparse => {
+            sparse_after_boost >= supporting_sparse_floor
+                || lexical_signal >= supporting_sparse_floor
+                || exact_technical_match
+                || relative_document_support
+        }
+        pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
+            scores.dense_score >= supporting_dense_floor
+                || sparse_after_boost >= supporting_sparse_floor
+                || lexical_signal >= supporting_sparse_floor
+                || exact_technical_match
+                || relative_document_support
+        }
+    }
+}
+
 fn partial_multi_aspect_candidate_passes(
     result: &pb::SearchResultV004,
     query: &str,
@@ -12893,6 +13072,7 @@ fn apply_pre_mmr_no_answer_filter(
     cfg: &NoAnswerConfig,
     debug_enabled: bool,
     preserve_partial_evidence_for_mmr: bool,
+    preserve_graph_supporting_evidence: bool,
 ) -> usize {
     if !cfg.enabled || results.is_empty() {
         return 0;
@@ -12910,37 +13090,54 @@ fn apply_pre_mmr_no_answer_filter(
             debug_enabled,
         );
     }
-    let strongly_seeded_documents = results
-        .iter()
-        .filter_map(|result| {
-            let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
-            let exact_technical_match =
-                complete_technical_match(query_technical_tokens, &matched_tokens);
-            let sparse_after_boost = result
-                .scores
-                .as_ref()
-                .map(|scores| scores.sparse_score)
-                .unwrap_or(0.0);
-            let matched_terms = matched_term_count(result, query);
-            let matched_discriminating_terms = matched_discriminating_term_count(result, query);
-            let leading_discriminating_match =
-                leading_discriminating_query_term_matches(result, query);
-            (!is_negative_mention_evidence(result)
-                && !violates_query_exclusion_terms(result, query)
-                && no_answer_candidate_passes(
-                    result,
-                    search_mode,
-                    exact_technical_match,
-                    sparse_after_boost,
-                    matched_terms,
-                    matched_discriminating_terms,
-                    leading_discriminating_match,
-                    query_terms,
-                    mixed_script_query,
-                    cfg,
-                ))
-            .then(|| no_answer_document_key(result))
-        })
+    let mut strongly_seeded_document_signals = HashMap::<String, f32>::new();
+    for result in results.iter().filter(|result| {
+        let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+        let exact_technical_match =
+            complete_technical_match(query_technical_tokens, &matched_tokens);
+        let sparse_after_boost = result
+            .scores
+            .as_ref()
+            .map(|scores| scores.sparse_score)
+            .unwrap_or(0.0);
+        let matched_terms = matched_term_count(result, query);
+        let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+        let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
+        !is_negative_mention_evidence(result)
+            && !violates_query_exclusion_terms(result, query)
+            && no_answer_candidate_passes(
+                result,
+                search_mode,
+                exact_technical_match,
+                sparse_after_boost,
+                matched_terms,
+                matched_discriminating_terms,
+                leading_discriminating_match,
+                query_terms,
+                mixed_script_query,
+                cfg,
+            )
+    }) {
+        let signal = result
+            .scores
+            .as_ref()
+            .map(|scores| {
+                scores
+                    .dense_score
+                    .max(scores.sparse_score)
+                    .max(lexical_score_for_no_answer(result))
+                    .max(scores.fusion_score)
+                    .max(scores.final_score)
+            })
+            .unwrap_or_default();
+        strongly_seeded_document_signals
+            .entry(no_answer_document_key(result))
+            .and_modify(|existing| *existing = existing.max(signal))
+            .or_insert(signal);
+    }
+    let strongly_seeded_documents = strongly_seeded_document_signals
+        .keys()
+        .cloned()
         .collect::<HashSet<_>>();
     results.retain(|result| {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
@@ -12990,10 +13187,28 @@ fn apply_pre_mmr_no_answer_filter(
                 matched_discriminating_terms,
                 strongly_seeded_documents.contains(&no_answer_document_key(result)),
                 cfg,
-            ))
+            ) || (preserve_graph_supporting_evidence
+                && strongly_seeded_documents.contains(&no_answer_document_key(result))
+                && graph_supporting_direct_evidence_passes(
+                    result,
+                    search_mode,
+                    exact_technical_match,
+                    sparse_after_boost,
+                    matched_terms,
+                    matched_discriminating_terms,
+                    strongly_seeded_document_signals
+                        .get(&no_answer_document_key(result))
+                        .copied(),
+                    cfg,
+                )))
     });
     let filtered = before.saturating_sub(results.len());
-    filtered + prune_same_document_no_answer_siblings(results, query)
+    filtered
+        + if preserve_graph_supporting_evidence {
+            0
+        } else {
+            prune_same_document_no_answer_siblings(results, query)
+        }
 }
 
 fn apply_segmented_pre_mmr_no_answer_filter(
@@ -13032,6 +13247,7 @@ fn apply_segmented_pre_mmr_no_answer_filter(
                     cfg,
                     debug_enabled,
                     preserve_partial_evidence_for_mmr,
+                    false,
                 );
                 if let Some(passed) = candidate.pop() {
                     passed_segment_indices.push(*segment_index);
@@ -13070,6 +13286,7 @@ fn apply_segmented_pre_mmr_no_answer_filter(
                 cfg,
                 debug_enabled,
                 preserve_partial_evidence_for_mmr,
+                false,
             );
             let scores = result.scores.as_ref();
             let matched_tokens = matched_technical_tokens(&result, &technical_tokens);
@@ -14626,7 +14843,7 @@ mod v007_fix1_tests {
     }
 
     #[test]
-    fn graph_secondary_provenance_does_not_cross_parent_scope_into_direct_duplicate() {
+    fn graph_secondary_provenance_merges_when_related_parent_matches_direct_duplicate() {
         let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
         direct.parent_chunk_id = "canonical-parent".into();
         direct
@@ -14688,6 +14905,12 @@ mod v007_fix1_tests {
             .unwrap()
             .metadata
             .insert("graph_edge_id".into(), "edge-hop-limit".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_score".into(), "0.95".into());
 
         let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
 
@@ -14703,12 +14926,188 @@ mod v007_fix1_tests {
         );
         assert_eq!(
             extraction_retrieval_sources(result),
+            vec!["GRAPH_EXPANDED".to_string(), "VECTOR_DIRECT".to_string()]
+        );
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_secondary_provenance")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_relation_type")
+                .map(String::as_str),
+            Some("REPAIRED_BY")
+        );
+        assert_eq!(
+            citation.metadata.get("graph_edge_id").map(String::as_str),
+            Some("edge-hop-limit")
+        );
+        assert!(citation
+            .metadata
+            .get("graph_relations")
+            .is_some_and(|value| value.contains("REPAIRED_BY")));
+    }
+
+    #[test]
+    fn graph_secondary_provenance_rejects_unrelated_parent_scope() {
+        let mut direct = test_result("direct-child", "canonical direct evidence", 0.4);
+        direct.parent_chunk_id = "canonical-parent".into();
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+
+        let mut graph = test_result("graph-child", "graph duplicate evidence", 0.9);
+        graph.parent_chunk_id = "other-parent".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-a1".into());
+        graph.citation.as_mut().unwrap().metadata.insert(
+            "graph_related_parent_chunk_id".into(),
+            "other-parent".into(),
+        );
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "REPAIRED_BY".into());
+
+        let merged = merge_score_then_truncate(vec![direct], vec![graph], 10);
+
+        assert_eq!(merged.results.len(), 1);
+        let citation = merged.results[0].citation.as_ref().unwrap();
+        assert_eq!(
+            extraction_retrieval_sources(&merged.results[0]),
             vec!["VECTOR_DIRECT".to_string()]
         );
         assert!(!citation.metadata.contains_key("graph_secondary_provenance"));
         assert!(!citation.metadata.contains_key("graph_relation_type"));
-        assert!(!citation.metadata.contains_key("graph_edge_id"));
-        assert!(!citation.metadata.contains_key("graph_relations"));
+    }
+
+    #[test]
+    fn cross_parent_graph_duplicate_merges_when_related_parent_matches_direct_scope() {
+        let mut direct = test_result("direct-child", "direct related evidence", 0.8);
+        direct.parent_chunk_id = "related-parent".into();
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "VECTOR_DIRECT".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into());
+        direct
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "related-block".into());
+
+        let mut graph = test_result("graph-child", "graph related evidence", 0.7);
+        graph.parent_chunk_id = "related-parent".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_source".into(), "GRAPH_EXPANDED".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "related-block".into());
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_seed_parent_chunk_id".into(), "seed-parent".into());
+        graph.citation.as_mut().unwrap().metadata.insert(
+            "graph_related_parent_chunk_id".into(),
+            "related-parent".into(),
+        );
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "REPAIRED_BY".into());
+
+        let selection = select_graph_append_with_group_mmr(
+            vec![direct],
+            vec![graph],
+            2,
+            1,
+            1,
+            false,
+            0.75,
+            0.75,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            5,
+        );
+
+        assert_eq!(selection.results.len(), 1);
+        assert!(selection.results.iter().any(|result| {
+            result.matched_chunk_id == "direct-child"
+                && primary_retrieval_source(result) == Some("VECTOR_DIRECT")
+        }));
+        let citation = selection.results[0].citation.as_ref().unwrap();
+        assert_eq!(
+            citation
+                .metadata
+                .get("graph_relation_type")
+                .map(String::as_str),
+            Some("REPAIRED_BY")
+        );
     }
 
     #[test]
@@ -14918,6 +15317,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             true,
+            false,
         );
 
         assert_eq!(filtered, 1);
@@ -14966,6 +15366,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             true,
+            false,
         );
 
         let remaining = candidates
@@ -14976,6 +15377,172 @@ mod v007_fix1_tests {
             panic!("filtered={filtered} remaining={remaining:?}");
         }
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn graph_enabled_pre_mmr_preserves_same_document_direct_survivor() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Как PostgreSQL помогает восстановить отсутствующие точки в Qdrant?";
+
+        let mut canonical = test_result(
+            "child-a1-180",
+            "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for document versions, content chunks, lifecycle and access visibility.",
+            0.034,
+        );
+        canonical.parent_chunk_id = "support-parent".into();
+        canonical.matched_chunk_id = "support-child".into();
+        {
+            let scores = canonical.scores.as_mut().unwrap();
+            scores.dense_score = 0.54;
+            scores.sparse_score = 0.09;
+            scores.fusion_score = 0.034;
+            scores.final_score = 0.034;
+        }
+        canonical
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "support-block".into());
+
+        let mut reconciliation = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. PostgreSQL restores missing Qdrant points from canonical bindings.",
+            0.050,
+        );
+        reconciliation.parent_chunk_id = "strong-parent".into();
+        reconciliation.matched_chunk_id = "strong-child".into();
+        {
+            let scores = reconciliation.scores.as_mut().unwrap();
+            scores.dense_score = 0.66;
+            scores.sparse_score = 0.31;
+            scores.fusion_score = 0.050;
+            scores.final_score = 0.050;
+        }
+        reconciliation
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "strong-block".into());
+
+        let mut graph_disabled_candidates = vec![canonical.clone(), reconciliation.clone()];
+        let graph_disabled_filtered = apply_pre_mmr_no_answer_filter(
+            &mut graph_disabled_candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(graph_disabled_filtered, 1);
+        assert_eq!(graph_disabled_candidates.len(), 1);
+        assert_eq!(
+            graph_disabled_candidates[0].parent_chunk_id,
+            "strong-parent"
+        );
+
+        let mut graph_enabled_candidates = vec![canonical, reconciliation];
+        let graph_enabled_filtered = apply_pre_mmr_no_answer_filter(
+            &mut graph_enabled_candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+            true,
+        );
+        let parents = graph_enabled_candidates
+            .iter()
+            .map(|candidate| candidate.parent_chunk_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(graph_enabled_filtered, 0);
+        assert_eq!(
+            parents,
+            std::collections::BTreeSet::from(["strong-parent", "support-parent"])
+        );
+    }
+
+    #[test]
+    fn graph_supporting_seed_uses_bounded_lower_floor_inside_strong_document() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            min_dense_score: 0.50,
+            min_sparse_score: 0.20,
+            min_hybrid_score: 0.04,
+            ..Default::default()
+        };
+        let query = "Why can recovery of missing vectors not trust Qdrant alone?";
+
+        let mut strong = test_result(
+            "strong-parent",
+            "Missing vectors recovery compares PostgreSQL bindings with Qdrant.",
+            0.05,
+        );
+        strong.document_id = "doc-shared".into();
+        strong.parent_chunk_id = "strong-parent".into();
+        strong
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("external_document_id".into(), "doc-shared".into());
+        strong
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "reconciliation".into());
+
+        let mut support = test_result(
+            "support-parent",
+            "Qdrant is a projection and cannot independently authorize or trust a result.",
+            0.03,
+        );
+        support.document_id = "doc-shared".into();
+        support.parent_chunk_id = "support-parent".into();
+        support
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("external_document_id".into(), "doc-shared".into());
+        support
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-state".into());
+        {
+            let scores = support.scores.as_mut().unwrap();
+            scores.dense_score = 0.40;
+            scores.sparse_score = 0.08;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        let mut candidates = vec![strong, support];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+            true,
+        );
+
+        assert_eq!(filtered, 0);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.matched_chunk_id == "support-parent"));
     }
 
     #[test]
@@ -15015,6 +15582,7 @@ mod v007_fix1_tests {
             &[],
             pb::SearchModeV005::Hybrid,
             &cfg,
+            false,
             false,
             false,
         );
@@ -15061,6 +15629,7 @@ mod v007_fix1_tests {
             pb::SearchModeV005::Hybrid,
             &cfg,
             true,
+            false,
             false,
         );
 
@@ -15111,6 +15680,7 @@ mod v007_fix1_tests {
             pb::SearchModeV005::Hybrid,
             &cfg,
             true,
+            false,
             false,
         );
 
@@ -15311,6 +15881,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             true,
+            false,
         );
 
         assert_eq!(filtered, 3);
@@ -15648,6 +16219,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             true,
+            false,
         );
 
         let remaining = candidates
@@ -15756,6 +16328,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             true,
+            false,
         );
 
         assert_eq!(filtered, 1);
@@ -15981,6 +16554,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             false,
+            false,
         );
 
         assert_eq!(filtered, 1);
@@ -16020,6 +16594,7 @@ mod v007_fix1_tests {
             &[],
             pb::SearchModeV005::Hybrid,
             &cfg,
+            false,
             false,
             false,
         );
@@ -16062,6 +16637,7 @@ mod v007_fix1_tests {
             &[],
             pb::SearchModeV005::Hybrid,
             &cfg,
+            false,
             false,
             false,
         );
@@ -16151,6 +16727,7 @@ mod v007_fix1_tests {
             &cfg,
             false,
             true,
+            false,
         );
 
         assert_eq!(filtered, 1);
