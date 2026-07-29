@@ -11,7 +11,7 @@ case "$MODE" in
   --execute-all|--verify-identities|--verify-contracts|--cleanup-only|--verify-evidence|--current-sha-focused) ;;
   *) echo "FIX486G_FAIL=UNKNOWN_MODE:$MODE" >&2; exit 64;;
 esac
-E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"; STAT_CAPTURE="$ROOT/scripts/fix486g_statistical_capture.py"; STAT_EVAL="$ROOT/scripts/fix486g_statistical_proof.py"; CURRENT_SHA_ANALYZE="$ROOT/scripts/fix486g_current_sha_analyze.py"
+E="$EVIDENCE_ROOT/fix486g/$RUN_ID"; BANK="$ROOT/benchmarks/hierarchical/fix486"; SUPPLEMENTAL="$ROOT/benchmarks/hierarchical/fix486g-supplemental"; H="$ROOT/scripts/fix486g_proof.py"; STAT_CAPTURE="$ROOT/scripts/fix486g_statistical_capture.py"; STAT_EVAL="$ROOT/scripts/fix486g_statistical_proof.py"; CURRENT_SHA_ANALYZE="$ROOT/scripts/fix486g_current_sha_analyze.py"; STAGE_TRACE_ANALYZE="$ROOT/scripts/fix486g_candidate_stage_trace.py"
 PG=${FIX486G_POSTGRES_PORT:-59432}; QP=${FIX486G_QDRANT_HTTP_PORT:-6733}; QG=${FIX486G_QDRANT_GRPC_PORT:-6734}; GP=${FIX486G_GRPC_PORT:-50588}; MP=${FIX486G_METRICS_PORT:-9058}
 DB="postgres://astravector:astravector@127.0.0.1:$PG/astravector"; Q="http://127.0.0.1:$QP"; ADDR="127.0.0.1:$GP"; COL=${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_fix486g}
 MODEL_PATH=${ASTRAVECTOR_MODEL_PATH:-$WORKSPACE_ROOT/models/bge-m3/onnx/model.onnx}
@@ -177,7 +177,7 @@ verify_identity() {
 }
 branch_is_approved() {
   case "$BRANCH" in
-    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence|codex/fix486g-post-merge-recovery|agent/fix486g-current-sha-graph-parent-repair) return 0 ;;
+    codex/fix486g-graph-parent-proof|codex/fix486g-finalize-runtime-evidence|codex/fix486g-post-merge-recovery|agent/fix486g-current-sha-graph-parent-repair|agent/fix486g-candidate-lifecycle-survivor-repair) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -215,7 +215,8 @@ static_gates() {
   cargo test --locked --test fix486g_statistical_proof_contracts -- --nocapture &&
   cargo test --locked --test fix486g_visibility_recheck_contracts -- --nocapture &&
   python3 -m unittest -v tests/test_fix486g_proof.py &&
-  python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_capture.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py
+  python3 -m unittest -v tests/test_fix486g_candidate_stage_trace.py &&
+  python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_capture.py scripts/fix486g_statistical_proof.py scripts/fix486g_candidate_stage_trace.py tests/test_fix486g_proof.py tests/test_fix486g_candidate_stage_trace.py
 }
 start_infrastructure() {
   for port in "$PG" "$QP" "$QG" "$GP" "$MP"; do
@@ -690,6 +691,7 @@ current_sha_focused_capture() {
     [[ $rc -eq 0 ]] || return 1
   done
   python3 "$CURRENT_SHA_ANALYZE" --bank "$SUPPLEMENTAL" --raw-input "$output" --identity-map "$E/identity-map/logical-to-runtime.json" --output "$E/current-sha-focused/analysis.json"
+  python3 "$STAGE_TRACE_ANALYZE" --bank "$SUPPLEMENTAL" --raw-input "$output" --identity-map "$E/identity-map/logical-to-runtime.json" --output-dir "$E/current-sha-focused"
 }
 
 current_sha_focused() {
@@ -775,7 +777,8 @@ verify_contracts() {
   (cd "$ROOT" &&
     cargo test --locked --test fix486g_graph_parent_contracts --test fix486g_runner_hardening_contracts --test fix486g_statistical_capture_contracts --test fix486g_statistical_proof_contracts --test fix486g_visibility_recheck_contracts -- --nocapture &&
     python3 -m unittest -v tests/test_fix486g_proof.py &&
-    python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_capture.py scripts/fix486g_statistical_proof.py tests/test_fix486g_proof.py)
+    python3 -m unittest -v tests/test_fix486g_candidate_stage_trace.py &&
+    python3 -m py_compile scripts/fix486g_proof.py scripts/fix486g_statistical_capture.py scripts/fix486g_statistical_proof.py scripts/fix486g_candidate_stage_trace.py tests/test_fix486g_proof.py tests/test_fix486g_candidate_stage_trace.py)
 }
 verify_existing_evidence() {
   local verification

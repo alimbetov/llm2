@@ -3042,6 +3042,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         ranking_trace.observe(pb::RankingStageV005::FusionAdmission, &direct_results);
         ranking_trace.observe(pb::RankingStageV005::PostFusionDedup, &direct_results);
         ranking_trace.observe(pb::RankingStageV005::PostgresHydration, &direct_results);
+        ranking_trace.observe(pb::RankingStageV005::Retrieved, &direct_results);
         let mut no_answer_stats = NoAnswerFilterStats::default();
         let no_answer_debug = no_answer_debug_enabled(r.include_debug, &self.cfg.search.no_answer);
         let query_technical_tokens = if self.cfg.search.no_answer.enabled {
@@ -3056,6 +3057,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         } else {
             Vec::new()
         };
+        ranking_trace.observe(pb::RankingStageV005::PreNoAnswer, &pre_mmr_before);
         no_answer_stats.pre_mmr_filtered_count =
             if query_plan.mode == QueryProcessingMode::Segmented {
                 apply_segmented_pre_mmr_no_answer_filter(
@@ -3127,6 +3129,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         ranking_trace.mark_removed(
             pb::RankingStageV005::PreMmrNoAnswer,
+            &pre_mmr_before,
+            &direct_results,
+            pb::CandidateDropReasonV005::NoAnswerFiltered,
+            "pre-MMR no-answer policy",
+        );
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::PostNoAnswer,
             &pre_mmr_before,
             &direct_results,
             pb::CandidateDropReasonV005::NoAnswerFiltered,
@@ -3268,6 +3277,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             Vec::new()
         };
         ranking_trace.observe(pb::RankingStageV005::GraphSeed, &graph_seed_trace);
+        ranking_trace.observe(pb::RankingStageV005::GraphSeedAdmitted, &graph_seed_trace);
         let remaining_budget_before_graph_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis() as u64;
@@ -3708,6 +3718,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         retain_results_outside_rejected_parents(&mut direct_results, &rejected_parent_keys);
         retain_results_outside_rejected_parents(&mut graph_results, &rejected_parent_keys);
         ranking_trace.observe(pb::RankingStageV005::GraphExpansion, &graph_results);
+        ranking_trace.observe(pb::RankingStageV005::GraphExpanded, &graph_results);
         let merge_started = std::time::Instant::now();
         let direct_count = direct_results.len();
         let graph_count = graph_results.len();
@@ -3842,7 +3853,9 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             mmr_input_trace.extend(graph_results.iter().cloned());
         }
         ranking_trace.observe(pb::RankingStageV005::GraphMerge, &mmr_input_trace);
+        ranking_trace.observe(pb::RankingStageV005::PostDedup, &mmr_input_trace);
         ranking_trace.observe(pb::RankingStageV005::MmrInput, &mmr_input_trace);
+        ranking_trace.observe(pb::RankingStageV005::PreMmr, &mmr_input_trace);
         let selection_result = select_results_with_strategy_aware_mmr(
             direct_results,
             graph_results,
@@ -3877,6 +3890,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut results = selection_result.results;
         ranking_trace.mark_removed(
             pb::RankingStageV005::MmrSelected,
+            &mmr_input_trace,
+            &results,
+            pb::CandidateDropReasonV005::MmrLimit,
+            "MMR selection or context limit",
+        );
+        ranking_trace.mark_removed(
+            pb::RankingStageV005::PostMmr,
             &mmr_input_trace,
             &results,
             pb::CandidateDropReasonV005::MmrLimit,
@@ -4113,6 +4133,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         strip_internal_embedding_metadata(&mut results);
         ranking_trace.observe(pb::RankingStageV005::FinalSelection, &results);
+        ranking_trace.observe(pb::RankingStageV005::Final, &results);
         let ranking_trace = ranking_trace.finish();
         let final_results_count = results.len();
         counter!("retrieved_contexts_total").increment(final_results_count as u64);
@@ -11907,15 +11928,16 @@ impl RankingTraceCollector {
         }
         let retained = after
             .iter()
-            .map(result_identity_key)
+            .map(ranking_trace_identity_key)
             .collect::<HashSet<_>>();
         for (rank, result) in before.iter().enumerate() {
+            let key = ranking_trace_identity_key(result);
             self.observe_one(
                 stage,
                 result,
                 rank + 1,
-                retained.contains(&result_identity_key(result)),
-                (!retained.contains(&result_identity_key(result))).then_some(reason),
+                retained.contains(&key),
+                (!retained.contains(&key)).then_some(reason),
                 detail,
             );
         }
@@ -11930,7 +11952,7 @@ impl RankingTraceCollector {
         drop_reason: Option<pb::CandidateDropReasonV005>,
         detail: &str,
     ) {
-        let key = result_identity_key(result);
+        let key = ranking_trace_identity_key(result);
         if !self.candidates.contains_key(&key) {
             self.total_seen += 1;
             if self.candidates.len() >= self.max_candidates {
@@ -11943,6 +11965,15 @@ impl RankingTraceCollector {
                 .cloned()
                 .unwrap_or_default();
             let sources = extraction_retrieval_sources(result);
+            let primary_retrieval_source = primary_retrieval_source(result)
+                .map(str::to_owned)
+                .unwrap_or_else(|| sources.first().cloned().unwrap_or_default());
+            let metadata_value = |name: &str| {
+                citation
+                    .and_then(|c| c.metadata.get(name))
+                    .cloned()
+                    .unwrap_or_default()
+            };
             self.order.push(key.clone());
             self.candidates.insert(
                 key.clone(),
@@ -11954,6 +11985,14 @@ impl RankingTraceCollector {
                         matched_chunk_id: result.matched_chunk_id.clone(),
                         parent_chunk_id: result.parent_chunk_id.clone(),
                         source_block_id,
+                        retrieval_source: primary_retrieval_source,
+                        graph_seed_chunk_id: metadata_value("graph_seed_chunk_id"),
+                        graph_related_chunk_id: metadata_value("graph_related_chunk_id"),
+                        graph_related_parent_chunk_id: metadata_value(
+                            "graph_related_parent_chunk_id",
+                        ),
+                        graph_edge_id: metadata_value("graph_edge_id"),
+                        graph_binding_id: metadata_value("graph_binding_id"),
                     }),
                     stages: Vec::new(),
                     primary_direct: sources.iter().any(|s| s != "GRAPH_EXPANDED"),
@@ -13689,6 +13728,36 @@ fn result_identity_key(result: &pb::SearchResultV004) -> String {
         );
     }
     format!("{}:{}", result.access_zone_id, result.matched_chunk_id)
+}
+
+fn ranking_trace_identity_key(result: &pb::SearchResultV004) -> String {
+    let citation = result.citation.as_ref();
+    let metadata = |name: &str| {
+        citation
+            .and_then(|c| c.metadata.get(name))
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    let retrieval_source = primary_retrieval_source(result)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            extraction_retrieval_sources(result)
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        });
+    [
+        result.access_zone_id.as_str(),
+        retrieval_source.as_str(),
+        result.matched_chunk_id.as_str(),
+        result.parent_chunk_id.as_str(),
+        metadata("graph_seed_chunk_id"),
+        metadata("graph_related_chunk_id"),
+        metadata("graph_related_parent_chunk_id"),
+        metadata("graph_edge_id"),
+        metadata("graph_binding_id"),
+    ]
+    .join(":")
 }
 
 fn prune_same_document_no_answer_siblings(
@@ -17007,6 +17076,52 @@ mod v007_fix1_tests {
             ..Default::default()
         };
         assert_eq!(graph_seed_chunk_id(&result_without_matched), Some(parent));
+    }
+
+    #[test]
+    fn ranking_trace_identity_distinguishes_graph_lineage_from_canonical_context() {
+        let zone = Uuid::from_u128(1).to_string();
+        let parent = Uuid::from_u128(2).to_string();
+        let matched = Uuid::from_u128(3).to_string();
+        let direct = pb::SearchResultV004 {
+            access_zone_id: zone.clone(),
+            document_id: "doc".into(),
+            parent_chunk_id: parent.clone(),
+            matched_chunk_id: matched.clone(),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([
+                    ("source_block_id".into(), "canonical-parent".into()),
+                    ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ]),
+            }),
+            ..Default::default()
+        };
+        let graph = pb::SearchResultV004 {
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([
+                    ("source_block_id".into(), "canonical-parent".into()),
+                    ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                    ("graph_seed_chunk_id".into(), Uuid::from_u128(4).to_string()),
+                    (
+                        "graph_related_chunk_id".into(),
+                        Uuid::from_u128(5).to_string(),
+                    ),
+                    (
+                        "graph_related_parent_chunk_id".into(),
+                        Uuid::from_u128(6).to_string(),
+                    ),
+                    ("graph_edge_id".into(), "edge-a1-a3".into()),
+                    ("graph_binding_id".into(), Uuid::from_u128(7).to_string()),
+                ]),
+            }),
+            ..direct.clone()
+        };
+
+        assert_eq!(result_identity_key(&direct), result_identity_key(&graph));
+        assert_ne!(
+            ranking_trace_identity_key(&direct),
+            ranking_trace_identity_key(&graph)
+        );
     }
 
     #[test]
