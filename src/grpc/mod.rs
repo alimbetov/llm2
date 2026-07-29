@@ -12968,19 +12968,22 @@ fn graph_supporting_direct_evidence_passes(
         return false;
     };
     let lexical_signal = lexical_score_for_no_answer(result);
+    let supporting_dense_floor = cfg.min_dense_score * 0.75;
+    let supporting_sparse_floor = cfg.min_sparse_score * 0.75;
     match search_mode {
         pb::SearchModeV005::Dense => {
-            scores.dense_score >= cfg.min_dense_score || scores.final_score >= cfg.min_dense_score
+            scores.dense_score >= supporting_dense_floor
+                || scores.final_score >= supporting_dense_floor
         }
         pb::SearchModeV005::Sparse => {
-            sparse_after_boost >= cfg.min_sparse_score
-                || lexical_signal >= cfg.min_sparse_score
+            sparse_after_boost >= supporting_sparse_floor
+                || lexical_signal >= supporting_sparse_floor
                 || exact_technical_match
         }
         pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
-            scores.dense_score >= cfg.min_dense_score
-                || sparse_after_boost >= cfg.min_sparse_score * 0.75
-                || lexical_signal >= cfg.min_sparse_score * 0.75
+            scores.dense_score >= supporting_dense_floor
+                || sparse_after_boost >= supporting_sparse_floor
+                || lexical_signal >= supporting_sparse_floor
                 || exact_technical_match
         }
     }
@@ -15431,6 +15434,82 @@ mod v007_fix1_tests {
             parents,
             std::collections::BTreeSet::from(["strong-parent", "support-parent"])
         );
+    }
+
+    #[test]
+    fn graph_supporting_seed_uses_bounded_lower_floor_inside_strong_document() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            min_dense_score: 0.50,
+            min_sparse_score: 0.20,
+            min_hybrid_score: 0.04,
+            ..Default::default()
+        };
+        let query = "Why can recovery of missing vectors not trust Qdrant alone?";
+
+        let mut strong = test_result(
+            "strong-parent",
+            "Missing vectors recovery compares PostgreSQL bindings with Qdrant.",
+            0.05,
+        );
+        strong.document_id = "doc-shared".into();
+        strong.parent_chunk_id = "strong-parent".into();
+        strong
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("external_document_id".into(), "doc-shared".into());
+        strong
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "reconciliation".into());
+
+        let mut support = test_result(
+            "support-parent",
+            "Qdrant is a projection and cannot independently authorize or trust a result.",
+            0.03,
+        );
+        support.document_id = "doc-shared".into();
+        support.parent_chunk_id = "support-parent".into();
+        support
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("external_document_id".into(), "doc-shared".into());
+        support
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("source_block_id".into(), "canonical-state".into());
+        {
+            let scores = support.scores.as_mut().unwrap();
+            scores.dense_score = 0.40;
+            scores.sparse_score = 0.08;
+            scores.fusion_score = 0.03;
+            scores.final_score = 0.03;
+        }
+        let mut candidates = vec![strong, support];
+
+        let filtered = apply_pre_mmr_no_answer_filter(
+            &mut candidates,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+            false,
+            true,
+            true,
+        );
+
+        assert_eq!(filtered, 0);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.matched_chunk_id == "support-parent"));
     }
 
     #[test]
