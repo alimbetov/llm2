@@ -12956,6 +12956,7 @@ fn graph_supporting_direct_evidence_passes(
     sparse_after_boost: f32,
     matched_terms: usize,
     matched_discriminating_terms: usize,
+    strongest_document_signal: Option<f32>,
     cfg: &NoAnswerConfig,
 ) -> bool {
     if is_root_container_result(result)
@@ -12970,21 +12971,33 @@ fn graph_supporting_direct_evidence_passes(
     let lexical_signal = lexical_score_for_no_answer(result);
     let supporting_dense_floor = cfg.min_dense_score * 0.75;
     let supporting_sparse_floor = cfg.min_sparse_score * 0.75;
+    let candidate_signal = scores
+        .dense_score
+        .max(sparse_after_boost)
+        .max(lexical_signal)
+        .max(scores.fusion_score)
+        .max(scores.final_score);
+    let relative_document_support = strongest_document_signal
+        .filter(|signal| signal.is_finite() && *signal > 0.0)
+        .is_some_and(|signal| candidate_signal >= signal * 0.70);
     match search_mode {
         pb::SearchModeV005::Dense => {
             scores.dense_score >= supporting_dense_floor
                 || scores.final_score >= supporting_dense_floor
+                || relative_document_support
         }
         pb::SearchModeV005::Sparse => {
             sparse_after_boost >= supporting_sparse_floor
                 || lexical_signal >= supporting_sparse_floor
                 || exact_technical_match
+                || relative_document_support
         }
         pb::SearchModeV005::Hybrid | pb::SearchModeV005::Unspecified => {
             scores.dense_score >= supporting_dense_floor
                 || sparse_after_boost >= supporting_sparse_floor
                 || lexical_signal >= supporting_sparse_floor
                 || exact_technical_match
+                || relative_document_support
         }
     }
 }
@@ -13077,37 +13090,54 @@ fn apply_pre_mmr_no_answer_filter(
             debug_enabled,
         );
     }
-    let strongly_seeded_documents = results
-        .iter()
-        .filter_map(|result| {
-            let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
-            let exact_technical_match =
-                complete_technical_match(query_technical_tokens, &matched_tokens);
-            let sparse_after_boost = result
-                .scores
-                .as_ref()
-                .map(|scores| scores.sparse_score)
-                .unwrap_or(0.0);
-            let matched_terms = matched_term_count(result, query);
-            let matched_discriminating_terms = matched_discriminating_term_count(result, query);
-            let leading_discriminating_match =
-                leading_discriminating_query_term_matches(result, query);
-            (!is_negative_mention_evidence(result)
-                && !violates_query_exclusion_terms(result, query)
-                && no_answer_candidate_passes(
-                    result,
-                    search_mode,
-                    exact_technical_match,
-                    sparse_after_boost,
-                    matched_terms,
-                    matched_discriminating_terms,
-                    leading_discriminating_match,
-                    query_terms,
-                    mixed_script_query,
-                    cfg,
-                ))
-            .then(|| no_answer_document_key(result))
-        })
+    let mut strongly_seeded_document_signals = HashMap::<String, f32>::new();
+    for result in results.iter().filter(|result| {
+        let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+        let exact_technical_match =
+            complete_technical_match(query_technical_tokens, &matched_tokens);
+        let sparse_after_boost = result
+            .scores
+            .as_ref()
+            .map(|scores| scores.sparse_score)
+            .unwrap_or(0.0);
+        let matched_terms = matched_term_count(result, query);
+        let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+        let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
+        !is_negative_mention_evidence(result)
+            && !violates_query_exclusion_terms(result, query)
+            && no_answer_candidate_passes(
+                result,
+                search_mode,
+                exact_technical_match,
+                sparse_after_boost,
+                matched_terms,
+                matched_discriminating_terms,
+                leading_discriminating_match,
+                query_terms,
+                mixed_script_query,
+                cfg,
+            )
+    }) {
+        let signal = result
+            .scores
+            .as_ref()
+            .map(|scores| {
+                scores
+                    .dense_score
+                    .max(scores.sparse_score)
+                    .max(lexical_score_for_no_answer(result))
+                    .max(scores.fusion_score)
+                    .max(scores.final_score)
+            })
+            .unwrap_or_default();
+        strongly_seeded_document_signals
+            .entry(no_answer_document_key(result))
+            .and_modify(|existing| *existing = existing.max(signal))
+            .or_insert(signal);
+    }
+    let strongly_seeded_documents = strongly_seeded_document_signals
+        .keys()
+        .cloned()
         .collect::<HashSet<_>>();
     results.retain(|result| {
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
@@ -13166,6 +13196,9 @@ fn apply_pre_mmr_no_answer_filter(
                     sparse_after_boost,
                     matched_terms,
                     matched_discriminating_terms,
+                    strongly_seeded_document_signals
+                        .get(&no_answer_document_key(result))
+                        .copied(),
                     cfg,
                 )))
     });
