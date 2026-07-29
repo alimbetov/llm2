@@ -365,6 +365,49 @@ fn synthetic_complete_campaign_passes_and_writes_every_artifact() {
 }
 
 #[test]
+fn statistical_evidence_rejects_source_sha_mismatch() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let source_identity = tempfile::NamedTempFile::new().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let rows = synthetic_campaign();
+    write_rows(input.path(), &rows);
+    fs::write(
+        source_identity.path(),
+        serde_json::to_string(&json!({
+            "branch": "agent/fix486g-current-sha-graph-parent-repair",
+            "source_sha": "old-source-sha",
+            "remote_branch_sha": "old-source-sha",
+            "local_remote_equal": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let status = Command::new("python3")
+        .args([SCRIPT, "evaluate", "--bank", BANK, "--raw-input"])
+        .arg(input.path())
+        .args(["--source-identity"])
+        .arg(source_identity.path())
+        .args([
+            "--expected-source-sha",
+            "current-source-sha",
+            "--output-dir",
+        ])
+        .arg(output.path())
+        .status()
+        .unwrap();
+
+    assert!(!status.success());
+    let result = report(&output.path().join("statistical-report.json"));
+    assert_eq!(result["verdict"], "FIX486G_STATISTICAL_QUALITY_BLOCKED");
+    assert!(result["failure_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|code| code == "SOURCE_SHA_MISMATCH: manifest source old-source-sha != expected tested current-source-sha"));
+}
+
+#[test]
 fn direct_survivor_is_sufficient_for_faults_that_invalidate_the_graph_target() {
     let input = tempfile::NamedTempFile::new().unwrap();
     let output = tempfile::tempdir().unwrap();

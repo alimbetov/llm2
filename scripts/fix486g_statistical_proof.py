@@ -1251,12 +1251,41 @@ def blocked_artifacts(output_dir: Path, reason: str) -> None:
     write_artifacts(output_dir, payloads)
 
 
+def verify_source_identity(
+    rows: list[dict[str, Any]], source_identity_path: Path | None, expected_source_sha: str | None
+) -> dict[str, Any] | None:
+    if not source_identity_path and not expected_source_sha:
+        return None
+    if not source_identity_path:
+        fail("SOURCE_IDENTITY_REQUIRED", "expected source SHA requires --source-identity")
+    source_identity = read_json(source_identity_path)
+    source_sha = source_identity.get("source_sha")
+    if not isinstance(source_sha, str) or not source_sha:
+        fail("SOURCE_IDENTITY_INVALID", f"{source_identity_path}: source_sha required")
+    if expected_source_sha and source_sha != expected_source_sha:
+        fail("SOURCE_SHA_MISMATCH", f"manifest source {source_sha} != expected tested {expected_source_sha}")
+    row_sources = {
+        row.get("source_sha")
+        for row in rows
+        if isinstance(row.get("source_sha"), str) and row.get("source_sha")
+    }
+    if row_sources and row_sources != {source_sha}:
+        fail("OBSERVATION_SOURCE_SHA_MISMATCH", f"observation sources {sorted(row_sources)} != manifest {source_sha}")
+    return {"path": str(source_identity_path), "sha256": sha256(source_identity_path), "source_sha": source_sha}
+
+
 def evaluate(
-    bank: Path, raw_paths: list[Path], identity_path: Path | None, output_dir: Path
+    bank: Path,
+    raw_paths: list[Path],
+    identity_path: Path | None,
+    output_dir: Path,
+    source_identity_path: Path | None = None,
+    expected_source_sha: str | None = None,
 ) -> dict[str, Any]:
     bank_data = verify_and_load_bank(bank)
     rows = read_jsonl(raw_paths)
     validation = validate_rows(rows, bank_data)
+    source_identity = verify_source_identity(rows, source_identity_path, expected_source_sha)
     identities = identity_lookup(identity_path)
     gates: dict[str, int] = defaultdict(int)
     for gate in GLOBAL_HARD_GATES:
@@ -1294,6 +1323,7 @@ def evaluate(
             "evaluator_sha256": sha256(Path(__file__)),
             "raw_inputs": input_identities,
             "identity_map": ({"path": str(identity_path), "sha256": sha256(identity_path)} if identity_path else None),
+            "source_identity": source_identity,
         },
         "bank_id": bank_data["manifest"]["bank_id"],
         "bank_version": bank_data["manifest"]["version"],
@@ -1382,6 +1412,8 @@ def main() -> int:
     evaluate_parser.add_argument("--raw-input", "--input", type=Path, action="append", dest="raw_inputs", required=True)
     evaluate_parser.add_argument("--identity-map", type=Path)
     evaluate_parser.add_argument("--output-dir", type=Path, required=True)
+    evaluate_parser.add_argument("--source-identity", type=Path)
+    evaluate_parser.add_argument("--expected-source-sha")
     args = parser.parse_args()
     try:
         if args.command == "plan":
@@ -1399,7 +1431,14 @@ def main() -> int:
             payload["network_calls"] = False
             emit(payload, args.output)
             return 0
-        report = evaluate(args.bank, args.raw_inputs, args.identity_map, args.output_dir)
+        report = evaluate(
+            args.bank,
+            args.raw_inputs,
+            args.identity_map,
+            args.output_dir,
+            args.source_identity,
+            args.expected_source_sha,
+        )
         print(json.dumps({"verdict": report["verdict"], "failure_codes": report["failure_codes"]}, sort_keys=True))
         return 0 if report["verdict"] == PASS else 1
     except (EvaluationError, OSError, KeyError, TypeError) as error:
