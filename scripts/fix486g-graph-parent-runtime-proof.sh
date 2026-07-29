@@ -678,7 +678,7 @@ current_sha_focused_capture() {
   while IFS= read -r query; do
     [[ -n "$query" ]] || continue
     statistical_capture_selection warm 1 "$output" --query-id "$query" || return 1
-  done < <(jq -r 'select(.profile=="POSITIVE_GRAPH") | .query_id' "$SUPPLEMENTAL/qrels/query-qrel-assignments-v1.jsonl")
+  done < <(jq -r 'select(.qrel_profile=="POSITIVE_GRAPH") | .query_id' "$SUPPLEMENTAL/qrels/query-qrel-assignments-v1.jsonl")
   prepare_fault_targets || return 1
   for setup in graph_wrong_parent_overlay graph_cross_zone_overlay graph_inactive_deleted_expired_overlay graph_second_hop_overlay graph_cycle_overlay; do
     label="current-sha-focused-$setup"
