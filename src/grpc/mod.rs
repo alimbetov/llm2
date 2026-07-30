@@ -13946,7 +13946,7 @@ fn restore_graph_supported_direct_survivors(
     graph_results: &[pb::SearchResultV004],
     query: &str,
     query_technical_tokens: &[String],
-    _has_rejected_graph_parent: bool,
+    has_rejected_graph_parent: bool,
     cfg: &NoAnswerConfig,
     max_survivors: usize,
 ) -> usize {
@@ -13960,6 +13960,7 @@ fn restore_graph_supported_direct_survivors(
         .collect::<HashSet<_>>();
     if support_documents.is_empty()
         && graph_survivor_fallback_intent(query, query_technical_tokens)
+        && (!graph_results.is_empty() || has_rejected_graph_parent)
         && !direct_results.is_empty()
     {
         support_documents.extend(
