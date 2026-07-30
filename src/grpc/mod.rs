@@ -12179,26 +12179,75 @@ fn graph_seed_candidate_passes(
     let strong_lexical_evidence = matched_terms >= 2
         && matched_discriminating_terms >= 1
         && matched_terms.saturating_mul(2) >= query_terms.max(1);
-    let document_relative_support = result.citation.as_ref().is_some_and(|citation| {
-        citation
-            .metadata
-            .get("document_relative_support")
-            .is_some_and(|value| value == "true")
-            || citation
+    let document_relative_support = query_has_graph_recovery_intent(query, query_technical_tokens)
+        && result.citation.as_ref().is_some_and(|citation| {
+            citation
                 .metadata
-                .get("ranking_protection")
-                .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
-    });
-    let multilingual_semantic_support = result.scores.as_ref().is_some_and(|scores| {
-        result.matched_chunk_id != result.parent_chunk_id
-            && scores.dense_score >= cfg.min_dense_score
-            && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
-    });
+                .get("document_relative_support")
+                .is_some_and(|value| value == "true")
+                || citation
+                    .metadata
+                    .get("ranking_protection")
+                    .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
+        });
+    let multilingual_semantic_support =
+        query_has_graph_recovery_intent(query, query_technical_tokens)
+            && result.scores.as_ref().is_some_and(|scores| {
+                result.matched_chunk_id != result.parent_chunk_id
+                    && scores.dense_score >= cfg.min_dense_score
+                    && (scores.sparse_score > 0.0
+                        || scores.fusion_score > 0.0
+                        || scores.final_score > 0.0)
+            });
     leading_discriminating_match
         || exact_technical_match
         || strong_lexical_evidence
         || document_relative_support
         || multilingual_semantic_support
+}
+
+fn query_has_graph_recovery_intent(query: &str, query_technical_tokens: &[String]) -> bool {
+    let lowered = query.to_lowercase();
+    let positive_terms = ordered_positive_query_terms(query);
+    let has = |needle: &str| {
+        lowered.contains(needle) || positive_terms.iter().any(|term| term.contains(needle))
+    };
+    let technical_anchor = query_technical_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "qdrant"
+                | "postgresql"
+                | "canonical"
+                | "reconciliation"
+                | "binding"
+                | "bindings"
+                | "projection"
+                | "hydrate"
+                | "hydration"
+        )
+    });
+    let storage_anchor = has("qdrant")
+        || has("postgresql")
+        || has("canonical")
+        || has("канони")
+        || has("рекон")
+        || has("reconciliation")
+        || has("binding")
+        || has("projection")
+        || has("проекц");
+    let recovery_anchor = has("missing")
+        || has("recover")
+        || has("recovery")
+        || has("republish")
+        || has("жоқ")
+        || has("қалп")
+        || has("келт")
+        || has("отсутств")
+        || has("пропав")
+        || has("восстанов")
+        || has("расхожд")
+        || has("свер");
+    technical_anchor || (storage_anchor && recovery_anchor)
 }
 
 fn graph_seed_source_results_for_admitted_parents<'a>(
@@ -17625,6 +17674,52 @@ mod v007_fix1_tests {
             "canonical state without reconciliation",
             &[],
             &NoAnswerConfig::default()
+        ));
+    }
+
+    #[test]
+    fn document_relative_support_requires_graph_recovery_intent_for_seed_lane() {
+        let cfg = NoAnswerConfig::default();
+        let mut result = pb::SearchResultV004 {
+            parent_text: "ASTRA_RECONCILIATION_A3. Missing Qdrant points are recovered from canonical bindings.".into(),
+            matched_text: "ASTRA_RECONCILIATION_A3. Missing Qdrant points are recovered.".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            parent_chunk_id: "protected-parent".into(),
+            matched_chunk_id: "protected-child".into(),
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: cfg.min_dense_score,
+                sparse_score: 0.05,
+                fusion_score: 0.03,
+                final_score: 0.03,
+            }),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([(
+                    "ranking_protection".into(),
+                    "PRIMARY_DIRECT".into(),
+                )]),
+            }),
+            ..Default::default()
+        };
+
+        assert!(!graph_seed_candidate_passes(
+            &result,
+            "How do I reset an AstraVector user password?",
+            &[],
+            &cfg,
+        ));
+        assert!(graph_seed_candidate_passes(
+            &result,
+            "How does PostgreSQL recover missing Qdrant points?",
+            &[],
+            &cfg,
+        ));
+
+        result.citation.as_mut().unwrap().metadata.clear();
+        assert!(graph_seed_candidate_passes(
+            &result,
+            "How does PostgreSQL recover missing Qdrant points?",
+            &[],
+            &cfg,
         ));
     }
 
