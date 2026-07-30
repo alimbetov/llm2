@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 verify-fix486b-runtime-baseline verify-fix486c-frozen-bank verify-fix486d-child-parent-runtime verify-fix486d-child-parent-runtime-proof verify-fix486f-stale-orphan-hydration-runtime verify-fix486f-stale-orphan-hydration-runtime-proof verify-fix486g-graph-parent-runtime verify-fix486g-graph-parent-runtime-proof verify-fix487a-retrieval-freeze verify-fix487b-contracts verify-fix487b-mixed-load-pilot verify-fix487b-existing-evidence fix487b-cleanup fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 verify-fix486b-runtime-baseline verify-fix486c-frozen-bank verify-fix486d-child-parent-runtime verify-fix486d-child-parent-runtime-proof verify-fix486f-stale-orphan-hydration-runtime verify-fix486f-stale-orphan-hydration-runtime-proof verify-fix486g-graph-parent-runtime verify-fix486g-graph-parent-runtime-proof verify-fix487a-retrieval-freeze verify-fix487b-contracts verify-fix487b-mixed-load-pilot verify-fix487b-existing-evidence verify-fix487bc-capacity-contracts verify-fix487bc-capacity-campaign verify-fix487bc-existing-capacity-evidence verify-fix487c-soak-contracts verify-fix487c-soak-60m verify-fix487c-existing-soak-evidence fix487b-cleanup fix487bc-cleanup fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -399,4 +399,33 @@ verify-fix487b-existing-evidence:
 	python3 scripts/fix487b_evidence.py --root "$${FIX487B_EVIDENCE_DIR:?set FIX487B_EVIDENCE_DIR}"
 
 fix487b-cleanup:
+	docker compose -p astravector_fix487b -f docker-compose.fix487b.yml down
+
+verify-fix487bc-capacity-contracts:
+	$(MAKE) verify-fix487b-contracts
+	python3 -m py_compile scripts/fix487bc_capacity_campaign.py scripts/fix487bc_capacity_evidence.py
+	python3 -m unittest -v tests/test_fix487bc_capacity_campaign.py tests/test_fix487bc_capacity_evidence.py
+	bash -n scripts/fix487bc-capacity-campaign.sh
+
+verify-fix487bc-capacity-campaign:
+	@if [ "$$ASTRAVECTOR_FIX487BC_EXECUTE_CAPACITY" != "true" ]; then echo "FIX487BC_BLOCKED=EXPLICIT_CAPACITY_OPT_IN_REQUIRED"; exit 2; fi
+	bash scripts/fix487bc-capacity-campaign.sh
+
+verify-fix487bc-existing-capacity-evidence:
+	python3 scripts/fix487bc_capacity_evidence.py --root "$${FIX487BC_CAPACITY_EVIDENCE_DIR:?set FIX487BC_CAPACITY_EVIDENCE_DIR}"
+
+verify-fix487c-soak-contracts:
+	$(MAKE) verify-fix487a-retrieval-freeze
+	python3 -m py_compile scripts/fix487c_soak.py
+	python3 -m unittest -v tests/test_fix487c_soak.py
+	bash -n scripts/fix487c-soak-60m.sh
+
+verify-fix487c-soak-60m:
+	@if [ "$$ASTRAVECTOR_FIX487C_EXECUTE_SOAK" != "true" ]; then echo "FIX487C_BLOCKED=EXPLICIT_SOAK_OPT_IN_REQUIRED"; exit 2; fi
+	bash scripts/fix487c-soak-60m.sh
+
+verify-fix487c-existing-soak-evidence:
+	python3 scripts/fix487c_soak.py --verify-evidence-root "$${FIX487C_SOAK_EVIDENCE_DIR:?set FIX487C_SOAK_EVIDENCE_DIR}"
+
+fix487bc-cleanup:
 	docker compose -p astravector_fix487b -f docker-compose.fix487b.yml down

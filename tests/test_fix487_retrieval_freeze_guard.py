@@ -65,6 +65,10 @@ class RetrievalFreezeGuardTests(unittest.TestCase):
 +verify-fix487b-contracts:
 +\tpython3 -m py_compile scripts/fix487b_dataset.py
 +\tpython3 -m unittest -v tests/test_fix487b_dataset.py
++verify-fix487bc-capacity-contracts:
++\tpython3 -m py_compile scripts/fix487bc_capacity_campaign.py scripts/fix487bc_capacity_evidence.py
++verify-fix487c-soak-contracts:
++\tpython3 -m py_compile scripts/fix487c_soak.py
 +verify-fix487a-retrieval-freeze:
 +\tpython3 scripts/fix487_retrieval_freeze_guard.py --repo .
 +\tpython3 -m unittest -v tests/test_fix487_retrieval_freeze_guard.py
