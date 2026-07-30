@@ -13320,7 +13320,7 @@ fn apply_pre_mmr_no_answer_filter(
             return true;
         }
         if preserve_graph_supporting_evidence
-            && graph_seed_survivor_evidence_passes(result, query, cfg)
+            && graph_seed_survivor_evidence_passes(result, query, query_technical_tokens, cfg)
         {
             return true;
         }
@@ -13773,10 +13773,11 @@ fn final_no_answer_should_trigger(
         if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
-        if graph_seed_survivor_evidence_passes(result, query, cfg) {
+        if graph_seed_survivor_evidence_passes(result, query, query_technical_tokens, cfg) {
             return true;
         }
-        if graph_expanded_relation_evidence_passes(result) {
+        if graph_expanded_relation_evidence_passes_for_query(result, query, query_technical_tokens)
+        {
             return true;
         }
         no_answer_candidate_passes(
@@ -13805,6 +13806,7 @@ fn final_no_answer_should_trigger(
 fn graph_seed_survivor_evidence_passes(
     result: &pb::SearchResultV004,
     query: &str,
+    query_technical_tokens: &[String],
     cfg: &NoAnswerConfig,
 ) -> bool {
     if !retrieval_sources_contains(result, "VECTOR_DIRECT")
@@ -13824,10 +13826,35 @@ fn graph_seed_survivor_evidence_passes(
     {
         return false;
     }
+    if !graph_expanded_relation_evidence_passes(result)
+        && !graph_query_support_evidence_passes(result, query, query_technical_tokens)
+    {
+        return false;
+    }
     result.scores.as_ref().is_some_and(|scores| {
         scores.dense_score >= cfg.min_dense_score
             && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
     })
+}
+
+fn graph_expanded_relation_evidence_passes_for_query(
+    result: &pb::SearchResultV004,
+    query: &str,
+    query_technical_tokens: &[String],
+) -> bool {
+    graph_expanded_relation_evidence_passes(result)
+        && graph_query_support_evidence_passes(result, query, query_technical_tokens)
+}
+
+fn graph_query_support_evidence_passes(
+    result: &pb::SearchResultV004,
+    query: &str,
+    query_technical_tokens: &[String],
+) -> bool {
+    if matched_discriminating_term_count(result, query) > 0 {
+        return true;
+    }
+    !matched_technical_tokens(result, query_technical_tokens).is_empty()
 }
 
 fn graph_expanded_relation_evidence_passes(result: &pb::SearchResultV004) -> bool {
@@ -13895,7 +13922,7 @@ fn apply_post_mmr_technical_no_answer_filter(
         if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
-        if graph_seed_survivor_evidence_passes(result, query, cfg) {
+        if graph_seed_survivor_evidence_passes(result, query, query_technical_tokens, cfg) {
             return true;
         }
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
@@ -16671,7 +16698,7 @@ mod v007_fix1_tests {
             enabled: true,
             ..Default::default()
         };
-        let query = "Почему при восстановлении пропавших векторов нельзя доверять только Qdrant?";
+        let query = "Explain missing Qdrant points reconciliation from canonical bindings.";
 
         let mut graph = test_result(
             "child-a3-180",
@@ -16706,6 +16733,11 @@ mod v007_fix1_tests {
             ]));
 
         assert!(graph_expanded_relation_evidence_passes(&graph));
+        assert!(graph_expanded_relation_evidence_passes_for_query(
+            &graph,
+            query,
+            &[],
+        ));
         assert!(!should_clear_post_mmr_results(
             &[graph],
             None,
@@ -16755,6 +16787,61 @@ mod v007_fix1_tests {
             "different-parent".into(),
         );
         assert!(!graph_expanded_relation_evidence_passes(&mismatched));
+    }
+
+    #[test]
+    fn graph_relation_without_query_support_does_not_bypass_no_answer() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How do I reset an AstraVector user password?";
+        let mut graph = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
+            0.43,
+        );
+        graph.parent_chunk_id = "graph-parent".into();
+        graph.matched_chunk_id = "child-a3-180".into();
+        graph.parent_text = graph.matched_text.clone();
+        graph.scores = Some(pb::SearchScoresV004 {
+            dense_score: 0.0,
+            sparse_score: 0.0,
+            fusion_score: 0.51,
+            final_score: 0.43,
+        });
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("graph_relation_type".into(), "REPAIRED_BY".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.51".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+
+        assert!(graph_expanded_relation_evidence_passes(&graph));
+        assert!(!graph_expanded_relation_evidence_passes_for_query(
+            &graph,
+            query,
+            &[],
+        ));
+        assert!(should_clear_post_mmr_results(
+            &[graph],
+            None,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+        ));
     }
 
     #[test]
@@ -16875,7 +16962,12 @@ mod v007_fix1_tests {
                 ("graph_seed_survivor".into(), "true".into()),
             ]));
 
-        assert!(graph_seed_survivor_evidence_passes(&survivor, query, &cfg));
+        assert!(graph_seed_survivor_evidence_passes(
+            &survivor,
+            query,
+            &["postgresql".into()],
+            &cfg
+        ));
         let mut post_mmr_results = vec![survivor.clone()];
         assert_eq!(
             apply_post_mmr_technical_no_answer_filter(
