@@ -57,6 +57,6 @@ search:
     run_id: "${ASTRAVECTOR_TEST_HYDRATION_FAILPOINT_RUN_ID:-}"
   ranking_trace:
     enabled: true
-    max_candidates: 100
-    max_stages_per_candidate: 32
+    max_candidates: 512
+    max_stages_per_candidate: 64
     include_text_preview: false
