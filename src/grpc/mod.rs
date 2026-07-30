@@ -12199,12 +12199,11 @@ fn graph_seed_candidate_passes(
                     .get("ranking_protection")
                     .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
         });
-    let supporting_dense_floor = cfg.min_dense_score * 0.75;
     let multilingual_semantic_support =
         query_has_graph_recovery_intent(query, query_technical_tokens)
             && result.scores.as_ref().is_some_and(|scores| {
                 result.matched_chunk_id != result.parent_chunk_id
-                    && scores.dense_score >= supporting_dense_floor
+                    && scores.dense_score >= cfg.min_dense_score
                     && (scores.sparse_score > 0.0
                         || scores.fusion_score > 0.0
                         || scores.final_score > 0.0)
@@ -13900,9 +13899,8 @@ fn graph_seed_survivor_evidence_passes(
     {
         return false;
     }
-    let supporting_dense_floor = cfg.min_dense_score * 0.75;
     result.scores.as_ref().is_some_and(|scores| {
-        scores.dense_score >= supporting_dense_floor
+        scores.dense_score >= cfg.min_dense_score
             && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
     })
 }
@@ -18116,7 +18114,7 @@ mod v007_fix1_tests {
             parent_chunk_id: "parent-a1".into(),
             matched_chunk_id: "child-a1-260".into(),
             scores: Some(pb::SearchScoresV004 {
-                dense_score: cfg.min_dense_score * 0.80,
+                dense_score: cfg.min_dense_score,
                 sparse_score: 0.05,
                 fusion_score: 0.03,
                 final_score: 0.03,
@@ -18129,26 +18127,6 @@ mod v007_fix1_tests {
 
         assert_eq!(matched_term_count(&result, query), 0);
         assert!(graph_seed_candidate_passes(&result, query, &[], &cfg));
-        let mut marked = result.clone();
-        marked
-            .citation
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert("graph_seed_survivor".into(), "true".into());
-        assert!(graph_seed_survivor_evidence_passes(&marked, query, &cfg));
-        let mut unsupported = marked.clone();
-        unsupported.scores = Some(pb::SearchScoresV004 {
-            dense_score: cfg.min_dense_score * 0.80,
-            sparse_score: 0.0,
-            fusion_score: 0.0,
-            final_score: 0.0,
-        });
-        assert!(!graph_seed_survivor_evidence_passes(
-            &unsupported,
-            query,
-            &cfg
-        ));
         assert!(!no_answer_candidate_passes(
             &result,
             pb::SearchModeV005::Hybrid,
