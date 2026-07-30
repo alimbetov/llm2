@@ -13899,8 +13899,17 @@ fn graph_seed_survivor_evidence_passes(
     {
         return false;
     }
+    let dense_floor = if citation
+        .metadata
+        .get("graph_supported_direct_survivor")
+        .is_some_and(|value| value == "true")
+    {
+        cfg.min_dense_score * 0.75
+    } else {
+        cfg.min_dense_score
+    };
     result.scores.as_ref().is_some_and(|scores| {
-        scores.dense_score >= cfg.min_dense_score
+        scores.dense_score >= dense_floor
             && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
     })
 }
@@ -17268,7 +17277,7 @@ mod v007_fix1_tests {
         survivor.parent_chunk_id = "direct-survivor-parent".into();
         survivor.matched_chunk_id = "direct-survivor-child".into();
         survivor.scores = Some(pb::SearchScoresV004 {
-            dense_score: cfg.min_dense_score,
+            dense_score: cfg.min_dense_score * 0.80,
             sparse_score: 0.12,
             fusion_score: 0.03,
             final_score: 0.03,
