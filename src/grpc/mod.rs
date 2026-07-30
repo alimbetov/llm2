@@ -13283,6 +13283,15 @@ fn apply_pre_mmr_no_answer_filter(
         if preserve_graph_supporting_evidence
             && graph_seed_candidate_passes(result, query, query_technical_tokens, cfg)
         {
+            mark_ranking_protection(
+                result,
+                RankingProtection {
+                    preserve_primary_direct: true,
+                    preserve_strong_lexical: is_strong_lexical_candidate(result),
+                    preserve_unique_source_block: result_source_block_id(result).is_some(),
+                    preserve_required_segment_coverage: false,
+                },
+            );
             if let Some(citation) = result.citation.as_mut() {
                 citation
                     .metadata
@@ -16945,6 +16954,62 @@ mod v007_fix1_tests {
             pb::SearchModeV005::Hybrid,
             &cfg,
         ));
+    }
+
+    #[test]
+    fn graph_seed_survivor_is_ranking_protected_before_mmr() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How does PostgreSQL recover missing Qdrant points?";
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state is the direct survivor for missing Qdrant recovery.",
+            0.03,
+        );
+        survivor.parent_chunk_id = "direct-survivor-parent".into();
+        survivor.matched_chunk_id = "direct-survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.05,
+            fusion_score: 0.03,
+            final_score: 0.03,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into()),
+            ]));
+        let mut candidates = vec![survivor];
+
+        assert_eq!(
+            apply_pre_mmr_no_answer_filter(
+                &mut candidates,
+                query,
+                &["postgresql".into(), "qdrant".into()],
+                pb::SearchModeV005::Hybrid,
+                &cfg,
+                false,
+                true,
+                true,
+            ),
+            0
+        );
+        let survivor = candidates.first().expect("survivor must remain");
+        assert!(graph_seed_survivor_evidence_passes(survivor, query, &cfg));
+        assert!(is_ranking_protected(survivor));
+        assert!(survivor
+            .citation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .get("ranking_protection")
+            .is_some_and(|value| value.contains("PRIMARY_DIRECT")));
     }
 
     #[test]
