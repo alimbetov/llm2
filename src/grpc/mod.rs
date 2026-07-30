@@ -3158,7 +3158,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_document_by_key = HashMap::new();
         let graph_seed_eligible_direct_results = pre_mmr_before
             .iter()
-            .filter(|result| graph_seed_candidate_passes(result, query, &query_technical_tokens))
+            .filter(|result| {
+                graph_seed_candidate_passes(
+                    result,
+                    query,
+                    &query_technical_tokens,
+                    &self.cfg.search.no_answer,
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         let graph_seed_source_results = graph_seed_source_results_for_admitted_parents(
@@ -12142,6 +12149,7 @@ fn graph_seed_candidate_passes(
     result: &pb::SearchResultV004,
     query: &str,
     query_technical_tokens: &[String],
+    cfg: &NoAnswerConfig,
 ) -> bool {
     if is_root_container_result(result)
         || is_negative_mention_evidence(result)
@@ -12150,9 +12158,6 @@ fn graph_seed_candidate_passes(
         return false;
     }
     let matched_terms = matched_term_count(result, query);
-    if matched_terms == 0 {
-        return false;
-    }
     let matched_discriminating_terms = matched_discriminating_term_count(result, query);
     let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
     let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
@@ -12171,10 +12176,16 @@ fn graph_seed_candidate_passes(
                 .get("ranking_protection")
                 .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
     });
+    let multilingual_semantic_support = result.scores.as_ref().is_some_and(|scores| {
+        result.matched_chunk_id != result.parent_chunk_id
+            && scores.dense_score >= cfg.min_dense_score
+            && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
+    });
     leading_discriminating_match
         || exact_technical_match
         || strong_lexical_evidence
         || document_relative_support
+        || multilingual_semantic_support
 }
 
 fn graph_seed_source_results_for_admitted_parents<'a>(
@@ -17238,7 +17249,7 @@ mod v007_fix1_tests {
         };
         let cfg = NoAnswerConfig::default();
 
-        assert!(graph_seed_candidate_passes(&result, query, &[]));
+        assert!(graph_seed_candidate_passes(&result, query, &[], &cfg));
         assert!(!no_answer_candidate_passes(
             &result,
             pb::SearchModeV005::Hybrid,
@@ -17271,7 +17282,8 @@ mod v007_fix1_tests {
         assert!(!graph_seed_candidate_passes(
             &result,
             "canonical reconciliation",
-            &[]
+            &[],
+            &NoAnswerConfig::default()
         ));
     }
 
@@ -17293,7 +17305,49 @@ mod v007_fix1_tests {
         assert!(!graph_seed_candidate_passes(
             &result,
             "canonical state without reconciliation",
-            &[]
+            &[],
+            &NoAnswerConfig::default()
+        ));
+    }
+
+    #[test]
+    fn multilingual_semantic_candidate_can_seed_graph_without_final_no_answer_admission() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Почему при восстановлении пропавших векторов нельзя доверять только Qdrant?";
+        let result = pb::SearchResultV004 {
+            parent_text: "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state for document versions, content chunks, lifecycle and access visibility.".into(),
+            matched_text: "ASTRA_CANONICAL_STATE_A1. PostgreSQL is the authoritative canonical state.".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            parent_chunk_id: "parent-a1".into(),
+            matched_chunk_id: "child-a1-260".into(),
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: cfg.min_dense_score,
+                sparse_score: 0.05,
+                fusion_score: 0.03,
+                final_score: 0.03,
+            }),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([("retrieval_source".into(), "VECTOR_DIRECT".into())]),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(matched_term_count(&result, query), 0);
+        assert!(graph_seed_candidate_passes(&result, query, &[], &cfg));
+        assert!(!no_answer_candidate_passes(
+            &result,
+            pb::SearchModeV005::Hybrid,
+            false,
+            result.scores.as_ref().unwrap().sparse_score,
+            matched_term_count(&result, query),
+            matched_discriminating_term_count(&result, query),
+            leading_discriminating_query_term_matches(&result, query),
+            query_term_count(query),
+            false,
+            &cfg,
         ));
     }
 
