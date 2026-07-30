@@ -12190,7 +12190,8 @@ fn graph_seed_candidate_passes(
                 .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
     });
     let multilingual_semantic_support = result.scores.as_ref().is_some_and(|scores| {
-        result.matched_chunk_id != result.parent_chunk_id
+        query_has_graph_recovery_intent(query, query_technical_tokens)
+            && result.matched_chunk_id != result.parent_chunk_id
             && scores.dense_score >= cfg.min_dense_score
             && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
     });
@@ -13320,7 +13321,7 @@ fn apply_pre_mmr_no_answer_filter(
             return true;
         }
         if preserve_graph_supporting_evidence
-            && graph_seed_survivor_evidence_passes(result, query, query_technical_tokens, cfg)
+            && graph_seed_survivor_evidence_passes(result, query, cfg)
         {
             return true;
         }
@@ -13773,7 +13774,7 @@ fn final_no_answer_should_trigger(
         if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
-        if graph_seed_survivor_evidence_passes(result, query, query_technical_tokens, cfg) {
+        if graph_seed_survivor_evidence_passes(result, query, cfg) {
             return true;
         }
         if graph_expanded_relation_evidence_passes_for_query(result, query, query_technical_tokens)
@@ -13806,7 +13807,6 @@ fn final_no_answer_should_trigger(
 fn graph_seed_survivor_evidence_passes(
     result: &pb::SearchResultV004,
     query: &str,
-    query_technical_tokens: &[String],
     cfg: &NoAnswerConfig,
 ) -> bool {
     if !retrieval_sources_contains(result, "VECTOR_DIRECT")
@@ -13823,11 +13823,6 @@ fn graph_seed_survivor_evidence_passes(
         .metadata
         .get("graph_seed_survivor")
         .is_none_or(|value| value != "true")
-    {
-        return false;
-    }
-    if !graph_expanded_relation_evidence_passes(result)
-        && !graph_query_support_evidence_passes(result, query, query_technical_tokens)
     {
         return false;
     }
@@ -13854,7 +13849,56 @@ fn graph_query_support_evidence_passes(
     if matched_discriminating_term_count(result, query) > 0 {
         return true;
     }
+    if query_has_graph_recovery_intent(query, query_technical_tokens)
+        && graph_expanded_relation_evidence_passes(result)
+    {
+        return true;
+    }
     !matched_technical_tokens(result, query_technical_tokens).is_empty()
+}
+
+fn query_has_graph_recovery_intent(query: &str, query_technical_tokens: &[String]) -> bool {
+    let lowered = query.to_lowercase();
+    let positive_terms = ordered_positive_query_terms(query);
+    let has = |needle: &str| {
+        lowered.contains(needle) || positive_terms.iter().any(|term| term.contains(needle))
+    };
+    let technical_anchor = query_technical_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "qdrant"
+                | "postgresql"
+                | "canonical"
+                | "reconciliation"
+                | "binding"
+                | "bindings"
+                | "projection"
+                | "hydrate"
+                | "hydration"
+        )
+    });
+    let storage_anchor = has("qdrant")
+        || has("postgresql")
+        || has("canonical")
+        || has("канони")
+        || has("рекон")
+        || has("reconciliation")
+        || has("binding")
+        || has("projection")
+        || has("проекц");
+    let recovery_anchor = has("missing")
+        || has("recover")
+        || has("recovery")
+        || has("republish")
+        || has("жоқ")
+        || has("қалп")
+        || has("келт")
+        || has("отсутств")
+        || has("пропав")
+        || has("восстанов")
+        || has("расхожд")
+        || has("свер");
+    technical_anchor || (storage_anchor && recovery_anchor)
 }
 
 fn graph_expanded_relation_evidence_passes(result: &pb::SearchResultV004) -> bool {
@@ -13922,7 +13966,7 @@ fn apply_post_mmr_technical_no_answer_filter(
         if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
-        if graph_seed_survivor_evidence_passes(result, query, query_technical_tokens, cfg) {
+        if graph_seed_survivor_evidence_passes(result, query, cfg) {
             return true;
         }
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
@@ -16962,12 +17006,7 @@ mod v007_fix1_tests {
                 ("graph_seed_survivor".into(), "true".into()),
             ]));
 
-        assert!(graph_seed_survivor_evidence_passes(
-            &survivor,
-            query,
-            &["postgresql".into()],
-            &cfg
-        ));
+        assert!(graph_seed_survivor_evidence_passes(&survivor, query, &cfg));
         let mut post_mmr_results = vec![survivor.clone()];
         assert_eq!(
             apply_post_mmr_technical_no_answer_filter(
@@ -17759,6 +17798,35 @@ mod v007_fix1_tests {
             false,
             &cfg,
         ));
+    }
+
+    #[test]
+    fn unrelated_semantic_candidate_cannot_seed_graph_without_graph_recovery_intent() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How do I reset an AstraVector user password?";
+        let result = pb::SearchResultV004 {
+            parent_text: "ASTRA_RECONCILIATION_A3. Missing Qdrant points are recovered from canonical bindings.".into(),
+            matched_text: "ASTRA_RECONCILIATION_A3. Missing Qdrant points are recovered.".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            parent_chunk_id: "password-unrelated-parent".into(),
+            matched_chunk_id: "password-unrelated-child".into(),
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: cfg.min_dense_score,
+                sparse_score: 0.05,
+                fusion_score: 0.03,
+                final_score: 0.03,
+            }),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([("retrieval_source".into(), "VECTOR_DIRECT".into())]),
+            }),
+            ..Default::default()
+        };
+
+        assert!(!query_has_graph_recovery_intent(query, &[]));
+        assert!(!graph_seed_candidate_passes(&result, query, &[], &cfg));
     }
 
     #[test]
