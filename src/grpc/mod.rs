@@ -3730,6 +3730,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             &pre_mmr_before,
             &graph_results,
             query,
+            &query_technical_tokens,
             &self.cfg.search.no_answer,
             self.cfg.graph_rag.retrieval.min_direct_contexts,
         );
@@ -13909,18 +13910,30 @@ fn restore_graph_supported_direct_survivors(
     pre_mmr_before: &[pb::SearchResultV004],
     graph_results: &[pb::SearchResultV004],
     query: &str,
+    query_technical_tokens: &[String],
     cfg: &NoAnswerConfig,
     max_survivors: usize,
 ) -> usize {
     if max_survivors == 0 || pre_mmr_before.is_empty() {
         return 0;
     }
-    let graph_documents = graph_results
+    let mut support_documents = graph_results
         .iter()
         .filter(|result| graph_expanded_relation_evidence_passes(result))
         .map(no_answer_document_key)
         .collect::<HashSet<_>>();
-    if graph_documents.is_empty() {
+    if support_documents.is_empty()
+        && query_has_graph_recovery_intent(query, query_technical_tokens)
+        && !direct_results.is_empty()
+    {
+        support_documents.extend(
+            direct_results
+                .iter()
+                .filter(|result| !is_root_container_result(result))
+                .map(no_answer_document_key),
+        );
+    }
+    if support_documents.is_empty() {
         return 0;
     }
     let mut existing = direct_results
@@ -13930,7 +13943,7 @@ fn restore_graph_supported_direct_survivors(
     let mut candidates = pre_mmr_before
         .iter()
         .filter(|result| {
-            graph_documents.contains(&no_answer_document_key(result))
+            support_documents.contains(&no_answer_document_key(result))
                 && !is_graph_expanded_result(result)
                 && !is_root_container_result(result)
                 && !is_negative_mention_evidence(result)
@@ -17169,6 +17182,7 @@ mod v007_fix1_tests {
                 &[survivor],
                 &[graph],
                 query,
+                &[],
                 &cfg,
                 2,
             ),
@@ -17230,12 +17244,84 @@ mod v007_fix1_tests {
                 &[survivor],
                 &[graph],
                 "How do I reset a user password?",
+                &[],
                 &cfg,
                 2,
             ),
             0
         );
         assert!(direct.is_empty());
+    }
+
+    #[test]
+    fn recovery_fault_query_restores_direct_survivor_from_same_document_evidence() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state remains the direct survivor when graph targets are rejected.",
+            0.03,
+        );
+        survivor.document_id = "doc-a".into();
+        survivor.parent_chunk_id = "direct-survivor-parent".into();
+        survivor.matched_chunk_id = "direct-survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.12,
+            fusion_score: 0.03,
+            final_score: 0.03,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+                ("source_block_id".into(), "parent-a1".into()),
+            ]));
+        let mut surviving_related = test_result(
+            "related-direct",
+            "Reconciliation section remains visible after invalid graph target rejection.",
+            0.04,
+        );
+        surviving_related.document_id = "doc-a".into();
+        surviving_related
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+                ("source_block_id".into(), "related-visible-parent".into()),
+            ]));
+        let mut direct = vec![surviving_related];
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[],
+                "Find related evidence for Qdrant reconciliation.",
+                &["qdrant".into(), "reconciliation".into()],
+                &cfg,
+                2,
+            ),
+            1
+        );
+        assert_eq!(direct.len(), 2);
+        assert!(direct
+            .iter()
+            .any(|result| result_source_block_id(result) == Some("parent-a1")
+                && graph_seed_survivor_evidence_passes(
+                    result,
+                    "Find related evidence for Qdrant reconciliation.",
+                    &cfg,
+                )));
     }
 
     #[test]
