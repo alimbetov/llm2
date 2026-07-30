@@ -12567,7 +12567,12 @@ fn excluded_query_terms(query: &str) -> HashSet<String> {
     ] {
         let mut offset = 0;
         while let Some(index) = lowered[offset..].find(marker) {
-            let start = offset + index + marker.len();
+            let marker_index = offset + index;
+            if exclusion_marker_is_dependency_clause(&lowered, marker, marker_index) {
+                offset = marker_index + marker.len();
+                continue;
+            }
+            let start = marker_index + marker.len();
             let tail = &lowered[start..];
             let end = tail.find([',', ';', '.', '?', '!']).unwrap_or(tail.len());
             clauses.push(tail[..end].trim().to_string());
@@ -12589,6 +12594,40 @@ fn excluded_query_terms(query: &str) -> HashSet<String> {
         .flat_map(|clause| ordered_lexical_terms_raw(&clause))
         .filter(|term| !matches!(term.as_str(), "without" | "using" | "excluding" | "except"))
         .collect()
+}
+
+fn exclusion_marker_is_dependency_clause(query: &str, marker: &str, marker_index: usize) -> bool {
+    if !matches!(marker, "without" | "без") {
+        return false;
+    }
+    let prefix_start = marker_index.saturating_sub(96);
+    let prefix = &query[prefix_start..marker_index];
+    if marker == "without" {
+        return [
+            "insufficient",
+            "not sufficient",
+            "never sufficient",
+            "cannot",
+            "can not",
+            "can't",
+            "incomplete",
+            "fails",
+            "fail ",
+            "invalid",
+        ]
+        .iter()
+        .any(|phrase| prefix.contains(phrase));
+    }
+    [
+        "недостаточ",
+        "нельзя",
+        "не может",
+        "невозмож",
+        "қате",
+        "жеткіліксіз",
+    ]
+    .iter()
+    .any(|phrase| prefix.contains(phrase))
 }
 
 fn violates_query_exclusion_terms(result: &pb::SearchResultV004, query: &str) -> bool {
@@ -16721,6 +16760,27 @@ mod v007_fix1_tests {
         let kazakh =
             excluded_query_terms("Reconciliation туралы айтпай, legal hold және TTL түсіндір.");
         assert!(kazakh.contains("reconciliation"));
+    }
+
+    #[test]
+    fn dependency_without_clause_is_not_treated_as_exclusion() {
+        let english = excluded_query_terms(
+            "Why is a stale vector candidate insufficient without PostgreSQL hydration?",
+        );
+        assert!(!english.contains("postgresql"));
+        assert!(!english.contains("hydration"));
+
+        let russian = excluded_query_terms(
+            "Почему stale vector candidate недостаточен без PostgreSQL hydration?",
+        );
+        assert!(!russian.contains("postgresql"));
+        assert!(!russian.contains("hydration"));
+
+        let actual_exclusion = excluded_query_terms(
+            "Find authoritative document-state evidence without Graph expansion.",
+        );
+        assert!(actual_exclusion.contains("graph"));
+        assert!(actual_exclusion.contains("expansion"));
     }
 
     #[test]
