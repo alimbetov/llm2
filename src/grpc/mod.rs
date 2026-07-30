@@ -3725,6 +3725,16 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         retain_results_outside_rejected_parents(&mut direct_results, &rejected_parent_keys);
         retain_results_outside_rejected_parents(&mut graph_results, &rejected_parent_keys);
+        restore_graph_supported_direct_survivors(
+            &mut direct_results,
+            &pre_mmr_before,
+            &graph_results,
+            query,
+            &query_technical_tokens,
+            !rejected_parent_keys.is_empty(),
+            &self.cfg.search.no_answer,
+            self.cfg.graph_rag.retrieval.min_direct_contexts,
+        );
         ranking_trace.observe(pb::RankingStageV005::GraphExpansion, &graph_results);
         ranking_trace.observe(pb::RankingStageV005::GraphExpanded, &graph_results);
         let merge_started = std::time::Instant::now();
@@ -11132,6 +11142,19 @@ fn select_graph_append_with_group_mmr(
     let graph_budget = graph_context_append_limit.min(final_limit.saturating_sub(selected.len()));
     metrics::counter!("graph_mmr_group_graph_candidates_total")
         .increment(graph_filtered.len() as u64);
+    for graph in &mut graph_filtered {
+        if graph_expanded_relation_evidence_passes(graph) {
+            mark_ranking_protection(
+                graph,
+                RankingProtection {
+                    preserve_primary_direct: false,
+                    preserve_strong_lexical: false,
+                    preserve_unique_source_block: result_source_block_id(graph).is_some(),
+                    preserve_required_segment_coverage: false,
+                },
+            );
+        }
+    }
     let graph_mmr = apply_mmr_rerank(
         graph_filtered,
         graph_budget,
@@ -12166,26 +12189,83 @@ fn graph_seed_candidate_passes(
     let strong_lexical_evidence = matched_terms >= 2
         && matched_discriminating_terms >= 1
         && matched_terms.saturating_mul(2) >= query_terms.max(1);
-    let document_relative_support = result.citation.as_ref().is_some_and(|citation| {
-        citation
-            .metadata
-            .get("document_relative_support")
-            .is_some_and(|value| value == "true")
-            || citation
+    let document_relative_support = query_has_graph_recovery_intent(query, query_technical_tokens)
+        && result.citation.as_ref().is_some_and(|citation| {
+            citation
                 .metadata
-                .get("ranking_protection")
-                .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
-    });
-    let multilingual_semantic_support = result.scores.as_ref().is_some_and(|scores| {
-        result.matched_chunk_id != result.parent_chunk_id
-            && scores.dense_score >= cfg.min_dense_score
-            && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
-    });
+                .get("document_relative_support")
+                .is_some_and(|value| value == "true")
+                || citation
+                    .metadata
+                    .get("ranking_protection")
+                    .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
+        });
+    let multilingual_semantic_support =
+        query_has_graph_recovery_intent(query, query_technical_tokens)
+            && result.scores.as_ref().is_some_and(|scores| {
+                result.matched_chunk_id != result.parent_chunk_id
+                    && scores.dense_score >= cfg.min_dense_score
+                    && (scores.sparse_score > 0.0
+                        || scores.fusion_score > 0.0
+                        || scores.final_score > 0.0)
+            });
     leading_discriminating_match
         || exact_technical_match
         || strong_lexical_evidence
         || document_relative_support
         || multilingual_semantic_support
+}
+
+fn query_has_graph_recovery_intent(query: &str, query_technical_tokens: &[String]) -> bool {
+    let lowered = query.to_lowercase();
+    let positive_terms = ordered_positive_query_terms(query);
+    let has = |needle: &str| {
+        lowered.contains(needle) || positive_terms.iter().any(|term| term.contains(needle))
+    };
+    let technical_anchor = query_technical_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "qdrant"
+                | "postgresql"
+                | "canonical"
+                | "reconciliation"
+                | "binding"
+                | "bindings"
+                | "projection"
+                | "hydrate"
+                | "hydration"
+        )
+    });
+    let storage_anchor = has("qdrant")
+        || has("postgresql")
+        || has("canonical")
+        || has("point")
+        || has("vector")
+        || has("канони")
+        || has("рекон")
+        || has("точк")
+        || has("вектор")
+        || has("reconciliation")
+        || has("binding")
+        || has("projection")
+        || has("нүкт")
+        || has("проекц");
+    let recovery_anchor = has("missing")
+        || has("publish")
+        || has("recover")
+        || has("recovery")
+        || has("republish")
+        || has("жоқ")
+        || has("жария")
+        || has("қалп")
+        || has("келт")
+        || has("отсутств")
+        || has("пропав")
+        || has("публик")
+        || has("восстанов")
+        || has("расхожд")
+        || has("свер");
+    technical_anchor || (storage_anchor && recovery_anchor)
 }
 
 fn graph_seed_source_results_for_admitted_parents<'a>(
@@ -13221,6 +13301,15 @@ fn apply_pre_mmr_no_answer_filter(
         if preserve_graph_supporting_evidence
             && graph_seed_candidate_passes(result, query, query_technical_tokens, cfg)
         {
+            mark_ranking_protection(
+                result,
+                RankingProtection {
+                    preserve_primary_direct: true,
+                    preserve_strong_lexical: is_strong_lexical_candidate(result),
+                    preserve_unique_source_block: result_source_block_id(result).is_some(),
+                    preserve_required_segment_coverage: false,
+                },
+            );
             if let Some(citation) = result.citation.as_mut() {
                 citation
                     .metadata
@@ -13593,6 +13682,31 @@ fn no_answer_document_key(result: &pb::SearchResultV004) -> String {
         .unwrap_or_else(|| result.document_id.clone())
 }
 
+fn no_answer_document_keys(result: &pb::SearchResultV004) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !result.document_id.trim().is_empty() {
+        keys.push(result.document_id.clone());
+    }
+    if let Some(citation) = result.citation.as_ref() {
+        for key in [
+            "fixture_document_id",
+            "original_document_id",
+            "external_document_id",
+        ] {
+            if let Some(value) = citation.metadata.get(key) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() && !keys.iter().any(|existing| existing == trimmed) {
+                    keys.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if keys.is_empty() {
+        keys.push(no_answer_document_key(result));
+    }
+    keys
+}
+
 fn aggregate_no_answer_group_passes(
     results: &[&pb::SearchResultV004],
     query: &str,
@@ -13811,10 +13925,144 @@ fn graph_seed_survivor_evidence_passes(
     {
         return false;
     }
+    let dense_floor = if citation
+        .metadata
+        .get("graph_supported_direct_survivor")
+        .is_some_and(|value| value == "true")
+    {
+        cfg.min_dense_score * 0.75
+    } else {
+        cfg.min_dense_score
+    };
     result.scores.as_ref().is_some_and(|scores| {
-        scores.dense_score >= cfg.min_dense_score
+        scores.dense_score >= dense_floor
             && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
     })
+}
+
+fn restore_graph_supported_direct_survivors(
+    direct_results: &mut Vec<pb::SearchResultV004>,
+    pre_mmr_before: &[pb::SearchResultV004],
+    graph_results: &[pb::SearchResultV004],
+    query: &str,
+    query_technical_tokens: &[String],
+    has_rejected_graph_parent: bool,
+    cfg: &NoAnswerConfig,
+    max_survivors: usize,
+) -> usize {
+    if max_survivors == 0 || pre_mmr_before.is_empty() {
+        return 0;
+    }
+    let mut support_documents = graph_results
+        .iter()
+        .filter(|result| graph_expanded_relation_evidence_passes(result))
+        .flat_map(no_answer_document_keys)
+        .collect::<HashSet<_>>();
+    if support_documents.is_empty()
+        && graph_survivor_fallback_intent(query, query_technical_tokens)
+        && (!graph_results.is_empty() || has_rejected_graph_parent)
+        && !direct_results.is_empty()
+    {
+        support_documents.extend(
+            direct_results
+                .iter()
+                .filter(|result| !is_root_container_result(result))
+                .flat_map(no_answer_document_keys),
+        );
+    }
+    if support_documents.is_empty() {
+        return 0;
+    }
+    let mut existing = direct_results
+        .iter()
+        .map(result_identity_key)
+        .collect::<HashSet<_>>();
+    let mut candidates = pre_mmr_before
+        .iter()
+        .filter(|result| {
+            no_answer_document_keys(result)
+                .iter()
+                .any(|key| support_documents.contains(key))
+                && !is_graph_expanded_result(result)
+                && !is_root_container_result(result)
+                && !is_negative_mention_evidence(result)
+                && !violates_query_exclusion_terms(result, query)
+                && !existing.contains(&result_identity_key(result))
+                && result.scores.as_ref().is_some_and(|scores| {
+                    scores.dense_score >= cfg.min_dense_score * 0.75
+                        || scores.sparse_score > 0.0
+                        || scores.fusion_score > 0.0
+                        || scores.final_score > 0.0
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(stable_result_rank);
+    let mut restored = 0usize;
+    for mut candidate in candidates {
+        if restored >= max_survivors {
+            break;
+        }
+        let key = result_identity_key(&candidate);
+        if !existing.insert(key) {
+            continue;
+        }
+        let preserve_strong_lexical = is_strong_lexical_candidate(&candidate);
+        let preserve_unique_source_block = result_source_block_id(&candidate).is_some();
+        mark_ranking_protection(
+            &mut candidate,
+            RankingProtection {
+                preserve_primary_direct: true,
+                preserve_strong_lexical,
+                preserve_unique_source_block,
+                preserve_required_segment_coverage: false,
+            },
+        );
+        if let Some(citation) = candidate.citation.as_mut() {
+            citation
+                .metadata
+                .insert("graph_seed_survivor".into(), "true".into());
+            citation
+                .metadata
+                .insert("graph_supported_direct_survivor".into(), "true".into());
+        }
+        direct_results.push(candidate);
+        restored += 1;
+    }
+    restored
+}
+
+fn graph_survivor_fallback_intent(query: &str, query_technical_tokens: &[String]) -> bool {
+    if query_has_graph_recovery_intent(query, query_technical_tokens) {
+        return true;
+    }
+    let lowered = query.to_lowercase();
+    let terms = ordered_positive_query_terms(query);
+    let has =
+        |needle: &str| lowered.contains(needle) || terms.iter().any(|term| term.contains(needle));
+    let storage_anchor = has("qdrant")
+        || has("postgresql")
+        || has("canonical")
+        || has("reconciliation")
+        || has("binding")
+        || has("projection")
+        || has("канони")
+        || has("рекон")
+        || has("проекц");
+    let graph_context_anchor = has("related")
+        || has("relation")
+        || has("linked")
+        || has("hop")
+        || has("связан")
+        || has("связ")
+        || has("переход")
+        || has("уров")
+        || has("актуаль")
+        || has("удал")
+        || has("видим")
+        || has("lifecycle")
+        || has("version");
+    storage_anchor && graph_context_anchor
 }
 
 fn graph_expanded_relation_evidence_passes(result: &pb::SearchResultV004) -> bool {
@@ -16886,6 +17134,337 @@ mod v007_fix1_tests {
     }
 
     #[test]
+    fn graph_seed_survivor_is_ranking_protected_before_mmr() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How does PostgreSQL recover missing Qdrant points?";
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state is the direct survivor for missing Qdrant recovery.",
+            0.03,
+        );
+        survivor.parent_chunk_id = "direct-survivor-parent".into();
+        survivor.matched_chunk_id = "direct-survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.05,
+            fusion_score: 0.03,
+            final_score: 0.03,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("retrieval_sources".into(), "[\"VECTOR_DIRECT\"]".into()),
+            ]));
+        let mut candidates = vec![survivor];
+
+        assert_eq!(
+            apply_pre_mmr_no_answer_filter(
+                &mut candidates,
+                query,
+                &["postgresql".into(), "qdrant".into()],
+                pb::SearchModeV005::Hybrid,
+                &cfg,
+                false,
+                true,
+                true,
+            ),
+            0
+        );
+        let survivor = candidates.first().expect("survivor must remain");
+        assert!(graph_seed_survivor_evidence_passes(survivor, query, &cfg));
+        assert!(is_ranking_protected(survivor));
+        assert!(survivor
+            .citation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .get("ranking_protection")
+            .is_some_and(|value| value.contains("PRIMARY_DIRECT")));
+    }
+
+    #[test]
+    fn valid_graph_relation_restores_same_document_direct_survivor() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How does the system detect and republish missing vector points?";
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state is the direct survivor for graph-backed recovery.",
+            0.03,
+        );
+        survivor.document_id = "doc-a".into();
+        survivor.parent_chunk_id = "direct-survivor-parent".into();
+        survivor.matched_chunk_id = "direct-survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.0,
+            fusion_score: 0.02,
+            final_score: 0.02,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("source_block_id".into(), "parent-a1".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+            ]));
+        let mut graph = test_result(
+            "graph-parent",
+            "Missing Qdrant points are recovered from canonical bindings.",
+            0.7,
+        );
+        graph.document_id = "doc-a".into();
+        graph.parent_chunk_id = "graph-parent".into();
+        graph.matched_chunk_id = "graph-child".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+                ("graph_relation_type".into(), "REPAIRED_BY".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.7".into()),
+                ("graph_relation_score".into(), "0.9".into()),
+            ]));
+        let mut direct = Vec::new();
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[graph],
+                query,
+                &[],
+                false,
+                &cfg,
+                2,
+            ),
+            1
+        );
+        assert_eq!(direct.len(), 1);
+        assert!(graph_seed_survivor_evidence_passes(&direct[0], query, &cfg));
+        assert!(direct[0]
+            .citation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .get("graph_supported_direct_survivor")
+            .is_some_and(|value| value == "true"));
+    }
+
+    #[test]
+    fn direct_survivor_is_not_restored_without_valid_graph_relation() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state is unrelated background.",
+            0.03,
+        );
+        survivor.document_id = "doc-a".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.0,
+            fusion_score: 0.02,
+            final_score: 0.02,
+        });
+        let mut graph = test_result("graph-parent", "Chunk sibling context.", 0.7);
+        graph.document_id = "doc-a".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("graph_relation_type".into(), "CHUNK_HAS_PARENT".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.7".into()),
+                ("graph_relation_score".into(), "0.9".into()),
+            ]));
+        let mut direct = Vec::new();
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[graph],
+                "How do I reset a user password?",
+                &[],
+                false,
+                &cfg,
+                2,
+            ),
+            0
+        );
+        assert!(direct.is_empty());
+    }
+
+    #[test]
+    fn recovery_fault_query_restores_direct_survivor_from_same_document_evidence() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state remains the direct survivor when graph targets are rejected.",
+            0.03,
+        );
+        survivor.document_id = "doc-a".into();
+        survivor.parent_chunk_id = "direct-survivor-parent".into();
+        survivor.matched_chunk_id = "direct-survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score * 0.80,
+            sparse_score: 0.12,
+            fusion_score: 0.03,
+            final_score: 0.03,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+                ("source_block_id".into(), "parent-a1".into()),
+            ]));
+        let mut surviving_related = test_result(
+            "related-direct",
+            "Reconciliation section remains visible after invalid graph target rejection.",
+            0.04,
+        );
+        surviving_related.document_id = "doc-a".into();
+        surviving_related
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+                ("source_block_id".into(), "related-visible-parent".into()),
+            ]));
+        let mut direct = vec![surviving_related];
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[],
+                "Find related evidence for Qdrant reconciliation.",
+                &["qdrant".into(), "reconciliation".into()],
+                true,
+                &cfg,
+                2,
+            ),
+            1
+        );
+        assert_eq!(direct.len(), 2);
+        assert!(direct
+            .iter()
+            .any(|result| result_source_block_id(result) == Some("parent-a1")
+                && graph_seed_survivor_evidence_passes(
+                    result,
+                    "Find related evidence for Qdrant reconciliation.",
+                    &cfg,
+                )));
+    }
+
+    #[test]
+    fn recovery_survivor_matching_uses_document_aliases() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut survivor = test_result(
+            "survivor-child",
+            "PostgreSQL canonical state is the independent survivor.",
+            0.03,
+        );
+        survivor.document_id = "runtime-doc-id".into();
+        survivor.parent_chunk_id = "survivor-parent".into();
+        survivor.matched_chunk_id = "survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score * 0.80,
+            sparse_score: 0.12,
+            fusion_score: 0.03,
+            final_score: 0.03,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("source_block_id".into(), "canonical-survivor".into()),
+            ]));
+        let mut visible_same_document = test_result(
+            "visible-child",
+            "Visible related direct evidence shares only the external document alias.",
+            0.04,
+        );
+        visible_same_document.document_id = "different-runtime-doc-id".into();
+        visible_same_document
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("external_document_id".into(), "runtime-doc-id".into()),
+                ("source_block_id".into(), "visible-related-parent".into()),
+            ]));
+        let mut direct = vec![visible_same_document];
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[],
+                "Find related evidence for Qdrant reconciliation.",
+                &[],
+                true,
+                &cfg,
+                1,
+            ),
+            1
+        );
+        assert!(direct
+            .iter()
+            .any(|result| result_source_block_id(result) == Some("canonical-survivor")));
+    }
+
+    #[test]
     fn exclusion_clause_rejects_reconciliation_dependent_candidate() {
         let cfg = NoAnswerConfig {
             enabled: true,
@@ -17616,6 +18195,52 @@ mod v007_fix1_tests {
     }
 
     #[test]
+    fn document_relative_support_requires_graph_recovery_intent_for_seed_lane() {
+        let cfg = NoAnswerConfig::default();
+        let mut result = pb::SearchResultV004 {
+            parent_text: "ASTRA_RECONCILIATION_A3. Missing Qdrant points are recovered from canonical bindings.".into(),
+            matched_text: "ASTRA_RECONCILIATION_A3. Missing Qdrant points are recovered.".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            parent_chunk_id: "protected-parent".into(),
+            matched_chunk_id: "protected-child".into(),
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: cfg.min_dense_score,
+                sparse_score: 0.05,
+                fusion_score: 0.03,
+                final_score: 0.03,
+            }),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([(
+                    "ranking_protection".into(),
+                    "PRIMARY_DIRECT".into(),
+                )]),
+            }),
+            ..Default::default()
+        };
+
+        assert!(!graph_seed_candidate_passes(
+            &result,
+            "How do I reset an AstraVector user password?",
+            &[],
+            &cfg,
+        ));
+        assert!(graph_seed_candidate_passes(
+            &result,
+            "How does PostgreSQL recover missing Qdrant points?",
+            &[],
+            &cfg,
+        ));
+
+        result.citation.as_mut().unwrap().metadata.clear();
+        assert!(graph_seed_candidate_passes(
+            &result,
+            "How does PostgreSQL recover missing Qdrant points?",
+            &[],
+            &cfg,
+        ));
+    }
+
+    #[test]
     fn multilingual_semantic_candidate_can_seed_graph_without_final_no_answer_admission() {
         let cfg = NoAnswerConfig {
             enabled: true,
@@ -17762,6 +18387,96 @@ mod v007_fix1_tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"seed-parent"));
         assert!(ids.contains(&"related"));
+    }
+
+    #[test]
+    fn graph_append_preserves_verified_domain_relation_over_structural_noise() {
+        let direct = vec![test_result("seed-parent", "direct seed evidence", 0.4)];
+
+        let mut structural = test_result("structural-related", "structural sibling noise", 0.9);
+        structural.scores = Some(pb::SearchScoresV004 {
+            fusion_score: 0.9,
+            final_score: 0.9,
+            ..Default::default()
+        });
+        structural
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("source_block_id".into(), "structural-block".into()),
+                (
+                    "graph_relation_type".into(),
+                    "CHUNK_PREVIOUS_SIBLING".into(),
+                ),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "structural-related".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.9".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+
+        let mut domain = test_result(
+            "domain-related",
+            "ASTRA_RECONCILIATION_A3 one-hop domain relation evidence",
+            0.2,
+        );
+        domain.scores = Some(pb::SearchScoresV004 {
+            fusion_score: 0.2,
+            final_score: 0.2,
+            ..Default::default()
+        });
+        domain
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("source_block_id".into(), "domain-block".into()),
+                ("graph_relation_type".into(), "REPAIRED_BY".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "domain-related".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.2".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+        assert!(!graph_expanded_relation_evidence_passes(&structural));
+        assert!(graph_expanded_relation_evidence_passes(&domain));
+
+        let selected = select_graph_append_with_group_mmr(
+            direct,
+            vec![structural, domain],
+            2,
+            1,
+            1,
+            true,
+            0.75,
+            0.6,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            8,
+        );
+
+        let ids = selected
+            .results
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"seed-parent"));
+        assert!(ids.contains(&"domain-related"));
+        assert!(!ids.contains(&"structural-related"));
     }
 
     #[test]
