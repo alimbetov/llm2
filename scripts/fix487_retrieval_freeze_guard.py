@@ -26,6 +26,8 @@ ALLOWED_PATH_PATTERNS = (
     "scripts/fix487_*.py",
     "scripts/fix487-*.sh",
     "tests/test_fix487_*.py",
+    "config/application-fix487*.yaml",
+    "docker-compose.fix487*.yml",
 )
 
 PROTECTED_FIXTURE_PATTERNS = (
@@ -60,8 +62,20 @@ PROTECTED_RETRIEVAL_SOURCE_PATTERNS = (
 
 MAKEFILE_ALLOWED_LINES = (
     "verify-fix487a-retrieval-freeze",
+    "verify-fix487b-contracts",
+    "verify-fix487b-mixed-load-pilot",
+    "verify-fix487b-existing-evidence",
+    "fix487b-cleanup",
     "fix487_retrieval_freeze_guard.py",
     "test_fix487_retrieval_freeze_guard.py",
+    "fix487b_dataset.py",
+    "fix487b_mixed_load.py",
+    "fix487b_evidence.py",
+    "fix487b_audit.py",
+    "fix487b-mixed-load-pilot.sh",
+    "test_fix487b_",
+    "ASTRAVECTOR_FIX487B_EXECUTE_PILOT",
+    "FIX487B_BLOCKED=EXPLICIT_PILOT_OPT_IN_REQUIRED",
 )
 
 OPERATIONAL_TOKENS = (

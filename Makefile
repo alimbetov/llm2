@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 verify-fix486b-runtime-baseline verify-fix486c-frozen-bank verify-fix486d-child-parent-runtime verify-fix486d-child-parent-runtime-proof verify-fix486f-stale-orphan-hydration-runtime verify-fix486f-stale-orphan-hydration-runtime-proof verify-fix486g-graph-parent-runtime verify-fix486g-graph-parent-runtime-proof verify-fix487a-retrieval-freeze fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 verify-fix486b-runtime-baseline verify-fix486c-frozen-bank verify-fix486d-child-parent-runtime verify-fix486d-child-parent-runtime-proof verify-fix486f-stale-orphan-hydration-runtime verify-fix486f-stale-orphan-hydration-runtime-proof verify-fix486g-graph-parent-runtime verify-fix486g-graph-parent-runtime-proof verify-fix487a-retrieval-freeze verify-fix487b-contracts verify-fix487b-mixed-load-pilot verify-fix487b-existing-evidence fix487b-cleanup fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -384,3 +384,19 @@ verify-fix487a-retrieval-freeze:
 	python3 -m py_compile scripts/fix487_retrieval_freeze_guard.py
 	python3 -m unittest -v tests/test_fix487_retrieval_freeze_guard.py
 	python3 scripts/fix487_retrieval_freeze_guard.py --repo .
+
+verify-fix487b-contracts:
+	$(MAKE) verify-fix487a-retrieval-freeze
+	python3 -m py_compile scripts/fix487b_dataset.py scripts/fix487b_mixed_load.py scripts/fix487b_evidence.py scripts/fix487b_audit.py
+	python3 -m unittest -v tests/test_fix487b_dataset.py tests/test_fix487b_mixed_load.py tests/test_fix487b_evidence.py tests/test_fix487b_audit.py
+	bash -n scripts/fix487b-mixed-load-pilot.sh
+
+verify-fix487b-mixed-load-pilot:
+	@if [ "$$ASTRAVECTOR_FIX487B_EXECUTE_PILOT" != "true" ]; then echo "FIX487B_BLOCKED=EXPLICIT_PILOT_OPT_IN_REQUIRED"; exit 2; fi
+	bash scripts/fix487b-mixed-load-pilot.sh
+
+verify-fix487b-existing-evidence:
+	python3 scripts/fix487b_evidence.py --root "$${FIX487B_EVIDENCE_DIR:?set FIX487B_EVIDENCE_DIR}"
+
+fix487b-cleanup:
+	docker compose -p astravector_fix487b -f docker-compose.fix487b.yml down

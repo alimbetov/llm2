@@ -15,6 +15,8 @@ class RetrievalFreezeGuardTests(unittest.TestCase):
             "docs/fix487/phase-a-retrieval-freeze/RESULT.md",
             "scripts/fix487_retrieval_freeze_guard.py",
             "tests/test_fix487_retrieval_freeze_guard.py",
+            "config/application-fix487b.yaml",
+            "docker-compose.fix487b.yml",
         ):
             self.assertTrue(guard.matches_any(path, guard.ALLOWED_PATH_PATTERNS))
 
@@ -60,6 +62,9 @@ class RetrievalFreezeGuardTests(unittest.TestCase):
     def test_makefile_target_hunk_is_allowed(self):
         diff = """@@
 +.PHONY: verify-fix487a-retrieval-freeze
++verify-fix487b-contracts:
++\tpython3 -m py_compile scripts/fix487b_dataset.py
++\tpython3 -m unittest -v tests/test_fix487b_dataset.py
 +verify-fix487a-retrieval-freeze:
 +\tpython3 scripts/fix487_retrieval_freeze_guard.py --repo .
 +\tpython3 -m unittest -v tests/test_fix487_retrieval_freeze_guard.py
