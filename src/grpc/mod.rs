@@ -3725,6 +3725,14 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         }
         retain_results_outside_rejected_parents(&mut direct_results, &rejected_parent_keys);
         retain_results_outside_rejected_parents(&mut graph_results, &rejected_parent_keys);
+        restore_graph_supported_direct_survivors(
+            &mut direct_results,
+            &pre_mmr_before,
+            &graph_results,
+            query,
+            &self.cfg.search.no_answer,
+            self.cfg.graph_rag.retrieval.min_direct_contexts,
+        );
         ranking_trace.observe(pb::RankingStageV005::GraphExpansion, &graph_results);
         ranking_trace.observe(pb::RankingStageV005::GraphExpanded, &graph_results);
         let merge_started = std::time::Instant::now();
@@ -12229,21 +12237,29 @@ fn query_has_graph_recovery_intent(query: &str, query_technical_tokens: &[String
     let storage_anchor = has("qdrant")
         || has("postgresql")
         || has("canonical")
+        || has("point")
+        || has("vector")
         || has("канони")
         || has("рекон")
+        || has("точк")
+        || has("вектор")
         || has("reconciliation")
         || has("binding")
         || has("projection")
+        || has("нүкт")
         || has("проекц");
     let recovery_anchor = has("missing")
+        || has("publish")
         || has("recover")
         || has("recovery")
         || has("republish")
         || has("жоқ")
+        || has("жария")
         || has("қалп")
         || has("келт")
         || has("отсутств")
         || has("пропав")
+        || has("публик")
         || has("восстанов")
         || has("расхожд")
         || has("свер");
@@ -13886,6 +13902,82 @@ fn graph_seed_survivor_evidence_passes(
         scores.dense_score >= cfg.min_dense_score
             && (scores.sparse_score > 0.0 || scores.fusion_score > 0.0 || scores.final_score > 0.0)
     })
+}
+
+fn restore_graph_supported_direct_survivors(
+    direct_results: &mut Vec<pb::SearchResultV004>,
+    pre_mmr_before: &[pb::SearchResultV004],
+    graph_results: &[pb::SearchResultV004],
+    query: &str,
+    cfg: &NoAnswerConfig,
+    max_survivors: usize,
+) -> usize {
+    if max_survivors == 0 || pre_mmr_before.is_empty() {
+        return 0;
+    }
+    let graph_documents = graph_results
+        .iter()
+        .filter(|result| graph_expanded_relation_evidence_passes(result))
+        .map(no_answer_document_key)
+        .collect::<HashSet<_>>();
+    if graph_documents.is_empty() {
+        return 0;
+    }
+    let mut existing = direct_results
+        .iter()
+        .map(result_identity_key)
+        .collect::<HashSet<_>>();
+    let mut candidates = pre_mmr_before
+        .iter()
+        .filter(|result| {
+            graph_documents.contains(&no_answer_document_key(result))
+                && !is_graph_expanded_result(result)
+                && !is_root_container_result(result)
+                && !is_negative_mention_evidence(result)
+                && !violates_query_exclusion_terms(result, query)
+                && !existing.contains(&result_identity_key(result))
+                && result.scores.as_ref().is_some_and(|scores| {
+                    scores.dense_score >= cfg.min_dense_score * 0.75
+                        || scores.sparse_score > 0.0
+                        || scores.fusion_score > 0.0
+                        || scores.final_score > 0.0
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(stable_result_rank);
+    let mut restored = 0usize;
+    for mut candidate in candidates {
+        if restored >= max_survivors {
+            break;
+        }
+        let key = result_identity_key(&candidate);
+        if !existing.insert(key) {
+            continue;
+        }
+        let preserve_strong_lexical = is_strong_lexical_candidate(&candidate);
+        let preserve_unique_source_block = result_source_block_id(&candidate).is_some();
+        mark_ranking_protection(
+            &mut candidate,
+            RankingProtection {
+                preserve_primary_direct: true,
+                preserve_strong_lexical,
+                preserve_unique_source_block,
+                preserve_required_segment_coverage: false,
+            },
+        );
+        if let Some(citation) = candidate.citation.as_mut() {
+            citation
+                .metadata
+                .insert("graph_seed_survivor".into(), "true".into());
+            citation
+                .metadata
+                .insert("graph_supported_direct_survivor".into(), "true".into());
+        }
+        direct_results.push(candidate);
+        restored += 1;
+    }
+    restored
 }
 
 fn graph_expanded_relation_evidence_passes(result: &pb::SearchResultV004) -> bool {
@@ -17010,6 +17102,140 @@ mod v007_fix1_tests {
             .metadata
             .get("ranking_protection")
             .is_some_and(|value| value.contains("PRIMARY_DIRECT")));
+    }
+
+    #[test]
+    fn valid_graph_relation_restores_same_document_direct_survivor() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "How does the system detect and republish missing vector points?";
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state is the direct survivor for graph-backed recovery.",
+            0.03,
+        );
+        survivor.document_id = "doc-a".into();
+        survivor.parent_chunk_id = "direct-survivor-parent".into();
+        survivor.matched_chunk_id = "direct-survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.0,
+            fusion_score: 0.02,
+            final_score: 0.02,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("source_block_id".into(), "parent-a1".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+            ]));
+        let mut graph = test_result(
+            "graph-parent",
+            "Missing Qdrant points are recovered from canonical bindings.",
+            0.7,
+        );
+        graph.document_id = "doc-a".into();
+        graph.parent_chunk_id = "graph-parent".into();
+        graph.matched_chunk_id = "graph-child".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("fixture_document_id".into(), "doc-hierarchy".into()),
+                ("graph_relation_type".into(), "REPAIRED_BY".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.7".into()),
+                ("graph_relation_score".into(), "0.9".into()),
+            ]));
+        let mut direct = Vec::new();
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[graph],
+                query,
+                &cfg,
+                2,
+            ),
+            1
+        );
+        assert_eq!(direct.len(), 1);
+        assert!(graph_seed_survivor_evidence_passes(&direct[0], query, &cfg));
+        assert!(direct[0]
+            .citation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .get("graph_supported_direct_survivor")
+            .is_some_and(|value| value == "true"));
+    }
+
+    #[test]
+    fn direct_survivor_is_not_restored_without_valid_graph_relation() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut survivor = test_result(
+            "direct-survivor-child",
+            "PostgreSQL canonical state is unrelated background.",
+            0.03,
+        );
+        survivor.document_id = "doc-a".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score,
+            sparse_score: 0.0,
+            fusion_score: 0.02,
+            final_score: 0.02,
+        });
+        let mut graph = test_result("graph-parent", "Chunk sibling context.", 0.7);
+        graph.document_id = "doc-a".into();
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("graph_relation_type".into(), "CHUNK_HAS_PARENT".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.7".into()),
+                ("graph_relation_score".into(), "0.9".into()),
+            ]));
+        let mut direct = Vec::new();
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[graph],
+                "How do I reset a user password?",
+                &cfg,
+                2,
+            ),
+            0
+        );
+        assert!(direct.is_empty());
     }
 
     #[test]
