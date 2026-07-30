@@ -3052,11 +3052,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         };
         let preserve_partial_evidence_for_mmr = self.cfg.graph_rag.rerank.mmr_enabled;
         let pre_mmr_no_answer_started = Instant::now();
-        let pre_mmr_before = if ranking_trace.enabled {
-            direct_results.clone()
-        } else {
-            Vec::new()
-        };
+        let pre_mmr_before = direct_results.clone();
         ranking_trace.observe(pb::RankingStageV005::PreNoAnswer, &pre_mmr_before);
         no_answer_stats.pre_mmr_filtered_count =
             if query_plan.mode == QueryProcessingMode::Segmented {
@@ -3160,8 +3156,13 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
         let mut graph_seed_source_block_by_key = HashMap::new();
         let mut graph_seed_parent_by_key = HashMap::new();
         let mut graph_seed_document_by_key = HashMap::new();
+        let graph_seed_eligible_direct_results = pre_mmr_before
+            .iter()
+            .filter(|result| graph_seed_candidate_passes(result, query, &query_technical_tokens))
+            .cloned()
+            .collect::<Vec<_>>();
         let graph_seed_source_results = graph_seed_source_results_for_admitted_parents(
-            &direct_results,
+            &graph_seed_eligible_direct_results,
             &pre_parent_dedup_graph_seed_results,
         );
         seed_scores.clear();
@@ -12137,6 +12138,45 @@ fn graph_seed_score(result: &pb::SearchResultV004) -> f32 {
         .unwrap_or(0.5)
 }
 
+fn graph_seed_candidate_passes(
+    result: &pb::SearchResultV004,
+    query: &str,
+    query_technical_tokens: &[String],
+) -> bool {
+    if is_root_container_result(result)
+        || is_negative_mention_evidence(result)
+        || violates_query_exclusion_terms(result, query)
+    {
+        return false;
+    }
+    let matched_terms = matched_term_count(result, query);
+    if matched_terms == 0 {
+        return false;
+    }
+    let matched_discriminating_terms = matched_discriminating_term_count(result, query);
+    let leading_discriminating_match = leading_discriminating_query_term_matches(result, query);
+    let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
+    let exact_technical_match = complete_technical_match(query_technical_tokens, &matched_tokens);
+    let query_terms = query_term_count(query);
+    let strong_lexical_evidence = matched_terms >= 2
+        && matched_discriminating_terms >= 1
+        && matched_terms.saturating_mul(2) >= query_terms.max(1);
+    let document_relative_support = result.citation.as_ref().is_some_and(|citation| {
+        citation
+            .metadata
+            .get("document_relative_support")
+            .is_some_and(|value| value == "true")
+            || citation
+                .metadata
+                .get("ranking_protection")
+                .is_some_and(|value| value.contains("PRIMARY_DIRECT"))
+    });
+    leading_discriminating_match
+        || exact_technical_match
+        || strong_lexical_evidence
+        || document_relative_support
+}
+
 fn graph_seed_source_results_for_admitted_parents<'a>(
     direct_results: &'a [pb::SearchResultV004],
     pre_parent_dedup_results: &'a [pb::SearchResultV004],
@@ -17176,6 +17216,85 @@ mod v007_fix1_tests {
         assert!(selected_ids.contains(Uuid::from_u128(102).to_string().as_str()));
         assert!(selected_ids.contains(fallback_parent.as_str()));
         assert!(!selected_ids.contains(Uuid::from_u128(103).to_string().as_str()));
+    }
+
+    #[test]
+    fn weak_direct_candidate_can_seed_graph_without_being_final_direct_context() {
+        let query = "canonical reconciliation";
+        let result = pb::SearchResultV004 {
+            parent_text: "canonical state background".into(),
+            matched_text: "canonical state".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: 0.01,
+                sparse_score: 0.01,
+                fusion_score: 0.01,
+                final_score: 0.01,
+            }),
+            citation: Some(pb::SearchCitationV004 {
+                metadata: HashMap::from([("retrieval_source".into(), "VECTOR_DIRECT".into())]),
+            }),
+            ..Default::default()
+        };
+        let cfg = NoAnswerConfig::default();
+
+        assert!(graph_seed_candidate_passes(&result, query, &[]));
+        assert!(!no_answer_candidate_passes(
+            &result,
+            pb::SearchModeV005::Hybrid,
+            false,
+            0.01,
+            matched_term_count(&result, query),
+            matched_discriminating_term_count(&result, query),
+            leading_discriminating_query_term_matches(&result, query),
+            query_term_count(query),
+            false,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn negative_evidence_cannot_enter_graph_seed_lane() {
+        let result = pb::SearchResultV004 {
+            parent_text: "This section does not mention canonical reconciliation.".into(),
+            matched_text: "canonical reconciliation".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: 0.9,
+                sparse_score: 0.9,
+                fusion_score: 0.9,
+                final_score: 0.9,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!graph_seed_candidate_passes(
+            &result,
+            "canonical reconciliation",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn query_exclusion_candidate_cannot_enter_graph_seed_lane() {
+        let result = pb::SearchResultV004 {
+            parent_text: "canonical reconciliation rebuilds missing projection points".into(),
+            matched_text: "canonical reconciliation".into(),
+            matched_granularity: pb::ChunkGranularityV004::Sub180V004 as i32,
+            scores: Some(pb::SearchScoresV004 {
+                dense_score: 0.9,
+                sparse_score: 0.9,
+                fusion_score: 0.9,
+                final_score: 0.9,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!graph_seed_candidate_passes(
+            &result,
+            "canonical state without reconciliation",
+            &[]
+        ));
     }
 
     #[test]
