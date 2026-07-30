@@ -13682,6 +13682,31 @@ fn no_answer_document_key(result: &pb::SearchResultV004) -> String {
         .unwrap_or_else(|| result.document_id.clone())
 }
 
+fn no_answer_document_keys(result: &pb::SearchResultV004) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !result.document_id.trim().is_empty() {
+        keys.push(result.document_id.clone());
+    }
+    if let Some(citation) = result.citation.as_ref() {
+        for key in [
+            "fixture_document_id",
+            "original_document_id",
+            "external_document_id",
+        ] {
+            if let Some(value) = citation.metadata.get(key) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() && !keys.iter().any(|existing| existing == trimmed) {
+                    keys.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if keys.is_empty() {
+        keys.push(no_answer_document_key(result));
+    }
+    keys
+}
+
 fn aggregate_no_answer_group_passes(
     results: &[&pb::SearchResultV004],
     query: &str,
@@ -13931,7 +13956,7 @@ fn restore_graph_supported_direct_survivors(
     let mut support_documents = graph_results
         .iter()
         .filter(|result| graph_expanded_relation_evidence_passes(result))
-        .map(no_answer_document_key)
+        .flat_map(no_answer_document_keys)
         .collect::<HashSet<_>>();
     if support_documents.is_empty()
         && graph_survivor_fallback_intent(query, query_technical_tokens)
@@ -13942,7 +13967,7 @@ fn restore_graph_supported_direct_survivors(
             direct_results
                 .iter()
                 .filter(|result| !is_root_container_result(result))
-                .map(no_answer_document_key),
+                .flat_map(no_answer_document_keys),
         );
     }
     if support_documents.is_empty() {
@@ -13955,7 +13980,9 @@ fn restore_graph_supported_direct_survivors(
     let mut candidates = pre_mmr_before
         .iter()
         .filter(|result| {
-            support_documents.contains(&no_answer_document_key(result))
+            no_answer_document_keys(result)
+                .iter()
+                .any(|key| support_documents.contains(key))
                 && !is_graph_expanded_result(result)
                 && !is_root_container_result(result)
                 && !is_negative_mention_evidence(result)
@@ -14009,8 +14036,10 @@ fn graph_survivor_fallback_intent(query: &str, query_technical_tokens: &[String]
     if query_has_graph_recovery_intent(query, query_technical_tokens) {
         return true;
     }
+    let lowered = query.to_lowercase();
     let terms = ordered_positive_query_terms(query);
-    let has = |needle: &str| terms.iter().any(|term| term.contains(needle));
+    let has =
+        |needle: &str| lowered.contains(needle) || terms.iter().any(|term| term.contains(needle));
     let storage_anchor = has("qdrant")
         || has("postgresql")
         || has("canonical")
@@ -17368,6 +17397,71 @@ mod v007_fix1_tests {
                     "Find related evidence for Qdrant reconciliation.",
                     &cfg,
                 )));
+    }
+
+    #[test]
+    fn recovery_survivor_matching_uses_document_aliases() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut survivor = test_result(
+            "survivor-child",
+            "PostgreSQL canonical state is the independent survivor.",
+            0.03,
+        );
+        survivor.document_id = "runtime-doc-id".into();
+        survivor.parent_chunk_id = "survivor-parent".into();
+        survivor.matched_chunk_id = "survivor-child".into();
+        survivor.scores = Some(pb::SearchScoresV004 {
+            dense_score: cfg.min_dense_score * 0.80,
+            sparse_score: 0.12,
+            fusion_score: 0.03,
+            final_score: 0.03,
+        });
+        survivor
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("source_block_id".into(), "canonical-survivor".into()),
+            ]));
+        let mut visible_same_document = test_result(
+            "visible-child",
+            "Visible related direct evidence shares only the external document alias.",
+            0.04,
+        );
+        visible_same_document.document_id = "different-runtime-doc-id".into();
+        visible_same_document
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "VECTOR_DIRECT".into()),
+                ("external_document_id".into(), "runtime-doc-id".into()),
+                ("source_block_id".into(), "visible-related-parent".into()),
+            ]));
+        let mut direct = vec![visible_same_document];
+
+        assert_eq!(
+            restore_graph_supported_direct_survivors(
+                &mut direct,
+                &[survivor],
+                &[],
+                "Find related evidence for Qdrant reconciliation.",
+                &[],
+                true,
+                &cfg,
+                1,
+            ),
+            1
+        );
+        assert!(direct
+            .iter()
+            .any(|result| result_source_block_id(result) == Some("canonical-survivor")));
     }
 
     #[test]
