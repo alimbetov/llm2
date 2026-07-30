@@ -3731,6 +3731,7 @@ impl AstraVectorV004Control for AstraVectorV004ControlService {
             &graph_results,
             query,
             &query_technical_tokens,
+            !rejected_parent_keys.is_empty(),
             &self.cfg.search.no_answer,
             self.cfg.graph_rag.retrieval.min_direct_contexts,
         );
@@ -13920,6 +13921,7 @@ fn restore_graph_supported_direct_survivors(
     graph_results: &[pb::SearchResultV004],
     query: &str,
     query_technical_tokens: &[String],
+    has_rejected_graph_parent: bool,
     cfg: &NoAnswerConfig,
     max_survivors: usize,
 ) -> usize {
@@ -13932,7 +13934,8 @@ fn restore_graph_supported_direct_survivors(
         .map(no_answer_document_key)
         .collect::<HashSet<_>>();
     if support_documents.is_empty()
-        && query_has_graph_recovery_intent(query, query_technical_tokens)
+        && graph_survivor_fallback_intent(query, query_technical_tokens)
+        && (!graph_results.is_empty() || has_rejected_graph_parent)
         && !direct_results.is_empty()
     {
         support_documents.extend(
@@ -14000,6 +14003,37 @@ fn restore_graph_supported_direct_survivors(
         restored += 1;
     }
     restored
+}
+
+fn graph_survivor_fallback_intent(query: &str, query_technical_tokens: &[String]) -> bool {
+    if query_has_graph_recovery_intent(query, query_technical_tokens) {
+        return true;
+    }
+    let terms = ordered_positive_query_terms(query);
+    let has = |needle: &str| terms.iter().any(|term| term.contains(needle));
+    let storage_anchor = has("qdrant")
+        || has("postgresql")
+        || has("canonical")
+        || has("reconciliation")
+        || has("binding")
+        || has("projection")
+        || has("канони")
+        || has("рекон")
+        || has("проекц");
+    let graph_context_anchor = has("related")
+        || has("relation")
+        || has("linked")
+        || has("hop")
+        || has("связан")
+        || has("связ")
+        || has("переход")
+        || has("уров")
+        || has("актуаль")
+        || has("удал")
+        || has("видим")
+        || has("lifecycle")
+        || has("version");
+    storage_anchor && graph_context_anchor
 }
 
 fn graph_expanded_relation_evidence_passes(result: &pb::SearchResultV004) -> bool {
@@ -17192,6 +17226,7 @@ mod v007_fix1_tests {
                 &[graph],
                 query,
                 &[],
+                false,
                 &cfg,
                 2,
             ),
@@ -17254,6 +17289,7 @@ mod v007_fix1_tests {
                 &[graph],
                 "How do I reset a user password?",
                 &[],
+                false,
                 &cfg,
                 2,
             ),
@@ -17317,6 +17353,7 @@ mod v007_fix1_tests {
                 &[],
                 "Find related evidence for Qdrant reconciliation.",
                 &["qdrant".into(), "reconciliation".into()],
+                true,
                 &cfg,
                 2,
             ),
