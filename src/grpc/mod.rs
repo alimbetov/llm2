@@ -11132,6 +11132,19 @@ fn select_graph_append_with_group_mmr(
     let graph_budget = graph_context_append_limit.min(final_limit.saturating_sub(selected.len()));
     metrics::counter!("graph_mmr_group_graph_candidates_total")
         .increment(graph_filtered.len() as u64);
+    for graph in &mut graph_filtered {
+        if graph_expanded_relation_evidence_passes(graph) {
+            mark_ranking_protection(
+                graph,
+                RankingProtection {
+                    preserve_primary_direct: false,
+                    preserve_strong_lexical: false,
+                    preserve_unique_source_block: result_source_block_id(graph).is_some(),
+                    preserve_required_segment_coverage: false,
+                },
+            );
+        }
+    }
     let graph_mmr = apply_mmr_rerank(
         graph_filtered,
         graph_budget,
@@ -17762,6 +17775,96 @@ mod v007_fix1_tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"seed-parent"));
         assert!(ids.contains(&"related"));
+    }
+
+    #[test]
+    fn graph_append_preserves_verified_domain_relation_over_structural_noise() {
+        let direct = vec![test_result("seed-parent", "direct seed evidence", 0.4)];
+
+        let mut structural = test_result("structural-related", "structural sibling noise", 0.9);
+        structural.scores = Some(pb::SearchScoresV004 {
+            fusion_score: 0.9,
+            final_score: 0.9,
+            ..Default::default()
+        });
+        structural
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("source_block_id".into(), "structural-block".into()),
+                (
+                    "graph_relation_type".into(),
+                    "CHUNK_PREVIOUS_SIBLING".into(),
+                ),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "structural-related".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.9".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+
+        let mut domain = test_result(
+            "domain-related",
+            "ASTRA_RECONCILIATION_A3 one-hop domain relation evidence",
+            0.2,
+        );
+        domain.scores = Some(pb::SearchScoresV004 {
+            fusion_score: 0.2,
+            final_score: 0.2,
+            ..Default::default()
+        });
+        domain
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("source_block_id".into(), "domain-block".into()),
+                ("graph_relation_type".into(), "REPAIRED_BY".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "domain-related".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.2".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+        assert!(!graph_expanded_relation_evidence_passes(&structural));
+        assert!(graph_expanded_relation_evidence_passes(&domain));
+
+        let selected = select_graph_append_with_group_mmr(
+            direct,
+            vec![structural, domain],
+            2,
+            1,
+            1,
+            true,
+            0.75,
+            0.6,
+            30,
+            "TOKEN_JACCARD",
+            "TOKEN_JACCARD",
+            true,
+            true,
+            8,
+        );
+
+        let ids = selected
+            .results
+            .iter()
+            .map(|result| result.matched_chunk_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"seed-parent"));
+        assert!(ids.contains(&"domain-related"));
+        assert!(!ids.contains(&"structural-related"));
     }
 
     #[test]
