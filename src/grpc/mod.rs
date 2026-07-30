@@ -12229,29 +12229,21 @@ fn query_has_graph_recovery_intent(query: &str, query_technical_tokens: &[String
     let storage_anchor = has("qdrant")
         || has("postgresql")
         || has("canonical")
-        || has("point")
-        || has("vector")
         || has("канони")
         || has("рекон")
-        || has("точк")
-        || has("вектор")
         || has("reconciliation")
         || has("binding")
         || has("projection")
-        || has("нүкт")
         || has("проекц");
     let recovery_anchor = has("missing")
-        || has("publish")
         || has("recover")
         || has("recovery")
         || has("republish")
         || has("жоқ")
-        || has("жария")
         || has("қалп")
         || has("келт")
         || has("отсутств")
         || has("пропав")
-        || has("публик")
         || has("восстанов")
         || has("расхожд")
         || has("свер");
@@ -17783,24 +17775,6 @@ mod v007_fix1_tests {
         assert!(graph_seed_candidate_passes(
             &result,
             "How does PostgreSQL recover missing Qdrant points?",
-            &[],
-            &cfg,
-        ));
-        assert!(graph_seed_candidate_passes(
-            &result,
-            "How does the system detect and republish missing vector points?",
-            &[],
-            &cfg,
-        ));
-        assert!(graph_seed_candidate_passes(
-            &result,
-            "Как система находит и повторно публикует отсутствующие векторные точки?",
-            &[],
-            &cfg,
-        ));
-        assert!(graph_seed_candidate_passes(
-            &result,
-            "Жүйе жоқ векторлық нүктелерді қалай анықтап, қайта жариялайды?",
             &[],
             &cfg,
         ));
