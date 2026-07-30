@@ -13707,6 +13707,9 @@ fn final_no_answer_should_trigger(
         if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
+        if graph_expanded_relation_evidence_passes(result) {
+            return true;
+        }
         no_answer_candidate_passes(
             result,
             search_mode,
@@ -13728,6 +13731,54 @@ fn final_no_answer_should_trigger(
             search_mode,
             cfg,
         ))
+}
+
+fn graph_expanded_relation_evidence_passes(result: &pb::SearchResultV004) -> bool {
+    if !extraction_retrieval_sources(result)
+        .iter()
+        .any(|source| source == "GRAPH_EXPANDED")
+    {
+        return false;
+    }
+    let Some(citation) = result.citation.as_ref() else {
+        return false;
+    };
+    let metadata = &citation.metadata;
+    let relation_type = metadata
+        .get("graph_relation_type")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if relation_type.is_empty() || relation_type.starts_with("CHUNK_") {
+        return false;
+    }
+    let related_parent_matches = metadata
+        .get("graph_related_parent_chunk_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|related_parent| related_parent == result.parent_chunk_id.trim());
+    if !related_parent_matches {
+        return false;
+    }
+    let hop_distance = metadata
+        .get("graph_hop_distance")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+    if hop_distance > 1 {
+        return false;
+    }
+    let graph_score = metadata
+        .get("graph_score")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or_default();
+    let relation_score = metadata
+        .get("graph_relation_score")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or_default();
+    graph_score.is_finite()
+        && relation_score.is_finite()
+        && graph_score > 0.0
+        && relation_score > 0.0
 }
 
 fn apply_post_mmr_technical_no_answer_filter(
@@ -16512,6 +16563,98 @@ mod v007_fix1_tests {
             pb::SearchModeV005::Hybrid,
             &cfg,
         ));
+    }
+
+    #[test]
+    fn verified_graph_relation_evidence_satisfies_final_no_answer_gate() {
+        let cfg = NoAnswerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let query = "Почему при восстановлении пропавших векторов нельзя доверять только Qdrant?";
+
+        let mut graph = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished from canonical bindings.",
+            0.43,
+        );
+        graph.parent_chunk_id = "graph-parent".into();
+        graph.matched_chunk_id = "child-a3-180".into();
+        graph.parent_text = graph.matched_text.clone();
+        graph.scores = Some(pb::SearchScoresV004 {
+            dense_score: 0.0,
+            sparse_score: 0.0,
+            fusion_score: 0.51,
+            final_score: 0.43,
+        });
+        graph
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("graph_relation_type".into(), "REPAIRED_BY".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.51".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+
+        assert!(graph_expanded_relation_evidence_passes(&graph));
+        assert!(!should_clear_post_mmr_results(
+            &[graph],
+            None,
+            query,
+            &[],
+            pb::SearchModeV005::Hybrid,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn structural_or_mismatched_graph_relation_does_not_satisfy_final_no_answer_gate() {
+        let mut structural = test_result(
+            "child-a3-180",
+            "ASTRA_RECONCILIATION_A3. Missing Qdrant points are detected and republished.",
+            0.43,
+        );
+        structural.parent_chunk_id = "graph-parent".into();
+        structural
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .extend(HashMap::from([
+                ("retrieval_source".into(), "GRAPH_EXPANDED".into()),
+                ("retrieval_sources".into(), "[\"GRAPH_EXPANDED\"]".into()),
+                ("graph_relation_type".into(), "CHUNK_HAS_PARENT".into()),
+                (
+                    "graph_related_parent_chunk_id".into(),
+                    "graph-parent".into(),
+                ),
+                ("graph_hop_distance".into(), "1".into()),
+                ("graph_score".into(), "0.51".into()),
+                ("graph_relation_score".into(), "1.0".into()),
+            ]));
+        assert!(!graph_expanded_relation_evidence_passes(&structural));
+
+        let mut mismatched = structural.clone();
+        mismatched
+            .citation
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("graph_relation_type".into(), "REPAIRED_BY".into());
+        mismatched.citation.as_mut().unwrap().metadata.insert(
+            "graph_related_parent_chunk_id".into(),
+            "different-parent".into(),
+        );
+        assert!(!graph_expanded_relation_evidence_passes(&mismatched));
     }
 
     #[test]
