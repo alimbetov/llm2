@@ -13882,6 +13882,9 @@ fn apply_post_mmr_technical_no_answer_filter(
         if is_negative_mention_evidence(result) || violates_query_exclusion_terms(result, query) {
             return false;
         }
+        if graph_seed_survivor_evidence_passes(result, query, cfg) {
+            return true;
+        }
         let matched_tokens = matched_technical_tokens(result, query_technical_tokens);
         let exact_technical_match =
             complete_technical_match(query_technical_tokens, &matched_tokens);
@@ -16860,6 +16863,18 @@ mod v007_fix1_tests {
             ]));
 
         assert!(graph_seed_survivor_evidence_passes(&survivor, query, &cfg));
+        let mut post_mmr_results = vec![survivor.clone()];
+        assert_eq!(
+            apply_post_mmr_technical_no_answer_filter(
+                &mut post_mmr_results,
+                query,
+                &["postgresql".into()],
+                pb::SearchModeV005::Hybrid,
+                &cfg,
+            ),
+            0
+        );
+        assert_eq!(post_mmr_results.len(), 1);
         assert!(!should_clear_post_mmr_results(
             &[survivor],
             None,
