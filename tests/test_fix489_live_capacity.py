@@ -63,6 +63,7 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         profile = (ROOT / "config" / "application-fix489-capacity.yaml").read_text(encoding="utf-8")
         self.assertIn("FIX489_QUERY_DEADLINE_MS:-45000", profile)
         self.assertIn("FIX489_POSTGRES_STATEMENT_TIMEOUT_MS:-30000", profile)
+        self.assertIn("FIX489_SPARSE_REQUIRED:-false", profile)
         for script_name in ("fix487bc-capacity-campaign.sh", "fix487c-soak-60m.sh"):
             text = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
             self.assertIn('ASTRAVECTOR_PROFILE="fix489-capacity"', text)

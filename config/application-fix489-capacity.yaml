@@ -18,6 +18,9 @@ postgres:
 qdrant:
   timeout_ms: ${FIX489_QDRANT_TIMEOUT_MS:-15000}
 
+sparse:
+  required: ${FIX489_SPARSE_REQUIRED:-false}
+
 search:
   query_processing:
     long_query_deadline_ms: ${FIX489_LONG_QUERY_DEADLINE_MS:-45000}
