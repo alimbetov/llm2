@@ -100,6 +100,8 @@ def qdrant_collections_response_is_ready(value: Any) -> bool:
 
 
 def vector_sync_is_complete(sync: dict[str, Any]) -> bool:
+    if "readyToActivate" in sync:
+        return bool(sync.get("readyToActivate"))
     expected = int(sync.get("expectedBindings", 0) or 0)
     return (
         expected > 0
