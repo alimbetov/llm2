@@ -1,5 +1,9 @@
 # Local Development
 
+Canonical hands-on path is [local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md](local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md). It is the only local tutorial intended to be copy-paste executable end to end: infrastructure, model check, runtime, gRPC ingestion, vector sync, activation, semantic search, PostgreSQL audit and Qdrant audit.
+
+This page remains a lightweight development overview. Smoke-test isolated ports and FIX487 phase-owned ports are separate from the local-demo profile.
+
 ## Purpose
 
 Помочь разработчику собрать, проверить и запустить `AstraVector_v004` локально.
@@ -28,6 +32,8 @@ grpcurl --version
 ```
 
 ## Local Ports
+
+These ports are historical smoke/development references. The canonical local-demo profile uses PostgreSQL `127.0.0.1:55432`, Qdrant HTTP `127.0.0.1:6333`, Qdrant gRPC `127.0.0.1:6334`, AstraVector gRPC `127.0.0.1:50051`, metrics `127.0.0.1:9090`, and collection `astravector_local_demo`.
 
 | Component | Address |
 |---|---|

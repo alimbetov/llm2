@@ -15,7 +15,7 @@
 | Reader | Start here | Purpose |
 |---|---|---|
 | Analyst | `00-analyst-overview.md` | Понять назначение проекта, зрелость, риски и roadmap |
-| Developer | `03-local-development.md` | Собрать и запустить локально |
+| Developer | `local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md` | Поднять runtime, загрузить текст и выполнить реальный Search |
 | DevOps / Operator | `09-deployment.md` | Развернуть и сопровождать |
 | Support / Tester | `08-smoke-tests.md` | Запускать и интерпретировать smoke tests |
 | Architect | `01-architecture.md` | Понять design и data flow |
@@ -23,6 +23,7 @@
 ## Detailed Sections
 
 - `00-analyst-overview.md`: бизнес-технический обзор без необходимости знать Rust.
+- `local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md`: canonical local demo с PostgreSQL, Qdrant, ONNX, gRPC ingestion, activation и Search.
 - `01-architecture.md`: компоненты, PostgreSQL, Qdrant, outbox, access model.
 - `02-readiness-and-verdicts.md`: официальный статус и границы статуса.
 - `03-local-development.md`: инструменты, порты, workflow.

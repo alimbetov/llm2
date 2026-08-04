@@ -1,5 +1,7 @@
 # Build And Run
 
+For a complete local book that includes PostgreSQL, Qdrant, ONNX model checks, runtime startup, gRPC ingestion, activation and Search, use [local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md](local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md).
+
 ## Purpose
 
 Показать реальные команды сборки и реальные binary names.

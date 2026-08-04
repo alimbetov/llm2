@@ -1,0 +1,38 @@
+service:
+  environment: local-demo
+
+grpc:
+  host: 0.0.0.0
+  port: 50051
+
+metrics:
+  host: 0.0.0.0
+  port: 9090
+
+postgres:
+  url: ${ASTRAVECTOR_DB_URL:-postgres://astravector:astravector@127.0.0.1:55432/astravector}
+  auto_migrate: true
+  required_on_startup: true
+  required_for_readiness: true
+
+qdrant:
+  url: ${ASTRAVECTOR_QDRANT_URL:-http://127.0.0.1:6333}
+  collection: ${ASTRAVECTOR_QDRANT_COLLECTION:-astravector_local_demo}
+  auto_create_collection: true
+  validate_collection_schema: true
+  ensure_payload_indexes: true
+
+sparse:
+  required: false
+
+security:
+  enabled: false
+  protect_health: false
+  trust_forwarded_identity_headers: false
+
+access_zone_registry:
+  auto_create_on_ingestion: ${ASTRAVECTOR_ACCESS_ZONE_REGISTRY_AUTO_CREATE_ON_INGESTION:-true}
+  auto_create_on_search: false
+
+search:
+  default_mode: DENSE

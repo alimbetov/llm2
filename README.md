@@ -21,6 +21,16 @@
 
 ## Quick Start
 
+Canonical local end-to-end tutorial for a new developer:
+
+```bash
+cp .env.local-demo.example .env.local-demo
+# set ASTRAVECTOR_MODEL_PATH and ASTRAVECTOR_TOKENIZER_PATH
+make local-demo-e2e
+```
+
+See [docs/local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md](docs/local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md). This path uses PostgreSQL `127.0.0.1:55432`, Qdrant `127.0.0.1:6333`, AstraVector gRPC `127.0.0.1:50051`, and the `astravector_local_demo` collection.
+
 ```bash
 cd /Users/ruslanalimbetov/Documents/llm2/astravector
 cargo fmt --check
@@ -37,6 +47,7 @@ make quality-runtime-confidence-remote
 ## Основная документация
 
 - [Карта документации](docs/README.md)
+- [Local end-to-end book](docs/local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md)
 - [Analyst overview](docs/00-analyst-overview.md)
 - [Архитектура](docs/01-architecture.md)
 - [Readiness и verdicts](docs/02-readiness-and-verdicts.md)
