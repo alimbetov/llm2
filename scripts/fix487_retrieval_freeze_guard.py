@@ -23,9 +23,13 @@ REQUIRED_MANIFEST_FILES = (
 
 ALLOWED_PATH_PATTERNS = (
     "docs/fix487/**",
+    "docs/fix489/**",
     "scripts/fix487_*.py",
     "scripts/fix487-*.sh",
+    "scripts/fix489_*.py",
+    "scripts/astravector_live_client.py",
     "tests/test_fix487_*.py",
+    "tests/test_fix489_*.py",
     "config/application-fix487*.yaml",
     "docker-compose.fix487*.yml",
 )
@@ -88,8 +92,12 @@ MAKEFILE_ALLOWED_LINES = (
     "fix487bc-capacity-campaign.sh",
     "fix487c_soak.py",
     "fix487c-soak-60m.sh",
+    "fix489_live_capacity.py",
+    "astravector_live_client.py",
     "test_fix487bc_",
     "test_fix487c_",
+    "test_fix489_",
+    "verify-fix489-live-capacity-contracts",
     "ASTRAVECTOR_FIX487BC_EXECUTE_CAPACITY",
     "ASTRAVECTOR_FIX487C_EXECUTE_SOAK",
     "FIX487BC_BLOCKED=EXPLICIT_CAPACITY_OPT_IN_REQUIRED",

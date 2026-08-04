@@ -30,12 +30,14 @@ class Fix488LocalScriptsTests(unittest.TestCase):
             self.assertNotIn("password=", text.lower(), path)
 
     def test_postgres_audit_uses_current_chunk_schema(self):
-        helper = (ROOT / "scripts" / "local-demo" / "local_demo.py").read_text(encoding="utf-8")
+        helper = (ROOT / "scripts" / "astravector_live_client.py").read_text(encoding="utf-8")
+        demo = (ROOT / "scripts" / "local-demo" / "local_demo.py").read_text(encoding="utf-8")
+        self.assertIn("AstraVectorLiveClient", demo)
         self.assertIn("SELECT granularity AS chunk_granularity", helper)
         self.assertNotIn("SELECT chunk_granularity, count(*) FROM astravector.content_chunks_v004", helper)
 
     def test_postgres_audit_scopes_outbox_through_bindings(self):
-        helper = (ROOT / "scripts" / "local-demo" / "local_demo.py").read_text(encoding="utf-8")
+        helper = (ROOT / "scripts" / "astravector_live_client.py").read_text(encoding="utf-8")
         self.assertIn("JOIN astravector.vector_bindings_v004 b", helper)
         self.assertIn("b.id=o.binding_id", helper)
         self.assertIn("b.access_zone_id=o.binding_access_zone_id", helper)

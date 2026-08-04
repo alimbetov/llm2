@@ -18,6 +18,8 @@ trap finish EXIT INT TERM
 
 cd "$ROOT_DIR"
 mkdir -p "$EVIDENCE_DIR"
+# shellcheck disable=SC1091
+. scripts/local-demo/common.sh
 
 if [[ "${ASTRAVECTOR_FIX487BC_EXECUTE_CAPACITY:-false}" != "true" ]]; then
   STATUS="BLOCKED"
@@ -51,8 +53,18 @@ if [[ -z "${ASTRAVECTOR_TOKENIZER_PATH:-}" || ! -f "${ASTRAVECTOR_TOKENIZER_PATH
   exit 2
 fi
 
+docker compose up -d postgres qdrant
+scripts/local-demo/infra-wait.sh
+cargo sqlx migrate run
+cargo build --release --locked
+if ! grpcurl -plaintext 127.0.0.1:50051 list >/dev/null 2>&1; then
+  scripts/local-demo/run-runtime.sh
+fi
+grpcurl -plaintext 127.0.0.1:50051 list >"$EVIDENCE_DIR/grpc-services.txt"
+
 python3 scripts/fix487bc_capacity_campaign.py --output "$EVIDENCE_DIR"
-STATUS="BLOCKED"
-REASON="LIVE_CAPACITY_EXECUTION_NOT_IMPLEMENTED_IN_THIS_RUN"
-echo "FIX487BC_CAPACITY_CAMPAIGN_BLOCKED reason=${REASON}"
-exit 2
+python3 scripts/fix489_live_capacity.py --capacity-output "$EVIDENCE_DIR"
+python3 scripts/fix487bc_capacity_evidence.py --root "$EVIDENCE_DIR"
+STATUS="PASS"
+REASON="FIX489_CAPACITY_CAMPAIGN_PASS"
+echo "FIX489_CAPACITY_CAMPAIGN_PASS evidence=${EVIDENCE_DIR}"
