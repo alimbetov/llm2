@@ -297,8 +297,17 @@ async def execute_level(
 
 
 def grpc_status_from_error(error: str) -> str:
-    for status in ("RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED", "UNAVAILABLE", "INVALID_ARGUMENT", "FAILED_PRECONDITION", "INTERNAL", "UNKNOWN"):
-        if status in error:
+    normalized = error.replace("_", "").replace(" ", "").replace("-", "").upper()
+    for status in (
+        "RESOURCE_EXHAUSTED",
+        "DEADLINE_EXCEEDED",
+        "UNAVAILABLE",
+        "INVALID_ARGUMENT",
+        "FAILED_PRECONDITION",
+        "INTERNAL",
+        "UNKNOWN",
+    ):
+        if status.replace("_", "").upper() in normalized:
             return status
     return "UNKNOWN"
 

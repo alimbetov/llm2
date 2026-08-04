@@ -77,6 +77,20 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
     def test_official_capacity_levels_remain_default(self):
         self.assertEqual(fix489.capacity_levels(), (25, 50, 100, 200))
 
+    def test_grpcurl_camel_case_statuses_are_normalized(self):
+        self.assertEqual(
+            fix489.grpc_status_from_error("ERROR:\n  Code: DeadlineExceeded\n  Message: inference deadline"),
+            "DEADLINE_EXCEEDED",
+        )
+        self.assertEqual(
+            fix489.grpc_status_from_error("ERROR:\n  Code: ResourceExhausted\n  Message: admission queue full"),
+            "RESOURCE_EXHAUSTED",
+        )
+        self.assertEqual(
+            fix489.grpc_status_from_error("ERROR:\n  Code: FailedPrecondition\n  Message: document inactive"),
+            "FAILED_PRECONDITION",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
