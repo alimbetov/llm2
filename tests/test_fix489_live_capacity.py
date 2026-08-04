@@ -68,6 +68,13 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
             self.assertIn('ASTRAVECTOR_PROFILE="fix489-capacity"', text)
             self.assertIn('FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-45000}"', text)
 
+    def test_live_workload_uses_run_scoped_namespace(self):
+        workload_a = fix489.LiveWorkload(client=object(), output=pathlib.Path("/tmp/fix489/run-a"))
+        workload_b = fix489.LiveWorkload(client=object(), output=pathlib.Path("/tmp/fix489/run-b"))
+        self.assertEqual(workload_a.run_namespace, "fix489-run-a")
+        self.assertEqual(workload_b.run_namespace, "fix489-run-b")
+        self.assertNotEqual(workload_a.run_namespace, workload_b.run_namespace)
+
     def test_capacity_level_artifacts_cover_monitoring_and_audits(self):
         expected = {
             "operations.jsonl",

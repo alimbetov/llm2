@@ -67,6 +67,7 @@ class LiveWorkload:
     def __init__(self, client: AstraVectorLiveClient, output: Path, access_zone_codes: tuple[str, ...] = ("4871", "4872", "4873")):
         self.client = client
         self.output = output
+        self.run_namespace = f"fix489-{output.name}"
         self.access_zone_codes = access_zone_codes
         self.documents: list[dict[str, Any]] = []
         self.delete_counter = 0
@@ -80,7 +81,7 @@ class LiveWorkload:
             indexed = self.client.index_text(
                 text=text,
                 source_path=doc["source_uri"],
-                namespace="fix489",
+                namespace=self.run_namespace,
                 access_zone_code=doc["access_zone"],
                 caller_service="fix489-live-capacity",
                 title=doc["title"],
@@ -104,6 +105,7 @@ class LiveWorkload:
             prepared.append(
                 {
                     "logical_identity": doc["external_document_id"],
+                    "run_namespace": self.run_namespace,
                     "access_zone_code": doc["access_zone"],
                     "access_zone_id": access_zone_id,
                     "document_id": document_id,
@@ -152,7 +154,7 @@ class LiveWorkload:
             indexed = self.client.index_text(
                 text=text,
                 source_path=f"synthetic://fix489/{op.operation_id}",
-                namespace=f"fix489-{op.operation_id}",
+                namespace=f"{self.run_namespace}-{op.operation_id}",
                 access_zone_code=doc["access_zone_code"],
                 caller_service="fix489-live-capacity",
                 title=f"FIX489 live ingest {op.operation_id}",
@@ -180,7 +182,7 @@ class LiveWorkload:
             indexed = self.client.index_text(
                 text=text,
                 source_path=f"synthetic://fix489/delete/{op.operation_id}",
-                namespace=f"fix489-delete-{op.operation_id}-{self.delete_counter}",
+                namespace=f"{self.run_namespace}-delete-{op.operation_id}-{self.delete_counter}",
                 access_zone_code=doc["access_zone_code"],
                 caller_service="fix489-live-capacity",
                 title=f"FIX489 delete {op.operation_id}",

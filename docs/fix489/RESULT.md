@@ -70,3 +70,12 @@ observed cause: grpcurl returned camel-case Code: DeadlineExceeded, but the harn
 repair: normalize grpcurl status spellings to canonical gRPC status codes and run FIX489 capacity/soak with the bounded fix489-capacity operational deadline profile.
 production retrieval semantics changed: no
 ```
+
+Second blocked attempt:
+
+```text
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489/operation-smoke-20260804T171252Z
+observed cause: repeated runs reused static deterministic namespace fix489, so a stale REGISTERED document version with zero chunks could be selected again by the harness.
+repair: make FIX489 live workload document namespaces run-scoped from the evidence directory name.
+production retrieval semantics changed: no
+```
