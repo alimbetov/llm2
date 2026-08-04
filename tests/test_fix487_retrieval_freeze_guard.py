@@ -16,6 +16,7 @@ class RetrievalFreezeGuardTests(unittest.TestCase):
             "scripts/fix487_retrieval_freeze_guard.py",
             "tests/test_fix487_retrieval_freeze_guard.py",
             "config/application-fix487b.yaml",
+            "config/application-fix489-capacity.yaml",
             "docker-compose.fix487b.yml",
         ):
             self.assertTrue(guard.matches_any(path, guard.ALLOWED_PATH_PATTERNS))

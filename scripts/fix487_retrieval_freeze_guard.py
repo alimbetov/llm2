@@ -31,6 +31,7 @@ ALLOWED_PATH_PATTERNS = (
     "tests/test_fix487_*.py",
     "tests/test_fix489_*.py",
     "config/application-fix487*.yaml",
+    "config/application-fix489*.yaml",
     "docker-compose.fix487*.yml",
 )
 

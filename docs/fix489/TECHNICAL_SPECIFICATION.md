@@ -54,3 +54,10 @@ FIX489_CAPACITY_LEVELS
 ```
 
 The official defaults remain the FIX487 capacity/soak contract.
+
+The official live capacity and soak entrypoints use the `fix489-capacity`
+profile by default when no explicit `ASTRAVECTOR_PROFILE` is supplied. This
+profile changes only bounded operational budgets for CPU model-backed local
+execution: request deadlines, PostgreSQL/Qdrant timeouts and query queue
+budgets. It must not change retrieval ranking, Graph, RRF, MMR, frozen queries,
+qrels or fixtures.

@@ -59,6 +59,15 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
             self.assertNotIn("LIVE_SOAK_EXECUTION_NOT_IMPLEMENTED_IN_THIS_RUN", text)
             self.assertIn("scripts/fix489_live_capacity.py", text)
 
+    def test_capacity_and_soak_use_fix489_operational_profile_by_default(self):
+        profile = (ROOT / "config" / "application-fix489-capacity.yaml").read_text(encoding="utf-8")
+        self.assertIn("FIX489_QUERY_DEADLINE_MS:-45000", profile)
+        self.assertIn("FIX489_POSTGRES_STATEMENT_TIMEOUT_MS:-30000", profile)
+        for script_name in ("fix487bc-capacity-campaign.sh", "fix487c-soak-60m.sh"):
+            text = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+            self.assertIn('ASTRAVECTOR_PROFILE="fix489-capacity"', text)
+            self.assertIn('FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-45000}"', text)
+
     def test_capacity_level_artifacts_cover_monitoring_and_audits(self):
         expected = {
             "operations.jsonl",

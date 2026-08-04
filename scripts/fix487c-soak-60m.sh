@@ -21,6 +21,11 @@ mkdir -p "$EVIDENCE_DIR"
 # shellcheck disable=SC1091
 . scripts/local-demo/common.sh
 
+if [[ "${ASTRAVECTOR_PROFILE}" == "local-demo" ]]; then
+  export ASTRAVECTOR_PROFILE="fix489-capacity"
+fi
+export FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-45000}"
+
 if [[ "${ASTRAVECTOR_FIX487C_EXECUTE_SOAK:-false}" != "true" ]]; then
   STATUS="BLOCKED"
   REASON="EXPLICIT_SOAK_OPT_IN_REQUIRED"

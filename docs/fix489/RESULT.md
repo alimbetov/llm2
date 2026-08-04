@@ -59,3 +59,14 @@ Required final verdicts remain pending until the official 25/50/100/200 capacity
 FIX489_CAPACITY_CAMPAIGN_PASS
 FIX489_SOAK_60M_PASS
 ```
+
+Interrupted official capacity attempt:
+
+```text
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix487bc/fix487bc-20260804T153216Z
+concurrency-25: FAILED before repair
+concurrency-50: FAILED before repair
+observed cause: grpcurl returned camel-case Code: DeadlineExceeded, but the harness classified only DEADLINE_EXCEEDED and therefore counted controlled CPU saturation as UNKNOWN hard failure.
+repair: normalize grpcurl status spellings to canonical gRPC status codes and run FIX489 capacity/soak with the bounded fix489-capacity operational deadline profile.
+production retrieval semantics changed: no
+```
