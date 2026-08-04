@@ -1,4 +1,4 @@
-.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 verify-fix486b-runtime-baseline verify-fix486c-frozen-bank verify-fix486d-child-parent-runtime verify-fix486d-child-parent-runtime-proof verify-fix486f-stale-orphan-hydration-runtime verify-fix486f-stale-orphan-hydration-runtime-proof verify-fix486g-graph-parent-runtime verify-fix486g-graph-parent-runtime-proof verify-fix487a-retrieval-freeze verify-fix487b-contracts verify-fix487b-mixed-load-pilot verify-fix487b-existing-evidence verify-fix487bc-capacity-contracts verify-fix487bc-capacity-campaign verify-fix487bc-existing-capacity-evidence verify-fix487c-soak-contracts verify-fix487c-soak-60m verify-fix487c-existing-soak-evidence fix487b-cleanup fix487bc-cleanup fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
+.PHONY: fmt check test test-e2e e2e-network sqlx-prepare smoke-load smoke-load-blocking quality-fixtures quality-quick quality-quick-remote quality-runtime-quick quality-runtime-quick-remote quality-runtime-dense-quick quality-runtime-dense-quick-remote quality-runtime-sparse-quick-remote quality-runtime-hybrid-quick-remote quality-runtime-graph-quick-remote quality-runtime-rag-analysis-bank-remote quality-runtime-mmr-quick-remote quality-runtime-hard-negative-quick-remote quality-runtime-full-capability-quick-remote quality-runtime-tuning-remote quality-runtime-validation-remote quality-runtime-holdout-remote quality-runtime-confidence quality-runtime-confidence-remote quality-runtime-confidence-report quality-runtime-full quality-production-candidate quality-system-smoke-remote production-recovery-gate-m2 production-recovery-gate-m2-repeatability production-search-gate-m2 production-search-gate-m2-repeatability verify-fix463 verify-fix465 verify-fix467 verify-fix468 verify-fix480 verify-fix481 verify-fix482 verify-fix486b-runtime-baseline verify-fix486c-frozen-bank verify-fix486d-child-parent-runtime verify-fix486d-child-parent-runtime-proof verify-fix486f-stale-orphan-hydration-runtime verify-fix486f-stale-orphan-hydration-runtime-proof verify-fix486g-graph-parent-runtime verify-fix486g-graph-parent-runtime-proof verify-fix487a-retrieval-freeze verify-fix487b-contracts verify-fix487b-mixed-load-pilot verify-fix487b-existing-evidence verify-fix487bc-capacity-contracts verify-fix487bc-capacity-campaign verify-fix487bc-existing-capacity-evidence verify-fix487c-soak-contracts verify-fix487c-soak-60m verify-fix487c-existing-soak-evidence local-demo-check local-demo-infra-up local-demo-infra-wait local-demo-build local-demo-runtime-start local-demo-runtime-stop local-demo-load local-demo-search local-demo-inspect local-demo-e2e local-demo-down local-demo-reset verify-fix488-local-demo fix487b-cleanup fix487bc-cleanup fix481-prepare-judgments fix481-finalize-judgments fix482-structural-validator fix482-contract-tests fix482-prepare-judgments fix483-contracts fix483-long-query-quality fix483-short-regression fix483-integration fix483-load-smoke verify-fix483-production verify-rag-core smoke-rag-long-query smoke-rag-hybrid smoke-rag-failures smoke-rag-mixed-load verify-rag-production-candidate quality-fixtures-enriched clippy release migrate run run-runtime-local db-up db-down
 fmt:
 	cargo fmt --check
 check:
@@ -31,6 +31,50 @@ db-up:
 	docker compose up -d postgres
 db-down:
 	docker compose down
+
+local-demo-check:
+	./scripts/local-demo/check-prerequisites.sh
+	./scripts/local-demo/check-model.sh
+
+local-demo-infra-up:
+	./scripts/local-demo/infra-up.sh
+
+local-demo-infra-wait:
+	./scripts/local-demo/infra-wait.sh
+
+local-demo-build:
+	./scripts/local-demo/build-runtime.sh
+
+local-demo-runtime-start:
+	./scripts/local-demo/run-runtime.sh
+
+local-demo-runtime-stop:
+	./scripts/local-demo/stop-runtime.sh
+
+local-demo-load:
+	./scripts/local-demo/load-text.sh examples/local-demo/sample-ru.txt
+
+local-demo-search:
+	./scripts/local-demo/search.sh 'Где AstraVector хранит каноническое состояние?'
+	./scripts/local-demo/search.sh 'ASTRAVECTOR_LOCAL_DEMO_2026'
+
+local-demo-inspect:
+	./scripts/local-demo/inspect-postgres.sh
+	./scripts/local-demo/inspect-qdrant.sh
+
+local-demo-e2e:
+	./scripts/local-demo/e2e.sh
+
+local-demo-down:
+	./scripts/local-demo/down.sh
+
+local-demo-reset:
+	./scripts/local-demo/reset.sh --yes
+
+verify-fix488-local-demo:
+	$(MAKE) verify-fix487a-retrieval-freeze
+	bash -n scripts/local-demo/*.sh
+	python3 -m unittest -v tests/test_fix488_local_request_builders.py tests/test_fix488_local_evidence.py tests/test_fix488_local_scripts.py
 
 verify-fix486b-runtime-baseline:
 	./scripts/fix486b-runtime-baseline.sh

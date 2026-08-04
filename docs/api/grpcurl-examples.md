@@ -10,13 +10,15 @@
 
 ## Short Summary
 
-Если reflection включен, можно использовать `grpcurl -plaintext 127.0.0.1:55051 list`. Если нет, используйте `-import-path proto -proto astravector_embedding.proto`.
+Canonical local-demo endpoint is `127.0.0.1:50051`; older smoke profiles can use isolated ports such as `55051`. For the full local text ingestion and Search walkthrough, see [../local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md](../local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md).
+
+Если reflection включен, можно использовать `grpcurl -plaintext 127.0.0.1:50051 list`. Если нет, используйте `-import-path proto -proto astravector_embedding.proto`.
 
 ## Reflection
 
 ```bash
-grpcurl -plaintext 127.0.0.1:55051 list
-grpcurl -plaintext 127.0.0.1:55051 describe astravector.embedding.v1.AstraVectorV004Control
+grpcurl -plaintext 127.0.0.1:50051 list
+grpcurl -plaintext 127.0.0.1:50051 describe astravector.embedding.v1.AstraVectorV004Control
 ```
 
 ## Without Reflection
@@ -25,7 +27,7 @@ grpcurl -plaintext 127.0.0.1:55051 describe astravector.embedding.v1.AstraVector
 grpcurl -plaintext \
   -import-path proto \
   -proto astravector_embedding.proto \
-  127.0.0.1:55051 list
+  127.0.0.1:50051 list
 ```
 
 ## Search
@@ -42,7 +44,7 @@ grpcurl -plaintext \
     "parentLimit": 3,
     "timeoutMs": 15000
   }' \
-  127.0.0.1:55051 \
+  127.0.0.1:50051 \
   astravector.embedding.v1.AstraVectorV004Control/Search
 ```
 
@@ -58,7 +60,7 @@ grpcurl -plaintext \
     "activationPolicy": "ACTIVE_LATEST_ONLY",
     "idempotencyKey": "docs-register-example"
   }' \
-  127.0.0.1:55051 \
+  127.0.0.1:50051 \
   astravector.embedding.v1.AstraVectorV004Control/RegisterDocumentVersion
 ```
 
@@ -83,7 +85,7 @@ grpcurl -plaintext \
     "idempotencyKey": "docs-chunk-example",
     "correlationId": "docs"
   }' \
-  127.0.0.1:55051 \
+  127.0.0.1:50051 \
   astravector.embedding.v1.AstraVectorV004Control/CreateMultiGranularityChunks
 ```
 
@@ -96,7 +98,7 @@ grpcurl -plaintext \
     "documentId": "11111111-2222-4333-8444-555555555555",
     "documentVersion": 1
   }' \
-  127.0.0.1:55051 \
+  127.0.0.1:50051 \
   astravector.embedding.v1.AstraVectorV004Control/ActivateDocumentVersion
 ```
 
@@ -110,7 +112,7 @@ grpcurl -plaintext \
     "maxContextTokens": 1200,
     "callerAccessLevel": "PUBLIC"
   }' \
-  127.0.0.1:55051 \
+  127.0.0.1:50051 \
   astravector.embedding.v1.AstraVectorV004Control/ResolveParentContext
 ```
 

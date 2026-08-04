@@ -1,5 +1,9 @@
 # Qdrant
 
+For the canonical local end-to-end profile, use [local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md](local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md). It uses Qdrant HTTP `http://127.0.0.1:6333`, Qdrant gRPC `127.0.0.1:6334`, and collection `astravector_local_demo`.
+
+The older examples below can refer to smoke-test isolated ports and collections.
+
 ## Purpose
 
 Показать, как проверять Qdrant projection и payload.

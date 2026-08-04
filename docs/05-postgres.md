@@ -1,5 +1,13 @@
 # PostgreSQL
 
+For the canonical local end-to-end profile, use [local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md](local/ASTRAVECTOR_LOCAL_END_TO_END_BOOK.md). It uses:
+
+```text
+postgres://astravector:astravector@127.0.0.1:55432/astravector
+```
+
+The older examples below can refer to smoke-test databases.
+
 ## Purpose
 
 Показать, как подключаться к PostgreSQL smoke DB и проверять canonical state.

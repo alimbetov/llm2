@@ -1,0 +1,12 @@
+ASTRAVECTOR_LOCAL_DEMO_2026
+
+AstraVector хранит каноническое состояние документов в PostgreSQL. В PostgreSQL находятся версии документов, исходные chunks, bindings, lifecycle status и transactional outbox. Это источник истины, который можно проверять обычными SQL-запросами.
+
+Qdrant используется как заменяемая векторная проекция для семантического поиска. В Qdrant публикуются searchable points с payload, который связывает vector point с access zone, document version, chunk identity и lifecycle metadata.
+
+Transactional outbox обеспечивает доставку векторных изменений из PostgreSQL в Qdrant. Если Qdrant временно недоступен, AstraVector не должен объявлять binding синхронизированным до фактической публикации point.
+
+Если коллекция Qdrant потеряна, проекцию можно восстановить из канонического состояния PostgreSQL. Поэтому локальная демонстрация всегда проверяет обе стороны: canonical rows в PostgreSQL и projected points в Qdrant.
+
+Этот текст специально содержит уникальный маркер ASTRAVECTOR_LOCAL_DEMO_2026, чтобы exact-anchor search можно было отличить от случайного совпадения.
+
