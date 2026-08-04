@@ -112,6 +112,13 @@ def vector_sync_is_complete(sync: dict[str, Any]) -> bool:
     )
 
 
+def document_vector_status_ready(response: dict[str, Any]) -> bool:
+    status = response.get("status") or {}
+    if "readyToActivate" in status:
+        return bool(status.get("readyToActivate"))
+    return vector_sync_is_complete(status.get("sync") or {})
+
+
 def deterministic_document_id(namespace: str, path: str | Path, content_hash: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{namespace}:{Path(path)}:{content_hash}"))
 
@@ -346,10 +353,11 @@ class AstraVectorLiveClient:
                 document_version=document_version,
                 include_qdrant=True,
             )
-            sync = ((last.get("status") or {}).get("sync") or {})
+            status = last.get("status") or {}
+            sync = status.get("sync") or {}
             if int(sync.get("outboxFailed", 0) or 0) > 0:
                 raise RuntimeError("OUTBOX_FAILED")
-            if vector_sync_is_complete(sync):
+            if document_vector_status_ready(last):
                 return last
             time.sleep(1)
         raise RuntimeError("OUTBOX_NOT_COMPLETED")

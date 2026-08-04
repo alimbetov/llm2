@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astravector_live_client import (  # noqa: E402
     AstraVectorLiveClient,
+    document_vector_status_ready,
     make_logical_blocks,
     qdrant_collections_response_is_ready,
     sha256_text,
@@ -416,7 +417,7 @@ def wait_vector_sync(args=None):
         }, ensure_ascii=False))
         if int(sync.get("outboxFailed", 0)) > 0:
             raise SystemExit("FIX488_LOCAL_END_TO_END_FAIL reason=OUTBOX_FAILED")
-        if vector_sync_is_complete(sync):
+        if document_vector_status_ready(last):
             write_json(LOCAL / "vector-status.json", last)
             print("Vector publication: PASS")
             return last

@@ -98,6 +98,24 @@ class Fix488LocalRequestBuilderTests(unittest.TestCase):
         )
         self.assertTrue(local_demo.vector_sync_is_complete({"readyToActivate": True}))
 
+    def test_document_vector_status_ready_uses_facade_ready_to_activate(self):
+        self.assertFalse(
+            local_demo.document_vector_status_ready(
+                {
+                    "status": {
+                        "readyToActivate": False,
+                        "sync": {
+                            "expectedBindings": 6,
+                            "syncedBindings": 6,
+                            "outboxCompleted": 6,
+                            "qdrantPointsFound": 6,
+                        },
+                    }
+                }
+            )
+        )
+        self.assertTrue(local_demo.document_vector_status_ready({"status": {"readyToActivate": True}}))
+
 
 if __name__ == "__main__":
     unittest.main()
