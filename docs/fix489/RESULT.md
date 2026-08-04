@@ -42,6 +42,32 @@ p95_ms: 1508.0
 p99_ms: 1508.0
 ```
 
+Latest post-repair live mixed-load client smoke:
+
+```text
+verdict: FIX489_LIVE_MIXED_LOAD_CLIENT_PASS
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489/operation-smoke-20260804T172206Z
+completed_operations: 7
+grpc_statuses.OK: 7
+success_rate: 1.0
+operation_types_observed:
+- SEARCH
+- RETRIEVE_CONTEXT
+- GRAPH_RETRIEVE_CONTEXT
+- INGEST_VERSION
+- DELETE_OR_EXPIRE
+- SYNC_STATUS
+- LIFECYCLE_STATUS
+UNKNOWN: 0
+unexpected_INTERNAL: 0
+orphan_binding_count: 0
+orphan_outbox_count: 0
+failed_outbox: 0
+p50_ms: 292.0
+p95_ms: 1528.0
+p99_ms: 1528.0
+```
+
 Short developer capacity slice:
 
 ```text
