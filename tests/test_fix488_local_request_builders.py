@@ -103,6 +103,7 @@ class Fix488LocalRequestBuilderTests(unittest.TestCase):
             local_demo.document_vector_status_ready(
                 {
                     "status": {
+                        "state": "OPERATION_STATE_SYNCING",
                         "readyToActivate": False,
                         "sync": {
                             "expectedBindings": 6,
@@ -113,6 +114,24 @@ class Fix488LocalRequestBuilderTests(unittest.TestCase):
                     }
                 }
             )
+        )
+        self.assertFalse(
+            local_demo.document_vector_status_ready(
+                {
+                    "status": {
+                        "state": "OPERATION_STATE_SYNCING",
+                        "sync": {
+                            "expectedBindings": 6,
+                            "syncedBindings": 6,
+                            "outboxCompleted": 6,
+                            "qdrantPointsFound": 6,
+                        },
+                    }
+                }
+            )
+        )
+        self.assertTrue(
+            local_demo.document_vector_status_ready({"status": {"state": "OPERATION_STATE_READY_TO_ACTIVATE"}})
         )
         self.assertTrue(local_demo.document_vector_status_ready({"status": {"readyToActivate": True}}))
 

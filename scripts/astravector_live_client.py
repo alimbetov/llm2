@@ -114,8 +114,13 @@ def vector_sync_is_complete(sync: dict[str, Any]) -> bool:
 
 def document_vector_status_ready(response: dict[str, Any]) -> bool:
     status = response.get("status") or {}
-    if "readyToActivate" in status:
-        return bool(status.get("readyToActivate"))
+    state = str(status.get("state") or "")
+    if state:
+        return state == "OPERATION_STATE_READY_TO_ACTIVATE" or bool(
+            status.get("readyToActivate") or status.get("searchable")
+        )
+    if "readyToActivate" in status or "searchable" in status:
+        return bool(status.get("readyToActivate") or status.get("searchable"))
     return vector_sync_is_complete(status.get("sync") or {})
 
 
