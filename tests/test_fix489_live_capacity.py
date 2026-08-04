@@ -76,6 +76,58 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertEqual(workload_b.run_namespace, "fix489-run-b")
         self.assertNotEqual(workload_a.run_namespace, workload_b.run_namespace)
 
+    def test_delete_or_expire_uses_prepared_pool_not_measured_ingest(self):
+        class FakeClient:
+            def __init__(self):
+                self.index_calls = 0
+                self.deleted: list[tuple[str, str, int]] = []
+
+            def index_text(self, **kwargs):
+                self.index_calls += 1
+                document_id = f"doc-{self.index_calls}"
+                return {
+                    "document_id": document_id,
+                    "response": {
+                        "document": {
+                            "accessZoneId": f"zone-{self.index_calls}",
+                            "documentId": document_id,
+                            "documentVersion": 1,
+                        }
+                    },
+                }
+
+            def wait_vector_sync(self, **kwargs):
+                return {"status": {"state": "OPERATION_STATE_READY_TO_ACTIVATE"}}
+
+            def activate_document(self, **kwargs):
+                return {"activated": True}
+
+            def delete_document_vectors(self, *, access_zone_id, document_id, document_version, reason):
+                self.deleted.append((access_zone_id, document_id, document_version))
+                return {"operation": {"state": "OPERATION_STATE_ACCEPTED"}, "reason": reason}
+
+        client = FakeClient()
+        workload = fix489.LiveWorkload(client=client, output=pathlib.Path("/tmp/fix489/delete-pool-contract"))
+        workload.prepare_documents(count=1)
+        workload.prepare_delete_documents(count=2)
+        calls_after_setup = client.index_calls
+
+        op = fix489.ScheduledOperation(
+            operation_id="fix487b-op-001-delete_or_expire",
+            cycle_index=1,
+            operation_type="DELETE_OR_EXPIRE",
+            access_zone="4871",
+            access_level="PUBLIC",
+            logical_identity="fix487b-doc-001",
+            scheduled_at=1,
+        )
+        status, _response, classification = workload.execute_sync(op)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(classification, "DELETE_SCHEDULED")
+        self.assertEqual(client.index_calls, calls_after_setup)
+        self.assertEqual(len(client.deleted), 1)
+
     def test_capacity_level_artifacts_cover_monitoring_and_audits(self):
         expected = {
             "operations.jsonl",

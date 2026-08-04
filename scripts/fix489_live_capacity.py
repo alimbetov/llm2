@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -70,7 +71,9 @@ class LiveWorkload:
         self.run_namespace = f"fix489-{output.name}"
         self.access_zone_codes = access_zone_codes
         self.documents: list[dict[str, Any]] = []
+        self.delete_documents: list[dict[str, Any]] = []
         self.delete_counter = 0
+        self.delete_lock = threading.Lock()
 
     def prepare_documents(self, count: int = 9) -> list[dict[str, Any]]:
         if self.documents:
@@ -119,6 +122,62 @@ class LiveWorkload:
         write_json(self.output / "source-identity.json", {"prepared_documents": prepared})
         write_json(self.output / "dataset-manifest.json", build_manifest(build_documents(count=count)))
         return prepared
+
+    def prepare_delete_documents(self, count: int | None = None) -> list[dict[str, Any]]:
+        if self.delete_documents:
+            return self.delete_documents
+        base_docs = self.prepare_documents()
+        pool_size = count if count is not None else env_int("FIX489_DELETE_POOL_SIZE", 60)
+        prepared: list[dict[str, Any]] = []
+        for index in range(pool_size):
+            base = base_docs[index % len(base_docs)]
+            text = f"FIX489 delete control document {index}. Prepared outside measured delete latency."
+            namespace = f"{self.run_namespace}-delete-pool-{index:04d}"
+            indexed = self.client.index_text(
+                text=text,
+                source_path=f"synthetic://fix489/delete-pool/{index:04d}",
+                namespace=namespace,
+                access_zone_code=base["access_zone_code"],
+                caller_service="fix489-live-capacity",
+                title=f"FIX489 delete pool {index:04d}",
+                metadata={"fix489_delete_control": "true", "fix489_delete_pool_index": str(index)},
+            )
+            runtime_doc = indexed["response"].get("document") or {}
+            access_zone_id = runtime_doc.get("accessZoneId", base["access_zone_id"])
+            document_id = runtime_doc.get("documentId", indexed["document_id"])
+            document_version = int(runtime_doc.get("documentVersion", 1))
+            status = self.client.wait_vector_sync(
+                access_zone_id=access_zone_id,
+                document_id=document_id,
+                document_version=document_version,
+                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+            )
+            activation = self.client.activate_document(
+                access_zone_id=access_zone_id,
+                document_id=document_id,
+                document_version=document_version,
+            )
+            prepared.append(
+                {
+                    "pool_index": index,
+                    "access_zone_code": base["access_zone_code"],
+                    "access_zone_id": access_zone_id,
+                    "document_id": document_id,
+                    "document_version": document_version,
+                    "status": status,
+                    "activation": activation,
+                }
+            )
+        self.delete_documents = prepared
+        write_json(self.output / "delete-source-identity.json", {"prepared_delete_documents": prepared})
+        return prepared
+
+    def pick_delete_document(self) -> dict[str, Any]:
+        docs = self.prepare_delete_documents()
+        with self.delete_lock:
+            index = self.delete_counter
+            self.delete_counter += 1
+        return docs[index % len(docs)]
 
     def pick_document(self, op: ScheduledOperation) -> dict[str, Any]:
         docs = self.prepare_documents()
@@ -177,27 +236,11 @@ class LiveWorkload:
             )
             return "OK", response, "INGESTED_ACTIVE"
         if op.operation_type == "DELETE_OR_EXPIRE":
-            self.delete_counter += 1
-            text = f"FIX489 delete control document {op.operation_id} {self.delete_counter}."
-            indexed = self.client.index_text(
-                text=text,
-                source_path=f"synthetic://fix489/delete/{op.operation_id}",
-                namespace=f"{self.run_namespace}-delete-{op.operation_id}-{self.delete_counter}",
-                access_zone_code=doc["access_zone_code"],
-                caller_service="fix489-live-capacity",
-                title=f"FIX489 delete {op.operation_id}",
-                metadata={"fix489_delete_control": "true"},
-            )
-            runtime_doc = indexed["response"].get("document") or {}
-            access_zone_id = runtime_doc.get("accessZoneId", doc["access_zone_id"])
-            document_id = runtime_doc.get("documentId", indexed["document_id"])
-            document_version = int(runtime_doc.get("documentVersion", 1))
-            self.client.wait_vector_sync(access_zone_id=access_zone_id, document_id=document_id, document_version=document_version)
-            self.client.activate_document(access_zone_id=access_zone_id, document_id=document_id, document_version=document_version)
+            delete_doc = self.pick_delete_document()
             response = self.client.delete_document_vectors(
-                access_zone_id=access_zone_id,
-                document_id=document_id,
-                document_version=document_version,
+                access_zone_id=delete_doc["access_zone_id"],
+                document_id=delete_doc["document_id"],
+                document_version=delete_doc["document_version"],
                 reason="fix489 mixed-load delete control",
             )
             return "OK", response, "DELETE_SCHEDULED"
@@ -407,6 +450,7 @@ async def run_capacity(root: Path) -> dict[str, Any]:
     write_json(root / "campaign-manifest.json", {"schema_version": 1, "campaign": "fix489-live-capacity", "levels": campaign_plan()})
     write_json(root / "workload-manifest.json", workload_manifest(489, env_int("FIX489_WORKERS", 5), env_int("FIX489_CLIENT_DEADLINE_MS", 30000)))
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 9))
+    workload.prepare_delete_documents(count=env_int("FIX489_DELETE_POOL_SIZE", 60))
     level_results: list[dict[str, Any]] = []
     for level in capacity_levels():
         samples: list[dict[str, Any]] = []
@@ -455,6 +499,7 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
         return {"status": "BLOCKED", "reason": plan["reason"]}
     workload = LiveWorkload(client, root)
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 9))
+    workload.prepare_delete_documents(count=env_int("FIX489_DELETE_POOL_SIZE", 60))
     write_json(root / "workload-manifest.json", workload_manifest(48960, int(plan["soak_concurrency"]), env_int("FIX489_CLIENT_DEADLINE_MS", 30000)))
     samples: list[dict[str, Any]] = []
     rows = await execute_level(
@@ -506,6 +551,7 @@ def run_operation_smoke(root: Path) -> dict[str, Any]:
     write_json(root / "bootstrap.json", {"phase": "FIX489", "mode": "operation-smoke", "started_at_ms": now_ms()})
     (root / "grpc-services.txt").write_text(services, encoding="utf-8")
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 1))
+    workload.prepare_delete_documents(count=env_int("FIX489_DELETE_POOL_SIZE", 1))
     operation_types = (
         "SEARCH",
         "RETRIEVE_CONTEXT",

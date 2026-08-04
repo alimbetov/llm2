@@ -105,3 +105,38 @@ observed cause: repeated runs reused static deterministic namespace fix489, so a
 repair: make FIX489 live workload document namespaces run-scoped from the evidence directory name.
 production retrieval semantics changed: no
 ```
+
+Third blocked attempt:
+
+```text
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix487bc/fix487bc-20260804T172529Z
+tested_sha: 3829e9dd8f033c9d5437ea803d29ee3d87b81f15
+concurrency-25: SATURATED_CONTROLLED
+concurrency-25_completed_operations: 3757
+concurrency-25_UNKNOWN: 0
+concurrency-25_safety_counters: 0
+concurrency-50: FAILED
+concurrency-50_completed_operations: 1250
+concurrency-50_UNKNOWN: 3
+observed cause: measured DELETE_OR_EXPIRE created, embedded, activated and then deleted a fresh document inside the measured operation path; under concurrency 50 the hidden ingest/projection wait produced OUTBOX_NOT_COMPLETED tail failures.
+repair: prepare phase-owned delete-control documents before measurement; measured DELETE_OR_EXPIRE now calls only the production delete API for a prepared active document.
+production retrieval semantics changed: no
+```
+
+Post delete-pool repair targeted evidence:
+
+```text
+operation_smoke: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489/operation-smoke-delete-pool-20260804T200203Z
+operation_smoke_verdict: FIX489_LIVE_MIXED_LOAD_CLIENT_PASS
+operation_smoke_UNKNOWN: 0
+operation_smoke_success_rate: 1.0
+
+capacity_50_slice: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489/capacity-50-delete-pool-20260804T200322Z
+capacity_50_slice_verdict: SATURATED_CONTROLLED
+capacity_50_completed_operations: 1425
+capacity_50_UNKNOWN: 0
+capacity_50_OUTBOX_NOT_COMPLETED: 0
+capacity_50_DELETE_OR_EXPIRE: 70 OK / DELETE_SCHEDULED
+capacity_50_resource_exhausted_rate: 0.018947368421052633
+capacity_50_safety_counters: 0
+```
