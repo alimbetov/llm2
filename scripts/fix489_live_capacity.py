@@ -454,7 +454,7 @@ UNION ALL
 SELECT 'duplicate_binding_identity_count', COALESCE(SUM(extra),0)::bigint FROM (
   SELECT GREATEST(COUNT(*)-1,0) AS extra
   FROM astravector.vector_bindings_v004
-  GROUP BY access_zone_id, chunk_id, representation_type, model_version
+  GROUP BY access_zone_id, chunk_id, representation_type, cache_entry_id
 ) d
 UNION ALL
 SELECT 'duplicate_chunk_identity_count', COALESCE(SUM(extra),0)::bigint FROM (

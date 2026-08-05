@@ -186,6 +186,12 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         evidence = load_module("fix487bc_capacity_evidence", ROOT / "scripts" / "fix487bc_capacity_evidence.py")
         self.assertTrue(expected.issubset(set(evidence.LEVEL_ARTIFACTS)))
 
+    def test_postgres_audit_uses_actual_binding_schema(self):
+        source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")
+        audit_source = source[source.index("def postgres_audit") : source.index("def qdrant_audit")]
+        self.assertIn("cache_entry_id", audit_source)
+        self.assertNotIn("vector_bindings_v004\n  GROUP BY access_zone_id, chunk_id, representation_type, model_version", audit_source)
+
     def test_official_capacity_levels_remain_default(self):
         self.assertEqual(fix489.capacity_levels(), (5, 10, 15, 20, 25, 50))
 
