@@ -476,6 +476,6 @@ fix487bc-cleanup:
 
 verify-fix489-live-capacity-contracts:
 	$(MAKE) verify-fix487a-retrieval-freeze
-	python3 -m py_compile scripts/astravector_live_client.py scripts/fix489_live_capacity.py
-	python3 -m unittest -v tests/test_fix489_live_capacity.py
+	python3 -m py_compile scripts/astravector_live_client.py scripts/fix489_live_capacity.py scripts/fix487bc_capacity_campaign.py scripts/fix487bc_capacity_evidence.py
+	python3 -m unittest -v tests/test_astravector_live_client.py tests/test_fix489_live_capacity.py tests/test_fix489_capacity_evidence.py
 	bash -n scripts/fix487bc-capacity-campaign.sh scripts/fix487c-soak-60m.sh

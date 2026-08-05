@@ -19,6 +19,10 @@ class Fix487BCCapacityEvidenceTests(unittest.TestCase):
     def test_complete_capacity_evidence_passes_and_hashes_everything(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "campaign-manifest.json").write_text(
+                '{"levels":[{"concurrency":5},{"concurrency":10},{"concurrency":15},{"concurrency":20},{"concurrency":25},{"concurrency":50}]}\n',
+                encoding="utf-8",
+            )
             for path in evidence.expected_paths(root):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}\n", encoding="utf-8")
@@ -30,10 +34,17 @@ class Fix487BCCapacityEvidenceTests(unittest.TestCase):
     def test_each_capacity_level_has_required_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "campaign-manifest.json").write_text(
+                '{"levels":[{"concurrency":5},{"concurrency":10},{"concurrency":15},{"concurrency":20},{"concurrency":25},{"concurrency":50}]}\n',
+                encoding="utf-8",
+            )
             paths = [str(path.relative_to(root)) for path in evidence.expected_paths(root)]
-            for level in evidence.LEVELS:
+            for level in evidence.DEFAULT_LEVELS:
                 self.assertIn(f"levels/concurrency-{level}/level-result.json", paths)
                 self.assertIn(f"levels/concurrency-{level}/resource-samples.jsonl", paths)
+                self.assertIn(f"levels/concurrency-{level}/warmup-operations.jsonl", paths)
+                self.assertIn(f"levels/concurrency-{level}/measurement-operations.jsonl", paths)
+                self.assertIn(f"levels/concurrency-{level}/retrieval-controls.jsonl", paths)
 
 
 if __name__ == "__main__":

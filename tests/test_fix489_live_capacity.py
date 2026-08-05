@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import sys
 import unittest
@@ -20,6 +21,10 @@ fix489 = load_module("fix489_live_capacity", ROOT / "scripts" / "fix489_live_cap
 
 
 class Fix489LiveCapacityContracts(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("FIX489_CAPACITY_LEVELS", None)
+        os.environ.pop("FIX489_RUN_EXTREME_LEVELS", None)
+
     def test_live_client_builds_single_document_root_for_multilingual_text(self):
         blocks = live_client.make_logical_blocks(
             "Русский абзац.\n\nKazakh мәтіні.\n\nEnglish paragraph.",
@@ -68,6 +73,9 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
             text = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
             self.assertIn('ASTRAVECTOR_PROFILE="fix489-capacity"', text)
             self.assertIn('FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-67500}"', text)
+        campaign_script = (ROOT / "scripts" / "fix487bc-capacity-campaign.sh").read_text(encoding="utf-8")
+        self.assertIn('FIX489_CAPACITY_LEVELS="${FIX489_CAPACITY_LEVELS:-5,10,15,20,25,50}"', campaign_script)
+        self.assertIn('FIX489_LOAD_MODE="${FIX489_LOAD_MODE:-CLOSED_LOOP}"', campaign_script)
 
     def test_live_workload_uses_run_scoped_namespace(self):
         workload_a = fix489.LiveWorkload(client=object(), output=pathlib.Path("/tmp/fix489/run-a"))
@@ -127,6 +135,41 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertEqual(classification, "DELETE_SCHEDULED")
         self.assertEqual(client.index_calls, calls_after_setup)
         self.assertEqual(len(client.deleted), 1)
+        self.assertEqual(workload.delete_documents[0]["pool_state"], fix489.DELETE_SCHEDULED)
+
+    def test_delete_or_expire_does_not_reuse_deleted_pool_documents(self):
+        class FakeClient:
+            def __init__(self):
+                self.index_calls = 0
+                self.deleted: list[str] = []
+
+            def index_text(self, **kwargs):
+                self.index_calls += 1
+                document_id = f"doc-{self.index_calls}"
+                return {"document_id": document_id, "response": {"document": {"accessZoneId": "zone", "documentId": document_id, "documentVersion": 1}}}
+
+            def wait_vector_sync(self, **kwargs):
+                return {"status": {"state": "OPERATION_STATE_READY_TO_ACTIVATE"}}
+
+            def activate_document(self, **kwargs):
+                return {"activated": True}
+
+            def delete_document_vectors(self, *, access_zone_id, document_id, document_version, reason):
+                self.deleted.append(document_id)
+                return {"operation": {"state": "OPERATION_STATE_ACCEPTED"}}
+
+        client = FakeClient()
+        workload = fix489.LiveWorkload(client=client, output=pathlib.Path("/tmp/fix489/delete-no-reuse"))
+        workload.prepare_documents(count=1)
+        workload.prepare_delete_documents(count=2)
+        ops = [
+            fix489.ScheduledOperation(f"op-{idx}", idx, "DELETE_OR_EXPIRE", "4871", "PUBLIC", "doc", idx)
+            for idx in range(2)
+        ]
+        for op in ops:
+            workload.execute_sync(op)
+        self.assertEqual(client.deleted, ["doc-2", "doc-3"])
+        self.assertTrue(all(row["pool_state"] == fix489.DELETE_SCHEDULED for row in workload.delete_documents[:2]))
 
     def test_capacity_level_artifacts_cover_monitoring_and_audits(self):
         expected = {
@@ -144,7 +187,7 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertTrue(expected.issubset(set(evidence.LEVEL_ARTIFACTS)))
 
     def test_official_capacity_levels_remain_default(self):
-        self.assertEqual(fix489.capacity_levels(), (25, 50, 100, 200))
+        self.assertEqual(fix489.capacity_levels(), (5, 10, 15, 20, 25, 50))
 
     def test_grpcurl_camel_case_statuses_are_normalized(self):
         self.assertEqual(

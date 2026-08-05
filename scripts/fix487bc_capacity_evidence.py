@@ -24,7 +24,10 @@ ROOT_ARTIFACTS = (
 )
 LEVEL_ARTIFACTS = (
     "operations.jsonl",
+    "warmup-operations.jsonl",
+    "measurement-operations.jsonl",
     "resource-samples.jsonl",
+    "retrieval-controls.jsonl",
     "metrics-before.json",
     "metrics-after-warmup.json",
     "metrics-after-measurement.json",
@@ -39,11 +42,15 @@ LEVEL_ARTIFACTS = (
     "outbox-after-cooldown.json",
     "latency-summary.json",
     "grpc-status-summary.json",
+    "cooldown-summary.json",
+    "memory-summary.json",
+    "queue-summary.json",
+    "runtime-failure-summary.json",
     "integrity-summary.json",
     "level-result.json",
     "level-result.md",
 )
-LEVELS = (25, 50, 100, 200)
+DEFAULT_LEVELS = (5, 10, 15, 20, 25, 50)
 
 
 def sha256_file(path: Path) -> str:
@@ -56,7 +63,12 @@ def sha256_file(path: Path) -> str:
 
 def expected_paths(root: Path) -> list[Path]:
     paths = [root / name for name in ROOT_ARTIFACTS]
-    for level in LEVELS:
+    levels = list(DEFAULT_LEVELS)
+    manifest_path = root / "campaign-manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        levels = [int(row["concurrency"]) for row in manifest.get("levels", [])]
+    for level in levels:
         paths.extend(root / "levels" / f"concurrency-{level}" / name for name in LEVEL_ARTIFACTS)
     return paths
 
