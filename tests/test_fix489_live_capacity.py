@@ -189,6 +189,11 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
     def test_official_capacity_levels_remain_default(self):
         self.assertEqual(fix489.capacity_levels(), (5, 10, 15, 20, 25, 50))
 
+    def test_delete_pool_size_is_bounded_by_expected_delete_share(self):
+        pool_size = fix489.expected_delete_pool_size((5, 10, 15, 20, 25, 50), 600, 180)
+        self.assertGreaterEqual(pool_size, 100)
+        self.assertLess(pool_size, 250)
+
     def test_grpcurl_camel_case_statuses_are_normalized(self):
         self.assertEqual(
             fix489.grpc_status_from_error("ERROR:\n  Code: DeadlineExceeded\n  Message: inference deadline"),

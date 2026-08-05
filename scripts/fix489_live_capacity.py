@@ -85,8 +85,11 @@ def percentile(values: list[float], p: float) -> float:
 
 def expected_delete_pool_size(levels: tuple[int, ...], measurement_seconds: int, warmup_seconds: int) -> int:
     largest = max(levels) if levels else 1
-    estimated_cycles = max(1, int(((measurement_seconds + warmup_seconds) * largest) / 100))
-    return max(100, estimated_cycles * 5 + largest)
+    warmup_multiplier = 1.0 + (warmup_seconds / max(1, measurement_seconds))
+    operation_floor = max(MIN_COMPLETED.get(level, level * 10) for level in levels) if levels else 100
+    estimated_delete_operations = int((operation_floor * warmup_multiplier * 0.05) + 0.999)
+    safety_margin = max(20, largest)
+    return max(100, estimated_delete_operations + safety_margin)
 
 
 def parse_runtime_rss_kib(sample: dict[str, Any]) -> int | None:
