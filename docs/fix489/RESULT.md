@@ -140,3 +140,28 @@ capacity_50_DELETE_OR_EXPIRE: 70 OK / DELETE_SCHEDULED
 capacity_50_resource_exhausted_rate: 0.018947368421052633
 capacity_50_safety_counters: 0
 ```
+
+Post 50-percent operational budget targeted evidence:
+
+```text
+runtime_profile: fix489-capacity
+query_deadline_ms: 67500
+postgres_statement_timeout_ms: 45000
+qdrant_timeout_ms: 22500
+query_max_queue_age_ms: 750
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489/capacity-25-budget67500-delete-pool-20260805T014427Z
+concurrency: 25
+completed_operations: 1743
+grpc_statuses.OK: 1730
+grpc_statuses.RESOURCE_EXHAUSTED: 13
+UNKNOWN: 0
+unexpected_INTERNAL: 0
+resource_exhausted_rate: 0.007458405048766495
+success_rate: 0.9925415949512335
+p50_ms: 5808.0
+p95_ms: 7215.0
+p99_ms: 9524.0
+safety_counters: 0
+verdict: SATURATED_CONTROLLED
+classification: local Mac CPU stable capacity remains below the fixed official first level of 25, or the load generator needs explicit request pacing before 25 can be used as a stable floor.
+```

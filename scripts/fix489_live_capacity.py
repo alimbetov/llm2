@@ -35,6 +35,7 @@ QUERY_BY_TYPE = {
     "SYNC_STATUS": "vector sync status",
     "LIFECYCLE_STATUS": "document lifecycle status",
 }
+DEFAULT_FIX489_CLIENT_DEADLINE_MS = 67_500
 
 
 def env_int(name: str, default: int) -> int:
@@ -193,7 +194,7 @@ class LiveWorkload:
                 top_k=3,
                 candidate_limit=20,
                 parent_limit=3,
-                timeout_ms=env_int("FIX489_CLIENT_DEADLINE_MS", 30000),
+                timeout_ms=env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS),
             )
             classification = "FOUND" if response.get("results") else "EMPTY"
             return "OK", response, classification
@@ -203,7 +204,7 @@ class LiveWorkload:
                 access_zone_code=doc["access_zone_code"],
                 question=QUERY_BY_TYPE[op.operation_type],
                 max_contexts=3,
-                timeout_ms=env_int("FIX489_CLIENT_DEADLINE_MS", 30000),
+                timeout_ms=env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS),
                 enable_graph_expansion=op.operation_type == "GRAPH_RETRIEVE_CONTEXT",
             )
             classification = "FOUND" if response.get("contexts") else "EMPTY"
@@ -448,7 +449,7 @@ async def run_capacity(root: Path) -> dict[str, Any]:
     write_json(root / "environment.json", {"grpc_addr": client.grpc_addr, "database_url": client.database_url, "qdrant_url": client.qdrant_url, "collection": client.collection})
     (root / "grpc-services.txt").write_text(services, encoding="utf-8")
     write_json(root / "campaign-manifest.json", {"schema_version": 1, "campaign": "fix489-live-capacity", "levels": campaign_plan()})
-    write_json(root / "workload-manifest.json", workload_manifest(489, env_int("FIX489_WORKERS", 5), env_int("FIX489_CLIENT_DEADLINE_MS", 30000)))
+    write_json(root / "workload-manifest.json", workload_manifest(489, env_int("FIX489_WORKERS", 5), env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS)))
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 9))
     workload.prepare_delete_documents(count=env_int("FIX489_DELETE_POOL_SIZE", 60))
     level_results: list[dict[str, Any]] = []
@@ -500,7 +501,7 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
     workload = LiveWorkload(client, root)
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 9))
     workload.prepare_delete_documents(count=env_int("FIX489_DELETE_POOL_SIZE", 60))
-    write_json(root / "workload-manifest.json", workload_manifest(48960, int(plan["soak_concurrency"]), env_int("FIX489_CLIENT_DEADLINE_MS", 30000)))
+    write_json(root / "workload-manifest.json", workload_manifest(48960, int(plan["soak_concurrency"]), env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS)))
     samples: list[dict[str, Any]] = []
     rows = await execute_level(
         workload=workload,

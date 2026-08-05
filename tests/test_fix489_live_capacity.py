@@ -61,13 +61,13 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
 
     def test_capacity_and_soak_use_fix489_operational_profile_by_default(self):
         profile = (ROOT / "config" / "application-fix489-capacity.yaml").read_text(encoding="utf-8")
-        self.assertIn("FIX489_QUERY_DEADLINE_MS:-45000", profile)
-        self.assertIn("FIX489_POSTGRES_STATEMENT_TIMEOUT_MS:-30000", profile)
+        self.assertIn("FIX489_QUERY_DEADLINE_MS:-67500", profile)
+        self.assertIn("FIX489_POSTGRES_STATEMENT_TIMEOUT_MS:-45000", profile)
         self.assertIn("FIX489_SPARSE_REQUIRED:-false", profile)
         for script_name in ("fix487bc-capacity-campaign.sh", "fix487c-soak-60m.sh"):
             text = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
             self.assertIn('ASTRAVECTOR_PROFILE="fix489-capacity"', text)
-            self.assertIn('FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-45000}"', text)
+            self.assertIn('FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-67500}"', text)
 
     def test_live_workload_uses_run_scoped_namespace(self):
         workload_a = fix489.LiveWorkload(client=object(), output=pathlib.Path("/tmp/fix489/run-a"))
