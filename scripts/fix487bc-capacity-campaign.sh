@@ -69,8 +69,11 @@ if ! grpcurl -plaintext 127.0.0.1:50051 list >/dev/null 2>&1; then
 fi
 grpcurl -plaintext 127.0.0.1:50051 list >"$EVIDENCE_DIR/grpc-services.txt"
 
+REASON="CAPACITY_PLAN_FAILED"
 python3 scripts/fix487bc_capacity_campaign.py --output "$EVIDENCE_DIR"
+REASON="LIVE_CAPACITY_RUN_FAILED"
 python3 scripts/fix489_live_capacity.py --capacity-output "$EVIDENCE_DIR"
+REASON="CAPACITY_EVIDENCE_VERIFICATION_FAILED"
 python3 scripts/fix487bc_capacity_evidence.py --root "$EVIDENCE_DIR"
 STATUS="PASS"
 REASON="FIX489_CAPACITY_CAMPAIGN_PASS"

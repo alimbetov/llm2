@@ -192,7 +192,15 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")
         audit_source = source[source.index("def postgres_audit") : source.index("def qdrant_audit")]
         self.assertIn("cache_entry_id", audit_source)
+        self.assertIn("sequence_no", audit_source)
+        self.assertNotIn("ordinal_in_parent", audit_source)
         self.assertNotIn("vector_bindings_v004\n  GROUP BY access_zone_id, chunk_id, representation_type, model_version", audit_source)
+
+    def test_capacity_script_preserves_specific_terminal_failure_reasons(self):
+        source = (ROOT / "scripts" / "fix487bc-capacity-campaign.sh").read_text(encoding="utf-8")
+        self.assertIn('REASON="CAPACITY_PLAN_FAILED"', source)
+        self.assertIn('REASON="LIVE_CAPACITY_RUN_FAILED"', source)
+        self.assertIn('REASON="CAPACITY_EVIDENCE_VERIFICATION_FAILED"', source)
 
     def test_prepare_paths_capture_vector_readiness_evidence(self):
         source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")

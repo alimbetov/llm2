@@ -469,7 +469,7 @@ UNION ALL
 SELECT 'duplicate_chunk_identity_count', COALESCE(SUM(extra),0)::bigint FROM (
   SELECT GREATEST(COUNT(*)-1,0) AS extra
   FROM astravector.content_chunks_v004
-  GROUP BY access_zone_id, document_id, document_version, source_block_id, granularity, ordinal_in_parent
+  GROUP BY access_zone_id, document_id, document_version, source_block_id, granularity, sequence_no
 ) d
 UNION ALL
 SELECT 'failed_outbox', COUNT(*)::bigint FROM astravector.vector_outbox WHERE status IN ('FAILED', 'DEAD_LETTER')
