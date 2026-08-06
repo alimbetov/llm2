@@ -21,7 +21,14 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from astravector_live_client import AstraVectorLiveClient, run_command, tool_version, write_json  # noqa: E402
+from astravector_live_client import (  # noqa: E402
+    AstraVectorLiveClient,
+    normalize_vector_status,
+    run_command,
+    tool_version,
+    vector_readiness_blockers,
+    write_json,
+)
 from fix487b_dataset import build_documents, build_manifest  # noqa: E402
 from fix487b_mixed_load import ScheduledOperation, deterministic_cycle, workload_manifest  # noqa: E402
 from fix487bc_capacity_campaign import (  # noqa: E402
@@ -1052,6 +1059,170 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
     return result
 
 
+def _poll_timing_summary(polls_path: Path) -> dict[str, Any]:
+    if not polls_path.is_file():
+        return {"poll_count": 0}
+    rows = [json.loads(line) for line in polls_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    summary: dict[str, Any] = {"poll_count": len(rows)}
+    first_completed = next((row for row in rows if int(row.get("snapshot", {}).get("outbox_completed", 0) or 0) > 0), None)
+    full_synced = next(
+        (
+            row
+            for row in rows
+            if int(row.get("snapshot", {}).get("expected_bindings", 0) or 0) > 0
+            and int(row.get("snapshot", {}).get("synced_bindings", 0) or 0) >= int(row.get("snapshot", {}).get("expected_bindings", 0) or 0)
+        ),
+        None,
+    )
+    qdrant_visible = next((row for row in rows if int(row.get("snapshot", {}).get("qdrant_points_found", 0) or 0) > 0), None)
+    ready = next((row for row in rows if bool(row.get("snapshot", {}).get("ready_to_activate"))), None)
+    summary.update(
+        {
+            "time_to_first_outbox_completion_ms": first_completed.get("elapsed_ms") if first_completed else None,
+            "time_to_full_binding_sync_ms": full_synced.get("elapsed_ms") if full_synced else None,
+            "time_to_qdrant_point_visibility_ms": qdrant_visible.get("elapsed_ms") if qdrant_visible else None,
+            "time_to_ready_to_activate_ms": ready.get("elapsed_ms") if ready else None,
+            "last_poll": rows[-1] if rows else None,
+        }
+    )
+    return summary
+
+
+def _diagnose_one_document(
+    *,
+    client: AstraVectorLiveClient,
+    root: Path,
+    run_name: str,
+    namespace: str,
+    doc: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    doc_dir = root / run_name / f"document-{index:04d}"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    text = "\n\n".join(block["text"] for block in doc["logical_blocks"])
+    started = now_ms()
+    indexed = client.index_text(
+        text=text,
+        source_path=doc["source_uri"],
+        namespace=namespace,
+        access_zone_code=doc["access_zone"],
+        caller_service="fix489-readiness-diagnostics",
+        title=doc["title"],
+        metadata={**{str(k): str(v) for k, v in doc["metadata"].items()}, "fix489_readiness_diagnostic": "true"},
+    )
+    indexed_at = now_ms()
+    runtime_doc = indexed["response"].get("document") or {}
+    access_zone_id = runtime_doc.get("accessZoneId", "")
+    document_id = runtime_doc.get("documentId", indexed["document_id"])
+    document_version = int(runtime_doc.get("documentVersion", doc["document_version"]))
+    row: dict[str, Any] = {
+        "run_name": run_name,
+        "index": index,
+        "logical_identity": doc["external_document_id"],
+        "access_zone_code": doc["access_zone"],
+        "access_zone_id": access_zone_id,
+        "document_id": document_id,
+        "document_version": document_version,
+        "index_started_at_ms": started,
+        "index_completed_at_ms": indexed_at,
+        "index_latency_ms": indexed_at - started,
+        "status": "UNKNOWN",
+        "error": "",
+    }
+    try:
+        status = client.wait_vector_sync(
+            access_zone_id=access_zone_id,
+            document_id=document_id,
+            document_version=document_version,
+            timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+            evidence_path=doc_dir,
+        )
+        snapshot = normalize_vector_status(status)
+        snapshot.update({"access_zone_id": access_zone_id, "document_id": document_id, "document_version": document_version})
+        blockers = vector_readiness_blockers(snapshot)
+        row.update({"status": "READY", "snapshot": snapshot, "blockers": blockers})
+    except Exception as exc:  # noqa: BLE001 - diagnostic runner must preserve exact failure text.
+        row.update({"status": "BLOCKED", "error": str(exc)})
+        try:
+            status = client.vector_status(access_zone_id=access_zone_id, document_id=document_id, document_version=document_version)
+            snapshot = normalize_vector_status(status)
+            snapshot.update({"access_zone_id": access_zone_id, "document_id": document_id, "document_version": document_version})
+            row.update({"snapshot": snapshot, "blockers": vector_readiness_blockers(snapshot)})
+        except Exception as status_exc:  # noqa: BLE001
+            row.update({"snapshot_error": str(status_exc), "blockers": ["UNKNOWN_READINESS_BLOCKER"]})
+    row.update(_poll_timing_summary(doc_dir / "vector-sync-polls.jsonl"))
+    write_json(doc_dir / "indexed-response.json", indexed)
+    write_json(doc_dir / "postgres-document-diagnostic.json", client.inspect_document_vector_state(
+        access_zone_id=access_zone_id,
+        document_id=document_id,
+        document_version=document_version,
+    ))
+    write_json(doc_dir / "qdrant-document-diagnostic.json", client.qdrant_document_diagnostic(
+        access_zone_id=access_zone_id,
+        document_id=document_id,
+        document_version=document_version,
+    ))
+    return row
+
+
+def run_readiness_diagnostics(root: Path) -> dict[str, Any]:
+    client = AstraVectorLiveClient()
+    services = client.wait_grpc(timeout_seconds=env_int("FIX489_GRPC_WAIT_SECONDS", 30))
+    root.mkdir(parents=True, exist_ok=True)
+    write_json(root / "bootstrap.json", {"phase": "FIX489-R1", "mode": "vector-readiness-diagnostics", "started_at_ms": now_ms()})
+    write_json(root / "environment.json", {"grpc_addr": client.grpc_addr, "database_url": client.database_url, "qdrant_url": client.qdrant_url, "collection": client.collection})
+    (root / "grpc-services.txt").write_text(services, encoding="utf-8")
+    docs = build_documents(count=9)
+    run_a_namespace = f"fix489-r1-{root.name}-a"
+    run_b_namespace = f"fix489-r1-{root.name}-b"
+    run_a = [_diagnose_one_document(client=client, root=root, run_name="run-a-one-document", namespace=run_a_namespace, doc=docs[0], index=0)]
+    run_b: list[dict[str, Any]] = []
+    for index, doc in enumerate(docs):
+        run_b.append(_diagnose_one_document(client=client, root=root, run_name="run-b-nine-documents", namespace=run_b_namespace, doc=doc, index=index))
+    time.sleep(5)
+    run_c: list[dict[str, Any]] = []
+    for row in run_b:
+        try:
+            status = client.vector_status(
+                access_zone_id=row["access_zone_id"],
+                document_id=row["document_id"],
+                document_version=int(row["document_version"]),
+            )
+            snapshot = normalize_vector_status(status)
+            snapshot.update({"access_zone_id": row["access_zone_id"], "document_id": row["document_id"], "document_version": int(row["document_version"])})
+            run_c.append(
+                {
+                    "document_id": row["document_id"],
+                    "document_version": row["document_version"],
+                    "snapshot": snapshot,
+                    "blockers": vector_readiness_blockers(snapshot),
+                    "status": "READY" if bool(snapshot.get("ready_to_activate")) else "BLOCKED",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            run_c.append({"document_id": row["document_id"], "document_version": row["document_version"], "status": "ERROR", "error": str(exc)})
+    write_jsonl(root / "run-a-documents.jsonl", run_a)
+    write_jsonl(root / "run-b-documents.jsonl", run_b)
+    write_jsonl(root / "run-c-repeat-status.jsonl", run_c)
+    blocker_counts = Counter(blocker.split(":", 1)[0] for row in [*run_a, *run_b, *run_c] for blocker in row.get("blockers", []))
+    all_captured = len(run_a) == 1 and len(run_b) == 9 and len(run_c) == 9
+    no_generic_timeout = all("OUTBOX_NOT_COMPLETED" not in row.get("error", "") for row in [*run_a, *run_b])
+    result = {
+        "verdict": "FIX489_VECTOR_READINESS_DIAGNOSTICS_PASS" if all_captured and no_generic_timeout else "FIX489_VECTOR_READINESS_DIAGNOSTICS_BLOCKED",
+        "all_9_document_statuses_captured": len(run_b) == 9,
+        "run_a_ready": sum(1 for row in run_a if row.get("status") == "READY"),
+        "run_b_ready": sum(1 for row in run_b if row.get("status") == "READY"),
+        "run_b_blocked": sum(1 for row in run_b if row.get("status") != "READY"),
+        "run_c_ready": sum(1 for row in run_c if row.get("status") == "READY"),
+        "no_generic_timeout_reason": no_generic_timeout,
+        "blocker_counts": dict(sorted(blocker_counts.items())),
+    }
+    write_json(root / "readiness-diagnostics-summary.json", result)
+    write_json(root / "terminal-status.json", {"status": "PASS" if result["verdict"].endswith("_PASS") else "BLOCKED", **result})
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
 def run_operation_smoke(root: Path) -> dict[str, Any]:
     client = AstraVectorLiveClient()
     services = client.wait_grpc(timeout_seconds=env_int("FIX489_GRPC_WAIT_SECONDS", 30))
@@ -1130,7 +1301,11 @@ def main() -> int:
     parser.add_argument("--soak-output")
     parser.add_argument("--capacity-root")
     parser.add_argument("--operation-smoke-output")
+    parser.add_argument("--readiness-diagnostics-output")
     args = parser.parse_args()
+    if args.readiness_diagnostics_output:
+        result = run_readiness_diagnostics(Path(args.readiness_diagnostics_output))
+        return 0 if result.get("verdict") == "FIX489_VECTOR_READINESS_DIAGNOSTICS_PASS" else 2
     if args.operation_smoke_output:
         result = run_operation_smoke(Path(args.operation_smoke_output))
         return 0 if result.get("verdict") == "FIX489_LIVE_MIXED_LOAD_CLIENT_PASS" else 2

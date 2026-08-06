@@ -197,6 +197,16 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn('"readiness" / f"prepared-{len(prepared):04d}"', source)
         self.assertIn('"readiness" / f"delete-pool-{index:04d}"', source)
 
+    def test_readiness_diagnostics_mode_captures_runs_without_capacity_ladder(self):
+        source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")
+        self.assertIn("--readiness-diagnostics-output", source)
+        self.assertIn("run-a-one-document", source)
+        self.assertIn("run-b-nine-documents", source)
+        self.assertIn("run-c-repeat-status.jsonl", source)
+        diagnostics_source = source[source.index("def run_readiness_diagnostics") : source.index("def run_operation_smoke")]
+        self.assertNotIn("execute_level(", diagnostics_source)
+        self.assertNotIn("capacity_levels()", diagnostics_source)
+
     def test_official_capacity_levels_remain_default(self):
         self.assertEqual(fix489.capacity_levels(), (5, 10, 15, 20, 25, 50))
 
