@@ -76,6 +76,8 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         campaign_script = (ROOT / "scripts" / "fix487bc-capacity-campaign.sh").read_text(encoding="utf-8")
         self.assertIn('FIX489_CAPACITY_LEVELS="${FIX489_CAPACITY_LEVELS:-5,10,15,20,25,50}"', campaign_script)
         self.assertIn('FIX489_LOAD_MODE="${FIX489_LOAD_MODE:-CLOSED_LOOP}"', campaign_script)
+        self.assertIn('fix489-capacity-$(date -u +%Y%m%dT%H%M%SZ)', campaign_script)
+        self.assertIn('${EVIDENCE_ROOT}/fix489-capacity/${RUN_ID}', campaign_script)
 
     def test_live_workload_uses_run_scoped_namespace(self):
         workload_a = fix489.LiveWorkload(client=object(), output=pathlib.Path("/tmp/fix489/run-a"))

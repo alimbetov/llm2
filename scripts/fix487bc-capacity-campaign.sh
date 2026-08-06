@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${FIX487BC_RUN_ID:-fix487bc-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${FIX487BC_RUN_ID:-fix489-capacity-$(date -u +%Y%m%dT%H%M%SZ)}"
 EVIDENCE_ROOT="${ASTRAVECTOR_EVIDENCE_ROOT:-${ROOT_DIR}/../astravector-evidence}"
-EVIDENCE_DIR="${EVIDENCE_ROOT}/fix487bc/${RUN_ID}"
+EVIDENCE_DIR="${EVIDENCE_ROOT}/fix489-capacity/${RUN_ID}"
 STATUS="BLOCKED"
 REASON="UNKNOWN"
 

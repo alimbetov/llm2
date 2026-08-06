@@ -36,7 +36,7 @@ make verify-fix489-live-capacity-contracts
 Evidence root:
 
 ```text
-${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/fix487bc/<run-id>
+${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/fix489-capacity/<run-id>
 ${ASTRAVECTOR_EVIDENCE_ROOT:-../astravector-evidence}/fix487c/<run-id>
 ```
 
