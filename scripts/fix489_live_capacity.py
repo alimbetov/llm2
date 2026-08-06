@@ -484,9 +484,24 @@ SELECT 'active_document_versions', COUNT(*)::bigint FROM astravector.document_ve
 UNION ALL
 SELECT 'deleted_document_versions', COUNT(*)::bigint FROM astravector.document_versions WHERE status='DELETED'
 UNION ALL
-SELECT 'phase_owned_document_versions', COUNT(*)::bigint FROM astravector.document_versions WHERE source_uri LIKE 'synthetic://fix489/%' OR source_uri LIKE 'synthetic://fix487b/%'
+SELECT 'phase_owned_document_versions', COUNT(*)::bigint FROM astravector.document_versions dv
+WHERE EXISTS (
+  SELECT 1 FROM astravector.content_chunks_v004 c
+  WHERE c.access_zone_id=dv.access_zone_id
+    AND c.document_id=dv.document_id
+    AND c.document_version=dv.document_version
+    AND (c.metadata->>'fix489'='true' OR c.metadata->>'fix487b'='true')
+)
 UNION ALL
-SELECT 'phase_owned_active_document_versions', COUNT(*)::bigint FROM astravector.document_versions WHERE status='ACTIVE' AND (source_uri LIKE 'synthetic://fix489/%' OR source_uri LIKE 'synthetic://fix487b/%')
+SELECT 'phase_owned_active_document_versions', COUNT(*)::bigint FROM astravector.document_versions dv
+WHERE dv.status='ACTIVE'
+  AND EXISTS (
+    SELECT 1 FROM astravector.content_chunks_v004 c
+    WHERE c.access_zone_id=dv.access_zone_id
+      AND c.document_id=dv.document_id
+      AND c.document_version=dv.document_version
+      AND (c.metadata->>'fix489'='true' OR c.metadata->>'fix487b'='true')
+  )
 """
     )
     metrics = {str(row["metric"]): int(row["value"]) for row in rows}

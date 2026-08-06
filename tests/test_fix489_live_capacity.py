@@ -194,6 +194,9 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn("cache_entry_id", audit_source)
         self.assertIn("sequence_no", audit_source)
         self.assertNotIn("ordinal_in_parent", audit_source)
+        self.assertNotIn("document_versions WHERE source_uri", audit_source)
+        self.assertIn("c.metadata->>'fix489'='true'", audit_source)
+        self.assertIn("c.metadata->>'fix487b'='true'", audit_source)
         self.assertNotIn("vector_bindings_v004\n  GROUP BY access_zone_id, chunk_id, representation_type, model_version", audit_source)
 
     def test_capacity_script_preserves_specific_terminal_failure_reasons(self):
@@ -201,6 +204,13 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn('REASON="CAPACITY_PLAN_FAILED"', source)
         self.assertIn('REASON="LIVE_CAPACITY_RUN_FAILED"', source)
         self.assertIn('REASON="CAPACITY_EVIDENCE_VERIFICATION_FAILED"', source)
+
+    def test_cleanup_target_removes_runtime_and_default_compose(self):
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        cleanup = makefile[makefile.index("fix487bc-cleanup:") : makefile.index("verify-fix489-live-capacity-contracts:")]
+        self.assertIn("scripts/local-demo/stop-runtime.sh", cleanup)
+        self.assertIn("docker compose -p astravector -f docker-compose.yml down", cleanup)
+        self.assertIn("docker compose -p astravector_fix487b -f docker-compose.fix487b.yml down", cleanup)
 
     def test_prepare_paths_capture_vector_readiness_evidence(self):
         source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")

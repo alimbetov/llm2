@@ -472,6 +472,8 @@ verify-fix487c-existing-soak-evidence:
 	python3 scripts/fix487c_soak.py --verify-evidence-root "$${FIX487C_SOAK_EVIDENCE_DIR:?set FIX487C_SOAK_EVIDENCE_DIR}"
 
 fix487bc-cleanup:
+	-bash scripts/local-demo/stop-runtime.sh
+	-docker compose -p astravector -f docker-compose.yml down
 	docker compose -p astravector_fix487b -f docker-compose.fix487b.yml down
 
 verify-fix489-live-capacity-contracts:
