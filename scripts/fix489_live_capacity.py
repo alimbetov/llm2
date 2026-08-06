@@ -140,6 +140,7 @@ class LiveWorkload:
                 document_id=document_id,
                 document_version=document_version,
                 timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+                evidence_path=self.output / "readiness" / f"prepared-{len(prepared):04d}",
             )
             activation = self.client.activate_document(
                 access_zone_id=access_zone_id,
@@ -192,6 +193,7 @@ class LiveWorkload:
                 document_id=document_id,
                 document_version=document_version,
                 timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+                evidence_path=self.output / "readiness" / f"delete-pool-{index:04d}",
             )
             activation = self.client.activate_document(
                 access_zone_id=access_zone_id,

@@ -192,6 +192,11 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn("cache_entry_id", audit_source)
         self.assertNotIn("vector_bindings_v004\n  GROUP BY access_zone_id, chunk_id, representation_type, model_version", audit_source)
 
+    def test_prepare_paths_capture_vector_readiness_evidence(self):
+        source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")
+        self.assertIn('"readiness" / f"prepared-{len(prepared):04d}"', source)
+        self.assertIn('"readiness" / f"delete-pool-{index:04d}"', source)
+
     def test_official_capacity_levels_remain_default(self):
         self.assertEqual(fix489.capacity_levels(), (5, 10, 15, 20, 25, 50))
 
