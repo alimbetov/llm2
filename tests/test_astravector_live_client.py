@@ -153,6 +153,64 @@ class AstraVectorLiveClientContracts(unittest.TestCase):
             self.assertTrue((evidence / "qdrant-document-diagnostic.json").is_file())
             self.assertTrue((evidence / "debug-document-response.json").is_file())
 
+    def test_timeout_accepts_fresh_sql_and_qdrant_diagnostics_only_when_complete(self):
+        class FakeClient(live_client.AstraVectorLiveClient):
+            def __init__(self):
+                super().__init__(grpc_addr="127.0.0.1:0", database_url="postgres://fake", qdrant_url="http://127.0.0.1:0")
+
+            def vector_status(self, **kwargs):
+                return {
+                    "status": {
+                        "state": "OPERATION_STATE_SYNCING",
+                        "sync": {
+                            "expectedBindings": 3,
+                            "syncedBindings": 2,
+                            "outboxCompleted": 2,
+                            "qdrantPointsExpected": 3,
+                            "qdrantPointsFound": 2,
+                            "qdrantPointsMissing": 1,
+                        },
+                    }
+                }
+
+            def inspect_document_vector_state(self, **kwargs):
+                return {
+                    "binding_rows": [{"qdrant_sync_status": "SYNCED", "binding_count": 3}],
+                    "outbox_rows": [{"status": "COMPLETED", "outbox_count": 3}],
+                    "embedding_rows": [{"expected_bindings": 3, "dense_vectors_found": 3, "sparse_vectors_found": 0}],
+                }
+
+            def qdrant_document_diagnostic(self, **kwargs):
+                return {"status": "MEASURED", "point_count": 3}
+
+            def debug_document(self, **kwargs):
+                return {"status": "UNAVAILABLE"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp)
+            result = FakeClient().wait_vector_sync(
+                access_zone_id="00000000-0000-0000-0000-000000000001",
+                document_id="00000000-0000-0000-0000-000000000002",
+                document_version=1,
+                timeout_seconds=0,
+                evidence_path=evidence,
+            )
+            self.assertTrue(live_client.document_vector_status_ready(result))
+            events = (evidence / "vector-sync-polls.jsonl").read_text(encoding="utf-8")
+            self.assertIn("READY_AFTER_DIAGNOSTIC_REFRESH", events)
+
+    def test_incomplete_diagnostics_do_not_mask_timeout(self):
+        self.assertFalse(
+            live_client.diagnostic_vector_state_ready(
+                {
+                    "binding_rows": [{"qdrant_sync_status": "SYNCED", "binding_count": 3}],
+                    "outbox_rows": [{"status": "COMPLETED", "outbox_count": 3}],
+                    "embedding_rows": [{"expected_bindings": 3, "dense_vectors_found": 3, "sparse_vectors_found": 0}],
+                },
+                {"status": "MEASURED", "point_count": 2},
+            )
+        )
+
     def test_final_non_extending_poll_can_return_ready_at_deadline_boundary(self):
         class FakeClient(live_client.AstraVectorLiveClient):
             def __init__(self):

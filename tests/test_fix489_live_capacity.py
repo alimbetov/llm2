@@ -212,6 +212,12 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn("docker compose -p astravector -f docker-compose.yml down", cleanup)
         self.assertIn("docker compose -p astravector_fix487b -f docker-compose.fix487b.yml down", cleanup)
 
+    def test_debug_document_chunk_sql_groups_correlated_identity_columns(self):
+        source = (ROOT / "src" / "grpc" / "mod.rs").read_text(encoding="utf-8")
+        debug_source = source[source.index("async fn debug_document_state") : source.index("let binding_rows")]
+        self.assertIn("GROUP BY c.id,c.access_zone_id,c.document_id,c.document_version", debug_source)
+        self.assertIn("c.created_at ORDER BY c.created_at", debug_source)
+
     def test_prepare_paths_capture_vector_readiness_evidence(self):
         source = (ROOT / "scripts" / "fix489_live_capacity.py").read_text(encoding="utf-8")
         self.assertIn('"readiness" / f"prepared-{len(prepared):04d}"', source)

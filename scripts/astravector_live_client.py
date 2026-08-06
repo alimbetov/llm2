@@ -256,6 +256,42 @@ def vector_readiness_blockers(snapshot: dict[str, Any], sparse_required: bool = 
     return blockers
 
 
+def diagnostic_vector_state_ready(postgres_diag: dict[str, Any], qdrant_diag: dict[str, Any], sparse_required: bool = False) -> bool:
+    binding_rows = _list_value(postgres_diag.get("binding_rows"))
+    outbox_rows = _list_value(postgres_diag.get("outbox_rows"))
+    embedding_rows = _list_value(postgres_diag.get("embedding_rows"))
+    expected = 0
+    dense_found = 0
+    sparse_found = 0
+    if embedding_rows:
+        first = embedding_rows[0]
+        expected = _int_value(first.get("expected_bindings"))
+        dense_found = _int_value(first.get("dense_vectors_found"))
+        sparse_found = _int_value(first.get("sparse_vectors_found"))
+    if expected <= 0:
+        expected = sum(_int_value(row.get("binding_count")) for row in binding_rows)
+    synced = sum(
+        _int_value(row.get("binding_count"))
+        for row in binding_rows
+        if str(row.get("qdrant_sync_status") or "") == "SYNCED"
+    )
+    completed = sum(
+        _int_value(row.get("outbox_count"))
+        for row in outbox_rows
+        if str(row.get("status") or "") == "COMPLETED"
+    )
+    qdrant_points = _int_value(qdrant_diag.get("point_count"))
+    if expected <= 0:
+        return False
+    if synced < expected or completed < expected or qdrant_points < expected:
+        return False
+    if dense_found and dense_found < expected:
+        return False
+    if sparse_required and sparse_found < expected:
+        return False
+    return True
+
+
 def _quote_sql(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -690,22 +726,42 @@ WHERE b.access_zone_id = {zone}::uuid
             record(final_snapshot, final_blockers, "READY_AT_DEADLINE_BOUNDARY")
             return final
         record(final_snapshot, final_blockers, "timeout")
+        postgres_diag: dict[str, Any] | None = None
+        qdrant_diag: dict[str, Any] | None = None
         if evidence_dir is not None:
-            write_json(evidence_dir / "postgres-document-diagnostic.json", self.inspect_document_vector_state(
+            postgres_diag = self.inspect_document_vector_state(
                 access_zone_id=access_zone_id,
                 document_id=document_id,
                 document_version=document_version,
-            ))
-            write_json(evidence_dir / "qdrant-document-diagnostic.json", self.qdrant_document_diagnostic(
+            )
+            qdrant_diag = self.qdrant_document_diagnostic(
                 access_zone_id=access_zone_id,
                 document_id=document_id,
                 document_version=document_version,
-            ))
+            )
+            write_json(evidence_dir / "postgres-document-diagnostic.json", postgres_diag)
+            write_json(evidence_dir / "qdrant-document-diagnostic.json", qdrant_diag)
             write_json(evidence_dir / "debug-document-response.json", self.debug_document(
                 access_zone_id=access_zone_id,
                 document_id=document_id,
                 document_version=document_version,
             ))
+        if postgres_diag is not None and qdrant_diag is not None and diagnostic_vector_state_ready(
+            postgres_diag,
+            qdrant_diag,
+            sparse_required=sparse_required,
+        ):
+            refreshed = {
+                "status": {
+                    "state": "OPERATION_STATE_READY_TO_ACTIVATE",
+                    "readyToActivate": True,
+                    "searchable": True,
+                    "message": "Fresh SQL and Qdrant diagnostics confirmed vector readiness after stale status timeout",
+                    "sync": final.get("status", {}).get("sync", {}),
+                }
+            }
+            record(normalize_vector_status(refreshed), [], "READY_AFTER_DIAGNOSTIC_REFRESH")
+            return refreshed
         if any(blocker.startswith("QDRANT_") for blocker in final_blockers):
             code = "VECTOR_SYNC_QDRANT_MISMATCH"
         elif any("BINDING" in blocker or blocker.startswith("DENSE_") or blocker.startswith("SPARSE_") for blocker in final_blockers):
