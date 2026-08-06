@@ -165,3 +165,25 @@ safety_counters: 0
 verdict: SATURATED_CONTROLLED
 classification: local Mac CPU stable capacity remains below the fixed official first level of 25, or the load generator needs explicit request pacing before 25 can be used as a stable floor.
 ```
+
+FIX489-R1 per-document vector readiness diagnostics:
+
+```text
+tested_sha: b86e41c373338d2743256b563ed45e25f9c1998a
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-r1/readiness-20260806T160619Z
+verdict: FIX489_VECTOR_READINESS_DIAGNOSTICS_PASS
+run_a_ready: 1/1
+run_b_ready: 9/9
+run_b_blocked: 0
+run_c_ready: 9/9
+blocker_counts: {}
+no_generic_timeout_reason: true
+poll_timeline_captured: true
+postgres_per_document_diagnostics_captured: true
+qdrant_per_document_diagnostics_captured: true
+admin_debug_document_attempted: true
+retrieval_freeze: PASS
+production_retrieval_semantics_changed: no
+capacity_ladder_executed: no
+decision: previous prepare_documents OUTBOX_NOT_COMPLETED blocker did not reproduce on the isolated R1 diagnostic route; continue with official capacity only from a clean runtime and preserve the new per-document diagnostics if it recurs.
+```
