@@ -51,6 +51,7 @@ QUERY_BY_TYPE = {
     "LIFECYCLE_STATUS": "document lifecycle status",
 }
 DEFAULT_FIX489_CLIENT_DEADLINE_MS = 67_500
+DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS = 270
 DELETE_READY = "READY_TO_DELETE"
 DELETE_IN_FLIGHT = "DELETE_IN_FLIGHT"
 DELETE_SCHEDULED = "DELETE_SCHEDULED"
@@ -146,7 +147,7 @@ class LiveWorkload:
                 access_zone_id=access_zone_id,
                 document_id=document_id,
                 document_version=document_version,
-                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS),
                 evidence_path=self.output / "readiness" / f"prepared-{len(prepared):04d}",
             )
             activation = self.client.activate_document(
@@ -199,7 +200,7 @@ class LiveWorkload:
                 access_zone_id=access_zone_id,
                 document_id=document_id,
                 document_version=document_version,
-                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS),
                 evidence_path=self.output / "readiness" / f"delete-pool-{index:04d}",
             )
             activation = self.client.activate_document(
@@ -289,7 +290,7 @@ class LiveWorkload:
                 access_zone_id=access_zone_id,
                 document_id=document_id,
                 document_version=document_version,
-                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS),
             )
             response = self.client.activate_document(
                 access_zone_id=access_zone_id,
@@ -1149,7 +1150,7 @@ def _diagnose_one_document(
             access_zone_id=access_zone_id,
             document_id=document_id,
             document_version=document_version,
-            timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", 180),
+            timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS),
             evidence_path=doc_dir,
         )
         snapshot = normalize_vector_status(status)

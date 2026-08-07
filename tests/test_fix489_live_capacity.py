@@ -236,6 +236,11 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
     def test_official_capacity_levels_remain_default(self):
         self.assertEqual(fix489.capacity_levels(), (5, 10, 15, 20, 25, 50))
 
+    def test_vector_sync_timeout_covers_observed_cpu_qdrant_finalize_lag(self):
+        self.assertEqual(fix489.DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS, 270)
+        self.assertGreater(fix489.DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS, 224)
+        self.assertLessEqual(fix489.DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS, 300)
+
     def test_delete_pool_size_is_bounded_by_expected_delete_share(self):
         pool_size = fix489.expected_delete_pool_size((5, 10, 15, 20, 25, 50), 600, 180)
         self.assertGreaterEqual(pool_size, 100)
