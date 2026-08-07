@@ -30,6 +30,7 @@ class Fix487BCCapacityCampaignTests(unittest.TestCase):
         os.environ.pop("FIX489_CAPACITY_LEVELS", None)
 
     def test_campaign_plan_has_required_levels_durations_and_seeds(self):
+        os.environ.pop("FIX489_CAPACITY_LEVELS", None)
         plan = campaign.campaign_plan()
         self.assertEqual([row["concurrency"] for row in plan], [5, 10, 15, 20, 25, 50])
         self.assertEqual([row["seed"] for row in plan], [489005, 489010, 489015, 489020, 489025, 489050])
@@ -37,6 +38,12 @@ class Fix487BCCapacityCampaignTests(unittest.TestCase):
         self.assertTrue(all(row["load_warmup_seconds"] == 180 for row in plan))
         self.assertEqual(plan[0]["minimum_completed_operations"], 300)
         self.assertEqual(plan[-1]["minimum_completed_operations"], 1400)
+
+    def test_capacity_levels_can_be_shortened_for_local_targeted_runs(self):
+        os.environ["FIX489_CAPACITY_LEVELS"] = "5"
+        plan = campaign.campaign_plan()
+        self.assertEqual([row["concurrency"] for row in plan], [5])
+        self.assertEqual(plan[0]["seed"], 489005)
 
     def test_extreme_levels_are_optional(self):
         os.environ["FIX489_RUN_EXTREME_LEVELS"] = "true"
