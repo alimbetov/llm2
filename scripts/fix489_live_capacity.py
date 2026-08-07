@@ -123,6 +123,8 @@ class LiveWorkload:
         self.delete_documents: list[dict[str, Any]] = []
         self.delete_counter = 0
         self.delete_lock = threading.Lock()
+        self.pending_ingests: list[dict[str, Any]] = []
+        self.pending_ingest_lock = threading.Lock()
 
     def prepare_documents(self, count: int = 9) -> list[dict[str, Any]]:
         if self.documents:
@@ -242,6 +244,38 @@ class LiveWorkload:
         with self.delete_lock:
             self.delete_documents.append({**doc, "pool_index": len(self.delete_documents), "pool_state": DELETE_READY})
 
+    def add_pending_ingest(self, doc: dict[str, Any]) -> None:
+        with self.pending_ingest_lock:
+            self.pending_ingests.append(doc)
+
+    def drain_pending_ingests(self) -> list[dict[str, Any]]:
+        with self.pending_ingest_lock:
+            pending = list(self.pending_ingests)
+            self.pending_ingests.clear()
+        return pending
+
+    def finalize_pending_ingests(self, *, phase: str) -> list[dict[str, Any]]:
+        finalized: list[dict[str, Any]] = []
+        for index, doc in enumerate(self.drain_pending_ingests()):
+            status = self.client.wait_vector_sync(
+                access_zone_id=doc["access_zone_id"],
+                document_id=doc["document_id"],
+                document_version=doc["document_version"],
+                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS),
+                evidence_path=self.output / "readiness" / f"pending-{phase}-{index:04d}",
+            )
+            activation = self.client.activate_document(
+                access_zone_id=doc["access_zone_id"],
+                document_id=doc["document_id"],
+                document_version=doc["document_version"],
+            )
+            row = {**doc, "phase": phase, "status": status, "activation": activation, "finalization_state": "INGESTED_ACTIVE"}
+            self.add_delete_document(row)
+            finalized.append(row)
+        if finalized:
+            write_jsonl(self.output / f"pending-ingest-finalization-{phase}.jsonl", finalized)
+        return finalized
+
     def pick_document(self, op: ScheduledOperation) -> dict[str, Any]:
         docs = self.prepare_documents()
         return docs[op.cycle_index % len(docs)]
@@ -286,28 +320,17 @@ class LiveWorkload:
             access_zone_id = runtime_doc.get("accessZoneId", doc["access_zone_id"])
             document_id = runtime_doc.get("documentId", indexed["document_id"])
             document_version = int(runtime_doc.get("documentVersion", 1))
-            self.client.wait_vector_sync(
-                access_zone_id=access_zone_id,
-                document_id=document_id,
-                document_version=document_version,
-                timeout_seconds=env_int("FIX489_VECTOR_SYNC_TIMEOUT_SECONDS", DEFAULT_FIX489_VECTOR_SYNC_TIMEOUT_SECONDS),
-            )
-            response = self.client.activate_document(
-                access_zone_id=access_zone_id,
-                document_id=document_id,
-                document_version=document_version,
-            )
-            self.add_delete_document(
+            self.add_pending_ingest(
                 {
                     "access_zone_code": doc["access_zone_code"],
                     "access_zone_id": access_zone_id,
                     "document_id": document_id,
                     "document_version": document_version,
-                    "status": {"from_ingest_operation": op.operation_id},
-                    "activation": response,
+                    "operation_id": op.operation_id,
+                    "indexed_response": indexed["response"],
                 }
             )
-            return "OK", response, "INGESTED_ACTIVE"
+            return "OK", indexed["response"], "INGEST_ACCEPTED"
         if op.operation_type == "DELETE_OR_EXPIRE":
             delete_doc = self.pick_delete_document()
             try:
@@ -925,6 +948,7 @@ async def run_capacity(root: Path) -> dict[str, Any]:
             resource_samples=samples,
             phase="warmup",
         )
+        warmup_finalized = workload.finalize_pending_ingests(phase=f"concurrency-{level}-warmup")
         warmup_sample_count = len(samples)
         rows = await execute_level(
             workload=workload,
@@ -934,6 +958,7 @@ async def run_capacity(root: Path) -> dict[str, Any]:
             resource_samples=samples,
             phase="measurement",
         )
+        measurement_finalized = workload.finalize_pending_ingests(phase=f"concurrency-{level}-measurement")
         postgres_after_measurement = postgres_audit(client, workload.run_namespace)
         qdrant_after_measurement = qdrant_audit(client, workload.prepare_documents())
         cooldown = cooldown_poll(client, active=0, queued=0, max_seconds=env_int("FIX489_CAPACITY_COOLDOWN_SECONDS", 600))
@@ -954,6 +979,15 @@ async def run_capacity(root: Path) -> dict[str, Any]:
                 cooldown=cooldown,
                 warmup_sample_count=warmup_sample_count,
             )
+        )
+        write_json(
+            root / "levels" / f"concurrency-{level}" / "pending-ingest-finalization-summary.json",
+            {
+                "status": "MEASURED",
+                "warmup_finalized": len(warmup_finalized),
+                "measurement_finalized": len(measurement_finalized),
+                "total_finalized": len(warmup_finalized) + len(measurement_finalized),
+            },
         )
     curve = capacity_curve(level_results)
     write_json(root / "capacity-curve.json", curve)

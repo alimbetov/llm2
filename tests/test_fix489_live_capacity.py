@@ -2,6 +2,7 @@ import importlib.util
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 
@@ -138,6 +139,82 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertEqual(client.index_calls, calls_after_setup)
         self.assertEqual(len(client.deleted), 1)
         self.assertEqual(workload.delete_documents[0]["pool_state"], fix489.DELETE_SCHEDULED)
+
+    def test_measured_ingest_records_accepted_document_without_sync_blocking(self):
+        class FakeClient:
+            def __init__(self):
+                self.wait_calls = 0
+
+            def index_text(self, **kwargs):
+                return {
+                    "document_id": "doc-accepted",
+                    "response": {
+                        "document": {
+                            "accessZoneId": "zone-a",
+                            "documentId": "doc-accepted",
+                            "documentVersion": 1,
+                        }
+                    },
+                }
+
+            def wait_vector_sync(self, **kwargs):
+                self.wait_calls += 1
+                raise AssertionError("measured ingest must not wait for async vector sync")
+
+        workload = fix489.LiveWorkload(client=FakeClient(), output=pathlib.Path("/tmp/fix489/async-ingest-contract"))
+        workload.documents = [{"access_zone_code": "4871", "access_zone_id": "zone-a"}]
+        op = fix489.ScheduledOperation(
+            operation_id="fix487b-op-004-ingest_version",
+            cycle_index=0,
+            operation_type="INGEST_VERSION",
+            access_zone="4871",
+            access_level="PUBLIC",
+            logical_identity="fix487b-doc-000",
+            scheduled_at=4,
+        )
+
+        status, _response, classification = workload.execute_sync(op)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(classification, "INGEST_ACCEPTED")
+        self.assertEqual(len(workload.pending_ingests), 1)
+        self.assertEqual(workload.client.wait_calls, 0)
+
+    def test_pending_ingest_finalization_waits_activates_and_extends_delete_pool(self):
+        class FakeClient:
+            def __init__(self):
+                self.waited: list[dict] = []
+                self.activated: list[dict] = []
+
+            def wait_vector_sync(self, **kwargs):
+                self.waited.append(kwargs)
+                return {"status": {"state": "OPERATION_STATE_READY_TO_ACTIVATE"}}
+
+            def activate_document(self, **kwargs):
+                self.activated.append(kwargs)
+                return {"status": "ACTIVE"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workload = fix489.LiveWorkload(client=FakeClient(), output=pathlib.Path(tmp))
+            workload.add_pending_ingest(
+                {
+                    "access_zone_code": "4871",
+                    "access_zone_id": "zone-a",
+                    "document_id": "doc-accepted",
+                    "document_version": 1,
+                    "operation_id": "fix487b-op-004-ingest_version",
+                    "indexed_response": {},
+                }
+            )
+
+            finalized = workload.finalize_pending_ingests(phase="unit")
+
+            self.assertEqual(len(finalized), 1)
+            self.assertEqual(len(workload.pending_ingests), 0)
+            self.assertEqual(len(workload.delete_documents), 1)
+            self.assertEqual(workload.delete_documents[0]["pool_state"], fix489.DELETE_READY)
+            self.assertEqual(workload.client.waited[0]["evidence_path"], pathlib.Path(tmp) / "readiness" / "pending-unit-0000")
+            self.assertEqual(workload.client.activated[0]["document_id"], "doc-accepted")
 
     def test_delete_or_expire_does_not_reuse_deleted_pool_documents(self):
         class FakeClient:
