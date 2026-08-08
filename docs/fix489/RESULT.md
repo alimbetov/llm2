@@ -86,6 +86,90 @@ FIX489_CAPACITY_CAMPAIGN_PASS
 FIX489_SOAK_60M_PASS
 ```
 
+FIX489-R2 live capacity status after harness identity repair:
+
+```text
+latest_code_sha: 41a23dea956c4e3b90e23ccf654be10abce15b3b
+branch: agent/fix489-live-capacity-soak
+production_retrieval_semantics_changed: no
+raw_evidence_root: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-capacity
+```
+
+Static and contract gates on the latest code SHA:
+
+```text
+cargo fmt --all --check: PASS
+cargo check --locked --all-targets --all-features: PASS
+cargo clippy --locked --all-targets --all-features -- -D warnings: PASS
+cargo test --locked --all-targets --all-features: PASS
+make verify-fix489-live-capacity-contracts: PASS
+focused FIX489 Python contracts: 40/40 PASS
+```
+
+Capacity harness repair:
+
+```text
+defect: repeated INGEST_VERSION operation_id reused deterministic document identity across phases/levels.
+observed_failure: a previously finalized active ingest document could later be deleted/expired by the workload and then re-enter pending finalization, causing VECTOR_SYNC_QDRANT_MISMATCH against SOFT_DELETED bindings.
+repair: live INGEST_VERSION now creates a run-local unique invocation id for namespace/source identity, and pending ingest finalization is deduplicated by (access_zone_id, document_id, document_version).
+regression_tests:
+- repeated ingest operation uses unique invocation identity
+- pending ingests are deduplicated by runtime identity
+```
+
+Post-repair targeted live capacity slice:
+
+```text
+evidence: /Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-capacity/fix489-capacity-20260808T035516Z
+terminal_status: BLOCKED
+terminal_reason: LIVE_CAPACITY_RUN_FAILED
+campaign_reason: NO_STABLE_LEVEL_ON_LOCAL_HARDWARE
+
+concurrency_5_verdict: SATURATED_CONTROLLED
+concurrency_5_completed_operations: 430
+concurrency_5_grpc_OK: 401
+concurrency_5_RESOURCE_EXHAUSTED: 29
+concurrency_5_success_rate: 0.9325581395348838
+concurrency_5_p95_ms: 6341.0
+concurrency_5_p99_ms: 6630.0
+concurrency_5_safety_hard_gates: 0
+
+concurrency_10_verdict: SATURATED_CONTROLLED
+concurrency_10_completed_operations: 648
+concurrency_10_grpc_OK: 609
+concurrency_10_RESOURCE_EXHAUSTED: 39
+concurrency_10_success_rate: 0.9398148148148148
+concurrency_10_p95_ms: 6981.0
+concurrency_10_p99_ms: 9399.0
+concurrency_10_safety_hard_gates: 0
+
+cross_zone_leakage_count: 0
+access_level_violation_count: 0
+wrong_version_count: 0
+deleted_context_count: 0
+expired_context_count: 0
+indexing_context_count: 0
+missing_active_qdrant_points_after_cooldown: 0
+dead_letters: 0
+orphan_binding_count: 0
+orphan_outbox_count: 0
+duplicate_canonical_identity_count: 0
+panic: 0
+crash: 0
+deadlock: 0
+UNKNOWN: 0
+```
+
+Interpretation:
+
+```text
+FIX489_RUNTIME_SAFETY_GATES: PASS
+FIX489_HARNESS_IDENTITY_REPAIR: PASS
+FIX489_LOCAL_CAPACITY_STABLE_FLOOR: BLOCKED
+blocking_reason: official local ladder starts at concurrency=5, but this Mac CPU profile reaches controlled admission shedding already at concurrency=5.
+next_recommended_step: add a local discovery ladder for concurrency=1,2,3,4 before the official 5,10,15,20,25,50 campaign, then run the 60-minute soak only after a stable operating level is established.
+```
+
 Interrupted official capacity attempt:
 
 ```text
