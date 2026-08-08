@@ -124,7 +124,10 @@ class LiveWorkload:
         self.delete_counter = 0
         self.delete_lock = threading.Lock()
         self.pending_ingests: list[dict[str, Any]] = []
+        self.pending_ingest_keys: set[tuple[str, str, int]] = set()
         self.pending_ingest_lock = threading.Lock()
+        self.ingest_counter = 0
+        self.ingest_counter_lock = threading.Lock()
 
     def prepare_documents(self, count: int = 9) -> list[dict[str, Any]]:
         if self.documents:
@@ -245,14 +248,25 @@ class LiveWorkload:
             self.delete_documents.append({**doc, "pool_index": len(self.delete_documents), "pool_state": DELETE_READY})
 
     def add_pending_ingest(self, doc: dict[str, Any]) -> None:
+        key = (str(doc["access_zone_id"]), str(doc["document_id"]), int(doc["document_version"]))
         with self.pending_ingest_lock:
+            if key in self.pending_ingest_keys:
+                return
             self.pending_ingests.append(doc)
+            self.pending_ingest_keys.add(key)
 
     def drain_pending_ingests(self) -> list[dict[str, Any]]:
         with self.pending_ingest_lock:
             pending = list(self.pending_ingests)
             self.pending_ingests.clear()
+            self.pending_ingest_keys.clear()
         return pending
+
+    def next_ingest_invocation(self, op: ScheduledOperation) -> str:
+        with self.ingest_counter_lock:
+            self.ingest_counter += 1
+            sequence = self.ingest_counter
+        return f"{op.operation_id}-invoke-{sequence:08d}"
 
     def finalize_pending_ingests(self, *, phase: str) -> list[dict[str, Any]]:
         finalized: list[dict[str, Any]] = []
@@ -306,15 +320,16 @@ class LiveWorkload:
             classification = "FOUND" if response.get("contexts") else "EMPTY"
             return "OK", response, classification
         if op.operation_type == "INGEST_VERSION":
-            text = f"FIX489 live ingest operation {op.operation_id}. Stable runtime pressure document."
+            invocation_id = self.next_ingest_invocation(op)
+            text = f"FIX489 live ingest operation {invocation_id}. Stable runtime pressure document."
             indexed = self.client.index_text(
                 text=text,
-                source_path=f"synthetic://fix489/{op.operation_id}",
-                namespace=f"{self.run_namespace}-{op.operation_id}",
+                source_path=f"synthetic://fix489/{invocation_id}",
+                namespace=f"{self.run_namespace}-{invocation_id}",
                 access_zone_code=doc["access_zone_code"],
                 caller_service="fix489-live-capacity",
-                title=f"FIX489 live ingest {op.operation_id}",
-                metadata={"fix489_operation": op.operation_id},
+                title=f"FIX489 live ingest {invocation_id}",
+                metadata={"fix489_operation": op.operation_id, "fix489_invocation": invocation_id},
             )
             runtime_doc = indexed["response"].get("document") or {}
             access_zone_id = runtime_doc.get("accessZoneId", doc["access_zone_id"])
@@ -327,6 +342,7 @@ class LiveWorkload:
                     "document_id": document_id,
                     "document_version": document_version,
                     "operation_id": op.operation_id,
+                    "invocation_id": invocation_id,
                     "indexed_response": indexed["response"],
                 }
             )

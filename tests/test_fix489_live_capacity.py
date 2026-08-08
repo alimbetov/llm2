@@ -180,6 +180,64 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertEqual(len(workload.pending_ingests), 1)
         self.assertEqual(workload.client.wait_calls, 0)
 
+    def test_repeated_ingest_operation_uses_unique_invocation_identity(self):
+        class FakeClient:
+            def __init__(self):
+                self.namespaces: list[str] = []
+
+            def index_text(self, **kwargs):
+                self.namespaces.append(kwargs["namespace"])
+                document_id = f"doc-{len(self.namespaces)}"
+                return {
+                    "document_id": document_id,
+                    "response": {
+                        "document": {
+                            "accessZoneId": "zone-a",
+                            "documentId": document_id,
+                            "documentVersion": 1,
+                        }
+                    },
+                }
+
+        workload = fix489.LiveWorkload(client=FakeClient(), output=pathlib.Path("/tmp/fix489/unique-ingest"))
+        workload.documents = [{"access_zone_code": "4871", "access_zone_id": "zone-a"}]
+        op = fix489.ScheduledOperation(
+            operation_id="fix487b-op-004-ingest_version",
+            cycle_index=0,
+            operation_type="INGEST_VERSION",
+            access_zone="4871",
+            access_level="PUBLIC",
+            logical_identity="fix487b-doc-000",
+            scheduled_at=4,
+        )
+
+        workload.execute_sync(op)
+        workload.execute_sync(op)
+
+        self.assertEqual(len(workload.client.namespaces), 2)
+        self.assertNotEqual(workload.client.namespaces[0], workload.client.namespaces[1])
+        self.assertIn("invoke-00000001", workload.client.namespaces[0])
+        self.assertIn("invoke-00000002", workload.client.namespaces[1])
+        self.assertEqual(len(workload.pending_ingests), 2)
+
+    def test_pending_ingests_are_deduplicated_by_runtime_identity(self):
+        workload = fix489.LiveWorkload(client=object(), output=pathlib.Path("/tmp/fix489/pending-dedup"))
+        doc = {
+            "access_zone_code": "4871",
+            "access_zone_id": "zone-a",
+            "document_id": "doc-accepted",
+            "document_version": 1,
+            "operation_id": "fix487b-op-004-ingest_version",
+            "indexed_response": {},
+        }
+
+        workload.add_pending_ingest(doc)
+        workload.add_pending_ingest(dict(doc))
+
+        self.assertEqual(len(workload.pending_ingests), 1)
+        self.assertEqual(len(workload.drain_pending_ingests()), 1)
+        self.assertEqual(len(workload.pending_ingest_keys), 0)
+
     def test_pending_ingest_finalization_waits_activates_and_extends_delete_pool(self):
         class FakeClient:
             def __init__(self):
