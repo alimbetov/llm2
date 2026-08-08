@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-CAPACITY_LEVELS = (25, 50, 100, 200)
-LEVEL_SEEDS = {25: 487225, 50: 487250, 100: 487300, 200: 487400}
-MIN_COMPLETED = {25: 500, 50: 1000, 100: 1500, 200: 2000}
-PRACTICAL_RECOMMENDATIONS = (20, 25, 40, 50, 75, 100, 150)
+DEFAULT_CAPACITY_LEVELS = (5, 10, 15, 20, 25, 50)
+EXTREME_CAPACITY_LEVELS = (100, 200)
+LEVEL_SEEDS = {5: 489005, 10: 489010, 15: 489015, 20: 489020, 25: 489025, 50: 489050, 100: 489100, 200: 489200}
+MIN_COMPLETED = {5: 300, 10: 500, 15: 750, 20: 1000, 25: 1250, 50: 1400, 100: 1500, 200: 2000}
+PRACTICAL_RECOMMENDATIONS = (1, 2, 3, 4, 5, 7, 10, 12, 15, 20, 25, 40, 50, 75, 100, 150)
 STABLE_MAX_EXPECTED_ERROR_RATE = 0.005
+CAPACITY_SCOPE = "LOCAL_MAC_CPU"
 
 
 @dataclass(frozen=True)
@@ -20,16 +23,29 @@ class LevelPlan:
     concurrency: int
     seed: int
     runtime_warmup_seconds: int = 30
-    load_warmup_seconds: int = 300
+    load_warmup_seconds: int = 180
     measurement_seconds: int = 600
     cooldown_max_seconds: int = 600
     minimum_completed_operations: int = 0
 
 
+def configured_capacity_levels() -> tuple[int, ...]:
+    raw = os.environ.get("FIX489_CAPACITY_LEVELS")
+    if raw:
+        levels = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    else:
+        levels = DEFAULT_CAPACITY_LEVELS
+    if os.environ.get("FIX489_RUN_EXTREME_LEVELS", "").lower() == "true":
+        levels = tuple(dict.fromkeys((*levels, *EXTREME_CAPACITY_LEVELS)))
+    if not levels:
+        raise ValueError("capacity levels must contain at least one integer")
+    return levels
+
+
 def campaign_plan() -> list[dict]:
     return [
         asdict(LevelPlan(level, LEVEL_SEEDS[level], minimum_completed_operations=MIN_COMPLETED[level]))
-        for level in CAPACITY_LEVELS
+        for level in configured_capacity_levels()
     ]
 
 
@@ -47,6 +63,7 @@ def classify_level(metrics: dict) -> tuple[str, str | None]:
         "failed_outbox",
         "dead_letters",
         "missing_active_qdrant_points_after_cooldown",
+        "wrong_version_count",
         "UNKNOWN",
         "unexpected_INTERNAL",
         "panic",
@@ -62,13 +79,17 @@ def classify_level(metrics: dict) -> tuple[str, str | None]:
         return "FAILED", "UNBOUNDED_QUEUE"
     if not metrics.get("memory_behavior_stable", False):
         return "FAILED", "UNBOUNDED_MEMORY_GROWTH"
+    if int(metrics.get("outbox_pending_after_cooldown", 0)) > 0:
+        return "FAILED", "OUTBOX_NOT_DRAINED"
+    if int(metrics.get("outbox_retry_pending_after_cooldown", 0)) > 0:
+        return "FAILED", "OUTBOX_RETRY_NOT_DRAINED"
 
     completed = int(metrics.get("completed_operations", 0))
     min_completed = int(metrics.get("minimum_completed_operations", 0))
     success_rate = float(metrics.get("success_rate", 0.0))
     expected_error_rate = float(metrics.get("resource_exhausted_rate", 0.0)) + float(
         metrics.get("deadline_exceeded_rate", 0.0)
-    )
+    ) + float(metrics.get("unavailable_rate", 0.0))
     if completed >= min_completed and success_rate >= 0.995 and expected_error_rate <= STABLE_MAX_EXPECTED_ERROR_RATE:
         return "STABLE", None
     if metrics.get("controlled_saturation", False) and success_rate > 0.0:
@@ -90,13 +111,28 @@ def capacity_curve(level_results: list[dict]) -> dict:
         candidates = [value for value in PRACTICAL_RECOMMENDATIONS if value <= target and value <= maximum_stable]
         recommended = max(candidates) if candidates else max(1, target)
     return {
+        "capacity_scope": CAPACITY_SCOPE,
+        "production_capacity_claim": False,
         "maximum_stable_concurrency": maximum_stable,
         "first_controlled_saturation_concurrency": first_saturation or "NOT_REACHED",
         "highest_tested_controlled_concurrency": max(stable_levels + saturated_levels)
         if stable_levels or saturated_levels
         else None,
         "recommended_operating_concurrency": recommended,
+        "local_capacity_campaign_pass": local_capacity_campaign_pass(level_results),
     }
+
+
+def local_capacity_campaign_pass(level_results: list[dict]) -> bool:
+    if not any(row.get("verdict") == "STABLE" for row in level_results):
+        return False
+    by_level = {int(row["concurrency"]): row for row in level_results}
+    if 25 not in by_level or 50 not in by_level:
+        return False
+    allowed = {"STABLE", "SATURATED_CONTROLLED"}
+    if any(row.get("verdict") not in allowed for row in level_results):
+        return False
+    return all(int(row.get("hard_gate_not_measured_count", 0) or 0) == 0 for row in level_results)
 
 
 def write_plan(output: Path) -> dict:
@@ -104,6 +140,9 @@ def write_plan(output: Path) -> dict:
     manifest = {
         "schema_version": 1,
         "campaign": "fix487bc-capacity",
+        "capacity_scope": CAPACITY_SCOPE,
+        "production_capacity_claim": False,
+        "load_mode": "CLOSED_LOOP",
         "concurrency_5_pilot": {
             "status": "WAIVED_BY_PRODUCT_OWNER",
             "code": "CONCURRENCY_5_PILOT_WAIVED_BY_PRODUCT_OWNER",

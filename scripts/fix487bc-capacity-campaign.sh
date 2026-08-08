@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${FIX487BC_RUN_ID:-fix487bc-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${FIX487BC_RUN_ID:-fix489-capacity-$(date -u +%Y%m%dT%H%M%SZ)}"
 EVIDENCE_ROOT="${ASTRAVECTOR_EVIDENCE_ROOT:-${ROOT_DIR}/../astravector-evidence}"
-EVIDENCE_DIR="${EVIDENCE_ROOT}/fix487bc/${RUN_ID}"
+EVIDENCE_DIR="${EVIDENCE_ROOT}/fix489-capacity/${RUN_ID}"
 STATUS="BLOCKED"
 REASON="UNKNOWN"
 
@@ -18,6 +18,15 @@ trap finish EXIT INT TERM
 
 cd "$ROOT_DIR"
 mkdir -p "$EVIDENCE_DIR"
+# shellcheck disable=SC1091
+. scripts/local-demo/common.sh
+
+if [[ "${ASTRAVECTOR_PROFILE}" == "local-demo" ]]; then
+  export ASTRAVECTOR_PROFILE="fix489-capacity"
+fi
+export FIX489_CLIENT_DEADLINE_MS="${FIX489_CLIENT_DEADLINE_MS:-67500}"
+export FIX489_CAPACITY_LEVELS="${FIX489_CAPACITY_LEVELS:-5,10,15,20,25,50}"
+export FIX489_LOAD_MODE="${FIX489_LOAD_MODE:-CLOSED_LOOP}"
 
 if [[ "${ASTRAVECTOR_FIX487BC_EXECUTE_CAPACITY:-false}" != "true" ]]; then
   STATUS="BLOCKED"
@@ -51,8 +60,21 @@ if [[ -z "${ASTRAVECTOR_TOKENIZER_PATH:-}" || ! -f "${ASTRAVECTOR_TOKENIZER_PATH
   exit 2
 fi
 
+docker compose up -d postgres qdrant
+scripts/local-demo/infra-wait.sh
+cargo sqlx migrate run
+cargo build --release --locked
+if ! grpcurl -plaintext 127.0.0.1:50051 list >/dev/null 2>&1; then
+  scripts/local-demo/run-runtime.sh
+fi
+grpcurl -plaintext 127.0.0.1:50051 list >"$EVIDENCE_DIR/grpc-services.txt"
+
+REASON="CAPACITY_PLAN_FAILED"
 python3 scripts/fix487bc_capacity_campaign.py --output "$EVIDENCE_DIR"
-STATUS="BLOCKED"
-REASON="LIVE_CAPACITY_EXECUTION_NOT_IMPLEMENTED_IN_THIS_RUN"
-echo "FIX487BC_CAPACITY_CAMPAIGN_BLOCKED reason=${REASON}"
-exit 2
+REASON="LIVE_CAPACITY_RUN_FAILED"
+python3 scripts/fix489_live_capacity.py --capacity-output "$EVIDENCE_DIR"
+REASON="CAPACITY_EVIDENCE_VERIFICATION_FAILED"
+python3 scripts/fix487bc_capacity_evidence.py --root "$EVIDENCE_DIR"
+STATUS="PASS"
+REASON="FIX489_CAPACITY_CAMPAIGN_PASS"
+echo "FIX489_CAPACITY_CAMPAIGN_PASS evidence=${EVIDENCE_DIR}"

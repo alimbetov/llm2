@@ -14,6 +14,15 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from astravector_live_client import (  # noqa: E402
+    AstraVectorLiveClient,
+    document_vector_status_ready,
+    make_logical_blocks,
+    qdrant_collections_response_is_ready,
+    sha256_text,
+    vector_sync_is_complete,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCAL = ROOT / ".local-demo"
@@ -74,10 +83,6 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def sha256_text(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def run(args, *, input_text=None, check=True, capture=True, env_overlay=None):
@@ -156,30 +161,11 @@ def check_prerequisites(args=None):
 
 
 def check_model(args=None):
-    model = env("ASTRAVECTOR_MODEL_PATH")
-    tokenizer = env("ASTRAVECTOR_TOKENIZER_PATH")
-    if not model or not tokenizer:
-        print("FIX488_LOCAL_E2E_BLOCKED reason=MODEL_OR_TOKENIZER_NOT_CONFIGURED")
-        raise SystemExit(2)
-    model_path = Path(model).expanduser().resolve()
-    tokenizer_path = Path(tokenizer).expanduser().resolve()
-    if not model_path.is_file():
-        print(f"FIX488_LOCAL_E2E_BLOCKED reason=MODEL_NOT_AVAILABLE path={model_path}")
-        raise SystemExit(2)
-    if not tokenizer_path.is_file():
-        print(f"FIX488_LOCAL_E2E_BLOCKED reason=TOKENIZER_NOT_AVAILABLE path={tokenizer_path}")
-        raise SystemExit(2)
     try:
-        json.loads(tokenizer_path.read_text(encoding="utf-8"))
+        identity = AstraVectorLiveClient().model_identity()
     except Exception as exc:
-        print(f"FIX488_LOCAL_E2E_BLOCKED reason=UNSUPPORTED_LOCAL_ONNX_ARTIFACT tokenizer_json_error={exc}")
+        print(f"FIX488_LOCAL_E2E_BLOCKED reason={exc}")
         raise SystemExit(2)
-    identity = {
-        "model_path": str(model_path),
-        "model_sha256": sha256_file(model_path),
-        "tokenizer_path": str(tokenizer_path),
-        "tokenizer_sha256": sha256_file(tokenizer_path),
-    }
     print(json.dumps(identity, ensure_ascii=False, indent=2, sort_keys=True))
     return identity
 
@@ -200,15 +186,6 @@ def http_json(url, method="GET", body=None):
     with urllib.request.urlopen(req, timeout=10) as response:
         raw = response.read().decode("utf-8")
         return json.loads(raw) if raw else {}
-
-
-def qdrant_collections_response_is_ready(value):
-    if not isinstance(value, dict):
-        return False
-    if isinstance(value.get("collections"), list):
-        return True
-    result = value.get("result")
-    return isinstance(result, dict) and isinstance(result.get("collections"), list)
 
 
 def infra_wait(args=None):
@@ -233,33 +210,17 @@ def infra_wait(args=None):
 
 
 def grpcurl(method, payload, *, headers=None):
-    args = ["grpcurl", "-plaintext"]
-    for key, value in (headers or {}).items():
-        args.extend(["-H", f"{key}: {value}"])
-    args.extend(["-d", json.dumps(payload, ensure_ascii=False), grpc_addr(), method])
-    result = run(args, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"grpcurl failed for {method}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
-    return json.loads(result.stdout or "{}")
+    return AstraVectorLiveClient(grpc_addr=grpc_addr(), qdrant_url=qdrant_url(), collection=collection()).grpcurl(
+        method, payload, headers=headers
+    )
 
 
 def grpc_list():
-    result = run(["grpcurl", "-plaintext", grpc_addr(), "list"], check=False)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-    return result.stdout
+    return AstraVectorLiveClient(grpc_addr=grpc_addr(), qdrant_url=qdrant_url(), collection=collection()).grpc_list()
 
 
 def wait_grpc(timeout=120):
-    deadline = time.time() + timeout
-    last = ""
-    while time.time() < deadline:
-        result = run(["grpcurl", "-plaintext", grpc_addr(), "list"], check=False)
-        last = (result.stdout or result.stderr).strip()
-        if result.returncode == 0 and "AstraVectorV004Control" in result.stdout:
-            return result.stdout
-        time.sleep(1)
-    raise RuntimeError(f"gRPC endpoint not ready: {last}")
+    return AstraVectorLiveClient(grpc_addr=grpc_addr(), qdrant_url=qdrant_url(), collection=collection()).wait_grpc(timeout)
 
 
 def run_runtime(args=None):
@@ -286,7 +247,14 @@ def run_runtime(args=None):
         "RUST_LOG": env("RUST_LOG", "info"),
     }
     log = RUNTIME_LOG.open("ab")
-    proc = subprocess.Popen([str(ROOT / "target" / "release" / "astravector-runtime")], cwd=ROOT, env={**os.environ, **env_overlay}, stdout=log, stderr=log)
+    proc = subprocess.Popen(
+        [str(ROOT / "target" / "release" / "astravector-runtime")],
+        cwd=ROOT,
+        env={**os.environ, **env_overlay},
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
     RUNTIME_PID.write_text(str(proc.pid), encoding="utf-8")
     append_demo_env({"ASTRAVECTOR_RUNTIME_PID": proc.pid})
     try:
@@ -294,6 +262,8 @@ def run_runtime(args=None):
     except Exception:
         proc.poll()
         raise
+    if proc.poll() is not None:
+        raise RuntimeError(f"runtime exited after gRPC readiness check with code {proc.returncode}")
     (LOCAL / "grpc-services.txt").write_text(services, encoding="utf-8")
     print(f"AstraVector Rust runtime: READY pid={proc.pid}")
 
@@ -304,7 +274,12 @@ def stop_runtime(args=None):
         return
     pid = int(RUNTIME_PID.read_text().strip())
     try:
-        os.kill(pid, signal.SIGINT)
+        try:
+            os.killpg(pid, signal.SIGINT)
+        except ProcessLookupError:
+            raise
+        except Exception:
+            os.kill(pid, signal.SIGINT)
     except ProcessLookupError:
         RUNTIME_PID.unlink()
         print("stale runtime pid removed")
@@ -324,43 +299,14 @@ def stop_runtime(args=None):
 
 
 def make_blocks(text):
-    root_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"fix488:root:{sha256_text(text)}"))
-    blocks = [{
-        "blockId": root_id,
-        "blockType": "BLOCK_TYPE_DOCUMENT",
-        "text": "AstraVector local demo document root.",
-        "orderIndex": 0,
-        "sourceLocation": {
-            "charStart": 0,
-            "charEnd": len(text),
-            "sectionPath": "local-demo",
-            "heading": "AstraVector local demo",
-        },
-        "metadata": {"fix488_role": "root"},
-    }]
-    offset = 0
-    order = 1
-    for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
-        start = text.find(para, offset)
-        end = start + len(para)
-        block_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"fix488:block:{order}:{sha256_text(para)}"))
-        blocks.append({
-            "blockId": block_id,
-            "parentBlockId": root_id,
-            "blockType": "BLOCK_TYPE_PARAGRAPH",
-            "text": para,
-            "orderIndex": order,
-            "sourceLocation": {
-                "charStart": start,
-                "charEnd": end,
-                "sectionPath": "local-demo",
-                "heading": "AstraVector local demo",
-            },
-            "metadata": {"fix488_order": str(order)},
-        })
-        offset = end
-        order += 1
-    return blocks
+    return make_logical_blocks(
+        text,
+        namespace="fix488",
+        section_path="local-demo",
+        heading="AstraVector local demo",
+        root_text="AstraVector local demo document root.",
+        metadata_prefix="fix488",
+    )
 
 
 def load_text(args):
@@ -454,17 +400,6 @@ def vector_status(include_qdrant=True):
     return grpcurl("astravector.embedding.v1.AstraVectorIngestionFacade/GetDocumentVectorStatus", request)
 
 
-def vector_sync_is_complete(sync):
-    expected = int(sync.get("expectedBindings", 0) or 0)
-    return (
-        expected > 0
-        and int(sync.get("syncedBindings", 0) or 0) >= expected
-        and int(sync.get("outboxCompleted", 0) or 0) >= expected
-        and int(sync.get("outboxFailed", 0) or 0) == 0
-        and int(sync.get("qdrantPointsFound", 0) or 0) >= expected
-    )
-
-
 def wait_vector_sync(args=None):
     deadline = time.time() + int(env("FIX488_VECTOR_SYNC_TIMEOUT_SECONDS", "120"))
     last = {}
@@ -482,7 +417,7 @@ def wait_vector_sync(args=None):
         }, ensure_ascii=False))
         if int(sync.get("outboxFailed", 0)) > 0:
             raise SystemExit("FIX488_LOCAL_END_TO_END_FAIL reason=OUTBOX_FAILED")
-        if vector_sync_is_complete(sync):
+        if document_vector_status_ready(last):
             write_json(LOCAL / "vector-status.json", last)
             print("Vector publication: PASS")
             return last
@@ -539,39 +474,9 @@ def psql_json(sql):
 
 def inspect_postgres(args=None):
     zone, doc, version = doc_ref()
-    sql = f"""
-WITH ids AS (
-  SELECT '{zone}'::uuid AS access_zone_id, '{doc}'::uuid AS document_id, {version}::bigint AS document_version
-)
-SELECT json_build_object(
-  'document_versions', (SELECT json_agg(row_to_json(dv)) FROM (
-    SELECT access_zone_id, document_id, document_version, status, lifecycle_status, access_zone_code
-    FROM astravector.document_versions
-    WHERE access_zone_id=(SELECT access_zone_id FROM ids) AND document_id=(SELECT document_id FROM ids) AND document_version=(SELECT document_version FROM ids)
-  ) dv),
-  'chunk_count', (SELECT count(*) FROM astravector.content_chunks_v004 c, ids WHERE c.access_zone_id=ids.access_zone_id AND c.document_id=ids.document_id AND c.document_version=ids.document_version),
-  'chunks_by_granularity', (SELECT json_object_agg(chunk_granularity, count) FROM (
-    SELECT granularity AS chunk_granularity, count(*) FROM astravector.content_chunks_v004 c, ids WHERE c.access_zone_id=ids.access_zone_id AND c.document_id=ids.document_id AND c.document_version=ids.document_version GROUP BY granularity
-  ) g),
-  'binding_count', (SELECT count(*) FROM astravector.vector_bindings_v004 b, ids WHERE b.access_zone_id=ids.access_zone_id AND b.document_id=ids.document_id AND b.document_version=ids.document_version),
-  'bindings_by_sync', (SELECT json_object_agg(qdrant_sync_status, count) FROM (
-    SELECT qdrant_sync_status, count(*) FROM astravector.vector_bindings_v004 b, ids WHERE b.access_zone_id=ids.access_zone_id AND b.document_id=ids.document_id AND b.document_version=ids.document_version GROUP BY qdrant_sync_status
-  ) s),
-  'outbox_by_status', (SELECT json_object_agg(status, count) FROM (
-    SELECT o.status, count(*)
-    FROM astravector.vector_outbox o
-    JOIN astravector.vector_bindings_v004 b
-      ON b.id=o.binding_id
-     AND b.access_zone_id=o.binding_access_zone_id
-    JOIN ids
-      ON b.access_zone_id=ids.access_zone_id
-     AND b.document_id=ids.document_id
-     AND b.document_version=ids.document_version
-    GROUP BY o.status
-  ) o)
-);
-"""
-    data = psql_json(sql)
+    data = AstraVectorLiveClient(grpc_addr=grpc_addr(), qdrant_url=qdrant_url(), collection=collection()).inspect_postgres_document(
+        access_zone_id=zone, document_id=doc, document_version=version
+    )
     write_json(LOCAL / "postgres-audit.json", data)
     print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
     return data

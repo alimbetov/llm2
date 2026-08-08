@@ -1,0 +1,45 @@
+# FIX489 MacBook live capacity/soak profile.
+#
+# This profile changes only bounded operational budgets for CPU model-backed
+# load execution. Retrieval semantics, ranking weights, frozen fixtures and
+# qrels remain controlled by the base configuration and freeze guard.
+service:
+  environment: fix489-capacity
+
+grpc:
+  deadlines:
+    query_ms: ${FIX489_QUERY_DEADLINE_MS:-67500}
+
+postgres:
+  statement_timeout_ms: ${FIX489_POSTGRES_STATEMENT_TIMEOUT_MS:-45000}
+  lock_timeout_ms: ${FIX489_POSTGRES_LOCK_TIMEOUT_MS:-2250}
+  idle_in_transaction_session_timeout_ms: ${FIX489_POSTGRES_IDLE_IN_TX_TIMEOUT_MS:-15000}
+
+qdrant:
+  timeout_ms: ${FIX489_QDRANT_TIMEOUT_MS:-22500}
+
+sparse:
+  required: ${FIX489_SPARSE_REQUIRED:-false}
+
+search:
+  query_processing:
+    long_query_deadline_ms: ${FIX489_LONG_QUERY_DEADLINE_MS:-67500}
+    single_deadline_ms: ${FIX489_SINGLE_QUERY_DEADLINE_MS:-67500}
+    standard:
+      deadline_ms: ${FIX489_LONG_QUERY_STANDARD_DEADLINE_MS:-67500}
+    extended:
+      deadline_ms: ${FIX489_LONG_QUERY_EXTENDED_DEADLINE_MS:-101250}
+  lexical:
+    statement_timeout_ms: ${FIX489_LEXICAL_SEARCH_STATEMENT_TIMEOUT_MS:-1125}
+    min_remaining_budget_ms: ${FIX489_LEXICAL_SEARCH_MIN_REMAINING_BUDGET_MS:-450}
+    response_reserve_ms: ${FIX489_LEXICAL_SEARCH_RESPONSE_RESERVE_MS:-225}
+
+batching:
+  query:
+    queue_capacity: ${FIX489_QUERY_QUEUE_CAPACITY:-2000}
+    max_queue_age_ms: ${FIX489_QUERY_MAX_QUEUE_AGE_MS:-750}
+    min_inference_budget_ms: ${FIX489_QUERY_MIN_INFERENCE_BUDGET_MS:-750}
+    max_deadline_skew_ms: ${FIX489_QUERY_MAX_DEADLINE_SKEW_MS:-750}
+
+limits:
+  backpressure_acquire_timeout_ms: ${FIX489_BACKPRESSURE_ACQUIRE_TIMEOUT_MS:-225}
