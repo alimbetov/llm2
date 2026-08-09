@@ -54,7 +54,9 @@ if [[ -z "${FIX489_R3_CAPACITY_EVIDENCE_DIR:-}" || ! -f "${FIX489_R3_CAPACITY_EV
   exit 2
 fi
 
+REASON="INFRA_START_FAILED"
 docker compose up -d postgres qdrant
+REASON="INFRA_WAIT_FAILED"
 scripts/local-demo/infra-wait.sh
 REASON="MIGRATION_FAILED"
 cargo sqlx migrate run
