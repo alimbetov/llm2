@@ -10,9 +10,38 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 DEFAULT_CAPACITY_LEVELS = (5, 10, 15, 20, 25, 50)
+DISCOVERY_CAPACITY_LEVELS = (1, 2, 3, 4)
 EXTREME_CAPACITY_LEVELS = (100, 200)
-LEVEL_SEEDS = {5: 489005, 10: 489010, 15: 489015, 20: 489020, 25: 489025, 50: 489050, 100: 489100, 200: 489200}
-MIN_COMPLETED = {5: 300, 10: 500, 15: 750, 20: 1000, 25: 1250, 50: 1400, 100: 1500, 200: 2000}
+FULL_LOCAL_CAPACITY = "FULL_LOCAL_CAPACITY"
+LOCAL_STABLE_FLOOR_DISCOVERY = "LOCAL_STABLE_FLOOR_DISCOVERY"
+LEVEL_SEEDS = {
+    1: 489001,
+    2: 489002,
+    3: 489003,
+    4: 489004,
+    5: 489005,
+    10: 489010,
+    15: 489015,
+    20: 489020,
+    25: 489025,
+    50: 489050,
+    100: 489100,
+    200: 489200,
+}
+MIN_COMPLETED = {
+    1: 100,
+    2: 150,
+    3: 200,
+    4: 250,
+    5: 300,
+    10: 500,
+    15: 750,
+    20: 1000,
+    25: 1250,
+    50: 1400,
+    100: 1500,
+    200: 2000,
+}
 PRACTICAL_RECOMMENDATIONS = (1, 2, 3, 4, 5, 7, 10, 12, 15, 20, 25, 40, 50, 75, 100, 150)
 STABLE_MAX_EXPECTED_ERROR_RATE = 0.005
 CAPACITY_SCOPE = "LOCAL_MAC_CPU"
@@ -29,24 +58,51 @@ class LevelPlan:
     minimum_completed_operations: int = 0
 
 
-def configured_capacity_levels() -> tuple[int, ...]:
+def campaign_mode() -> str:
+    mode = os.environ.get("FIX489_CAMPAIGN_MODE", FULL_LOCAL_CAPACITY).strip() or FULL_LOCAL_CAPACITY
+    allowed = {FULL_LOCAL_CAPACITY, LOCAL_STABLE_FLOOR_DISCOVERY}
+    if mode not in allowed:
+        raise ValueError(f"unsupported FIX489_CAMPAIGN_MODE: {mode}")
+    return mode
+
+
+def configured_capacity_levels(mode: str | None = None) -> tuple[int, ...]:
+    resolved_mode = mode or campaign_mode()
     raw = os.environ.get("FIX489_CAPACITY_LEVELS")
     if raw:
         levels = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    elif resolved_mode == LOCAL_STABLE_FLOOR_DISCOVERY:
+        levels = DISCOVERY_CAPACITY_LEVELS
     else:
         levels = DEFAULT_CAPACITY_LEVELS
-    if os.environ.get("FIX489_RUN_EXTREME_LEVELS", "").lower() == "true":
+    if resolved_mode == FULL_LOCAL_CAPACITY and os.environ.get("FIX489_RUN_EXTREME_LEVELS", "").lower() == "true":
         levels = tuple(dict.fromkeys((*levels, *EXTREME_CAPACITY_LEVELS)))
     if not levels:
         raise ValueError("capacity levels must contain at least one integer")
+    unknown = [level for level in levels if level not in LEVEL_SEEDS or level not in MIN_COMPLETED]
+    if unknown:
+        raise ValueError(f"unsupported capacity levels for {resolved_mode}: {unknown}")
     return levels
 
 
-def campaign_plan() -> list[dict]:
-    return [
-        asdict(LevelPlan(level, LEVEL_SEEDS[level], minimum_completed_operations=MIN_COMPLETED[level]))
-        for level in configured_capacity_levels()
-    ]
+def level_plan(level: int, mode: str | None = None) -> LevelPlan:
+    resolved_mode = mode or campaign_mode()
+    if resolved_mode == LOCAL_STABLE_FLOOR_DISCOVERY:
+        return LevelPlan(
+            level,
+            LEVEL_SEEDS[level],
+            runtime_warmup_seconds=30,
+            load_warmup_seconds=60,
+            measurement_seconds=300,
+            cooldown_max_seconds=300,
+            minimum_completed_operations=MIN_COMPLETED[level],
+        )
+    return LevelPlan(level, LEVEL_SEEDS[level], minimum_completed_operations=MIN_COMPLETED[level])
+
+
+def campaign_plan(mode: str | None = None) -> list[dict]:
+    resolved_mode = mode or campaign_mode()
+    return [asdict(level_plan(level, resolved_mode)) for level in configured_capacity_levels(resolved_mode)]
 
 
 def classify_level(metrics: dict) -> tuple[str, str | None]:
@@ -97,7 +153,8 @@ def classify_level(metrics: dict) -> tuple[str, str | None]:
     return "FAILED", "INSUFFICIENT_COMPLETED_OPERATIONS"
 
 
-def capacity_curve(level_results: list[dict]) -> dict:
+def capacity_curve(level_results: list[dict], *, mode: str | None = None) -> dict:
+    resolved_mode = mode or campaign_mode()
     stable_levels = [row["concurrency"] for row in level_results if row["verdict"] == "STABLE"]
     saturated_levels = [row["concurrency"] for row in level_results if row["verdict"] == "SATURATED_CONTROLLED"]
     maximum_stable = max(stable_levels) if stable_levels else None
@@ -112,6 +169,7 @@ def capacity_curve(level_results: list[dict]) -> dict:
         recommended = max(candidates) if candidates else max(1, target)
     return {
         "capacity_scope": CAPACITY_SCOPE,
+        "campaign_mode": resolved_mode,
         "production_capacity_claim": False,
         "maximum_stable_concurrency": maximum_stable,
         "first_controlled_saturation_concurrency": first_saturation or "NOT_REACHED",
@@ -120,6 +178,9 @@ def capacity_curve(level_results: list[dict]) -> dict:
         else None,
         "recommended_operating_concurrency": recommended,
         "local_capacity_campaign_pass": local_capacity_campaign_pass(level_results),
+        "local_stable_floor_discovery_pass": local_stable_floor_discovery_pass(level_results)
+        if resolved_mode == LOCAL_STABLE_FLOOR_DISCOVERY
+        else False,
     }
 
 
@@ -135,11 +196,23 @@ def local_capacity_campaign_pass(level_results: list[dict]) -> bool:
     return all(int(row.get("hard_gate_not_measured_count", 0) or 0) == 0 for row in level_results)
 
 
+def local_stable_floor_discovery_pass(level_results: list[dict]) -> bool:
+    if not any(row.get("verdict") == "STABLE" for row in level_results):
+        return False
+    allowed = {"STABLE", "SATURATED_CONTROLLED"}
+    if any(row.get("verdict") not in allowed for row in level_results):
+        return False
+    return all(int(row.get("hard_gate_not_measured_count", 0) or 0) == 0 for row in level_results)
+
+
 def write_plan(output: Path) -> dict:
+    mode = campaign_mode()
+    campaign = "fix489-r3-local-stable-floor" if mode == LOCAL_STABLE_FLOOR_DISCOVERY else "fix487bc-capacity"
     output.mkdir(parents=True, exist_ok=True)
     manifest = {
         "schema_version": 1,
-        "campaign": "fix487bc-capacity",
+        "campaign": campaign,
+        "campaign_mode": mode,
         "capacity_scope": CAPACITY_SCOPE,
         "production_capacity_claim": False,
         "load_mode": "CLOSED_LOOP",
@@ -149,8 +222,10 @@ def write_plan(output: Path) -> dict:
             "waiver_reason": "PROCEED_DIRECTLY_TO_CAPACITY_CAMPAIGN",
             "historical_status_preserved": "FIX487B_CONCURRENCY_5_PILOT_BLOCKED",
         },
-        "levels": campaign_plan(),
+        "levels": campaign_plan(mode),
     }
+    if mode == LOCAL_STABLE_FLOOR_DISCOVERY:
+        manifest.pop("concurrency_5_pilot")
     (output / "campaign-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

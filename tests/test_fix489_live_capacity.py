@@ -340,6 +340,29 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn('REASON="LIVE_CAPACITY_RUN_FAILED"', source)
         self.assertIn('REASON="CAPACITY_EVIDENCE_VERIFICATION_FAILED"', source)
 
+    def test_r3_wrapper_enables_discovery_mode_after_static_contracts(self):
+        source = (ROOT / "scripts" / "fix489r3-local-stable-floor.sh").read_text(encoding="utf-8")
+        contracts_index = source.index("env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS make verify-fix489r3-contracts")
+        mode_index = source.index('export FIX489_CAMPAIGN_MODE="LOCAL_STABLE_FLOOR_DISCOVERY"')
+        levels_index = source.index('export FIX489_CAPACITY_LEVELS="${FIX489_CAPACITY_LEVELS:-1,2,3,4}"')
+        self.assertLess(contracts_index, mode_index)
+        self.assertLess(contracts_index, levels_index)
+
+    def test_r3_contract_target_sanitizes_mode_before_historical_contracts(self):
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        target = makefile[
+            makefile.index("verify-fix489r3-contracts:")
+            : makefile.index("verify-fix489r3-local-stable-floor:")
+        ]
+        self.assertIn(
+            "env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS $(MAKE) verify-fix489-live-capacity-contracts",
+            target,
+        )
+        self.assertIn(
+            "env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS python3 -m unittest",
+            target,
+        )
+
     def test_cleanup_target_removes_runtime_and_default_compose(self):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         cleanup = makefile[makefile.index("fix487bc-cleanup:") : makefile.index("verify-fix489-live-capacity-contracts:")]
@@ -380,6 +403,33 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         pool_size = fix489.expected_delete_pool_size((5, 10, 15, 20, 25, 50), 600, 180)
         self.assertGreaterEqual(pool_size, 100)
         self.assertLess(pool_size, 250)
+
+    def test_r3_delete_pool_size_uses_actual_discovery_plan_not_full_floor(self):
+        pool_size = fix489.expected_delete_pool_size((1, 2, 3, 4), 300, 60, minimum_pool_size=10)
+        self.assertGreaterEqual(pool_size, 25)
+        self.assertLess(pool_size, 60)
+
+    def test_soak_delete_pool_size_uses_observed_stable_throughput(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "campaign-manifest.json").write_text(
+                """{"levels":[{"concurrency":1,"measurement_seconds":300}]}""",
+                encoding="utf-8",
+            )
+            (root / "capacity-summary.json").write_text(
+                """{"levels":[{"concurrency":1,"completed_operations":613,"verdict":"STABLE"}]}""",
+                encoding="utf-8",
+            )
+
+            pool_size = fix489.expected_soak_delete_pool_size(root, 1, 3600, 300)
+
+        self.assertGreater(pool_size, 277)
+        self.assertLess(pool_size, 600)
+
+    def test_soak_wrapper_preserves_python_terminal_status_on_failure(self):
+        script = (ROOT / "scripts" / "fix489r3-soak-60m.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ "$exit_code" -ne 0 && -f "$EVIDENCE_DIR/terminal-status.json" ]]; then', script)
+        self.assertIn('exit "$exit_code"', script)
 
     def test_grpcurl_camel_case_statuses_are_normalized(self):
         self.assertEqual(

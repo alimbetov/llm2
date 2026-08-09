@@ -1,0 +1,32 @@
+# FIX489-R3 Result
+
+```text
+base_sha=799b503c8a10446b9da5b44b848174ab1f0bc662
+tested_sha=00eeafaa465ea848c69dea9d7b70bd38aa75b785
+soak_tested_sha=623c75b65146d1ee9bda3ecd66636d9019accfce
+FIX489_LIVE_MIXED_LOAD_CLIENT_PASS=previously_proven
+FIX489_VECTOR_READINESS_DIAGNOSTICS_PASS=previously_proven
+FIX489_RUNTIME_SAFETY_GATES_PASS=previously_proven
+FIX489_R3_LOCAL_STABLE_FLOOR_PASS=PASS
+FIX489_R3_SOAK_60M_PASS=PASS
+capacity_scope=LOCAL_MAC_CPU
+production_capacity_claim=false
+maximum_stable_concurrency=2
+recommended_operating_concurrency=1
+first_controlled_saturation_concurrency=3
+discovery_evidence=/Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-r3/fix489-r3-20260809T062307Z
+discovery_evidence_manifest_sha256=5d2ecabd84e1c0051e5232a01e49a0e07fae74be8a7cdf2a1ffc44dd3700ff4a
+soak_evidence=/Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-r3-soak/fix489-r3-soak-20260809T111138Z
+soak_evidence_manifest_sha256=02ce12a365169b857ff5d963db6b6ed66d14b56ca3c8c1e9f8a9d7de11a94c55
+```
+
+This page must be updated from live evidence only. A local Mac result must not
+be described as production capacity proof.
+
+Final R3 status:
+
+```text
+FIX489_R3_LOCAL_STABLE_FLOOR_PASS
+FIX489_R3_SOAK_60M_PASS
+FIX489_R3_PASS
+```

@@ -34,9 +34,11 @@ from fix487b_mixed_load import ScheduledOperation, deterministic_cycle, workload
 from fix487bc_capacity_campaign import (  # noqa: E402
     CAPACITY_SCOPE,
     LEVEL_SEEDS,
+    LOCAL_STABLE_FLOOR_DISCOVERY,
     MIN_COMPLETED,
     campaign_plan,
     capacity_curve,
+    campaign_mode,
     classify_level,
     configured_capacity_levels,
 )
@@ -79,6 +81,10 @@ def capacity_levels() -> tuple[int, ...]:
     return configured_capacity_levels()
 
 
+def capacity_campaign_mode() -> str:
+    return campaign_mode()
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -91,13 +97,77 @@ def percentile(values: list[float], p: float) -> float:
     return round(ordered[index], 3)
 
 
-def expected_delete_pool_size(levels: tuple[int, ...], measurement_seconds: int, warmup_seconds: int) -> int:
+def expected_delete_pool_size(
+    levels: tuple[int, ...],
+    measurement_seconds: int,
+    warmup_seconds: int,
+    *,
+    minimum_pool_size: int = 100,
+) -> int:
     largest = max(levels) if levels else 1
     warmup_multiplier = 1.0 + (warmup_seconds / max(1, measurement_seconds))
     operation_floor = max(MIN_COMPLETED.get(level, level * 10) for level in levels) if levels else 100
     estimated_delete_operations = int((operation_floor * warmup_multiplier * 0.05) + 0.999)
     safety_margin = max(20, largest)
-    return max(100, estimated_delete_operations + safety_margin)
+    return max(minimum_pool_size, estimated_delete_operations + safety_margin)
+
+
+def delete_operation_share(seed: int = 48960) -> float:
+    operations = deterministic_cycle(seed)
+    if not operations:
+        return 0.0
+    delete_count = sum(1 for operation in operations if operation.operation_type == "DELETE_OR_EXPIRE")
+    return delete_count / len(operations)
+
+
+def observed_capacity_operation_rate(capacity_root: Path, concurrency: int) -> float | None:
+    summary_path = capacity_root / "capacity-summary.json"
+    manifest_path = capacity_root / "campaign-manifest.json"
+    if not summary_path.is_file() or not manifest_path.is_file():
+        return None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    durations = {
+        int(row["concurrency"]): max(1, int(row.get("measurement_seconds", 0) or 0))
+        for row in manifest.get("levels", [])
+        if "concurrency" in row
+    }
+    stable_levels = [
+        row
+        for row in summary.get("levels", [])
+        if row.get("verdict") == "STABLE" and int(row.get("completed_operations", 0) or 0) > 0
+    ]
+    if not stable_levels:
+        return None
+    exact = [row for row in stable_levels if int(row.get("concurrency", 0) or 0) == concurrency]
+    candidates = exact or sorted(
+        stable_levels,
+        key=lambda row: (
+            abs(int(row.get("concurrency", 0) or 0) - concurrency),
+            -int(row.get("concurrency", 0) or 0),
+        ),
+    )
+    selected = candidates[0]
+    selected_concurrency = int(selected.get("concurrency", concurrency) or concurrency)
+    duration = durations.get(selected_concurrency, 300)
+    return float(selected["completed_operations"]) / float(duration)
+
+
+def expected_soak_delete_pool_size(
+    capacity_root: Path,
+    soak_concurrency: int,
+    measurement_seconds: int,
+    warmup_seconds: int,
+    *,
+    seed: int = 48960,
+    minimum_pool_size: int = 100,
+) -> int:
+    observed_rate = observed_capacity_operation_rate(capacity_root, soak_concurrency)
+    if observed_rate is None:
+        return expected_delete_pool_size((soak_concurrency,), measurement_seconds, warmup_seconds, minimum_pool_size=minimum_pool_size)
+    expected_deletes = int((observed_rate * (measurement_seconds + warmup_seconds) * delete_operation_share(seed)) + 0.999)
+    safety_margin = max(20, int(expected_deletes * 0.25 + 0.999), soak_concurrency * 5)
+    return max(minimum_pool_size, expected_deletes + safety_margin)
 
 
 def parse_runtime_rss_kib(sample: dict[str, Any]) -> int | None:
@@ -928,30 +998,49 @@ async def run_capacity(root: Path) -> dict[str, Any]:
     workload = LiveWorkload(client, root)
     root.mkdir(parents=True, exist_ok=True)
     services = client.wait_grpc(timeout_seconds=env_int("FIX489_GRPC_WAIT_SECONDS", 30))
-    write_json(root / "bootstrap.json", {"phase": "FIX489", "mode": "capacity", "started_at_ms": now_ms()})
+    mode = capacity_campaign_mode()
+    is_r3 = mode == LOCAL_STABLE_FLOOR_DISCOVERY
+    phase = "FIX489-R3" if is_r3 else "FIX489"
+    campaign_name = "fix489-r3-local-stable-floor" if is_r3 else "fix489-live-capacity"
+    write_json(root / "bootstrap.json", {"phase": phase, "mode": "capacity", "campaign_mode": mode, "started_at_ms": now_ms()})
     write_json(root / "environment.json", {"grpc_addr": client.grpc_addr, "database_url": client.database_url, "qdrant_url": client.qdrant_url, "collection": client.collection})
     (root / "grpc-services.txt").write_text(services, encoding="utf-8")
-    levels = capacity_levels()
-    warmup_seconds = env_int("FIX489_CAPACITY_WARMUP_SECONDS", 180)
-    measurement_seconds = env_int("FIX489_CAPACITY_MEASUREMENT_SECONDS", 600)
+    plan_rows = campaign_plan(mode)
+    levels = tuple(int(row["concurrency"]) for row in plan_rows)
+    plan_by_level = {int(row["concurrency"]): row for row in plan_rows}
     write_json(
         root / "campaign-manifest.json",
         {
             "schema_version": 2,
-            "campaign": "fix489-live-capacity",
+            "campaign": campaign_name,
+            "campaign_mode": mode,
             "capacity_scope": CAPACITY_SCOPE,
             "production_capacity_claim": False,
             "load_mode": os.environ.get("FIX489_LOAD_MODE", "CLOSED_LOOP"),
-            "levels": campaign_plan(),
+            "levels": plan_rows,
         },
     )
     write_json(root / "workload-manifest.json", workload_manifest(489, env_int("FIX489_WORKERS", 5), env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS)))
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 9))
+    largest_plan_warmup = max(int(row["load_warmup_seconds"]) for row in plan_rows) if plan_rows else 180
+    largest_plan_measurement = max(int(row["measurement_seconds"]) for row in plan_rows) if plan_rows else 600
     workload.prepare_delete_documents(
-        count=env_int("FIX489_DELETE_POOL_SIZE", expected_delete_pool_size(levels, measurement_seconds, warmup_seconds))
+        count=env_int(
+            "FIX489_DELETE_POOL_SIZE",
+            expected_delete_pool_size(
+                levels,
+                largest_plan_measurement,
+                largest_plan_warmup,
+                minimum_pool_size=10 if is_r3 else 100,
+            ),
+        )
     )
     level_results: list[dict[str, Any]] = []
     for level in levels:
+        level_plan = plan_by_level[level]
+        warmup_seconds = env_int("FIX489_CAPACITY_WARMUP_SECONDS", int(level_plan["load_warmup_seconds"]))
+        measurement_seconds = env_int("FIX489_CAPACITY_MEASUREMENT_SECONDS", int(level_plan["measurement_seconds"]))
+        cooldown_seconds = env_int("FIX489_CAPACITY_COOLDOWN_SECONDS", int(level_plan["cooldown_max_seconds"]))
         samples: list[dict[str, Any]] = []
         operations = deterministic_cycle(LEVEL_SEEDS.get(level, 489000 + level))
         postgres_before = postgres_audit(client, workload.run_namespace)
@@ -977,7 +1066,7 @@ async def run_capacity(root: Path) -> dict[str, Any]:
         measurement_finalized = workload.finalize_pending_ingests(phase=f"concurrency-{level}-measurement")
         postgres_after_measurement = postgres_audit(client, workload.run_namespace)
         qdrant_after_measurement = qdrant_audit(client, workload.prepare_documents())
-        cooldown = cooldown_poll(client, active=0, queued=0, max_seconds=env_int("FIX489_CAPACITY_COOLDOWN_SECONDS", 600))
+        cooldown = cooldown_poll(client, active=0, queued=0, max_seconds=cooldown_seconds)
         level_results.append(
             write_level_artifacts(
                 root,
@@ -987,7 +1076,7 @@ async def run_capacity(root: Path) -> dict[str, Any]:
                 samples,
                 client,
                 workload,
-                minimum_completed=env_int(f"FIX489_MIN_COMPLETED_{level}", MIN_COMPLETED.get(level, 1)),
+                minimum_completed=env_int(f"FIX489_MIN_COMPLETED_{level}", int(level_plan.get("minimum_completed_operations", MIN_COMPLETED.get(level, 1)))),
                 postgres_before=postgres_before,
                 qdrant_before=qdrant_before,
                 postgres_after_measurement=postgres_after_measurement,
@@ -1005,16 +1094,25 @@ async def run_capacity(root: Path) -> dict[str, Any]:
                 "total_finalized": len(warmup_finalized) + len(measurement_finalized),
             },
         )
-    curve = capacity_curve(level_results)
+    curve = capacity_curve(level_results, mode=mode)
     write_json(root / "capacity-curve.json", curve)
     write_json(root / "capacity-summary.json", {"levels": level_results, **curve})
     (root / "capacity-summary.md").write_text(f"# FIX489 Capacity Summary\n\n```json\n{json.dumps({'levels': level_results, **curve}, indent=2, sort_keys=True)}\n```\n", encoding="utf-8")
     write_json(root / "integrity-summary.json", client.integrity_counters())
-    status = "PASS" if curve.get("local_capacity_campaign_pass") else "BLOCKED"
+    pass_key = "local_stable_floor_discovery_pass" if is_r3 else "local_capacity_campaign_pass"
+    status = "PASS" if curve.get(pass_key) else "BLOCKED"
     reason = None if status == "PASS" else ("NO_STABLE_LEVEL_ON_LOCAL_HARDWARE" if not curve.get("maximum_stable_concurrency") else "CAPACITY_CAMPAIGN_GATES_FAILED")
     terminal = {
         "status": status,
-        "verdict": "FIX489_LOCAL_CAPACITY_CAMPAIGN_PASS" if status == "PASS" else "FIX489_LOCAL_CAPACITY_CAMPAIGN_BLOCKED",
+        "verdict": (
+            "FIX489_R3_LOCAL_STABLE_FLOOR_PASS"
+            if is_r3 and status == "PASS"
+            else "FIX489_R3_LOCAL_STABLE_FLOOR_BLOCKED"
+            if is_r3
+            else "FIX489_LOCAL_CAPACITY_CAMPAIGN_PASS"
+            if status == "PASS"
+            else "FIX489_LOCAL_CAPACITY_CAMPAIGN_BLOCKED"
+        ),
         "reason": reason,
     }
     write_json(root / "terminal-status.json", terminal)
@@ -1028,7 +1126,8 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
     capacity = json.loads((capacity_root / "capacity-curve.json").read_text(encoding="utf-8"))
     plan = plan_from_capacity(capacity)
     write_json(root / "capacity-source.json", capacity)
-    write_json(root / "bootstrap.json", {"phase": "FIX489", "mode": "soak", "started_at_ms": now_ms()})
+    is_r3 = capacity.get("campaign_mode") == LOCAL_STABLE_FLOOR_DISCOVERY
+    write_json(root / "bootstrap.json", {"phase": "FIX489-R3" if is_r3 else "FIX489", "mode": "soak", "soak_mode": plan.get("soak_mode"), "started_at_ms": now_ms()})
     write_json(root / "environment.json", {"grpc_addr": client.grpc_addr, "database_url": client.database_url, "qdrant_url": client.qdrant_url, "collection": client.collection})
     (root / "grpc-services.txt").write_text(services, encoding="utf-8")
     if plan["status"] != "READY":
@@ -1036,11 +1135,14 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
         return {"status": "BLOCKED", "reason": plan["reason"]}
     workload = LiveWorkload(client, root)
     workload.prepare_documents(count=env_int("FIX489_PREPARED_DOCUMENTS", 9))
-    soak_seconds = env_int("FIX489_SOAK_MEASUREMENT_SECONDS", 3600)
-    soak_warmup_seconds = env_int("FIX489_SOAK_WARMUP_SECONDS", 600)
+    soak_seconds = env_int("FIX489_SOAK_MEASUREMENT_SECONDS", int(plan.get("measurement_seconds", 3600)))
+    soak_warmup_seconds = env_int("FIX489_SOAK_WARMUP_SECONDS", int(plan.get("load_warmup_seconds", 600)))
     soak_concurrency = int(plan["soak_concurrency"])
     workload.prepare_delete_documents(
-        count=env_int("FIX489_DELETE_POOL_SIZE", expected_delete_pool_size((soak_concurrency,), soak_seconds, soak_warmup_seconds))
+        count=env_int(
+            "FIX489_DELETE_POOL_SIZE",
+            expected_soak_delete_pool_size(capacity_root, soak_concurrency, soak_seconds, soak_warmup_seconds),
+        )
     )
     write_json(root / "workload-manifest.json", workload_manifest(48960, int(plan["soak_concurrency"]), env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS)))
     samples: list[dict[str, Any]] = []
@@ -1120,7 +1222,22 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
     result = {"verdict": verdict, "reason": reason, **summary}
     write_json(root / "soak-result.json", result)
     (root / "soak-result.md").write_text(f"# FIX489 60-Minute Soak\n\n```json\n{json.dumps(result, indent=2, sort_keys=True)}\n```\n", encoding="utf-8")
-    write_json(root / "terminal-status.json", {"status": verdict, "verdict": "FIX489_SOAK_60M_PASS" if verdict == "PASS" else "FIX489_SOAK_60M_BLOCKED", "reason": reason})
+    write_json(
+        root / "terminal-status.json",
+        {
+            "status": verdict,
+            "verdict": (
+                "FIX489_R3_SOAK_60M_PASS"
+                if is_r3 and verdict == "PASS"
+                else "FIX489_R3_SOAK_60M_BLOCKED"
+                if is_r3
+                else "FIX489_SOAK_60M_PASS"
+                if verdict == "PASS"
+                else "FIX489_SOAK_60M_BLOCKED"
+            ),
+            "reason": reason,
+        },
+    )
     write_json(root / "cleanup.json", {"phase_owned_cleanup": "external", "completed": True})
     return result
 
