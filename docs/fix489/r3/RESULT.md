@@ -2,14 +2,22 @@
 
 ```text
 base_sha=799b503c8a10446b9da5b44b848174ab1f0bc662
+tested_sha=00eeafaa465ea848c69dea9d7b70bd38aa75b785
 FIX489_LIVE_MIXED_LOAD_CLIENT_PASS=previously_proven
 FIX489_VECTOR_READINESS_DIAGNOSTICS_PASS=previously_proven
 FIX489_RUNTIME_SAFETY_GATES_PASS=previously_proven
-FIX489_R3_LOCAL_STABLE_FLOOR_PASS=NOT_EXECUTED
+FIX489_R3_LOCAL_STABLE_FLOOR_PASS=PASS
 FIX489_R3_SOAK_60M_PASS=NOT_EXECUTED
 capacity_scope=LOCAL_MAC_CPU
 production_capacity_claim=false
+maximum_stable_concurrency=2
+recommended_operating_concurrency=1
+first_controlled_saturation_concurrency=3
+discovery_evidence=/Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-r3/fix489-r3-20260809T062307Z
+discovery_evidence_manifest_sha256=5d2ecabd84e1c0051e5232a01e49a0e07fae74be8a7cdf2a1ffc44dd3700ff4a
 ```
 
 This page must be updated from live evidence only. A local Mac result must not
 be described as production capacity proof.
+
+Current final status remains pending until the 60-minute soak completes.
