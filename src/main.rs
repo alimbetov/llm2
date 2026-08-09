@@ -5,6 +5,7 @@ use astravector_runtime::{
     config::{AppConfig, MAX_INGESTION_DOCUMENT_DEADLINE_MS, MIN_INGESTION_DOCUMENT_DEADLINE_MS},
     grpc::{AstraVectorService, AstraVectorV004ControlService},
     health::Readiness,
+    http::{self as internal_http, InternalHttpConfig, InternalHttpState},
     inference::{InferenceEngine, OnnxBgeM3Engine},
     ingestion_cleanup, lifecycle, metrics, outbox,
     pb::{
@@ -26,6 +27,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -41,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let cfg = Arc::new(loaded);
     cfg.validate()?;
+    let http_cfg = InternalHttpConfig::from_env()?;
+    http_cfg.validate(cfg.grpc.port, cfg.metrics.port)?;
     info!(
         document_deadline_ms = cfg.grpc.deadlines.document_batch_ms,
         minimum_ms = MIN_INGESTION_DOCUMENT_DEADLINE_MS,
@@ -197,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
         shutdown.clone(),
     );
+    let http_state = InternalHttpState::new(control_impl.clone(), readiness.clone(), cfg.clone());
     let mut control = AstraVectorV004ControlServer::new(control_impl.clone())
         .max_decoding_message_size(cfg.grpc.max_request_message_mb * 1024 * 1024)
         .max_encoding_message_size(cfg.grpc.max_response_message_mb * 1024 * 1024);
@@ -206,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
     let mut retrieval = AstraVectorRetrievalFacadeServer::new(control_impl.clone())
         .max_decoding_message_size(cfg.grpc.max_request_message_mb * 1024 * 1024)
         .max_encoding_message_size(cfg.grpc.max_response_message_mb * 1024 * 1024);
-    let mut admin = AstraVectorAdminFacadeServer::new(control_impl)
+    let mut admin = AstraVectorAdminFacadeServer::new(control_impl.clone())
         .max_decoding_message_size(cfg.grpc.max_request_message_mb * 1024 * 1024)
         .max_encoding_message_size(cfg.grpc.max_response_message_mb * 1024 * 1024);
     if cfg.grpc.compression.enabled {
@@ -269,7 +274,6 @@ async fn main() -> anyhow::Result<()> {
         .register_encoded_file_descriptor_set(astravector_runtime::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
-    // fix463: start as NOT_SERVING until PostgreSQL/Qdrant have been checked once.
     let mut initial_ready = scheduler.healthy();
     if cfg.postgres.required_for_readiness {
         initial_ready &= match &repo {
@@ -340,12 +344,30 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    let http_task = if http_cfg.enabled {
+        let http_shutdown = shutdown.clone();
+        let fail_shutdown = shutdown.clone();
+        Some(tokio::spawn(async move {
+            let result = internal_http::serve(http_cfg, http_state, http_shutdown).await;
+            if let Err(error) = &result {
+                error!(error=%error, "internal REST server stopped unexpectedly");
+                fail_shutdown.cancel();
+            }
+            result
+        }))
+    } else {
+        info!("AstraVector internal REST boundary disabled");
+        None
+    };
+
     let addr: SocketAddr = format!("{}:{}", cfg.grpc.host, cfg.grpc.port).parse()?;
-    info!(%addr,provider=%selected.name,"AstraVector v0.4.0 fix463 starting");
+    info!(%addr,provider=%selected.name,"AstraVector v0.4.0 fix490 starting");
     let sd = shutdown.clone();
+    let sd_wait = shutdown.clone();
     let rd = readiness.clone();
     let drain = cfg.shutdown.drain_timeout_seconds;
-    Server::builder()
+    let grpc_result = Server::builder()
         .add_service(health_service)
         .add_service(reflection)
         .add_service(grpc)
@@ -354,7 +376,10 @@ async fn main() -> anyhow::Result<()> {
         .add_service(retrieval)
         .add_service(admin)
         .serve_with_shutdown(addr, async move {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sd_wait.cancelled() => {},
+            }
             rd.set(false);
             sd.cancel();
             tokio::time::sleep(Duration::from_secs(drain)).await;
@@ -363,6 +388,16 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| {
             error!(error=%e,"gRPC server stopped");
             e
-        })?;
+        });
+
+    shutdown.cancel();
+    if let Some(task) = http_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(anyhow::anyhow!("internal REST task failed: {error}")),
+        }
+    }
+    grpc_result?;
     Ok(())
 }
