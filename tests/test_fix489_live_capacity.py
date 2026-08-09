@@ -404,6 +404,11 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertGreaterEqual(pool_size, 100)
         self.assertLess(pool_size, 250)
 
+    def test_r3_delete_pool_size_uses_actual_discovery_plan_not_full_floor(self):
+        pool_size = fix489.expected_delete_pool_size((1, 2, 3, 4), 300, 60, minimum_pool_size=10)
+        self.assertGreaterEqual(pool_size, 25)
+        self.assertLess(pool_size, 60)
+
     def test_grpcurl_camel_case_statuses_are_normalized(self):
         self.assertEqual(
             fix489.grpc_status_from_error("ERROR:\n  Code: DeadlineExceeded\n  Message: inference deadline"),

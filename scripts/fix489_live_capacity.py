@@ -97,13 +97,19 @@ def percentile(values: list[float], p: float) -> float:
     return round(ordered[index], 3)
 
 
-def expected_delete_pool_size(levels: tuple[int, ...], measurement_seconds: int, warmup_seconds: int) -> int:
+def expected_delete_pool_size(
+    levels: tuple[int, ...],
+    measurement_seconds: int,
+    warmup_seconds: int,
+    *,
+    minimum_pool_size: int = 100,
+) -> int:
     largest = max(levels) if levels else 1
     warmup_multiplier = 1.0 + (warmup_seconds / max(1, measurement_seconds))
     operation_floor = max(MIN_COMPLETED.get(level, level * 10) for level in levels) if levels else 100
     estimated_delete_operations = int((operation_floor * warmup_multiplier * 0.05) + 0.999)
     safety_margin = max(20, largest)
-    return max(100, estimated_delete_operations + safety_margin)
+    return max(minimum_pool_size, estimated_delete_operations + safety_margin)
 
 
 def parse_runtime_rss_kib(sample: dict[str, Any]) -> int | None:
@@ -961,7 +967,15 @@ async def run_capacity(root: Path) -> dict[str, Any]:
     largest_plan_warmup = max(int(row["load_warmup_seconds"]) for row in plan_rows) if plan_rows else 180
     largest_plan_measurement = max(int(row["measurement_seconds"]) for row in plan_rows) if plan_rows else 600
     workload.prepare_delete_documents(
-        count=env_int("FIX489_DELETE_POOL_SIZE", expected_delete_pool_size(levels, largest_plan_measurement, largest_plan_warmup))
+        count=env_int(
+            "FIX489_DELETE_POOL_SIZE",
+            expected_delete_pool_size(
+                levels,
+                largest_plan_measurement,
+                largest_plan_warmup,
+                minimum_pool_size=10 if is_r3 else 100,
+            ),
+        )
     )
     level_results: list[dict[str, Any]] = []
     for level in levels:
