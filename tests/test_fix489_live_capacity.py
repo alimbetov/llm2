@@ -409,6 +409,28 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertGreaterEqual(pool_size, 25)
         self.assertLess(pool_size, 60)
 
+    def test_soak_delete_pool_size_uses_observed_stable_throughput(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "campaign-manifest.json").write_text(
+                """{"levels":[{"concurrency":1,"measurement_seconds":300}]}""",
+                encoding="utf-8",
+            )
+            (root / "capacity-summary.json").write_text(
+                """{"levels":[{"concurrency":1,"completed_operations":613,"verdict":"STABLE"}]}""",
+                encoding="utf-8",
+            )
+
+            pool_size = fix489.expected_soak_delete_pool_size(root, 1, 3600, 300)
+
+        self.assertGreater(pool_size, 277)
+        self.assertLess(pool_size, 600)
+
+    def test_soak_wrapper_preserves_python_terminal_status_on_failure(self):
+        script = (ROOT / "scripts" / "fix489r3-soak-60m.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ "$exit_code" -ne 0 && -f "$EVIDENCE_DIR/terminal-status.json" ]]; then', script)
+        self.assertIn('exit "$exit_code"', script)
+
     def test_grpcurl_camel_case_statuses_are_normalized(self):
         self.assertEqual(
             fix489.grpc_status_from_error("ERROR:\n  Code: DeadlineExceeded\n  Message: inference deadline"),

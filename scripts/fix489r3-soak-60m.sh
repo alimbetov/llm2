@@ -11,6 +11,9 @@ REASON="UNKNOWN"
 finish() {
   local exit_code=$?
   mkdir -p "$EVIDENCE_DIR"
+  if [[ "$exit_code" -ne 0 && -f "$EVIDENCE_DIR/terminal-status.json" ]]; then
+    exit "$exit_code"
+  fi
   printf '{"status":"%s","reason":"%s","exit_code":%s}\n' "$STATUS" "$REASON" "$exit_code" >"$EVIDENCE_DIR/terminal-status.json"
   exit "$exit_code"
 }

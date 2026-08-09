@@ -112,6 +112,64 @@ def expected_delete_pool_size(
     return max(minimum_pool_size, estimated_delete_operations + safety_margin)
 
 
+def delete_operation_share(seed: int = 48960) -> float:
+    operations = deterministic_cycle(seed)
+    if not operations:
+        return 0.0
+    delete_count = sum(1 for operation in operations if operation.operation_type == "DELETE_OR_EXPIRE")
+    return delete_count / len(operations)
+
+
+def observed_capacity_operation_rate(capacity_root: Path, concurrency: int) -> float | None:
+    summary_path = capacity_root / "capacity-summary.json"
+    manifest_path = capacity_root / "campaign-manifest.json"
+    if not summary_path.is_file() or not manifest_path.is_file():
+        return None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    durations = {
+        int(row["concurrency"]): max(1, int(row.get("measurement_seconds", 0) or 0))
+        for row in manifest.get("levels", [])
+        if "concurrency" in row
+    }
+    stable_levels = [
+        row
+        for row in summary.get("levels", [])
+        if row.get("verdict") == "STABLE" and int(row.get("completed_operations", 0) or 0) > 0
+    ]
+    if not stable_levels:
+        return None
+    exact = [row for row in stable_levels if int(row.get("concurrency", 0) or 0) == concurrency]
+    candidates = exact or sorted(
+        stable_levels,
+        key=lambda row: (
+            abs(int(row.get("concurrency", 0) or 0) - concurrency),
+            -int(row.get("concurrency", 0) or 0),
+        ),
+    )
+    selected = candidates[0]
+    selected_concurrency = int(selected.get("concurrency", concurrency) or concurrency)
+    duration = durations.get(selected_concurrency, 300)
+    return float(selected["completed_operations"]) / float(duration)
+
+
+def expected_soak_delete_pool_size(
+    capacity_root: Path,
+    soak_concurrency: int,
+    measurement_seconds: int,
+    warmup_seconds: int,
+    *,
+    seed: int = 48960,
+    minimum_pool_size: int = 100,
+) -> int:
+    observed_rate = observed_capacity_operation_rate(capacity_root, soak_concurrency)
+    if observed_rate is None:
+        return expected_delete_pool_size((soak_concurrency,), measurement_seconds, warmup_seconds, minimum_pool_size=minimum_pool_size)
+    expected_deletes = int((observed_rate * (measurement_seconds + warmup_seconds) * delete_operation_share(seed)) + 0.999)
+    safety_margin = max(20, int(expected_deletes * 0.25 + 0.999), soak_concurrency * 5)
+    return max(minimum_pool_size, expected_deletes + safety_margin)
+
+
 def parse_runtime_rss_kib(sample: dict[str, Any]) -> int | None:
     raw = str(sample.get("runtime_ps") or "").strip()
     if not raw:
@@ -1081,7 +1139,10 @@ async def run_soak(root: Path, capacity_root: Path) -> dict[str, Any]:
     soak_warmup_seconds = env_int("FIX489_SOAK_WARMUP_SECONDS", int(plan.get("load_warmup_seconds", 600)))
     soak_concurrency = int(plan["soak_concurrency"])
     workload.prepare_delete_documents(
-        count=env_int("FIX489_DELETE_POOL_SIZE", expected_delete_pool_size((soak_concurrency,), soak_seconds, soak_warmup_seconds))
+        count=env_int(
+            "FIX489_DELETE_POOL_SIZE",
+            expected_soak_delete_pool_size(capacity_root, soak_concurrency, soak_seconds, soak_warmup_seconds),
+        )
     )
     write_json(root / "workload-manifest.json", workload_manifest(48960, int(plan["soak_concurrency"]), env_int("FIX489_CLIENT_DEADLINE_MS", DEFAULT_FIX489_CLIENT_DEADLINE_MS)))
     samples: list[dict[str, Any]] = []
