@@ -11,6 +11,10 @@ import fix487c_soak as soak
 
 class Fix487CSoakTests(unittest.TestCase):
     def test_soak_concurrency_is_75_percent_floor(self):
+        self.assertEqual(soak.soak_concurrency(1), 1)
+        self.assertEqual(soak.soak_concurrency(2), 1)
+        self.assertEqual(soak.soak_concurrency(3), 2)
+        self.assertEqual(soak.soak_concurrency(4), 3)
         self.assertEqual(soak.soak_concurrency(25), 18)
         self.assertEqual(soak.soak_concurrency(50), 37)
         self.assertEqual(soak.soak_concurrency(100), 75)
@@ -27,6 +31,17 @@ class Fix487CSoakTests(unittest.TestCase):
         self.assertEqual(plan["soak_concurrency"], 37)
         self.assertEqual(plan["measurement_seconds"], 3600)
         self.assertEqual(plan["seed"], 487460)
+
+    def test_r3_capacity_result_creates_local_stable_floor_soak_plan(self):
+        plan = soak.plan_from_capacity(
+            {"campaign_mode": "LOCAL_STABLE_FLOOR_DISCOVERY", "maximum_stable_concurrency": 3}
+        )
+        self.assertEqual(plan["status"], "READY")
+        self.assertEqual(plan["soak_mode"], "LOCAL_STABLE_FLOOR")
+        self.assertEqual(plan["soak_concurrency"], 2)
+        self.assertEqual(plan["load_warmup_seconds"], 300)
+        self.assertEqual(plan["measurement_seconds"], 3600)
+        self.assertEqual(plan["cooldown_max_seconds"], 900)
 
     def test_soak_pass_classification(self):
         verdict, reason = soak.classify_soak(

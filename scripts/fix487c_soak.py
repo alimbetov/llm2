@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 
 SOAK_SEED = 487460
+FIX489_R3_SOAK_SEED = 489360
+LOCAL_STABLE_FLOOR_DISCOVERY = "LOCAL_STABLE_FLOOR_DISCOVERY"
 SOAK_ARTIFACTS = (
     "bootstrap.json",
     "environment.json",
@@ -96,9 +98,21 @@ def plan_from_capacity(capacity: dict) -> dict:
     concurrency = soak_concurrency(max_stable)
     if concurrency is None:
         return {"status": "BLOCKED", "reason": "NO_STABLE_CAPACITY_LEVEL", "soak_concurrency": None}
+    if capacity.get("campaign_mode") == LOCAL_STABLE_FLOOR_DISCOVERY:
+        return {
+            "status": "READY",
+            "seed": FIX489_R3_SOAK_SEED,
+            "soak_mode": "LOCAL_STABLE_FLOOR",
+            "soak_concurrency": concurrency,
+            "runtime_warmup_seconds": 300,
+            "load_warmup_seconds": 300,
+            "measurement_seconds": 3600,
+            "cooldown_max_seconds": 900,
+        }
     return {
         "status": "READY",
         "seed": SOAK_SEED,
+        "soak_mode": "FULL_LOCAL_CAPACITY",
         "soak_concurrency": concurrency,
         "runtime_warmup_seconds": 300,
         "load_warmup_seconds": 600,
