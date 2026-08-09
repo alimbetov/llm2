@@ -1,6 +1,6 @@
 use crate::{
     config::AppConfig,
-    grpc::AstraVectorV004ControlService,
+    grpc::{AstraVectorV004ControlService, RetrievalEntryPoint},
     health::Readiness,
     pb::{self, astra_vector_v004_control_server::AstraVectorV004Control},
 };
@@ -46,7 +46,10 @@ impl InternalHttpConfig {
             return Ok(());
         }
         anyhow::ensure!(self.port != grpc_port, "HTTP port collides with gRPC port");
-        anyhow::ensure!(self.port != metrics_port, "HTTP port collides with metrics port");
+        anyhow::ensure!(
+            self.port != metrics_port,
+            "HTTP port collides with metrics port"
+        );
         anyhow::ensure!(
             self.max_request_body_bytes > 0,
             "HTTP max_request_body_bytes must be > 0"
@@ -260,7 +263,7 @@ async fn execute_retrieve(
         request.max_contexts.min(state.cfg.limits.search_top_k_max)
     };
 
-    let inner = Request::new(pb::SearchRequestV004 {
+    let mut inner = Request::new(pb::SearchRequestV004 {
         correlation_id: correlation_id.to_owned(),
         access_zone_id: request.access_zone_id,
         caller_access_level: access_level as i32,
@@ -310,14 +313,16 @@ async fn execute_retrieve(
         access_zone_codes: request.access_zone_codes,
     });
 
+    inner
+        .extensions_mut()
+        .insert(RetrievalEntryPoint("RetrieveContext"));
+
     // Internal transport: no REST authentication metadata is created or required.
     // caller_access_level remains only an existing retrieval visibility input.
-    let search = <AstraVectorV004ControlService as AstraVectorV004Control>::search(
-        &state.control,
-        inner,
-    )
-    .await?
-    .into_inner();
+    let search =
+        <AstraVectorV004ControlService as AstraVectorV004Control>::search(&state.control, inner)
+            .await?
+            .into_inner();
 
     Ok(rest_response_from_search(search, profile))
 }
@@ -383,7 +388,10 @@ fn retrieval_candidate_limit(profile: pb::RetrievalProfile) -> u32 {
     }
 }
 
-fn rest_response_from_search(search: pb::SearchResponseV004, profile: pb::RetrievalProfile) -> Value {
+fn rest_response_from_search(
+    search: pb::SearchResponseV004,
+    profile: pb::RetrievalProfile,
+) -> Value {
     let diagnostics = search.diagnostics.clone().unwrap_or_default();
     let typed_degradation = search.degradation.clone();
     let total_candidates = if diagnostics.candidate_count == 0 {
@@ -572,7 +580,11 @@ fn source_links_from_metadata(metadata: &std::collections::HashMap<String, Strin
     for (key, link_type, label) in [
         ("preview_url", "PREVIEW", "Предпросмотр документа"),
         ("download_url", "DOWNLOAD", "Скачать документ"),
-        ("source_url", "ORIGINAL_DOCUMENT", "Открыть оригинальный документ"),
+        (
+            "source_url",
+            "ORIGINAL_DOCUMENT",
+            "Открыть оригинальный документ",
+        ),
         ("source_uri", "ORIGINAL_DOCUMENT", "Источник документа"),
         ("page_url", "PAGE", "Открыть страницу"),
         ("section_url", "SECTION", "Открыть раздел"),
@@ -682,8 +694,14 @@ mod tests {
     #[test]
     fn internal_access_level_defaults_and_parses() {
         assert_eq!(default_access_level(), "INTERNAL");
-        assert_eq!(parse_access_level("PUBLIC").unwrap(), pb::AccessLevel::Public);
-        assert_eq!(parse_access_level("INTERNAL").unwrap(), pb::AccessLevel::Internal);
+        assert_eq!(
+            parse_access_level("PUBLIC").unwrap(),
+            pb::AccessLevel::Public
+        );
+        assert_eq!(
+            parse_access_level("INTERNAL").unwrap(),
+            pb::AccessLevel::Internal
+        );
         assert_eq!(
             parse_access_level("CONFIDENTIAL").unwrap(),
             pb::AccessLevel::Confidential

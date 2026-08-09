@@ -77,7 +77,7 @@ struct AdmissionPermit {
 struct RequestCancellationGuard(CancellationToken);
 
 #[derive(Clone, Copy)]
-struct RetrievalEntryPoint(&'static str);
+pub(crate) struct RetrievalEntryPoint(pub(crate) &'static str);
 
 #[derive(Clone, Copy)]
 struct RequestTiming {
