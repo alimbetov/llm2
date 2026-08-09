@@ -3,9 +3,9 @@
 ## Current State
 
 ```text
-implementation_status=DISCOVERY_PASS_SOAK_PENDING
+implementation_status=PASS
 official_discovery=PASS
-official_soak=NOT_EXECUTED
+official_soak=PASS
 ```
 
 Static contract commands executed during implementation:
@@ -59,4 +59,50 @@ maximum_stable_concurrency=2
 recommended_operating_concurrency=1
 first_controlled_saturation_concurrency=3
 evidence_manifest_sha256=5d2ecabd84e1c0051e5232a01e49a0e07fae74be8a7cdf2a1ffc44dd3700ff4a
+```
+
+First official soak attempt:
+
+```text
+tested_sha=d454de2e1ca1f85727ec1b587c7cf60c70fdd313
+run_id=fix489-r3-soak-20260809T073245Z
+terminal_status=FAILED
+reason=DELETE_POOL_EXHAUSTED
+UNKNOWN=206
+```
+
+Harness repair:
+
+```text
+tested_sha=623c75b65146d1ee9bda3ecd66636d9019accfce
+repair=test(fix489r3): size soak delete pool from observed throughput
+focused_validation=34/34 PASS
+```
+
+Official 60-minute soak repeat:
+
+```bash
+ASTRAVECTOR_FIX489R3_EXECUTE_SOAK=true \
+FIX489_R3_CAPACITY_EVIDENCE_DIR=/Users/ruslanalimbetov/Documents/llm2/astravector-evidence/fix489-r3/fix489-r3-20260809T062307Z \
+ASTRAVECTOR_MODEL_PATH=/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/model.onnx \
+ASTRAVECTOR_TOKENIZER_PATH=/Users/ruslanalimbetov/Documents/llm2/models/bge-m3/onnx/tokenizer.json \
+ASTRAVECTOR_EVIDENCE_ROOT=/Users/ruslanalimbetov/Documents/llm2/astravector-evidence \
+make verify-fix489r3-soak-60m
+```
+
+Result:
+
+```text
+run_id=fix489-r3-soak-20260809T111138Z
+tested_sha=623c75b65146d1ee9bda3ecd66636d9019accfce
+terminal_status=PASS
+verdict=FIX489_R3_SOAK_60M_PASS
+completed_operations=7381
+success_rate=1.0
+grpc_statuses.OK=7381
+UNKNOWN=0
+hard_gates=0
+memory_behavior_stable=true
+queues_bounded=true
+evidence_manifest_sha256=02ce12a365169b857ff5d963db6b6ed66d14b56ca3c8c1e9f8a9d7de11a94c55
 ```
