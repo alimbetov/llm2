@@ -42,7 +42,9 @@ if [[ -n "$(git status --short)" ]]; then
   exit 2
 fi
 
+REASON="RETRIEVAL_FREEZE_FAILED"
 make verify-fix487a-retrieval-freeze
+REASON="R3_CONTRACTS_FAILED"
 make verify-fix489r3-contracts
 
 export FIX489_CAMPAIGN_MODE="LOCAL_STABLE_FLOOR_DISCOVERY"
@@ -63,12 +65,17 @@ fi
 
 docker compose up -d postgres qdrant
 scripts/local-demo/infra-wait.sh
+REASON="MIGRATION_FAILED"
 cargo sqlx migrate run
+REASON="SQLX_PREPARE_CHECK_FAILED"
 cargo sqlx prepare --check -- --all-targets --all-features
+REASON="RELEASE_BUILD_FAILED"
 cargo build --release --locked
 if ! grpcurl -plaintext 127.0.0.1:50051 list >/dev/null 2>&1; then
+  REASON="RUNTIME_START_FAILED"
   scripts/local-demo/run-runtime.sh
 fi
+REASON="GRPC_REFLECTION_FAILED"
 grpcurl -plaintext 127.0.0.1:50051 list >"$EVIDENCE_DIR/grpc-services.txt"
 
 REASON="R3_DISCOVERY_PLAN_FAILED"
