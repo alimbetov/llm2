@@ -13,6 +13,7 @@ pub mod error;
 pub mod graph;
 pub mod grpc;
 pub mod health;
+pub mod http;
 pub mod inference;
 pub mod ingestion_cleanup;
 pub mod metrics;
