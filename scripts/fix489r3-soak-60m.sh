@@ -45,7 +45,7 @@ fi
 REASON="RETRIEVAL_FREEZE_FAILED"
 make verify-fix487a-retrieval-freeze
 REASON="R3_SOAK_CONTRACTS_FAILED"
-make verify-fix489r3-soak-contracts
+env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS make verify-fix489r3-soak-contracts
 
 if [[ -z "${FIX489_R3_CAPACITY_EVIDENCE_DIR:-}" || ! -f "${FIX489_R3_CAPACITY_EVIDENCE_DIR}/capacity-curve.json" ]]; then
   STATUS="BLOCKED"

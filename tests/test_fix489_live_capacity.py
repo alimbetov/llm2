@@ -342,11 +342,26 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
 
     def test_r3_wrapper_enables_discovery_mode_after_static_contracts(self):
         source = (ROOT / "scripts" / "fix489r3-local-stable-floor.sh").read_text(encoding="utf-8")
-        contracts_index = source.index("make verify-fix489r3-contracts")
+        contracts_index = source.index("env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS make verify-fix489r3-contracts")
         mode_index = source.index('export FIX489_CAMPAIGN_MODE="LOCAL_STABLE_FLOOR_DISCOVERY"')
         levels_index = source.index('export FIX489_CAPACITY_LEVELS="${FIX489_CAPACITY_LEVELS:-1,2,3,4}"')
         self.assertLess(contracts_index, mode_index)
         self.assertLess(contracts_index, levels_index)
+
+    def test_r3_contract_target_sanitizes_mode_before_historical_contracts(self):
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        target = makefile[
+            makefile.index("verify-fix489r3-contracts:")
+            : makefile.index("verify-fix489r3-local-stable-floor:")
+        ]
+        self.assertIn(
+            "env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS $(MAKE) verify-fix489-live-capacity-contracts",
+            target,
+        )
+        self.assertIn(
+            "env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS python3 -m unittest",
+            target,
+        )
 
     def test_cleanup_target_removes_runtime_and_default_compose(self):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")

@@ -483,9 +483,9 @@ verify-fix489-live-capacity-contracts:
 	bash -n scripts/fix487bc-capacity-campaign.sh scripts/fix487c-soak-60m.sh
 
 verify-fix489r3-contracts:
-	$(MAKE) verify-fix489-live-capacity-contracts
+	env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS $(MAKE) verify-fix489-live-capacity-contracts
 	python3 -m py_compile scripts/fix487bc_capacity_campaign.py scripts/fix487bc_capacity_evidence.py scripts/fix489_live_capacity.py
-	python3 -m unittest -v tests/test_fix487bc_capacity_campaign.py tests/test_fix489_capacity_evidence.py
+	env -u FIX489_CAMPAIGN_MODE -u FIX489_CAPACITY_LEVELS python3 -m unittest -v tests/test_fix487bc_capacity_campaign.py tests/test_fix489_capacity_evidence.py
 	bash -n scripts/fix489r3-local-stable-floor.sh
 
 verify-fix489r3-local-stable-floor:
