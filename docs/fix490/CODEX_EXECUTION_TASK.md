@@ -1,6 +1,19 @@
 # FIX490 Codex Execution Task
 
-Implement the approved FIX490 scope from `docs/fix490/TECHNICAL_SPECIFICATION.md` on branch `agent/rest-boundary-readiness-sync`.
+Implement the approved FIX490 scope from:
+
+```text
+docs/fix490/TECHNICAL_SPECIFICATION.md
+docs/fix490/REST_BOUNDARY_HARDENING_ADDENDUM.md
+```
+
+on branch:
+
+```text
+agent/rest-boundary-readiness-sync
+```
+
+The hardening addendum is **normative** for REST security, deadlines, cancellation, configuration, probes, HTTP protocol behavior, error mapping and verification details.
 
 ## Objective
 
@@ -12,67 +25,266 @@ Add a minimal REST retrieval boundary and synchronize top-level readiness/eviden
 repository=alimbetov/llm2
 branch=agent/rest-boundary-readiness-sync
 base_main_sha=2a34b65fd24bde11e1fc01dd4ff86ee04a5cd42b
-spec_commit=5e8fd71238c12d8b5ac1803d342e01bc1abc24fb
 ```
 
-Before implementation, verify whether `main` moved. If it moved, record the delta and rebase/currentize the working branch before claiming current-head parity/evidence.
+Before implementation, verify whether `main` moved. If it moved, record the delta and currentize the working branch before claiming current-head parity/evidence.
 
 ## Mandatory implementation
 
-1. Add one REST retrieval endpoint:
+Implement only:
 
 ```http
 POST /api/v1/retrieve
-```
-
-2. Add HTTP probes:
-
-```http
 GET /health
 GET /ready
 ```
 
-3. Reuse the existing retrieval application/core path behind `AstraVectorRetrievalFacade::RetrieveContext`. Do not call the service's own gRPC endpoint from the REST adapter.
+REST MUST reuse the same in-process retrieval application/core path behind `AstraVectorRetrievalFacade::RetrieveContext`. Do not call AstraVector's own localhost gRPC endpoint.
 
-4. Keep REST DTOs as a minimal JSON projection of existing `RetrieveContextRequest` / `RetrieveContextResponse` semantics.
-
-5. Reuse existing readiness state and existing authentication/access policy semantics.
-
-6. Add deterministic HTTP mapping for existing `AstraError` classes.
-
-7. Add parity tests proving REST and gRPC agree on context identity/order/content/status under equivalent requests.
-
-8. Add security/failure/degradation parity tests sufficient to prove the REST adapter cannot bypass existing access/lifecycle and degradation behavior.
-
-9. Run locked static/test gates and relevant existing invariant suites without weakening them.
-
-10. Audit and synchronize:
+REST v1 request fields are limited to direct projections of the existing facade contract:
 
 ```text
-README.md
-docs/ASTRAVECTOR_READINESS_REPORT.md
-docs/02-readiness-and-verdicts.md
-docs/12-roadmap.md
+question
+accessZoneId
+accessZoneIds
+accessZoneCode
+accessZoneCodes
+profile
+maxContexts
+filters
+enableGraphExpansion
+graphMaxHops
+graphMaxRelatedContexts
 ```
 
-against current authoritative phase results. Do not rewrite immutable historical evidence.
+Use the STANDARD public retrieval representation. Do not create REST-only ranking/search controls and do not expose debug/admin surfaces.
 
-11. Add `docs/fix490/CURRENT_HEAD_STATUS.md` with explicit provenance categories:
+## Security requirements
+
+Preserve the complete current security model:
 
 ```text
-IMPLEMENTED
-PROVEN_ON_CURRENT_OR_INHERITED_SHA
-PROVEN_LOCAL_ONLY
-STILL_OPEN
-NOT_IN_SCOPE
+x-api-key
+security.enabled
+security.protect_health
+security.trust_forwarded_identity_headers
+security.gateway_trust_header
+security.gateway_trust_token
+x-astravector-role
+trusted caller access level / identity
 ```
 
-12. Add `docs/fix490/RESULT.md` containing exact tested SHA, commands, gate results and one of:
+Prefer a minimal transport-neutral extraction shared by gRPC and REST rather than duplicated REST security logic.
+
+`caller_access_level`, caller identity and service identity are trusted security context. Do not trust them merely because the JSON body supplies them.
+
+Fail closed for invalid auth, invalid gateway trust and insufficient access.
+
+## HTTP configuration
+
+Add typed configuration using the canonical FIX490 section name:
+
+```yaml
+http:
+  enabled: true
+  required_on_startup: true
+  host: 0.0.0.0
+  port: 8080
+  max_request_body_bytes: 65536
+```
+
+Follow existing environment-override conventions.
+
+Validation must reject collisions with:
 
 ```text
-FIX490_REST_BOUNDARY_AND_READINESS_SYNC_PASS
-FIX490_REST_BOUNDARY_AND_READINESS_SYNC_BLOCKED
+gRPC    50051
+metrics 9090
 ```
+
+If HTTP is enabled and required, bind/start failure is fatal.
+
+## Probe semantics
+
+Use the existing shared `Readiness` object.
+
+```text
+GET /health -> 200 while process/HTTP adapter is alive
+GET /ready  -> 200 when ready=true
+GET /ready  -> 503 when ready=false
+```
+
+Honor existing `security.protect_health` semantics for HTTP probes.
+
+Do not introduce an HTTP-specific PostgreSQL/Qdrant readiness calculation.
+
+## HTTP protocol behavior
+
+`POST /api/v1/retrieve` accepts `application/json` only.
+
+Required protocol results:
+
+```text
+malformed JSON           -> 400
+unsupported Content-Type -> 415
+oversized body           -> 413
+```
+
+Use a bounded JSON body.
+
+Propagate `X-Correlation-Id` into the existing request context/logging path; generate a project-standard correlation id when absent.
+
+Minimal error JSON:
+
+```json
+{
+  "code": "RESOURCE_EXHAUSTED",
+  "message": "...",
+  "correlationId": "..."
+}
+```
+
+Do not expose stack traces, SQL, credentials, gateway tokens or sensitive backend payloads.
+
+## Complete error mapping
+
+Implement and test every current `AstraError` variant:
+
+```text
+InvalidArgument    -> 400
+OutOfRange         -> 400
+Unauthenticated    -> 401
+PermissionDenied   -> 403
+NotFound           -> 404
+AlreadyExists      -> 409
+FailedPrecondition -> 409
+OwnershipLost      -> 409
+ResourceExhausted  -> 429
+Cancelled          -> 499 classification where response is possible
+Unavailable        -> 503
+DeadlineExceeded   -> 504
+Internal           -> 500
+```
+
+Do not collapse known variants into catch-all 500.
+
+## Deadline and cancellation parity
+
+REST must remain bounded by the existing AstraVector query/retrieval deadline model and feed the same downstream cancellation-aware retrieval path.
+
+Required semantics:
+
+```text
+gRPC deadline exhaustion -> DEADLINE_EXCEEDED
+REST equivalent          -> 504
+resource exhaustion      -> 429
+backend unavailable      -> 503
+```
+
+Do not convert deadline/backend failures to `200` semantic no-answer.
+
+Bridge HTTP request cancellation/disconnect into per-request cancellation where the selected framework permits it. Global shutdown cancellation alone is not sufficient.
+
+## Server lifecycle
+
+Run REST and gRPC in the same process and reuse the existing global shutdown/drain lifecycle.
+
+Required behavior:
+
+- normal shutdown drains both listeners;
+- unexpected required HTTP termination causes global shutdown/non-zero exit;
+- required gRPC termination must not leave HTTP appearing healthy indefinitely;
+- no new REST microservice or reverse proxy container.
+
+## Minimal observability
+
+Add only bounded-cardinality HTTP transport metrics needed to operate the boundary, e.g. request count and duration.
+
+Allowed labels: route, method, status class.
+
+Do not label metrics with query text, user id, document id, access-zone id or correlation id.
+
+## Required tests
+
+### Positive REST/gRPC parity
+
+Prove equivalence for:
+
+```text
+single-zone retrieval
+multi-zone retrieval when enabled
+Graph disabled
+Graph enabled
+insufficient/no-answer response
+successful degraded response with surviving contexts
+```
+
+Compare at least:
+
+```text
+context count/order
+access_zone_id
+document_id
+document_version
+matched_chunk_id
+parent_chunk_id
+source_block_id
+matched_text
+parent_text
+dense/sparse/fusion/final scores
+evidence status
+degradation state/codes
+Graph-derived presence/provenance
+```
+
+### Security/lifecycle negative parity
+
+Cover, where supported by current harness:
+
+```text
+missing/bad API key
+untrusted forwarded identity
+bad gateway trust token
+insufficient access level
+wrong/inactive/missing zone
+multi-zone disabled
+too many zones
+invalid zone id
+DELETED
+EXPIRED
+INDEXING/non-active
+```
+
+REST must expose no context that the authoritative gRPC/security path would reject.
+
+### HTTP boundary tests
+
+Cover:
+
+```text
+malformed JSON -> 400
+unsupported media type -> 415
+oversized body -> 413
+health/readiness status codes
+protect_health parity
+complete AstraError mapping
+correlation propagation
+```
+
+### Failure/degradation parity
+
+Use supported failpoints/harness for:
+
+```text
+partial retrieval-branch degradation
+PostgreSQL hydration timeout/failure
+Qdrant unavailable/timeout
+request deadline exhaustion
+overload/backpressure
+request cancellation where testable
+```
+
+A valid degraded response with surviving contexts remains successful; total required-backend failure remains an HTTP failure.
 
 ## Frozen semantics
 
@@ -102,9 +314,66 @@ frozen quality banks/qrels/thresholds
 
 Any need to change one of these is a blocker, not permission to widen scope.
 
-## Evidence constraints
+## Regression gates
 
-Current merged FIX489-R3 evidence includes a local stable floor and a successful 60-minute soak. Preserve its scope exactly:
+Run exactly:
+
+```bash
+cargo fmt --all --check
+cargo check --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+```
+
+Also run focused REST parity/security/protocol/degradation tests and relevant existing retrieval/security/invariant suites. Do not weaken frozen assertions.
+
+## REST smoke
+
+Document and execute examples for:
+
+```text
+GET /health
+GET /ready
+POST /api/v1/retrieve
+```
+
+Run a short REST transport smoke at local concurrency 1 and 2 where practical. This is transport regression evidence, not capacity proof.
+
+Do **not** rerun the full FIX489-R3 60-minute soak solely because the thin REST adapter was added, unless core runtime semantics changed or new testing invalidates inherited evidence.
+
+## Documentation/evidence synchronization
+
+Audit and reconcile:
+
+```text
+README.md
+docs/README.md
+docs/ASTRAVECTOR_READINESS_REPORT.md
+docs/02-readiness-and-verdicts.md
+docs/12-roadmap.md
+```
+
+Add:
+
+```text
+docs/api/rest-api.md
+docs/fix490/CURRENT_HEAD_STATUS.md
+docs/fix490/RESULT.md
+```
+
+`docs/api/rest-api.md` must document request fields, response model, auth/trusted identity, errors, probes, configuration and curl examples.
+
+`CURRENT_HEAD_STATUS.md` must use explicit provenance categories:
+
+```text
+IMPLEMENTED
+PROVEN_ON_CURRENT_OR_INHERITED_SHA
+PROVEN_LOCAL_ONLY
+STILL_OPEN
+NOT_IN_SCOPE
+```
+
+Preserve FIX489-R3 evidence scope exactly:
 
 ```text
 capacity_scope=LOCAL_MAC_CPU
@@ -114,19 +383,29 @@ recommended_operating_concurrency=1
 FIX489_R3_SOAK_60M_PASS
 ```
 
-Do not translate local-hardware proof into production-capacity or `PRODUCTION_READY` claims.
+Do not claim `PRODUCTION_READY` without independent proof of every repository-defined production gate.
 
-## Required gates
+## Final result
 
-```bash
-cargo fmt --all --check
-cargo check --locked --all-targets --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
+`docs/fix490/RESULT.md` must contain exact tested SHA, current main SHA, executed commands, gate outcomes, REST/gRPC parity evidence, security negative evidence, HTTP boundary evidence, deadline/backpressure evidence and documentation/evidence audit result.
+
+Allowed implementation verdicts:
+
+```text
+FIX490_REST_BOUNDARY_AND_READINESS_SYNC_PASS
+FIX490_REST_BOUNDARY_AND_READINESS_SYNC_BLOCKED
 ```
 
-Also run focused REST parity and relevant existing retrieval/security/degradation integration tests. Record every executed command and exact result in `docs/fix490/RESULT.md`.
+## Independent verification
+
+After implementation, use:
+
+```text
+docs/fix490/CODEX_REST_VERIFICATION_PROMPT.md
+```
+
+for a separate verification pass. The verifier should review/test first and only make minimal FIX490-local fixes when a test proves a boundary defect.
 
 ## Review policy
 
-Prefer the smallest possible code change. The desired implementation is a transport adapter, not a new application layer or a refactor campaign. Do not perform opportunistic cleanup unrelated to FIX490.
+Prefer the smallest possible code change. The desired implementation is a transport adapter, not a new application layer or refactor campaign. Do not perform opportunistic cleanup unrelated to FIX490.
