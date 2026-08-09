@@ -340,6 +340,14 @@ class Fix489LiveCapacityContracts(unittest.TestCase):
         self.assertIn('REASON="LIVE_CAPACITY_RUN_FAILED"', source)
         self.assertIn('REASON="CAPACITY_EVIDENCE_VERIFICATION_FAILED"', source)
 
+    def test_r3_wrapper_enables_discovery_mode_after_static_contracts(self):
+        source = (ROOT / "scripts" / "fix489r3-local-stable-floor.sh").read_text(encoding="utf-8")
+        contracts_index = source.index("make verify-fix489r3-contracts")
+        mode_index = source.index('export FIX489_CAMPAIGN_MODE="LOCAL_STABLE_FLOOR_DISCOVERY"')
+        levels_index = source.index('export FIX489_CAPACITY_LEVELS="${FIX489_CAPACITY_LEVELS:-1,2,3,4}"')
+        self.assertLess(contracts_index, mode_index)
+        self.assertLess(contracts_index, levels_index)
+
     def test_cleanup_target_removes_runtime_and_default_compose(self):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         cleanup = makefile[makefile.index("fix487bc-cleanup:") : makefile.index("verify-fix489-live-capacity-contracts:")]
