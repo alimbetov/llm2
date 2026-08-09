@@ -14,7 +14,7 @@ use axum::{
 use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Status};
@@ -197,18 +197,17 @@ async fn retrieve(
     let payload = match payload {
         Ok(Json(payload)) => payload,
         Err(error) => {
-            let status = if matches!(
-                error,
-                axum::extract::rejection::JsonRejection::MissingJsonContentType(_)
-            ) {
-                StatusCode::UNSUPPORTED_MEDIA_TYPE
-            } else {
-                StatusCode::BAD_REQUEST
+            let status = error.status();
+            let code = match status {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE => "UNSUPPORTED_MEDIA_TYPE",
+                StatusCode::PAYLOAD_TOO_LARGE => "PAYLOAD_TOO_LARGE",
+                _ => "INVALID_JSON",
             };
+            counter!("astravector_http_requests_total", "route" => "/api/v1/retrieve", "method" => "POST", "status_class" => status_class(status)).increment(1);
             return (
                 status,
                 Json(json!({
-                    "code": if status == StatusCode::UNSUPPORTED_MEDIA_TYPE {"UNSUPPORTED_MEDIA_TYPE"} else {"INVALID_JSON"},
+                    "code": code,
                     "message": error.body_text(),
                     "correlationId": correlation_id_from_headers(&headers),
                 })),
@@ -216,6 +215,7 @@ async fn retrieve(
                 .into_response();
         }
     };
+
     let correlation_id = if payload.correlation_id.trim().is_empty() {
         correlation_id_from_headers(&headers)
     } else {
@@ -223,9 +223,8 @@ async fn retrieve(
     };
 
     let result = execute_retrieve(&state, payload, &correlation_id).await;
-    let elapsed = started.elapsed().as_secs_f64();
     histogram!("astravector_http_request_duration_seconds", "route" => "/api/v1/retrieve", "method" => "POST")
-        .record(elapsed);
+        .record(started.elapsed().as_secs_f64());
 
     match result {
         Ok(body) => {
@@ -250,8 +249,7 @@ async fn execute_retrieve(
     request: RestRetrieveRequest,
     correlation_id: &str,
 ) -> Result<Value, Status> {
-    let question = request.question.trim();
-    if question.is_empty() {
+    if request.question.trim().is_empty() {
         return Err(Status::invalid_argument("question is required"));
     }
     let access_level = parse_access_level(&request.caller_access_level)?;
@@ -261,7 +259,8 @@ async fn execute_retrieve(
     } else {
         request.max_contexts.min(state.cfg.limits.search_top_k_max)
     };
-    let mut inner = Request::new(pb::SearchRequestV004 {
+
+    let inner = Request::new(pb::SearchRequestV004 {
         correlation_id: correlation_id.to_owned(),
         access_zone_id: request.access_zone_id,
         caller_access_level: access_level as i32,
@@ -310,20 +309,26 @@ async fn execute_retrieve(
         access_zone_code: request.access_zone_code,
         access_zone_codes: request.access_zone_codes,
     });
-    // No authentication metadata is attached. This is an internal service boundary.
-    // access level is retrieval visibility semantics, not HTTP authentication.
-    inner.metadata_mut().clear();
+
+    // Internal transport: no REST authentication metadata is created or required.
+    // caller_access_level remains only an existing retrieval visibility input.
     let search = <AstraVectorV004ControlService as AstraVectorV004Control>::search(
         &state.control,
         inner,
     )
     .await?
     .into_inner();
+
     Ok(rest_response_from_search(search, profile))
 }
 
 fn parse_access_level(raw: &str) -> Result<pb::AccessLevel, Status> {
-    match raw.trim().trim_start_matches("ACCESS_LEVEL_").to_ascii_uppercase().as_str() {
+    match raw
+        .trim()
+        .trim_start_matches("ACCESS_LEVEL_")
+        .to_ascii_uppercase()
+        .as_str()
+    {
         "1" | "PUBLIC" => Ok(pb::AccessLevel::Public),
         "2" | "INTERNAL" => Ok(pb::AccessLevel::Internal),
         "3" | "CONFIDENTIAL" => Ok(pb::AccessLevel::Confidential),
@@ -390,28 +395,7 @@ fn rest_response_from_search(search: pb::SearchResponseV004, profile: pb::Retrie
         .warnings
         .iter()
         .map(|warning| warning.code.clone())
-        .filter(|code| {
-            matches!(
-                code.as_str(),
-                "GRAPH_EXPANSION_BACKPRESSURE"
-                    | "GRAPH_EXPANSION_TIMEOUT"
-                    | "MMR_FETCH_BACKPRESSURE"
-                    | "MMR_FETCH_TIMEOUT"
-                    | "TOKEN_SIMILARITY_FALLBACK"
-                    | "DEADLINE_BUDGET_DEGRADATION"
-                    | "LONG_QUERY_PARTIAL_COVERAGE"
-                    | "LONG_QUERY_CONTEXT_BUDGET_INSUFFICIENT"
-                    | "LONG_QUERY_COVERAGE_EXCEEDS_CONTEXT_LIMIT"
-                    | "LONG_QUERY_COVERAGE_REDUCED_BY_VISIBILITY_RECHECK"
-                    | "QUERY_SEGMENT_SKIPPED_INSUFFICIENT_BUDGET"
-                    | "QUERY_SEGMENT_RETRIEVAL_DEGRADED"
-                    | "BINDING_INVALID"
-                    | "VISIBILITY_REJECTED"
-                    | "HYDRATION_MISSING"
-                    | "PARENT_HYDRATION_TIMEOUT"
-                    | "EMPTY_CONTEXT"
-            )
-        })
+        .filter(|code| is_public_degradation_code(code))
         .collect::<Vec<_>>();
     if let Some(degradation) = typed_degradation.as_ref() {
         degradation_codes.extend(
@@ -439,6 +423,7 @@ fn rest_response_from_search(search: pb::SearchResponseV004, profile: pb::Retrie
     } else {
         "FOUND"
     };
+
     json!({
         "summary": {
             "totalCandidates": total_candidates,
@@ -455,20 +440,23 @@ fn rest_response_from_search(search: pb::SearchResponseV004, profile: pb::Retrie
             "fusionCandidateCount": diagnostics.fusion_candidate_count
         },
         "contexts": contexts,
-        "warnings": search.warnings.into_iter().map(|w| json!({"code":w.code,"message":w.message})).collect::<Vec<_>>(),
-        "degradation": typed_degradation.map(|d| json!({
-            "degraded": d.degraded,
-            "degradationClass": d.degradation_class,
-            "retryable": d.retryable,
-            "coverageClass": d.coverage_class,
-            "infrastructureFailure": d.infrastructure_failure,
-            "fullHydrationFailure": d.full_hydration_failure,
-            "droppedParents": d.dropped_parents.into_iter().map(|p| json!({
-                "parentId": p.parent_id,
-                "reason": p.reason,
-                "rejectionStage": p.rejection_stage,
-                "retryable": p.retryable,
-                "inputOrdinal": p.input_ordinal
+        "warnings": search.warnings.into_iter().map(|warning| json!({
+            "code": warning.code,
+            "message": warning.message
+        })).collect::<Vec<_>>(),
+        "degradation": typed_degradation.map(|degradation| json!({
+            "degraded": degradation.degraded,
+            "degradationClass": degradation.degradation_class,
+            "retryable": degradation.retryable,
+            "coverageClass": degradation.coverage_class,
+            "infrastructureFailure": degradation.infrastructure_failure,
+            "fullHydrationFailure": degradation.full_hydration_failure,
+            "droppedParents": degradation.dropped_parents.into_iter().map(|parent| json!({
+                "parentId": parent.parent_id,
+                "reason": parent.reason,
+                "rejectionStage": parent.rejection_stage,
+                "retryable": parent.retryable,
+                "inputOrdinal": parent.input_ordinal
             })).collect::<Vec<_>>()
         })),
         "diagnostics": {
@@ -478,6 +466,10 @@ fn rest_response_from_search(search: pb::SearchResponseV004, profile: pb::Retrie
             "totalMs": diagnostics.total_ms,
             "candidateCount": diagnostics.candidate_count,
             "finalCandidateCount": diagnostics.final_candidate_count,
+            "denseSearchMs": diagnostics.dense_search_ms,
+            "sparseSearchMs": diagnostics.sparse_search_ms,
+            "lexicalSearchMs": diagnostics.lexical_search_ms,
+            "fusionMs": diagnostics.fusion_ms,
             "graphExpansionDurationMs": diagnostics.graph_expansion_duration_ms,
             "graphMergeDurationMs": diagnostics.graph_merge_duration_ms,
             "mmrEnabled": diagnostics.mmr_enabled,
@@ -491,6 +483,29 @@ fn rest_response_from_search(search: pb::SearchResponseV004, profile: pb::Retrie
             "effectiveQueryTimeoutMs": diagnostics.effective_query_timeout_ms
         }
     })
+}
+
+fn is_public_degradation_code(code: &str) -> bool {
+    matches!(
+        code,
+        "GRAPH_EXPANSION_BACKPRESSURE"
+            | "GRAPH_EXPANSION_TIMEOUT"
+            | "MMR_FETCH_BACKPRESSURE"
+            | "MMR_FETCH_TIMEOUT"
+            | "TOKEN_SIMILARITY_FALLBACK"
+            | "DEADLINE_BUDGET_DEGRADATION"
+            | "LONG_QUERY_PARTIAL_COVERAGE"
+            | "LONG_QUERY_CONTEXT_BUDGET_INSUFFICIENT"
+            | "LONG_QUERY_COVERAGE_EXCEEDS_CONTEXT_LIMIT"
+            | "LONG_QUERY_COVERAGE_REDUCED_BY_VISIBILITY_RECHECK"
+            | "QUERY_SEGMENT_SKIPPED_INSUFFICIENT_BUDGET"
+            | "QUERY_SEGMENT_RETRIEVAL_DEGRADED"
+            | "BINDING_INVALID"
+            | "VISIBILITY_REJECTED"
+            | "HYDRATION_MISSING"
+            | "PARENT_HYDRATION_TIMEOUT"
+            | "EMPTY_CONTEXT"
+    )
 }
 
 fn rest_context_from_search_result(result: pb::SearchResultV004) -> Value {
@@ -514,8 +529,11 @@ fn rest_context_from_search_result(result: pb::SearchResultV004) -> Value {
     metadata
         .entry("parent_chunk_id".into())
         .or_insert_with(|| result.parent_chunk_id.clone());
+
     let scores = result.scores.unwrap_or_default();
     let source_block_id = metadata.get("source_block_id").cloned().unwrap_or_default();
+    let source_links = source_links_from_metadata(&metadata);
+
     json!({
         "matchedText": result.matched_text,
         "parentText": result.parent_text,
@@ -525,13 +543,14 @@ fn rest_context_from_search_result(result: pb::SearchResultV004) -> Value {
         "matchedChunkId": result.matched_chunk_id,
         "parentChunkId": result.parent_chunk_id,
         "accessZoneId": metadata.get("access_zone_id").cloned().unwrap_or_default(),
+        "sourceLinks": source_links,
         "citation": {
             "documentId": metadata.get("document_id").cloned().unwrap_or_default(),
-            "documentVersion": metadata.get("document_version").and_then(|v| v.parse::<u64>().ok()).unwrap_or_default(),
+            "documentVersion": metadata.get("document_version").and_then(|value| value.parse::<u64>().ok()).unwrap_or_default(),
             "sourceUri": metadata.get("source_uri").cloned().unwrap_or_default(),
             "title": metadata.get("document_title").cloned().unwrap_or_default(),
-            "pageStart": metadata.get("page_start").and_then(|v| v.parse::<u32>().ok()).unwrap_or_default(),
-            "pageEnd": metadata.get("page_end").and_then(|v| v.parse::<u32>().ok()).unwrap_or_default(),
+            "pageStart": metadata.get("page_start").and_then(|value| value.parse::<u32>().ok()).unwrap_or_default(),
+            "pageEnd": metadata.get("page_end").and_then(|value| value.parse::<u32>().ok()).unwrap_or_default(),
             "sectionPath": metadata.get("section_path").cloned().unwrap_or_default(),
             "heading": metadata.get("heading").cloned().unwrap_or_default(),
             "matchedChunkId": metadata.get("matched_chunk_id").cloned().unwrap_or_default(),
@@ -546,6 +565,48 @@ fn rest_context_from_search_result(result: pb::SearchResultV004) -> Value {
         },
         "metadata": metadata
     })
+}
+
+fn source_links_from_metadata(metadata: &std::collections::HashMap<String, String>) -> Vec<Value> {
+    let mut links = Vec::new();
+    for (key, link_type, label) in [
+        ("preview_url", "PREVIEW", "Предпросмотр документа"),
+        ("download_url", "DOWNLOAD", "Скачать документ"),
+        ("source_url", "ORIGINAL_DOCUMENT", "Открыть оригинальный документ"),
+        ("source_uri", "ORIGINAL_DOCUMENT", "Источник документа"),
+        ("page_url", "PAGE", "Открыть страницу"),
+        ("section_url", "SECTION", "Открыть раздел"),
+    ] {
+        if let Some(url) = metadata.get(key).filter(|value| !value.trim().is_empty()) {
+            links.push(json!({
+                "type": link_type,
+                "url": url,
+                "label": label,
+                "mimeType": metadata.get("mime_type").cloned().unwrap_or_default(),
+                "requiresAuth": true,
+                "expiresAt": metadata.get("expires_at").cloned().unwrap_or_default()
+            }));
+        }
+    }
+
+    for raw_key in ["matched_source_links", "document_source_links"] {
+        if let Some(raw) = metadata.get(raw_key) {
+            if let Ok(values) = serde_json::from_str::<Vec<Value>>(raw) {
+                links.extend(values);
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    links.retain(|link| {
+        let key = format!(
+            "{}|{}",
+            link.get("type").map(Value::to_string).unwrap_or_default(),
+            link.get("url").and_then(Value::as_str).unwrap_or_default()
+        );
+        seen.insert(key)
+    });
+    links
 }
 
 fn profile_name(profile: pb::RetrievalProfile) -> &'static str {
@@ -623,6 +684,14 @@ mod tests {
         assert_eq!(default_access_level(), "INTERNAL");
         assert_eq!(parse_access_level("PUBLIC").unwrap(), pb::AccessLevel::Public);
         assert_eq!(parse_access_level("INTERNAL").unwrap(), pb::AccessLevel::Internal);
+        assert_eq!(
+            parse_access_level("CONFIDENTIAL").unwrap(),
+            pb::AccessLevel::Confidential
+        );
+        assert_eq!(
+            parse_access_level("RESTRICTED").unwrap(),
+            pb::AccessLevel::Restricted
+        );
         assert!(parse_access_level("UNSPECIFIED").is_err());
     }
 
@@ -636,21 +705,58 @@ mod tests {
             retrieval_search_mode(pb::RetrievalProfile::LexicalStrict),
             pb::SearchModeV005::Sparse
         );
+        assert_eq!(retrieval_candidate_limit(pb::RetrievalProfile::Legal), 120);
         assert_eq!(
             retrieval_candidate_limit(pb::RetrievalProfile::Technical),
             100
         );
         assert_eq!(
+            retrieval_candidate_limit(pb::RetrievalProfile::LexicalStrict),
+            80
+        );
+        assert_eq!(
+            retrieval_candidate_limit(pb::RetrievalProfile::Semantic),
+            60
+        );
+        assert_eq!(
             retrieval_embedding_mode(pb::RetrievalProfile::Legal),
             pb::EmbeddingModeV005::DenseSparseRequired
+        );
+        assert_eq!(
+            retrieval_embedding_mode(pb::RetrievalProfile::Technical),
+            pb::EmbeddingModeV005::DenseSparseIfAvailable
         );
     }
 
     #[test]
     fn transport_error_mapping_is_deterministic() {
-        assert_eq!(http_status_from_tonic(Code::InvalidArgument), StatusCode::BAD_REQUEST);
-        assert_eq!(http_status_from_tonic(Code::ResourceExhausted), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(http_status_from_tonic(Code::Unavailable), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(http_status_from_tonic(Code::DeadlineExceeded), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            http_status_from_tonic(Code::InvalidArgument),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            http_status_from_tonic(Code::ResourceExhausted),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            http_status_from_tonic(Code::Unavailable),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            http_status_from_tonic(Code::DeadlineExceeded),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(http_status_from_tonic(Code::Aborted), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn http_config_rejects_port_collisions() {
+        let cfg = InternalHttpConfig {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port: 50051,
+            max_request_body_bytes: 65_536,
+        };
+        assert!(cfg.validate(50051, 9090).is_err());
     }
 }
