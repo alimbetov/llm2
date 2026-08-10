@@ -18,6 +18,7 @@ pub mod inference;
 pub mod ingestion_cleanup;
 pub mod metrics;
 pub mod persistence;
+pub mod projection;
 pub mod provider;
 pub mod query_processing;
 pub mod recovery;

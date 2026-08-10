@@ -1,7 +1,73 @@
-use crate::{config::RecoveryConfig, persistence::Repository};
+use crate::{config::RecoveryConfig, error::AstraError, persistence::Repository};
 use metrics::counter;
+use sqlx::{pool::PoolConnection, PgPool, Postgres, Transaction};
 use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
+
+const QDRANT_PROJECTION_FENCE_CLASS_ID: i32 = 491;
+const QDRANT_PROJECTION_FENCE_OBJECT_ID: i32 = 1;
+
+pub async fn acquire_qdrant_projection_write_fence<'a>(
+    pool: &'a PgPool,
+) -> Result<Transaction<'a, Postgres>, AstraError> {
+    let mut tx = pool.begin().await.map_err(db)?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared($1,$2)")
+        .bind(QDRANT_PROJECTION_FENCE_CLASS_ID)
+        .bind(QDRANT_PROJECTION_FENCE_OBJECT_ID)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+    if !acquired {
+        return Err(AstraError::ResourceExhausted(
+            "QDRANT_RECOVERY_FENCE_ACTIVE: projection write rejected while recovery holds fence"
+                .into(),
+        ));
+    }
+    Ok(tx)
+}
+
+pub async fn acquire_qdrant_recovery_exclusive_fence(
+    pool: &PgPool,
+) -> Result<QdrantRecoveryFence, AstraError> {
+    let mut conn = pool.acquire().await.map_err(db)?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1,$2)")
+        .bind(QDRANT_PROJECTION_FENCE_CLASS_ID)
+        .bind(QDRANT_PROJECTION_FENCE_OBJECT_ID)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db)?;
+    if !acquired {
+        return Err(AstraError::ResourceExhausted(
+            "QDRANT_RECOVERY_FENCE_BUSY: another projection writer or recovery is active".into(),
+        ));
+    }
+    Ok(QdrantRecoveryFence { conn: Some(conn) })
+}
+
+pub struct QdrantRecoveryFence {
+    conn: Option<PoolConnection<Postgres>>,
+}
+
+impl QdrantRecoveryFence {
+    pub async fn release(mut self) -> Result<(), AstraError> {
+        let Some(mut conn) = self.conn.take() else {
+            return Ok(());
+        };
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1,$2)")
+            .bind(QDRANT_PROJECTION_FENCE_CLASS_ID)
+            .bind(QDRANT_PROJECTION_FENCE_OBJECT_ID)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(db)?;
+        if released {
+            Ok(())
+        } else {
+            Err(AstraError::FailedPrecondition(
+                "QDRANT_RECOVERY_FENCE_RELEASE_FAILED: advisory lock was not held".into(),
+            ))
+        }
+    }
+}
 
 pub fn spawn(repo: Repository, cfg: RecoveryConfig, shutdown: CancellationToken) {
     tokio::spawn(async move {
@@ -58,4 +124,8 @@ pub fn spawn(repo: Repository, cfg: RecoveryConfig, shutdown: CancellationToken)
             }
         }
     });
+}
+
+fn db(e: sqlx::Error) -> AstraError {
+    AstraError::Unavailable(format!("postgres: {e}"))
 }

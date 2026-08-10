@@ -11,7 +11,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     sync::Arc,
     time::{Duration, Instant},
@@ -83,6 +83,15 @@ pub enum QdrantScrollStatus {
 #[derive(Debug, Clone)]
 pub struct QdrantScrollPointIdsResult {
     pub point_ids: HashSet<Uuid>,
+    pub pages_read: u64,
+    pub points_read: u64,
+    pub completed: bool,
+    pub status: QdrantScrollStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct QdrantScrollPointsResult {
+    pub payloads: HashMap<Uuid, Value>,
     pub pages_read: u64,
     pub points_read: u64,
     pub completed: bool,
@@ -404,6 +413,22 @@ impl QdrantClient {
             return Err(qdrant_status_error("collection_exists", r.status()));
         }
         Ok(true)
+    }
+
+    pub async fn delete_collection(&self) -> Result<(), AstraError> {
+        let url = format!("{}/collections/{}", self.base_url, self.collection);
+        let r = self
+            .send_with_retry("delete_collection", || {
+                self.request(self.http.delete(url.clone()))
+            })
+            .await?;
+        if r.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        if !r.status().is_success() {
+            return Err(qdrant_status_error("delete_collection", r.status()));
+        }
+        Ok(())
     }
 
     fn base_search_filter(
@@ -1155,6 +1180,150 @@ impl QdrantClient {
                 }
             }
         }
+        result
+    }
+
+    pub async fn scroll_all_points_with_payload(
+        &self,
+    ) -> Result<QdrantScrollPointsResult, AstraError> {
+        counter!("astravector_qdrant_scroll_requests_total").increment(1);
+        let started = Instant::now();
+        let _permit = self.scroll_semaphore.acquire().await.map_err(|_| {
+            AstraError::ResourceExhausted(
+                "QDRANT_SCROLL_RESOURCE_EXHAUSTED: qdrant scroll semaphore closed".into(),
+            )
+        })?;
+        gauge!("astravector_qdrant_scroll_concurrent_inflight").increment(1.0);
+
+        let result = async {
+            if !self.collection_exists().await? {
+                return Ok(QdrantScrollPointsResult {
+                    payloads: HashMap::new(),
+                    pages_read: 0,
+                    points_read: 0,
+                    completed: true,
+                    status: QdrantScrollStatus::Completed,
+                });
+            }
+
+            let url = format!("{}/collections/{}/points/scroll", self.base_url, self.collection);
+            let mut payloads: HashMap<Uuid, Value> = HashMap::new();
+            let mut seen_offsets: HashSet<String> = HashSet::new();
+            let mut next_page_offset: Option<Value> = None;
+            let mut pages_read: u64 = 0;
+            let timeout = Duration::from_secs(self.scroll_timeout_secs);
+
+            loop {
+                if started.elapsed() > timeout {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "timeout")
+                        .increment(1);
+                    return Err(AstraError::DeadlineExceeded(format!(
+                        "QDRANT_SCROLL_TIMEOUT: pages_read={pages_read} points_read={}",
+                        payloads.len()
+                    )));
+                }
+                if pages_read >= self.scroll_max_pages {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "limit_exceeded").increment(1);
+                    counter!("astravector_qdrant_scroll_limit_exceeded_total").increment(1);
+                    return Err(AstraError::ResourceExhausted(format!(
+                        "QDRANT_SCROLL_LIMIT_EXCEEDED: max_pages={} pages_read={pages_read} points_read={}",
+                        self.scroll_max_pages,
+                        payloads.len()
+                    )));
+                }
+                if payloads.len() as u64 >= self.scroll_max_points {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "limit_exceeded").increment(1);
+                    counter!("astravector_qdrant_scroll_limit_exceeded_total").increment(1);
+                    return Err(AstraError::ResourceExhausted(format!(
+                        "QDRANT_SCROLL_LIMIT_EXCEEDED: max_points={} pages_read={pages_read} points_read={}",
+                        self.scroll_max_points,
+                        payloads.len()
+                    )));
+                }
+
+                let mut body = json!({
+                    "limit": self.effective_scroll_page_size().max(1),
+                    "with_payload": true,
+                    "with_vector": false
+                });
+                if let Some(offset) = next_page_offset.clone() {
+                    body["offset"] = offset;
+                }
+
+                let r = self
+                    .send_with_retry("scroll_all_points", || {
+                        self.request(self.http.post(url.clone()).json(&body))
+                    })
+                    .await?;
+                if !r.status().is_success() {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "qdrant_error")
+                        .increment(1);
+                    return Err(qdrant_status_error("scroll_all_points", r.status()));
+                }
+                let page: Value = r.json().await.map_err(|e| {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "qdrant_error")
+                        .increment(1);
+                    AstraError::Internal(format!("QDRANT_SCROLL_FAILED: qdrant scroll json: {e}"))
+                })?;
+
+                pages_read += 1;
+                let points = page
+                    .pointer("/result/points")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for point in points {
+                    if let Some(id) = point
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|v| Uuid::parse_str(v).ok())
+                    {
+                        payloads.insert(id, point.get("payload").cloned().unwrap_or(Value::Null));
+                    }
+                }
+
+                if payloads.len() as u64 > self.scroll_max_points {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "limit_exceeded").increment(1);
+                    counter!("astravector_qdrant_scroll_limit_exceeded_total").increment(1);
+                    return Err(AstraError::ResourceExhausted(format!(
+                        "QDRANT_SCROLL_LIMIT_EXCEEDED: max_points={} pages_read={pages_read} points_read={}",
+                        self.scroll_max_points,
+                        payloads.len()
+                    )));
+                }
+
+                let Some(offset) = page
+                    .pointer("/result/next_page_offset")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                else {
+                    let points_read = payloads.len() as u64;
+                    histogram!("astravector_qdrant_scroll_pages_total").record(pages_read as f64);
+                    histogram!("astravector_qdrant_scroll_points_total").record(points_read as f64);
+                    return Ok(QdrantScrollPointsResult {
+                        payloads,
+                        pages_read,
+                        points_read,
+                        completed: true,
+                        status: QdrantScrollStatus::Completed,
+                    });
+                };
+
+                let offset_key = offset.to_string();
+                if !seen_offsets.insert(offset_key) {
+                    counter!("astravector_qdrant_scroll_errors_total", "reason" => "loop")
+                        .increment(1);
+                    return Err(AstraError::Internal(format!(
+                        "QDRANT_SCROLL_LOOP: repeated next_page_offset pages_read={pages_read} points_read={}",
+                        payloads.len()
+                    )));
+                }
+                next_page_offset = Some(offset);
+            }
+        }
+        .await;
+
+        gauge!("astravector_qdrant_scroll_concurrent_inflight").decrement(1.0);
         result
     }
 

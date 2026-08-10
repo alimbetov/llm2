@@ -1,0 +1,42 @@
+{
+  "verdict": "PARTIAL_IMPLEMENTATION_READY_FOR_RUNTIME_PROOF",
+  "shared_projection_builder": "IMPLEMENTED",
+  "projection_writer_fence": "IMPLEMENTED",
+  "qdrant_rebuild_cli": "IMPLEMENTED",
+  "destructive_replace_opt_in": "IMPLEMENTED",
+  "qdrant_audit_cli": "IMPLEMENTED",
+  "runtime_rebuild_proof": "PASS",
+  "local_demo_pre_rebuild_audit": {
+    "expected_eligible_bindings": 19776,
+    "actual_points": 25722,
+    "missing_points": 7050,
+    "orphan_points": 12996,
+    "payload_mismatches": 0,
+    "scan_completed": true,
+    "verdict": "QDRANT_PROJECTION_DRIFT"
+  },
+  "local_demo_rebuild": {
+    "expected_eligible_bindings": 19776,
+    "batches_scanned": 40,
+    "points_upserted": 19776,
+    "failed_points": 0,
+    "replace_existing": true,
+    "used_inference_fallback": false,
+    "verdict": "QDRANT_REBUILD_COMPLETED"
+  },
+  "local_demo_post_rebuild_audit": {
+    "expected_eligible_bindings": 19776,
+    "actual_points": 19776,
+    "missing_points": 0,
+    "orphan_points": 0,
+    "payload_mismatches": 0,
+    "pages_scanned": 20,
+    "points_scanned": 19776,
+    "scan_completed": true,
+    "verdict": "QDRANT_PROJECTION_CONSISTENT"
+  },
+  "defects_fixed": [
+    "QDRANT_RECOVERY_FENCE_IDLE_TRANSACTION_TIMEOUT"
+  ],
+  "retrieval_parity": "NOT_RUN"
+}

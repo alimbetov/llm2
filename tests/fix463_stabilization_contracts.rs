@@ -13,8 +13,10 @@ fn outbox_uses_operation_version_fencing() {
 fn reconciliation_is_not_noop_and_preserves_payload_contract() {
     let bin = fs::read_to_string("src/bin/astravector-reconciliation.rs").unwrap();
     let rec = fs::read_to_string("src/reconciliation/mod.rs").unwrap();
+    let projection = fs::read_to_string("src/projection.rs").unwrap();
     assert!(bin.contains("--full"));
     assert!(bin.contains("reconcile_unsynced_batch"));
+    assert!(rec.contains("CanonicalProjectionInput"));
     for required in [
         "access_level",
         "expires_at_epoch",
@@ -24,8 +26,8 @@ fn reconciliation_is_not_noop_and_preserves_payload_contract() {
         "quarantined",
     ] {
         assert!(
-            rec.contains(required),
-            "reconciler payload must contain {required}"
+            projection.contains(required),
+            "canonical projection payload must contain {required}"
         );
     }
     assert!(rec.contains("reconciliation_skipped_legal_hold_total"));

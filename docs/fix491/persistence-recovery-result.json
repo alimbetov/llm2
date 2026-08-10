@@ -1,0 +1,28 @@
+{
+  "final_verdict": "FIX491_PERSISTENCE_RECOVERY_BLOCKED",
+  "completed": [
+    "shared_projection_builder",
+    "outbox_projection_builder_wiring",
+    "reconciliation_projection_builder_wiring",
+    "qdrant_projection_writer_fence",
+    "postgres_audit_cli",
+    "qdrant_rebuild_cli",
+    "qdrant_audit_cli",
+    "local_demo_postgres_audit_pass",
+    "local_demo_qdrant_rebuild_pass",
+    "local_demo_qdrant_audit_pass",
+    "projection_contract_tests"
+  ],
+  "blocked_or_not_run": [
+    "postgres_bootstrap_proof",
+    "migration_history_checksum_audit",
+    "schema_drift_audit",
+    "canonical_data_integrity_audit",
+    "qdrant_runtime_rebuild_proof",
+    "interruption_resume_proof",
+    "recovery_fence_integration_test",
+    "postgres_fingerprint_proof",
+    "retrieval_parity_proof",
+    "full_isolated_disaster_proof"
+  ]
+}

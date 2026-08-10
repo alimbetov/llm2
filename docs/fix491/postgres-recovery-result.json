@@ -1,0 +1,21 @@
+{
+  "verdict": "PARTIAL_IMPLEMENTATION_READY_FOR_RUNTIME_PROOF",
+  "postgres_audit_cli": "IMPLEMENTED",
+  "postgres_bootstrap_proof": "NOT_RUN",
+  "migration_version_history_audit": "IMPLEMENTED",
+  "migration_checksum_audit": "NOT_RUN",
+  "schema_drift_classification": "NOT_RUN",
+  "canonical_data_integrity": "PARTIAL_IMPLEMENTED",
+  "local_demo_runtime_audit": {
+    "repository_migration_count": 39,
+    "applied_migration_count": 39,
+    "failed_migrations": 0,
+    "unknown_migrations": 0,
+    "pending_migrations": 0,
+    "orphan_bindings": 0,
+    "duplicate_bindings": 0,
+    "active_searchable_bindings_missing_dense": 0,
+    "dead_or_failed_outbox": 0,
+    "verdict": "POSTGRES_CANONICAL_AUDIT_PASS"
+  }
+}
