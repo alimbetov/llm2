@@ -2,49 +2,155 @@
 
 Work in repository `alimbetov/llm2` on branch `agent/fix491-persistence-recovery`.
 
-Read first, in this order:
-
-1. `docs/fix491/TECHNICAL_SPECIFICATION.md`
-2. `docs/fix491/ACCEPTANCE_CRITERIA.md`
-3. `src/outbox/mod.rs`
-4. `src/reconciliation/mod.rs`
-5. `src/qdrant/mod.rs`
-6. `src/recovery/mod.rs`
-7. current persistence code and all migrations
-8. existing FIX489/FIX490 evidence that establishes inherited invariants
+Do not work in `main`. Do not create another branch unless objectively required. Do not merge to `main` automatically.
 
 ## Mission
 
-Implement FIX491 exactly as specified: deterministic PostgreSQL canonical recovery/audit plus deterministic Qdrant projection rebuild/audit, without changing retrieval semantics.
+Implement FIX491 as a deterministic persistence recovery and proof mechanism for AstraVector:
 
-Preserve:
+1. PostgreSQL canonical schema recovery and audit.
+2. PostgreSQL canonical-data integrity audit.
+3. Qdrant projection compatibility audit, full rebuild, and consistency audit.
+4. Proof that loss of Qdrant does not imply loss of canonical knowledge.
+5. Proof that PostgreSQL schema is reproducible from repository migrations.
+6. Retrieval parity proof before and after complete Qdrant collection loss and rebuild.
 
-```text
-PostgreSQL = canonical state
-Qdrant     = rebuildable projection
-```
-
-Do not make Qdrant authoritative and do not add a new service.
-
-## Mandatory design direction before coding
-
-The current code already constructs Qdrant payloads in both outbox and reconciliation. Do NOT create a third FIX491-specific payload builder.
-
-First identify the exact current projection contract and extract one shared canonical projection builder/function used by:
+The non-negotiable authority model is:
 
 ```text
-outbox publisher
-reconciliation repair
-FIX491 rebuild
+PostgreSQL = canonical state / source of truth
+Qdrant     = rebuildable search/vector projection
 ```
 
-Add tests proving the same canonical PostgreSQL input produces the same `QdrantPoint` from all callers.
+Qdrant must never become authoritative. Do not add a new service.
 
-Existing outbox projection behavior is the reference unless a concrete defect is proven.
+## Read before coding
 
-Also reuse/extend existing `Reconciler` / `astravector-reconciliation` for scan/repair. Do not create a parallel reconciliation engine.
+Read completely, in this order:
 
-## Required operator capabilities
+1. `docs/fix491/TECHNICAL_SPECIFICATION.md`
+2. `docs/fix491/ACCEPTANCE_CRITERIA.md`
+3. this file
+4. `docs/fix491/CODEX_VERIFICATION_PROMPT.md` if present
+5. `src/outbox/mod.rs`
+6. `src/reconciliation/mod.rs`
+7. `src/qdrant/mod.rs`
+8. `src/recovery/mod.rs`
+9. `src/persistence/**` and current persistence code
+10. `src/main.rs`
+11. `src/bin/astravector-reconciliation.rs` if present
+12. `config/**`
+13. all `migrations/**`
+14. `tests/e2e_testcontainers.rs`
+15. existing recovery/reconciliation/local-demo scripts
+16. existing FIX489/FIX490 evidence establishing inherited invariants
+
+Before implementation, understand the actual current contracts for PostgreSQL canonical tables, persisted embeddings, vector bindings, vector outbox, Qdrant point construction, collection creation, reconciliation, lifecycle, TTL, legal hold, deletion fencing, sync statuses, payloads, and retrieval filters.
+
+Do not code from this specification alone when the repository establishes stricter semantics.
+
+## Step 0 — Baseline and scope
+
+Before changes capture:
+
+```bash
+git status --short --branch
+git branch --show-current
+git rev-parse HEAD
+git merge-base HEAD agent/rest-boundary-readiness-sync
+git diff --stat agent/rest-boundary-readiness-sync...HEAD
+```
+
+Record baseline SHA and lineage in evidence. If the named FIX490 base is no longer the correct repository lineage, determine and document the actual inherited base rather than fabricating a result.
+
+Do not mix unrelated changes into FIX491.
+
+## Architectural invariants
+
+Normal Qdrant recovery must be possible from persisted PostgreSQL canonical state without:
+
+- source-document reparsing;
+- rechunking;
+- BGE-M3/ONNX inference;
+- regenerating dense or sparse representations;
+- changing representation identities.
+
+Do not change:
+
+- CanonicalTokenizer/tokenizer ownership;
+- BGE-M3/ONNX ownership;
+- chunking or SOURCE/PARENT/SUB hierarchy;
+- dense/sparse/hybrid retrieval semantics;
+- fusion/RRF;
+- no-answer behavior;
+- parent hydration;
+- GraphRAG;
+- MMR;
+- token budget;
+- final visibility/access-zone/access-level semantics;
+- document/version lifecycle semantics;
+- TTL/legal-hold semantics;
+- canonical PostgreSQL authority;
+- outbox correctness/fencing semantics;
+- retrieval ranking.
+
+If correct FIX491 implementation objectively requires changing one of these invariants, stop and report:
+
+```text
+FIX491_BLOCKED_BY_ARCHITECTURE_CHANGE
+```
+
+Do not hide such a dependency inside opportunistic refactoring.
+
+## Step 1 — Eliminate projection divergence first
+
+The current code constructs Qdrant payload/points in normal publication and reconciliation. Do not add a third FIX491-specific builder.
+
+Identify the exact existing projection contract and extract one shared canonical projection builder/function used by:
+
+```text
+PostgreSQL canonical projection input
+              ↓
+   CanonicalProjectionBuilder
+              ↓
+          QdrantPoint
+        /      |       \
+       /       |        \
+   Outbox  Reconcile   Rebuild
+```
+
+Requirements:
+
+- one canonical builder;
+- one payload contract;
+- one persisted-representation-to-Qdrant mapping;
+- outbox, reconciliation, and rebuild all use it;
+- existing outbox behavior is the reference unless a concrete defect is demonstrated;
+- do not silently change production point semantics.
+
+Add parity tests proving the same canonical input produces a semantically identical `QdrantPoint` through all callers.
+
+## Step 2 — Keep one repair engine
+
+Reuse and extend existing `Reconciler` / `astravector-reconciliation` rather than creating a competing recovery repair subsystem.
+
+Target architecture:
+
+```text
+                  Projection Core
+                        │
+              ┌─────────┴─────────┐
+              ▼                   ▼
+           Outbox             Reconciler
+                                   │
+                          ┌────────┴────────┐
+                          ▼                 ▼
+                    incremental        full rebuild
+```
+
+Recovery CLI may orchestrate the existing engine. Do not create parallel `QdrantRepairService`, `RecoveryRepairEngine`, or equivalent unless repository architecture proves this unavoidable.
+
+## Step 3 — Required operator capabilities
 
 Provide scriptable semantics equivalent to:
 
@@ -57,100 +163,352 @@ astravector-runtime recovery qdrant-audit
 astravector-runtime recovery full-proof
 ```
 
-It is acceptable for `qdrant-rebuild/audit` to delegate to an extended `astravector-reconciliation` implementation. Keep one repair engine.
+Exact CLI spelling may follow existing CLI architecture, but all capabilities must exist and be documented.
 
-Every command must return non-zero on failure and emit a final machine-readable verdict.
+Commands must be non-interactive/scriptable, emit a human-readable summary plus a final machine-readable verdict, never log secrets, and return non-zero for failure or blocked states.
 
-## PostgreSQL implementation requirements
+`qdrant-rebuild`/`qdrant-audit` may delegate to extended reconciliation. Keep one repair engine.
 
-- Reuse SQLx migrations in `migrations/`.
-- Inspect `_sqlx_migrations` including checksums and unknown/failed/pending versions.
-- Build semantic schema inventory from PostgreSQL catalogs; do not rely only on raw `pg_dump diff`.
-- Cover extensions/versions, schemas, tables/partitioned tables, partition keys/children, columns, identity/defaults/nullability, constraints, indexes/predicates, sequences, functions/views/triggers and runtime-material ownership/privileges.
-- Add clean-DB bootstrap proof using disposable PostgreSQL 16 + pgvector infrastructure.
-- Add comparison/audit against an existing DB without mutating it.
-- Define deterministic `NO_DRIFT`, `BENIGN_DRIFT`, `MATERIAL_DRIFT`, `BLOCKED` rules. Unknown differences are not silently benign.
-- Add read-only canonical-data integrity checks over document/chunk/cache/binding/outbox/access-zone/lifecycle relationships.
-- Surface failed/dead outbox and deletion-fenced/in-progress states.
-- Keep data-loss boundary explicit: schema from migrations; canonical rows from operator-provided backup/PITR.
-- Document RPO/RTO boundary; do not implement a backup engine.
+## Step 4 — PostgreSQL migration recovery
 
-## Qdrant collection requirements
+Reuse SQLx migrations in `migrations/`.
 
-- Reuse `QdrantClient::ensure_collection` or shared extracted config logic.
-- Add explicit compatibility audit; `collection_exists` is insufficient.
-- Validate collection name, dense dimension/names, distance metric, sparse config and required payload indexes/types.
-- Record Qdrant server version/config identity in evidence.
-- Incompatible existing collection fails closed by default.
+`postgres-bootstrap-proof` must start from disposable PostgreSQL 16 + pgvector with no AstraVector schema and:
 
-## Qdrant rebuild requirements
+1. apply the complete repository migration chain;
+2. inspect `_sqlx_migrations`;
+3. verify known versions and checksums;
+4. detect failed, pending, and unknown migration versions;
+5. build semantic schema inventory;
+6. run canonical-data/schema checks appropriate to an empty bootstrap;
+7. fail non-zero on material inconsistency.
 
-- Rebuild only from PostgreSQL canonical bindings/chunks/persisted embeddings/representation metadata.
-- Reuse persisted dense/sparse vectors; normal recovery must not call inference.
-- If required persisted representation is missing, classify/fail; do not silently re-embed.
-- Preserve binding IDs and Qdrant point IDs.
-- Reuse one shared searchability/eligibility rule across normal projection/reconciliation/rebuild/audit expected set.
-- Preserve current lifecycle/TTL/legal-hold/deletion semantics exactly.
-- Do not rewrite historical completed outbox rows.
-- Prefer direct deterministic batched upsert through the shared projection builder followed by audit/reconciliation.
+Do not equate `cargo sqlx migrate run` with a complete recovery proof.
 
-## Recovery fencing
+## Step 5 — PostgreSQL semantic schema inventory
 
-A full/destructive rebuild must not race the normal outbox publisher or another recovery execution.
+Do not rely only on raw `pg_dump` text diff. Use PostgreSQL catalogs as the primary semantic comparison.
 
-Implement and document a safe fence using the smallest architecture-compatible mechanism, for example:
+Cover at minimum:
 
-- explicit offline mode requiring normal runtime/publisher stopped; or
-- PostgreSQL advisory/recovery lease/generation; or
-- another DB-backed fence compatible with current outbox fencing.
+- extensions and versions;
+- schemas;
+- ordinary and partitioned tables;
+- partition keys and children;
+- columns and types;
+- identity/generation/default expressions;
+- nullability;
+- PK/FK/UNIQUE/CHECK constraints;
+- indexes and partial-index predicates;
+- sequences;
+- views/materialized views when present;
+- functions;
+- triggers;
+- runtime-material ownership/privileges when required by runtime.
 
-Do not assume operator discipline without a detectable guard if destructive concurrent writes could corrupt proof.
+Use deterministic classifications:
 
-Add a test proving conflicting recovery is rejected or serialized.
+```text
+NO_DRIFT
+BENIGN_DRIFT
+MATERIAL_DRIFT
+BLOCKED
+```
 
-## Rebuild scaling/resumability
+Unknown differences are not silently benign. `MATERIAL_DRIFT` is a failing/non-zero result.
 
-Do not load the whole projection into memory.
+`postgres-audit` must be read-only and must not auto-repair the audited working database.
 
-Required:
+## Step 6 — PostgreSQL canonical-data integrity
+
+Schema equality is insufficient. Add a read-only canonical-data integrity audit using the real current schema and lifecycle semantics.
+
+Cover relevant relationships, including where present:
+
+- vector bindings → content chunks;
+- vector bindings → persisted embedding/cache representation;
+- chunks → document versions;
+- parent/source chunk relationships;
+- access-zone references;
+- duplicate logical binding identities;
+- invalid lifecycle combinations;
+- active/searchable bindings missing required persisted vectors;
+- failed/dead outbox rows;
+- stale/illegal delete states;
+- deletion-fenced or in-progress states;
+- orphan canonical relationships.
+
+Do not invent generic integrity rules that contradict current domain semantics. Report deterministic counters and a machine-readable verdict.
+
+## Step 7 — PostgreSQL recovery boundary
+
+Do not imply that migrations restore production data.
+
+Document explicitly:
+
+```text
+EMPTY PostgreSQL + repository migrations
+= schema recovery
+
+operator-provided PostgreSQL backup/PITR
++ pending migrations
++ postgres-audit
+= canonical data disaster recovery
+```
+
+Do not implement a backup engine. Document operator backup/PITR assumptions and the RPO/RTO boundary.
+
+## Step 8 — Qdrant collection compatibility
+
+Reuse `QdrantClient::ensure_collection` or extract shared collection configuration logic. Do not duplicate collection schema in a recovery-only implementation.
+
+`collection_exists` is insufficient. Audit at minimum:
+
+- collection name;
+- dense vector names/configuration;
+- dense dimension;
+- distance metric;
+- sparse vector configuration;
+- required payload indexes and their types;
+- Qdrant server/version/config identity available to the client.
+
+Fail closed for incompatible existing collections.
+
+Default destructive policy:
+
+```text
+missing collection       -> create and rebuild
+empty compatible         -> rebuild
+non-empty consistent     -> audit/no-op by default
+non-empty drifted        -> refuse destructive replacement
+incompatible             -> refuse
+```
+
+Destructive replacement requires explicit `--replace-existing` or an equivalent opt-in.
+
+Before destructive action log redacted target identity/config/counts and the explicit opt-in. Never log database passwords, Qdrant API keys, tokens, or connection secrets.
+
+## Step 9 — Qdrant rebuild source
+
+Rebuild only from PostgreSQL canonical bindings/chunks/persisted embeddings/representation metadata.
+
+Reuse persisted dense and sparse vectors. Normal recovery must not call inference.
+
+If an eligible binding requires a persisted representation that is missing, classify and fail with a canonical-integrity/recovery error. Do not silently re-embed because the currently deployed model/tokenizer may differ from the original indexing version.
+
+Preserve binding identities and Qdrant point IDs.
+
+## Step 10 — One eligibility/searchability contract
+
+Recovery must not implement its own handwritten approximation of searchability.
+
+Reuse/extract one eligibility rule for the expected Qdrant projection set across normal projection, reconciliation, rebuild, and audit.
+
+It must preserve current semantics for all relevant state, including:
+
+- document/version lifecycle;
+- binding state;
+- access zones and access levels;
+- expiration/TTL;
+- deleted state;
+- legal hold;
+- representation type/version;
+- Qdrant sync semantics;
+- current final visibility/searchability rules.
+
+Deleted, expired, inactive, or otherwise non-searchable canonical data must not be rebuilt as active searchable points.
+
+## Step 11 — Preserve outbox history
+
+Do not rewrite historical completed `vector_outbox` rows to `PENDING` merely to force republishing.
+
+Prefer:
+
+```text
+PostgreSQL canonical state
+        ↓
+shared projection builder
+        ↓
+deterministic direct batched upsert
+        ↓
+reconciliation / final audit
+```
+
+Historical completed outbox rows remain historical completed rows. If recovery-specific operations must be persisted, keep them explicitly identifiable and justify why they are required. Avoid this complexity when deterministic direct rebuild is sufficient.
+
+## Step 12 — Recovery fencing
+
+Full/destructive rebuild must not race:
+
+- the normal outbox publisher;
+- another recovery process;
+- destructive reconciliation activity.
+
+Implement a detectable guard using the smallest architecture-compatible mechanism, such as PostgreSQL advisory lock, DB-backed recovery lease/generation, or an offline mode with an actual technical check that conflicting publication cannot proceed.
+
+Documentation alone saying "stop the service" is not a sufficient correctness guard when concurrent writes can invalidate the proof.
+
+Add tests proving:
+
+```text
+Recovery A holds fence
+Recovery B starts
+→ rejected or serialized
+```
+
+and exercise the relevant rebuild-vs-outbox UPSERT/DELETE conflict path so race corruption cannot be silently accepted.
+
+## Step 13 — Batching, bounded memory, interruption, resume
+
+Do not load the complete projection into memory.
+
+Required properties:
 
 - deterministic stable scan order;
 - configurable bounded batch size;
 - bounded memory;
 - idempotent upsert;
-- safe rerun/resume after interruption;
+- safe rerun/restart after interruption;
 - cancellation support;
-- bounded retries using reconciliation workload policy;
-- progress and per-batch failure counters;
+- bounded retries using existing reconciliation workload policy where possible;
+- progress counters;
+- per-batch failure counters;
 - mandatory final audit.
 
-Prefer stateless resumability from deterministic scans/point identity; add persistent recovery-session state only if correctness requires it.
+Prefer stateless resumability based on stable scans and deterministic point identity. Add persistent recovery-session state only if correctness requires it.
 
-## Qdrant audit requirements
+Test interruption after one or more batches followed by restart/rerun and a clean final audit.
 
-Audit must report:
+## Step 14 — Qdrant full audit
 
-- expected eligible bindings;
-- actual points;
-- missing/orphan points;
-- payload mismatch;
-- dense/sparse/version mismatch where practical;
-- collection-schema mismatch;
-- scroll pages/points/completion status.
+Provide read-only Qdrant audit reporting at minimum:
 
-The existing Qdrant client exposes bounded scroll states. If scroll is timeout/limit/loop/error/incomplete, final audit MUST NOT report consistency.
+```text
+expected_eligible_bindings
+actual_points
+missing_points
+orphan_points
+payload_mismatches
+dense_representation_mismatches
+sparse_representation_mismatches
+representation_version_mismatches
+collection_schema_mismatches
+pages_scanned
+points_scanned
+scan_completed
+```
 
-Read-only audit must not delete/quarantine orphan points.
+Where the Qdrant API cannot economically prove a vector-level property, document the exact limitation rather than claiming it was checked.
 
-## PostgreSQL fingerprint around Qdrant loss
+The existing bounded scroll states are correctness-significant. If scroll ends due to timeout, page/point limit, loop detection, Qdrant error, cancellation, or any incomplete condition, final audit must not report consistency.
 
-Capture a deterministic read-only fingerprint/counters before deleting Qdrant and compare after rebuild. Cover recovery-relevant document/chunk/embedding/binding/outbox/graph state while excluding normalized operational timestamps.
+Only a complete scan may produce a consistent verdict.
 
-The proof must show Qdrant loss/rebuild did not rewrite canonical PostgreSQL history unexpectedly.
+Read-only audit must not delete or quarantine orphan points.
 
-## Retrieval proof requirements
+Suggested machine verdicts include:
 
-Frozen query set must include, when supported by the fixture:
+```text
+QDRANT_PROJECTION_CONSISTENT
+QDRANT_PROJECTION_DRIFT
+QDRANT_REBUILD_FAILED
+QDRANT_AUDIT_INCOMPLETE
+```
+
+## Step 15 — PostgreSQL fingerprint around Qdrant loss
+
+Capture a deterministic read-only fingerprint/counters before deleting Qdrant and compare after loss and after rebuild.
+
+Cover recovery-relevant canonical semantic state, including where present:
+
+- document versions;
+- chunks;
+- embedding cache/representations;
+- vector bindings;
+- outbox semantic history;
+- graph canonical state;
+- access zones;
+- lifecycle state.
+
+Exclude only explicitly documented operational timestamps/counters that recovery is legitimately allowed to change.
+
+Proof sequence:
+
+```text
+PG fingerprint A
+      ↓
+DELETE ONLY Qdrant collection
+      ↓
+PG fingerprint B
+      ↓
+Qdrant rebuild
+      ↓
+PG fingerprint C
+```
+
+For canonical semantic state require:
+
+```text
+A == B == C
+```
+
+Unexpected canonical PostgreSQL history mutation is a failure.
+
+## Step 16 — Startup/readiness corner case
+
+Explicitly investigate `qdrant.auto_create_collection=true` or equivalent behavior.
+
+A missing collection followed by runtime auto-creation can produce an existing but empty collection. Therefore:
+
+```text
+collection exists != projection restored
+```
+
+Do not silently redesign readiness semantics. Prove and document current behavior. If current readiness can report healthy/ready while canonical eligible bindings exist and Qdrant is an empty auto-created projection, record a concrete correctness finding and make only the smallest FIX491-local change necessary for a safe recovery contract.
+
+## Step 17 — Full disaster proof
+
+Run an isolated proof on disposable infrastructure:
+
+```text
+EMPTY PostgreSQL
+      ↓
+all migrations
+      ↓
+schema audit
+      ↓
+ingestion fixture
+      ↓
+PostgreSQL canonical state
+      ↓
+Qdrant projection
+      ↓
+activation
+      ↓
+retrieval baseline
+      ↓
+PostgreSQL fingerprint A
+      ↓
+DELETE ONLY Qdrant collection
+      ↓
+PostgreSQL fingerprint B
+      ↓
+Qdrant rebuild from PostgreSQL persisted state
+      ↓
+PostgreSQL fingerprint C
+      ↓
+Qdrant full audit
+      ↓
+retrieval parity
+      ↓
+final persistence verdict
+```
+
+Prefer extending `tests/e2e_testcontainers.rs`, existing local-demo infrastructure, and reconciliation helpers. Do not create a parallel integration framework without necessity.
+
+## Step 18 — Retrieval parity bank
+
+Use a frozen before/after query set. When supported by the fixture include:
 
 1. dense;
 2. sparse;
@@ -159,82 +517,63 @@ Frozen query set must include, when supported by the fixture:
 5. no-answer/hard-negative;
 6. Graph-enabled query.
 
-Capture baseline, delete only Qdrant collection, rebuild, audit, rerun same queries and compare classification/context identity/order/scores/provenance with documented tolerances.
+Compare the semantic result, not merely HTTP/command success. Include relevant fields such as:
 
-## Startup/readiness audit
+- classification / FOUND / no-answer / degraded state;
+- context count and order;
+- document and version identity;
+- matched/parent chunk identity;
+- access-zone identity;
+- matched and parent text identity where appropriate;
+- representation identity;
+- dense/sparse/fusion/final scores;
+- Graph provenance;
+- degradation codes.
 
-Do not silently change readiness semantics.
+Document minimal deterministic floating-point tolerances and use the same tolerances before and after recovery.
 
-Explicitly prove/document that auto-creating a missing empty Qdrant collection is NOT equivalent to restored projection. `collection exists` cannot substitute for FIX491 recovery proof.
+## Step 19 — Required focused negative and recovery tests
 
-## Destructive safety
-
-Default behavior:
-
-```text
-missing collection                -> create/rebuild
-empty compatible                  -> rebuild
-non-empty consistent              -> audit/no-op by default
-non-empty drifted                 -> refuse destructive replacement
-incompatible                      -> refuse
-```
-
-Require explicit `--replace-existing` (or equivalent) for destructive replacement.
-
-Before destructive action log redacted target identities/config/counts and explicit opt-in. Never log secrets.
-
-## Required focused tests
-
-PostgreSQL:
+PostgreSQL coverage:
 
 - clean migration bootstrap;
 - checksum mismatch;
-- unknown/pending migration;
-- material drift;
-- read-only audit;
-- canonical-data integrity.
+- unknown migration;
+- pending migration;
+- material column drift;
+- material index drift;
+- partition drift where partitioning exists;
+- read-only audit behavior;
+- canonical-data relationship corruption.
 
-Qdrant:
+Qdrant coverage:
 
-- projection-builder parity between outbox/reconciliation/rebuild;
+- shared projection-builder parity across outbox/reconciliation/rebuild;
 - missing collection recreation;
-- collection compatibility/incompatibility;
-- payload-index recreation;
+- compatible empty collection;
+- incompatible collection;
+- wrong dense dimension/config;
+- missing sparse configuration;
+- missing/wrong payload index;
 - non-empty destructive refusal;
-- explicit replace on disposable collection;
-- no inference fallback;
+- explicit replacement on disposable collection;
+- missing canonical vector;
+- proof that inference fallback is not used;
 - bounded batch behavior;
-- interruption + resume/rerun;
-- concurrent recovery fence;
+- interruption and restart/rerun;
+- concurrent recovery fencing;
+- rebuild/outbox concurrency safety;
 - incomplete scroll fail-closed;
-- missing/orphan/payload/version mismatch detection;
-- before/after retrieval parity;
-- PostgreSQL fingerprint unchanged.
+- missing expected point detection;
+- orphan point detection;
+- payload mismatch detection;
+- representation/version mismatch detection where practical;
+- PostgreSQL fingerprint unchanged;
+- before/after retrieval parity.
 
-Prefer extending existing testcontainers/local-demo and reconciliation helpers rather than creating a parallel framework.
+Prefer extending existing tests and helpers rather than building a second framework.
 
-## Safety invariants
-
-Do not change:
-
-- tokenizer/BGE-M3 ownership;
-- chunking;
-- dense/sparse/hybrid ranking;
-- fusion/RRF;
-- parent hydration;
-- GraphRAG;
-- MMR;
-- token budget;
-- visibility/access-zone/access-level semantics;
-- lifecycle/version semantics;
-- canonical PostgreSQL authority;
-- outbox correctness/fencing semantics.
-
-If such a change is required, stop with:
-
-`FIX491_BLOCKED_BY_ARCHITECTURE_CHANGE`
-
-## Mandatory gates
+## Step 20 — Mandatory regression gates
 
 Run:
 
@@ -246,9 +585,13 @@ cargo test --locked --all-targets --all-features
 cargo test --features integration-tests --test e2e_testcontainers -- --nocapture
 ```
 
-Then execute the FIX491 focused proof on disposable infrastructure.
+Run all new FIX491 focused integration/proof tests as well.
 
-## Evidence
+Do not rerun unrelated long-duration FIX489 soak tests merely because persistence recovery changed, unless FIX491 changes retrieval semantics or the repository's verification contract explicitly requires them.
+
+Do not claim PASS for a gate that was not executed.
+
+## Step 21 — Evidence and runbook
 
 Create/update:
 
@@ -261,11 +604,37 @@ docs/fix491/PERSISTENCE_RECOVERY_RESULT.md
 
 Generate machine-readable JSON counterparts for final proof counters/verdicts.
 
-Include tested SHA, exact commands, environment/database/collection identities (no secrets), versions, counters, migration/drift classification, canonical integrity, collection compatibility, recovery fence, interruption/resume, scan completeness, PostgreSQL fingerprint, retrieval parity, regression gates and final verdict.
+Evidence must include, as applicable:
 
-Do not claim PASS for checks not executed.
+- repository and branch;
+- baseline/base SHA;
+- tested SHA;
+- exact commands;
+- git diff scope;
+- environment identities without secrets;
+- PostgreSQL server version;
+- pgvector version;
+- migration count/history/checksum verdict;
+- schema drift classification;
+- canonical integrity counters;
+- Qdrant server version;
+- collection/config compatibility;
+- expected and actual point counts;
+- missing/orphan/mismatch counters;
+- scan completion state;
+- recovery fence result;
+- batch/retry/interruption/resume counters;
+- PostgreSQL fingerprints;
+- retrieval parity results and tolerances;
+- regression gate results;
+- discovered defects/limitations;
+- final verdict.
 
-Final verdict must be one of:
+Evidence must distinguish `NOT_RUN`, `BLOCKED`, and `FAIL`; never convert them to PASS.
+
+## Final acceptance gate
+
+The only top-level final verdicts are:
 
 ```text
 FIX491_PERSISTENCE_RECOVERY_PASS
@@ -273,4 +642,63 @@ FIX491_PERSISTENCE_RECOVERY_FAIL
 FIX491_PERSISTENCE_RECOVERY_BLOCKED
 ```
 
-Do not merge to `main` automatically.
+`FIX491_PERSISTENCE_RECOVERY_PASS` is permitted only when all applicable required conditions are proven, including:
+
+```text
+PostgreSQL clean bootstrap              PASS
+SQLx migration history/checksums        PASS
+PostgreSQL MATERIAL_DRIFT               0
+PostgreSQL canonical integrity          PASS
+
+Qdrant collection compatibility         PASS
+Qdrant full rebuild                     PASS
+Qdrant scan completion                  PASS
+missing eligible points                 0
+orphan Qdrant points                    0
+payload mismatch                        0
+required representation mismatch        0
+
+PostgreSQL canonical fingerprint        unchanged
+recovery fencing                        PASS
+interruption/resume                     PASS
+retrieval before/after parity           PASS
+
+cargo fmt                               PASS
+cargo check --locked                    PASS
+cargo clippy --locked                   PASS
+cargo test --locked                     PASS
+required integration/FIX491 tests       PASS
+```
+
+## Fix policy
+
+You may change production code required for FIX491. Prefer minimal architecture-preserving extraction and reuse.
+
+Do not perform generic refactoring, unrelated renaming, retrieval rewrites, model/chunking/ranking changes, frozen-evidence rewriting, or dependency upgrades without necessity.
+
+If an existing defect directly blocks FIX491, fix it minimally and add a regression test. If fixing it requires an out-of-scope architecture change, return BLOCKED rather than bypassing the invariant.
+
+## Commit and push
+
+After successful implementation and verification:
+
+1. inspect `git status` and final diff;
+2. commit only FIX491 changes;
+3. push to `agent/fix491-persistence-recovery`;
+4. do not merge to `main`;
+5. report final local HEAD SHA;
+6. verify and report remote branch SHA equals local HEAD.
+
+Final Codex response must report:
+
+1. final FIX491 verdict;
+2. local HEAD SHA;
+3. remote branch SHA;
+4. changed production files;
+5. added/changed tests;
+6. PostgreSQL recovery/audit result;
+7. Qdrant rebuild/audit result;
+8. retrieval parity result;
+9. regression gates;
+10. discovered defects/limitations;
+11. remaining blocked items, if any.
