@@ -4,6 +4,8 @@ use sqlx::{pool::PoolConnection, PgPool, Postgres, Transaction};
 use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
 
+pub mod postgres;
+
 const QDRANT_PROJECTION_FENCE_CLASS_ID: i32 = 491;
 const QDRANT_PROJECTION_FENCE_OBJECT_ID: i32 = 1;
 

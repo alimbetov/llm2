@@ -1,0 +1,3 @@
+   Compiling astravector-runtime v0.4.1 (/Users/ruslanalimbetov/Documents/llm2/astravector)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.29s
+     Running tests/fix491_postgres_recovery_contracts.rs (target/debug/deps/fix491_postgres_recovery_contracts-1afa885839d81576)

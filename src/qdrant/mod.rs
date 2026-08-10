@@ -120,6 +120,18 @@ pub struct QdrantVersionFilters {
     pub payload_filters: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QdrantCollectionCompatibilitySummary {
+    pub expected_dense_dimension: usize,
+    pub actual_dense_dimension: usize,
+    pub dense_distance: String,
+    pub sparse_vector_present: bool,
+    pub required_payload_indexes: usize,
+    pub missing_payload_indexes: Vec<String>,
+    pub mismatched_payload_indexes: Vec<String>,
+    pub verdict: String,
+}
+
 const RETRIEVAL_PAYLOAD_INDEXES: &[(&str, &str)] = &[
     ("access_zone_id", "keyword"),
     ("lifecycle_status", "keyword"),
@@ -138,6 +150,71 @@ const RETRIEVAL_PAYLOAD_INDEXES: &[(&str, &str)] = &[
     ("binding_id", "keyword"),
     ("qdrant_point_id", "keyword"),
 ];
+
+pub fn qdrant_collection_compatibility_from_info(
+    body: &Value,
+    expected_dimension: usize,
+) -> QdrantCollectionCompatibilitySummary {
+    let actual_dense_dimension = body
+        .pointer("/result/config/params/vectors/dense/size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let dense_distance = body
+        .pointer("/result/config/params/vectors/dense/distance")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let sparse_vector_present = body
+        .pointer("/result/config/params/sparse_vectors/sparse")
+        .is_some();
+    let payload_schema = body
+        .pointer("/result/payload_schema")
+        .and_then(Value::as_object);
+    let mut missing_payload_indexes = Vec::new();
+    let mut mismatched_payload_indexes = Vec::new();
+    for (field, expected_type) in RETRIEVAL_PAYLOAD_INDEXES {
+        let Some(schema) = payload_schema.and_then(|schema| schema.get(*field)) else {
+            missing_payload_indexes.push((*field).to_string());
+            continue;
+        };
+        let actual_type = schema
+            .get("data_type")
+            .or_else(|| schema.get("type"))
+            .and_then(Value::as_str)
+            .or_else(|| schema.as_str())
+            .unwrap_or("");
+        if !qdrant_payload_schema_type_matches(expected_type, actual_type) {
+            mismatched_payload_indexes.push(format!(
+                "{field}: expected={expected_type}, actual={actual_type}"
+            ));
+        }
+    }
+    let compatible = actual_dense_dimension == expected_dimension
+        && dense_distance.eq_ignore_ascii_case("Cosine")
+        && sparse_vector_present
+        && missing_payload_indexes.is_empty()
+        && mismatched_payload_indexes.is_empty();
+    QdrantCollectionCompatibilitySummary {
+        expected_dense_dimension: expected_dimension,
+        actual_dense_dimension,
+        dense_distance,
+        sparse_vector_present,
+        required_payload_indexes: RETRIEVAL_PAYLOAD_INDEXES.len(),
+        missing_payload_indexes,
+        mismatched_payload_indexes,
+        verdict: if compatible {
+            "QDRANT_COLLECTION_COMPATIBLE".to_string()
+        } else {
+            "QDRANT_COLLECTION_SCHEMA_MISMATCH".to_string()
+        },
+    }
+}
+
+fn qdrant_payload_schema_type_matches(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    let actual = actual.trim().to_ascii_lowercase();
+    expected == actual || (expected == "bool" && actual == "boolean")
+}
 
 fn qdrant_payload_indexes_enabled() -> bool {
     env::var("ASTRAVECTOR_QDRANT_ENSURE_PAYLOAD_INDEXES")
@@ -537,10 +614,10 @@ impl QdrantClient {
 
         if let Some(get) = get {
             if get.status().is_success() {
-                self.validate_collection(dense_dimension).await?;
                 if qdrant_payload_indexes_enabled() {
                     self.ensure_payload_indexes().await?;
                 }
+                self.validate_collection(dense_dimension).await?;
                 return Ok(());
             }
             if get.status() != StatusCode::NOT_FOUND {
@@ -575,10 +652,10 @@ impl QdrantClient {
                 create.status(),
             ));
         }
-        self.validate_collection(dense_dimension).await?;
         if qdrant_payload_indexes_enabled() {
             self.ensure_payload_indexes().await?;
         }
+        self.validate_collection(dense_dimension).await?;
         Ok(())
     }
 
@@ -690,42 +767,56 @@ impl QdrantClient {
         Ok(true)
     }
     pub async fn validate_collection(&self, expected_dimension: usize) -> Result<(), AstraError> {
+        let compatibility = self.collection_compatibility(expected_dimension).await?;
+        if compatibility.actual_dense_dimension != expected_dimension {
+            return Err(AstraError::FailedPrecondition(format!(
+                "QDRANT_COLLECTION_SCHEMA_MISMATCH: dense dimension mismatch: expected={}, actual={}",
+                compatibility.expected_dense_dimension, compatibility.actual_dense_dimension
+            )));
+        }
+        if !compatibility.dense_distance.eq_ignore_ascii_case("Cosine") {
+            return Err(AstraError::FailedPrecondition(format!(
+                "QDRANT_COLLECTION_SCHEMA_MISMATCH: dense distance mismatch: expected=Cosine, actual={}",
+                compatibility.dense_distance
+            )));
+        }
+        if !compatibility.sparse_vector_present {
+            return Err(AstraError::FailedPrecondition(
+                "QDRANT_COLLECTION_SCHEMA_MISMATCH: missing sparse vector named sparse".into(),
+            ));
+        }
+        if !compatibility.missing_payload_indexes.is_empty()
+            || !compatibility.mismatched_payload_indexes.is_empty()
+        {
+            return Err(AstraError::FailedPrecondition(format!(
+                "QDRANT_COLLECTION_SCHEMA_MISMATCH: payload index mismatch: missing={:?}, mismatched={:?}",
+                compatibility.missing_payload_indexes, compatibility.mismatched_payload_indexes
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn collection_compatibility(
+        &self,
+        expected_dimension: usize,
+    ) -> Result<QdrantCollectionCompatibilitySummary, AstraError> {
         let url = format!("{}/collections/{}", self.base_url, self.collection);
         let r = self
-            .send_with_retry("validate_collection", || {
+            .send_with_retry("collection_compatibility", || {
                 self.request(self.http.get(url.clone()))
             })
             .await?;
         if !r.status().is_success() {
-            return Err(qdrant_status_error("validate_collection", r.status()));
+            return Err(qdrant_status_error("collection_compatibility", r.status()));
         }
         let body: Value = r
             .json()
             .await
             .map_err(|e| AstraError::Internal(format!("qdrant collection json: {e}")))?;
-        let dimension = body
-            .pointer("/result/config/params/vectors/dense/size")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        if dimension != expected_dimension {
-            return Err(AstraError::FailedPrecondition(format!("QDRANT_COLLECTION_SCHEMA_MISMATCH: dense dimension mismatch: expected={expected_dimension}, actual={dimension}")));
-        }
-        let distance = body
-            .pointer("/result/config/params/vectors/dense/distance")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !distance.eq_ignore_ascii_case("Cosine") {
-            return Err(AstraError::FailedPrecondition(format!("QDRANT_COLLECTION_SCHEMA_MISMATCH: dense distance mismatch: expected=Cosine, actual={distance}")));
-        }
-        let sparse_ok = body
-            .pointer("/result/config/params/sparse_vectors/sparse")
-            .is_some();
-        if !sparse_ok {
-            return Err(AstraError::FailedPrecondition(
-                "QDRANT_COLLECTION_SCHEMA_MISMATCH: missing sparse vector named sparse".into(),
-            ));
-        }
-        Ok(())
+        Ok(qdrant_collection_compatibility_from_info(
+            &body,
+            expected_dimension,
+        ))
     }
 
     pub async fn search_dense(

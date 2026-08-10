@@ -19,7 +19,11 @@ use astravector_runtime::{
     provider,
     qdrant::QdrantClient,
     reconciliation::Reconciler,
-    recovery, retention,
+    recovery::{
+        self,
+        postgres::{postgres_recovery_audit_with_policy, PostgresRecoveryAuditPolicy},
+    },
+    retention,
     scheduler::Scheduler,
     security::ApiKeyAuth,
     tokenizer::CanonicalTokenizer,
@@ -414,6 +418,7 @@ async fn run_recovery_command(cfg: AppConfig) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("recovery command required"))?;
     let batch_size = read_arg_i64(&args, "--batch-size").unwrap_or(500).max(1);
     let replace_existing = args.iter().any(|arg| arg == "--replace-existing");
+    let include_inventory_items = args.iter().any(|arg| arg == "--include-inventory-items");
     let repo = Repository::connect(&cfg.postgres).await?;
     match command {
         "qdrant-audit" => {
@@ -427,13 +432,30 @@ async fn run_recovery_command(cfg: AppConfig) -> anyhow::Result<()> {
                 anyhow::bail!("{}", summary.verdict)
             }
         }
-        "postgres-audit" => {
-            let summary = postgres_audit(&repo).await?;
+        "qdrant-compatibility" => {
+            let qdrant = recovery_qdrant_client(&cfg)?;
+            let summary = qdrant.collection_compatibility(cfg.dense.dimension).await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
-            if summary["verdict"] == "POSTGRES_CANONICAL_AUDIT_PASS" {
+            if summary.verdict == "QDRANT_COLLECTION_COMPATIBLE" {
                 Ok(())
             } else {
-                anyhow::bail!("{}", summary["verdict"].as_str().unwrap_or("POSTGRES_AUDIT_FAIL"))
+                anyhow::bail!("{}", summary.verdict)
+            }
+        }
+        "postgres-audit" => {
+            let summary = postgres_recovery_audit_with_policy(
+                &repo,
+                std::path::Path::new("migrations"),
+                PostgresRecoveryAuditPolicy {
+                    sparse_required: cfg.sparse.required,
+                },
+            )
+            .await?;
+            println!("{}", recovery_pretty_json(&summary, include_inventory_items)?);
+            if summary.verdict == "POSTGRES_CANONICAL_AUDIT_PASS" {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", summary.verdict)
             }
         }
         "qdrant-rebuild" => {
@@ -452,155 +474,91 @@ async fn run_recovery_command(cfg: AppConfig) -> anyhow::Result<()> {
         "full-proof" => {
             let qdrant = recovery_qdrant_client(&cfg)?;
             let reconciler = Reconciler { repo, qdrant };
+            let postgres = postgres_recovery_audit_with_policy(
+                &reconciler.repo,
+                std::path::Path::new("migrations"),
+                PostgresRecoveryAuditPolicy {
+                    sparse_required: cfg.sparse.required,
+                },
+            )
+            .await?;
             let before = reconciler.qdrant_projection_audit(batch_size).await?;
             let rebuild = reconciler
                 .qdrant_rebuild_from_postgres(&cfg.dense, batch_size, replace_existing)
                 .await?;
             let after = reconciler.qdrant_projection_audit(batch_size).await?;
-            let verdict = if after.verdict == "QDRANT_PROJECTION_CONSISTENT" {
-                "FIX491_QDRANT_RECOVERY_PARTIAL_PASS"
+            let qdrant_lane = if after.verdict == "QDRANT_PROJECTION_CONSISTENT" {
+                "QDRANT_PROJECTION_RECOVERY_PASS"
             } else {
-                "FIX491_QDRANT_RECOVERY_PARTIAL_FAIL"
+                "QDRANT_PROJECTION_RECOVERY_FAIL"
+            };
+            let postgres_bootstrap_proof = "NOT_RUN";
+            let retrieval_parity = "NOT_RUN";
+            let verdict = if postgres.verdict == "POSTGRES_CANONICAL_AUDIT_PASS"
+                && qdrant_lane == "QDRANT_PROJECTION_RECOVERY_PASS"
+                && postgres_bootstrap_proof != "NOT_RUN"
+                && retrieval_parity != "NOT_RUN"
+            {
+                "FIX491_PERSISTENCE_RECOVERY_PASS"
+            } else {
+                "FIX491_PERSISTENCE_RECOVERY_BLOCKED"
             };
             let report = serde_json::json!({
                 "verdict": verdict,
+                "postgres": postgres,
+                "qdrant_lane": qdrant_lane,
                 "before": before,
                 "rebuild": rebuild,
                 "after": after,
-                "postgres_bootstrap_proof": "NOT_RUN",
-                "retrieval_parity": "NOT_RUN"
+                "postgres_bootstrap_proof": postgres_bootstrap_proof,
+                "retrieval_parity": retrieval_parity
             });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            if verdict.ends_with("_PASS") {
+            println!("{}", recovery_pretty_json(&report, include_inventory_items)?);
+            if verdict == "FIX491_PERSISTENCE_RECOVERY_PASS" {
                 Ok(())
             } else {
                 anyhow::bail!("{verdict}")
             }
         }
         other => anyhow::bail!(
-            "unsupported recovery command {other}; supported: postgres-audit, qdrant-audit, qdrant-rebuild, full-proof"
+            "unsupported recovery command {other}; supported: postgres-audit, qdrant-audit, qdrant-compatibility, qdrant-rebuild, full-proof"
         ),
     }
 }
 
-async fn postgres_audit(repo: &Repository) -> anyhow::Result<serde_json::Value> {
-    let expected_versions = repository_migration_versions()?;
-    let rows = sqlx::query("SELECT version,success FROM _sqlx_migrations ORDER BY version")
-        .fetch_all(&repo.pool)
-        .await?;
-    let expected: std::collections::HashSet<i64> = expected_versions.iter().copied().collect();
-    let mut applied = std::collections::HashSet::new();
-    let mut failed_migrations = 0_u64;
-    let mut unknown_migrations = Vec::new();
-    for row in rows {
-        use sqlx::Row;
-        let version: i64 = row.get("version");
-        let success: bool = row.get("success");
-        if !success {
-            failed_migrations += 1;
-        }
-        if !expected.contains(&version) {
-            unknown_migrations.push(version);
-        }
-        applied.insert(version);
+fn recovery_pretty_json<T: serde::Serialize>(
+    value: &T,
+    include_inventory_items: bool,
+) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(value)?;
+    if !include_inventory_items {
+        compact_recovery_inventory(&mut value);
     }
-    let pending_migrations = expected.difference(&applied).copied().collect::<Vec<i64>>();
-
-    let orphan_bindings: i64 = sqlx::query_scalar(
-        r#"
-SELECT count(*) FROM astravector.vector_bindings_v004 b
-LEFT JOIN astravector.content_chunks_v004 c
-  ON c.access_zone_id=b.access_zone_id AND c.id=b.chunk_id
-LEFT JOIN astravector.document_versions d
-  ON d.access_zone_id=b.access_zone_id
- AND d.document_id=b.document_id
- AND d.document_version=b.document_version
-LEFT JOIN astravector.embedding_cache_entries ce
-  ON ce.id=b.cache_entry_id
-LEFT JOIN astravector.access_zones az
-  ON az.access_zone_id=b.access_zone_id
-WHERE c.id IS NULL OR d.document_id IS NULL OR ce.id IS NULL OR az.access_zone_id IS NULL
-"#,
-    )
-    .fetch_one(&repo.pool)
-    .await?;
-    let duplicate_bindings: i64 = sqlx::query_scalar(
-        r#"
-SELECT count(*) FROM (
-  SELECT access_zone_id,document_id,document_version,chunk_id,representation_type,count(*)
-  FROM astravector.vector_bindings_v004
-  GROUP BY access_zone_id,document_id,document_version,chunk_id,representation_type
-  HAVING count(*) > 1
-) duplicates
-"#,
-    )
-    .fetch_one(&repo.pool)
-    .await?;
-    let active_missing_dense: i64 = sqlx::query_scalar(
-        r#"
-SELECT count(*) FROM astravector.vector_bindings_v004 b
-JOIN astravector.embedding_cache_entries ce ON ce.id=b.cache_entry_id
-LEFT JOIN astravector.embedding_dense d ON d.cache_entry_id=b.cache_entry_id
-WHERE b.lifecycle_status='ACTIVE'
-  AND b.qdrant_sync_status='SYNCED'
-  AND b.chunk_granularity IN ('PARENT','SUB_180','SUB_260')
-  AND ce.status='COMPLETED'
-  AND d.cache_entry_id IS NULL
-"#,
-    )
-    .fetch_one(&repo.pool)
-    .await?;
-    let dead_outbox: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM astravector.vector_outbox WHERE status IN ('DEAD_LETTER','FAILED')",
-    )
-    .fetch_one(&repo.pool)
-    .await?;
-    let blocking = failed_migrations
-        + unknown_migrations.len() as u64
-        + pending_migrations.len() as u64
-        + orphan_bindings as u64
-        + duplicate_bindings as u64
-        + active_missing_dense as u64
-        + dead_outbox as u64;
-    Ok(serde_json::json!({
-        "verdict": if blocking == 0 {
-            "POSTGRES_CANONICAL_AUDIT_PASS"
-        } else {
-            "POSTGRES_CANONICAL_AUDIT_FAIL"
-        },
-        "repository_migration_count": expected_versions.len(),
-        "applied_migration_count": applied.len(),
-        "failed_migrations": failed_migrations,
-        "unknown_migrations": unknown_migrations,
-        "pending_migrations": pending_migrations,
-        "canonical_integrity": {
-            "orphan_bindings": orphan_bindings,
-            "duplicate_bindings": duplicate_bindings,
-            "active_searchable_bindings_missing_dense": active_missing_dense,
-            "dead_or_failed_outbox": dead_outbox
-        },
-        "read_only": true,
-        "schema_drift_catalog_comparison": "NOT_IMPLEMENTED"
-    }))
+    Ok(serde_json::to_string_pretty(&value)?)
 }
 
-fn repository_migration_versions() -> anyhow::Result<Vec<i64>> {
-    let mut versions = Vec::new();
-    for entry in std::fs::read_dir("migrations")? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.ends_with(".sql") {
-            continue;
+fn compact_recovery_inventory(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if (object.contains_key("sha256") || object.contains_key("verdict"))
+                && object.contains_key("items")
+            {
+                if let Some(items) = object.remove("items") {
+                    let count = items.as_array().map_or(0, Vec::len);
+                    object.insert("item_count".to_string(), serde_json::json!(count));
+                }
+            }
+            for nested in object.values_mut() {
+                compact_recovery_inventory(nested);
+            }
         }
-        let Some((prefix, _)) = name.split_once('_') else {
-            continue;
-        };
-        versions.push(prefix.parse::<i64>()?);
+        serde_json::Value::Array(items) => {
+            for item in items {
+                compact_recovery_inventory(item);
+            }
+        }
+        _ => {}
     }
-    versions.sort_unstable();
-    Ok(versions)
 }
 
 fn recovery_qdrant_client(cfg: &AppConfig) -> anyhow::Result<QdrantClient> {

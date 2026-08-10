@@ -1,21 +1,38 @@
 {
-  "verdict": "PARTIAL_IMPLEMENTATION_READY_FOR_RUNTIME_PROOF",
-  "postgres_audit_cli": "IMPLEMENTED",
-  "postgres_bootstrap_proof": "NOT_RUN",
-  "migration_version_history_audit": "IMPLEMENTED",
-  "migration_checksum_audit": "NOT_RUN",
-  "schema_drift_classification": "NOT_RUN",
-  "canonical_data_integrity": "PARTIAL_IMPLEMENTED",
-  "local_demo_runtime_audit": {
+  "verdict": "POSTGRES_CANONICAL_AUDIT_PASS",
+  "run_id": "fix491-20260811-003559",
+  "evidence": "docs/fix491/evidence/fix491-20260811-003559/postgres-audit.stdout",
+  "clean_bootstrap_testcontainers": "PASS",
+  "recovery_fencing_testcontainers": "PASS",
+  "migration_history": {
     "repository_migration_count": 39,
     "applied_migration_count": 39,
     "failed_migrations": 0,
-    "unknown_migrations": 0,
-    "pending_migrations": 0,
+    "unknown_migrations": [],
+    "pending_migrations": [],
+    "checksum_mismatches": []
+  },
+  "canonical_integrity": {
+    "partial_active_documents": 0,
+    "orphan_chunks": 0,
     "orphan_bindings": 0,
+    "orphan_outbox": 0,
+    "orphan_graph_nodes": 0,
+    "orphan_graph_edges": 0,
+    "duplicate_chunks": 0,
     "duplicate_bindings": 0,
+    "duplicate_outbox_events": 0,
     "active_searchable_bindings_missing_dense": 0,
-    "dead_or_failed_outbox": 0,
-    "verdict": "POSTGRES_CANONICAL_AUDIT_PASS"
+    "active_searchable_bindings_missing_sparse": 24795,
+    "active_searchable_bindings_missing_sparse_policy": "DIAGNOSTIC_ONLY_WHEN_SPARSE_REQUIRED_FALSE",
+    "dead_or_failed_outbox": 0
+  },
+  "schema_inventory": {
+    "item_count": 6792,
+    "sha256": "f54e3e78a5465986034cdb4fd1936757368490b745fc868d6aef7fe6cb3b82ca"
+  },
+  "canonical_fingerprint": {
+    "item_count": 60,
+    "sha256": "a2cb2c30cd982649c26d29035498f0e20aca8339f54e8c15c14cc904e7b44d19"
   }
 }

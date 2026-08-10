@@ -360,6 +360,10 @@ production-recovery-gate-m2:
 production-recovery-gate-m2-repeatability:
 	./scripts/run_fix478_repeatability_gate.sh
 
+.PHONY: verify-fix491-persistence-recovery
+verify-fix491-persistence-recovery:
+	./scripts/fix491-persistence-recovery-proof.sh
+
 production-search-gate-m2:
 	ASTRAVECTOR_PROFILE=search-production-candidate LOAD_RUN_ID=$${LOAD_RUN_ID:-fix480-$$(git rev-parse --short=7 HEAD)-run-1} ./scripts/macbook-model-backed-load.sh
 

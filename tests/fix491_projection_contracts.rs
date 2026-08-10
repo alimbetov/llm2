@@ -1,4 +1,7 @@
-use astravector_runtime::{inference::EmbeddingResult, projection::CanonicalProjectionInput};
+use astravector_runtime::{
+    inference::EmbeddingResult, projection::CanonicalProjectionInput,
+    qdrant::qdrant_collection_compatibility_from_info,
+};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
@@ -120,5 +123,91 @@ fn fix491_projection_point_reuses_persisted_vectors_without_inference_fallback()
     assert_eq!(
         point.payload["binding_id"],
         json!("11111111-1111-1111-1111-111111111111")
+    );
+}
+
+fn qdrant_collection_info(payload_schema: serde_json::Value) -> serde_json::Value {
+    json!({
+        "result": {
+            "config": {
+                "params": {
+                    "vectors": {
+                        "dense": {
+                            "size": 1024,
+                            "distance": "Cosine"
+                        }
+                    },
+                    "sparse_vectors": {
+                        "sparse": {
+                            "index": {
+                                "on_disk": false
+                            }
+                        }
+                    }
+                }
+            },
+            "payload_schema": payload_schema
+        }
+    })
+}
+
+fn full_payload_schema() -> serde_json::Value {
+    json!({
+        "access_zone_id": {"data_type": "keyword"},
+        "lifecycle_status": {"data_type": "keyword"},
+        "chunk_granularity": {"data_type": "keyword"},
+        "document_id": {"data_type": "keyword"},
+        "document_version": {"data_type": "integer"},
+        "access_level": {"data_type": "integer"},
+        "expires_at_epoch": {"data_type": "integer"},
+        "quarantined": {"data_type": "bool"},
+        "model_version": {"data_type": "keyword"},
+        "tokenizer_version": {"data_type": "keyword"},
+        "dense_version": {"data_type": "keyword"},
+        "sparse_version": {"data_type": "keyword"},
+        "chunking_profile_version": {"data_type": "keyword"},
+        "quality_run_id": {"data_type": "keyword"},
+        "binding_id": {"data_type": "keyword"},
+        "qdrant_point_id": {"data_type": "keyword"}
+    })
+}
+
+#[test]
+fn fix491_qdrant_collection_compatibility_accepts_full_payload_schema() {
+    let summary = qdrant_collection_compatibility_from_info(
+        &qdrant_collection_info(full_payload_schema()),
+        1024,
+    );
+
+    assert_eq!(summary.verdict, "QDRANT_COLLECTION_COMPATIBLE");
+    assert!(summary.missing_payload_indexes.is_empty());
+    assert!(summary.mismatched_payload_indexes.is_empty());
+}
+
+#[test]
+fn fix491_qdrant_collection_compatibility_rejects_missing_payload_index() {
+    let mut schema = full_payload_schema();
+    schema
+        .as_object_mut()
+        .expect("payload schema object")
+        .remove("access_zone_id");
+
+    let summary = qdrant_collection_compatibility_from_info(&qdrant_collection_info(schema), 1024);
+
+    assert_eq!(summary.verdict, "QDRANT_COLLECTION_SCHEMA_MISMATCH");
+    assert_eq!(summary.missing_payload_indexes, vec!["access_zone_id"]);
+}
+
+#[test]
+fn fix491_qdrant_collection_compatibility_rejects_mismatched_payload_index_type() {
+    let mut schema = full_payload_schema();
+    schema["access_level"] = json!({"data_type": "keyword"});
+
+    let summary = qdrant_collection_compatibility_from_info(&qdrant_collection_info(schema), 1024);
+
+    assert_eq!(summary.verdict, "QDRANT_COLLECTION_SCHEMA_MISMATCH");
+    assert_eq!(
+        summary.mismatched_payload_indexes,
+        vec!["access_level: expected=integer, actual=keyword"]
     );
 }

@@ -1,0 +1,3 @@
+   Compiling astravector-runtime v0.4.1 (/Users/ruslanalimbetov/Documents/llm2/astravector)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.71s
+     Running tests/fix491_projection_contracts.rs (target/debug/deps/fix491_projection_contracts-ef2a67d3fd091ae3)
