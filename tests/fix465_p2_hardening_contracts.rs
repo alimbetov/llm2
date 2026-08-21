@@ -92,7 +92,8 @@ fn test_postgres_timeouts_use_set_config_with_binds() {
 
 #[test]
 fn test_fix465_version_alignment() {
-    let tag = "0.4.1-fix465-p2-production-hardening";
+    let tag = "0.4.1-image-contract";
+    let registry_ref = "registry.astrabase.asia/astravector:0.4.1-image-contract";
     let cargo = fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
     assert!(
         cargo.contains("version = \"0.4.1\""),
@@ -108,8 +109,18 @@ fn test_fix465_version_alignment() {
         let src = fs::read_to_string(file).expect("read versioned file");
         assert!(
             src.contains(tag),
-            "{file} must use aligned fix465 image tag"
+            "{file} must use aligned image-contract tag"
         );
+        if file.starts_with("k8s/") {
+            assert!(
+                src.contains(registry_ref),
+                "{file} must use the private registry image-contract reference"
+            );
+            assert!(
+                src.contains("astravector-registry-pull"),
+                "{file} must reference the private registry pull secret"
+            );
+        }
         assert!(
             !src.contains("0.4.0-fix463-production-candidate-stabilization"),
             "{file} must not use the old fix463 image tag"

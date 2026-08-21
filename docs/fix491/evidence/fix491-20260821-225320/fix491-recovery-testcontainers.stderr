@@ -1,0 +1,2 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running tests/fix491_recovery_testcontainers.rs (target/debug/deps/fix491_recovery_testcontainers-38880cccdd3ce979)

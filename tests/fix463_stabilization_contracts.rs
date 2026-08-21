@@ -50,8 +50,12 @@ fn k8s_runtime_uses_qdrant_and_consistent_image() {
     ] {
         let src = fs::read_to_string(file).unwrap();
         assert!(
-            src.contains("0.4.1-fix465-p2-production-hardening"),
-            "{file} must use aligned fix465 image tag"
+            src.contains("registry.astrabase.asia/astravector:0.4.1-image-contract"),
+            "{file} must use aligned image-contract registry tag"
+        );
+        assert!(
+            src.contains("astravector-registry-pull"),
+            "{file} must reference the private registry pull secret"
         );
     }
 }

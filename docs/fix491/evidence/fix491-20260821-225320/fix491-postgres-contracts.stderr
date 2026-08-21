@@ -1,0 +1,2 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running tests/fix491_postgres_recovery_contracts.rs (target/debug/deps/fix491_postgres_recovery_contracts-1afa885839d81576)

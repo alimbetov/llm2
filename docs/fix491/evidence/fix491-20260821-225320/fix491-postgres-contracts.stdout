@@ -1,0 +1,10 @@
+
+running 5 tests
+test fix491_canonical_integrity_blocks_any_partial_or_orphan_state ... ok
+test fix491_full_proof_is_fail_closed_until_all_lanes_run ... ok
+test fix491_migration_history_fails_on_unknown_pending_and_failed_rows ... ok
+test fix491_migration_history_fails_on_checksum_mismatch ... ok
+test fix491_repository_migration_checksum_uses_sqlx_sha384_semantics ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

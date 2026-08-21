@@ -12,6 +12,8 @@ spec:
     metadata:
       labels: { app: astravector-runtime }
     spec:
+      imagePullSecrets:
+        - name: astravector-registry-pull
       terminationGracePeriodSeconds: 45
       containers:
         - name: astravector

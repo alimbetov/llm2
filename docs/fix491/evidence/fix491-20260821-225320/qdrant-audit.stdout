@@ -1,0 +1,11 @@
+{
+  "expected_eligible_bindings": 19776,
+  "actual_points": 19776,
+  "missing_points": 0,
+  "orphan_points": 0,
+  "payload_mismatches": 0,
+  "pages_scanned": 20,
+  "points_scanned": 19776,
+  "scan_completed": true,
+  "verdict": "QDRANT_PROJECTION_CONSISTENT"
+}
