@@ -44,7 +44,7 @@ download_verified() {
   } >"$netrc"
 
   log "downloading ${file_name}"
-  curl --fail --show-error --silent --location \
+  curl --fail --show-error --silent --location --http1.1 --retry-all-errors \
     --retry "${ASTRAVECTOR_BOOTSTRAP_CURL_RETRIES:-5}" \
     --retry-delay "${ASTRAVECTOR_BOOTSTRAP_CURL_RETRY_DELAY_SECONDS:-2}" \
     --connect-timeout "${ASTRAVECTOR_BOOTSTRAP_CONNECT_TIMEOUT_SECONDS:-10}" \
