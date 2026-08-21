@@ -30,8 +30,7 @@ download_verified() {
   local target="$3"
   local expected_sha="$4"
   local tmp
-  tmp="$(mktemp "${target}.part.XXXXXX")"
-  rm -f "$tmp"
+  tmp="${target}.part"
 
   local netrc
   netrc="$(mktemp "${ASTRAVECTOR_MODEL_DIR}/.netrc.XXXXXX")"
