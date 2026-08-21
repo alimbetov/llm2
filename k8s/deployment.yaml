@@ -15,7 +15,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: astravector
-          image: astravector-runtime:0.4.1-fix465-p2-production-hardening
+          image: registry.astrabase.asia/astravector:0.4.1-image-contract
           ports:
             - { name: grpc, containerPort: 50051 }
             - { name: metrics, containerPort: 9090 }
@@ -23,7 +23,15 @@ spec:
             - configMapRef: { name: astravector-config }
             - secretRef: { name: astravector-secret }
           volumeMounts:
-            - { name: model, mountPath: /models/bge-m3, readOnly: true }
+            - { name: model, mountPath: /models/bge-m3, readOnly: false }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           startupProbe:
             grpc:
               port: 50051

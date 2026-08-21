@@ -44,7 +44,7 @@ model:
   id: BAAI/bge-m3
   format: ONNX
   precision: INT8
-  path: ${ASTRAVECTOR_MODEL_PATH:-/models/bge-m3/model.int8.onnx}
+  path: ${ASTRAVECTOR_MODEL_PATH:-/models/bge-m3/model.onnx}
   checksum: "${ASTRAVECTOR_MODEL_SHA256:-}"
   version: bge_m3_onnx_int8_v1
   dense_output_name: ${ASTRAVECTOR_DENSE_OUTPUT_NAME:-sentence_embedding}
