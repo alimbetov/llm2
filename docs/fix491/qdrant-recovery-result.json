@@ -1,0 +1,45 @@
+{
+  "verdict": "QDRANT_PROJECTION_RECOVERY_PASS",
+  "run_id": "fix491-20260811-003559",
+  "shared_projection_builder": "IMPLEMENTED",
+  "projection_writer_fence": "IMPLEMENTED",
+  "qdrant_rebuild_cli": "IMPLEMENTED",
+  "destructive_replace_opt_in": "IMPLEMENTED",
+  "qdrant_audit_cli": "IMPLEMENTED",
+  "qdrant_compatibility_cli": "IMPLEMENTED",
+  "collection_compatibility": {
+    "expected_dense_dimension": 1024,
+    "actual_dense_dimension": 1024,
+    "dense_distance": "Cosine",
+    "sparse_vector_present": true,
+    "required_payload_indexes": 16,
+    "missing_payload_indexes": [],
+    "mismatched_payload_indexes": [],
+    "verdict": "QDRANT_COLLECTION_COMPATIBLE"
+  },
+  "local_demo_rebuild": {
+    "expected_eligible_bindings": 19776,
+    "batches_scanned": 40,
+    "points_upserted": 19776,
+    "failed_points": 0,
+    "replace_existing": false,
+    "used_inference_fallback": false,
+    "verdict": "QDRANT_REBUILD_COMPLETED"
+  },
+  "local_demo_post_rebuild_audit": {
+    "expected_eligible_bindings": 19776,
+    "actual_points": 19776,
+    "missing_points": 0,
+    "orphan_points": 0,
+    "payload_mismatches": 0,
+    "pages_scanned": 20,
+    "points_scanned": 19776,
+    "scan_completed": true,
+    "verdict": "QDRANT_PROJECTION_CONSISTENT"
+  },
+  "retrieval_parity": "PASS",
+  "defects_fixed": [
+    "QDRANT_RECOVERY_FENCE_IDLE_TRANSACTION_TIMEOUT",
+    "QDRANT_COLLECTION_PAYLOAD_INDEX_COMPATIBILITY_NOT_AUDITED"
+  ]
+}

@@ -1,11 +1,7 @@
 use crate::{
-    adaptive::AdaptiveRuntime,
-    error::AstraError,
-    inference::EmbeddingResult,
-    persistence::Repository,
-    qdrant::{QdrantClient, QdrantPoint},
+    adaptive::AdaptiveRuntime, error::AstraError, persistence::Repository,
+    projection::CanonicalProjectionInput, qdrant::QdrantClient, recovery,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use metrics::{counter, gauge, histogram};
 use serde_json::json;
 use sqlx::Row;
@@ -121,54 +117,15 @@ async fn process_event(
     event: &OutboxEvent,
 ) -> Result<(), AstraError> {
     let row=sqlx::query("SELECT b.qdrant_point_id,b.document_id,b.document_version,b.root_chunk_id,b.source_chunk_id,b.parent_chunk_id,b.chunk_id,b.chunk_granularity,b.representation_type,b.access_level,b.expires_at,b.legal_hold,b.lifecycle_status,b.payload_version,b.ttl_generation,b.qdrant_sync_status,b.metadata,c.cache_key,c.model_version,c.tokenizer_version,c.dense_version,c.sparse_version,az.access_zone_code FROM astravector.vector_bindings_v004 b JOIN astravector.embedding_cache_entries c ON c.id=b.cache_entry_id LEFT JOIN astravector.access_zones az ON az.access_zone_id=b.access_zone_id WHERE b.access_zone_id=$1 AND b.id=$2").bind(event.access_zone_id).bind(event.binding_id).fetch_optional(&repo.pool).await.map_err(db)?.ok_or_else(||AstraError::FailedPrecondition("binding not found".into()))?;
-    let point_id: Uuid = row.get("qdrant_point_id");
+    let projection =
+        CanonicalProjectionInput::from_pg_row(&row, event.access_zone_id, event.binding_id);
+    let point_id = projection.qdrant_point_id;
     let lifecycle: String = row.get("lifecycle_status");
     let current_payload_version: i64 = row.get("payload_version");
     let current_ttl_generation: i64 = row.get("ttl_generation");
     let qdrant_sync_status: String = row.get("qdrant_sync_status");
     let legal_hold: bool = row.get("legal_hold");
-    let metadata: serde_json::Value = row.get("metadata");
-    let chunking_profile_version = metadata
-        .get("chunking_profile_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let expires_at_dt = row
-        .try_get::<Option<DateTime<Utc>>, _>("expires_at")
-        .ok()
-        .flatten();
-    let expires_at = expires_at_dt
-        .as_ref()
-        .map(|x| x.to_rfc3339_opts(SecondsFormat::Secs, true));
-    let expires_at_epoch = expires_at_dt
-        .map(|x| x.timestamp())
-        // fix4.5.3: never-expire legacy or ttl_days=0 points use far-future epoch so Qdrant filters stay range-only.
-        .unwrap_or(253_402_300_799_i64);
-    let source_block_id = metadata
-        .get("source_block_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let trace_quality = metadata
-        .get("trace_quality")
-        .and_then(|v| v.as_str())
-        .unwrap_or("MISSING");
-    let trace_relation_type = metadata
-        .get("trace_relation_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("SYNTHETIC");
-    let access_zone_code = row
-        .try_get::<Option<String>, _>("access_zone_code")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let quality_run_id = metadata
-        .get("quality_run_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let quality_runtime_bench = metadata
-        .get("quality_runtime_bench")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let payload = json!({"access_zone_id":event.access_zone_id,"access_zone_code":access_zone_code,"binding_id":event.binding_id,"qdrant_point_id":point_id,"document_id":row.get::<Uuid,_>("document_id"),"document_version":row.get::<i64,_>("document_version"),"root_chunk_id":row.get::<Uuid,_>("root_chunk_id"),"source_chunk_id":row.get::<Uuid,_>("source_chunk_id"),"parent_chunk_id":row.try_get::<Option<Uuid>,_>("parent_chunk_id").ok().flatten(),"chunk_id":row.get::<Uuid,_>("chunk_id"),"source_block_id":source_block_id,"trace_quality":trace_quality,"trace_relation_type":trace_relation_type,"chunk_granularity":row.get::<String,_>("chunk_granularity"),"representation_type":row.get::<String,_>("representation_type"),"access_level":row.get::<i16,_>("access_level"),"lifecycle_status":lifecycle,"expires_at":expires_at,"expires_at_epoch":expires_at_epoch,"legal_hold":row.get::<bool,_>("legal_hold"),"payload_version":row.get::<i64,_>("payload_version"),"model_version":row.get::<String,_>("model_version"),"tokenizer_version":row.get::<String,_>("tokenizer_version"),"dense_version":row.try_get::<Option<String>,_>("dense_version").ok().flatten(),"sparse_version":row.try_get::<Option<String>,_>("sparse_version").ok().flatten(),"chunking_profile_version":chunking_profile_version,"quality_run_id":quality_run_id,"quality_runtime_bench":quality_runtime_bench,"quarantined":false});
+    let payload = projection.payload();
     match event.operation.as_str() {
         "UPSERT_POINT" => {
             if lifecycle != "ACTIVE"
@@ -181,8 +138,10 @@ async fn process_event(
                 counter!("vector_outbox_binding_lifecycle_mismatch_total", "operation" => "UPSERT_POINT", "lifecycle" => lifecycle.clone()).increment((lifecycle != "ACTIVE") as u64);
                 return Ok(());
             }
-            upsert_from_cache(repo, q, &row, point_id, payload).await?;
-            mark_synced(repo, event).await?
+            let fence = recovery::acquire_qdrant_projection_write_fence(&repo.pool).await?;
+            upsert_from_cache(repo, q, &row, &projection).await?;
+            mark_synced(repo, event).await?;
+            fence.commit().await.map_err(db)?
         }
         "UPDATE_PAYLOAD" => {
             if lifecycle != "ACTIVE" || current_payload_version != event.operation_version {
@@ -190,13 +149,15 @@ async fn process_event(
                 counter!("vector_outbox_binding_version_mismatch_total", "operation" => "UPDATE_PAYLOAD").increment((current_payload_version != event.operation_version) as u64);
                 return Ok(());
             }
+            let fence = recovery::acquire_qdrant_projection_write_fence(&repo.pool).await?;
             if q.point_exists(point_id).await? {
                 q.update_payload(point_id, payload).await?
             } else {
                 counter!("astravector_qdrant_update_fallback_total").increment(1);
-                upsert_from_cache(repo, q, &row, point_id, payload).await?
+                upsert_from_cache(repo, q, &row, &projection).await?
             }
-            mark_synced(repo, event).await?
+            mark_synced(repo, event).await?;
+            fence.commit().await.map_err(db)?
         }
         "DELETE_POINT" => {
             if legal_hold {
@@ -217,6 +178,7 @@ async fn process_event(
                 info!(event_id=%event.id, binding_id=%event.binding_id, access_zone_id=%event.access_zone_id, operation=%event.operation, event_operation_version=event.operation_version, current_payload_version, current_ttl_generation, lifecycle=%lifecycle, qdrant_sync_status=%qdrant_sync_status, legal_hold, "OUTBOX_STALE_DELETE_SKIPPED_BY_BINDING_FENCE");
                 return Ok(());
             }
+            let fence = recovery::acquire_qdrant_projection_write_fence(&repo.pool).await?;
             let claimed = sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='DELETE_IN_PROGRESS',updated_at=now() WHERE access_zone_id=$1 AND id=$2 AND ttl_generation=$3 AND legal_hold=false AND qdrant_sync_status IN('DELETE_PENDING','DELETION_PENDING','DELETE_IN_PROGRESS') RETURNING qdrant_point_id")
                 .bind(event.access_zone_id)
                 .bind(event.binding_id)
@@ -247,11 +209,14 @@ async fn process_event(
                     "DELETE_POINT final DB update rejected by binding fence".into(),
                 ));
             }
+            fence.commit().await.map_err(db)?
         }
         "QUARANTINE_POINT" => {
+            let fence = recovery::acquire_qdrant_projection_write_fence(&repo.pool).await?;
             let mut p = payload;
             p["lifecycle_status"] = json!("ORPHAN_QUARANTINED");
-            q.update_payload(point_id, p).await?
+            q.update_payload(point_id, p).await?;
+            fence.commit().await.map_err(db)?
         }
         _ => {
             return Err(AstraError::InvalidArgument(
@@ -265,25 +230,17 @@ async fn upsert_from_cache(
     repo: &Repository,
     q: &QdrantClient,
     row: &sqlx::postgres::PgRow,
-    point_id: Uuid,
-    payload: serde_json::Value,
+    projection: &CanonicalProjectionInput,
 ) -> Result<(), AstraError> {
     let key: String = row.get("cache_key");
-    let r: EmbeddingResult = repo
+    let r = repo
         .load_completed(&key)
         .await?
         .ok_or_else(|| AstraError::Internal("canonical vector missing".into()))?;
     if let Some(dense) = r.dense.as_ref() {
         q.ensure_collection(dense.len()).await?;
     }
-    q.upsert(&QdrantPoint {
-        id: point_id,
-        dense: r.dense,
-        sparse_indices: r.sparse_indices,
-        sparse_values: r.sparse_values,
-        payload,
-    })
-    .await
+    q.upsert(&projection.point(r)).await
 }
 async fn mark_synced(repo: &Repository, event: &OutboxEvent) -> Result<(), AstraError> {
     let rows = sqlx::query("UPDATE astravector.vector_bindings_v004 SET qdrant_sync_status='SYNCED',last_qdrant_sync_version=payload_version,updated_at=now() WHERE access_zone_id=$1 AND id=$2 AND payload_version=$3 AND lifecycle_status='ACTIVE'")

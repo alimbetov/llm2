@@ -13,8 +13,10 @@ fn outbox_uses_operation_version_fencing() {
 fn reconciliation_is_not_noop_and_preserves_payload_contract() {
     let bin = fs::read_to_string("src/bin/astravector-reconciliation.rs").unwrap();
     let rec = fs::read_to_string("src/reconciliation/mod.rs").unwrap();
+    let projection = fs::read_to_string("src/projection.rs").unwrap();
     assert!(bin.contains("--full"));
     assert!(bin.contains("reconcile_unsynced_batch"));
+    assert!(rec.contains("CanonicalProjectionInput"));
     for required in [
         "access_level",
         "expires_at_epoch",
@@ -24,8 +26,8 @@ fn reconciliation_is_not_noop_and_preserves_payload_contract() {
         "quarantined",
     ] {
         assert!(
-            rec.contains(required),
-            "reconciler payload must contain {required}"
+            projection.contains(required),
+            "canonical projection payload must contain {required}"
         );
     }
     assert!(rec.contains("reconciliation_skipped_legal_hold_total"));
@@ -48,8 +50,12 @@ fn k8s_runtime_uses_qdrant_and_consistent_image() {
     ] {
         let src = fs::read_to_string(file).unwrap();
         assert!(
-            src.contains("0.4.1-fix465-p2-production-hardening"),
-            "{file} must use aligned fix465 image tag"
+            src.contains("registry.astrabase.asia/astravector:0.4.1-image-contract"),
+            "{file} must use aligned image-contract registry tag"
+        );
+        assert!(
+            src.contains("astravector-registry-pull"),
+            "{file} must reference the private registry pull secret"
         );
     }
 }

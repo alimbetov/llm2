@@ -1,7 +1,7 @@
 name: ci
 on: [push, pull_request]
 env:
-  ASTRAVECTOR_IMAGE_TAG: 0.4.1-fix465-p2-production-hardening
+  ASTRAVECTOR_IMAGE_TAG: 0.4.1-image-contract
 jobs:
   rust:
     runs-on: ubuntu-latest

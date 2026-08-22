@@ -1,0 +1,10 @@
+{
+  "expected_eligible_bindings": 19776,
+  "batches_scanned": 40,
+  "points_upserted": 19776,
+  "failed_points": 0,
+  "batch_size": 500,
+  "replace_existing": false,
+  "used_inference_fallback": false,
+  "verdict": "QDRANT_REBUILD_COMPLETED"
+}

@@ -1,0 +1,78 @@
+{
+  "run_id": "fix491-20260821-225320",
+  "final_verdict": "FIX491_PERSISTENCE_RECOVERY_BLOCKED",
+  "static_and_contracts_pass": true,
+  "postgres_recovery_pass": true,
+  "qdrant_collection_compatibility_pass": true,
+  "qdrant_projection_recovery_pass": true,
+  "retrieval_parity_pass": false,
+  "command_status": {
+    "cargo-fmt": 0,
+    "cargo-check": 0,
+    "fix491-projection-contracts": 0,
+    "fix491-postgres-contracts": 0,
+    "fix491-recovery-testcontainers": 0,
+    "postgres-audit": 0,
+    "qdrant-compatibility": 0,
+    "qdrant-audit": 0,
+    "retrieval-before": 127,
+    "qdrant-rebuild": 127,
+    "retrieval-after": 127
+  },
+  "postgres": {
+    "canonical_fingerprint": {
+      "item_count": 60,
+      "sha256": "a2cb2c30cd982649c26d29035498f0e20aca8339f54e8c15c14cc904e7b44d19"
+    },
+    "canonical_integrity": {
+      "active_searchable_bindings_missing_dense": 0,
+      "active_searchable_bindings_missing_sparse": 24795,
+      "dead_or_failed_outbox": 0,
+      "duplicate_bindings": 0,
+      "duplicate_chunks": 0,
+      "duplicate_outbox_events": 0,
+      "orphan_bindings": 0,
+      "orphan_chunks": 0,
+      "orphan_graph_edges": 0,
+      "orphan_graph_nodes": 0,
+      "orphan_outbox": 0,
+      "partial_active_documents": 0
+    },
+    "migration_history": {
+      "applied_migration_count": 39,
+      "checksum_mismatches": [],
+      "failed_migrations": 0,
+      "pending_migrations": [],
+      "repository_migration_count": 39,
+      "unknown_migrations": []
+    },
+    "read_only": true,
+    "schema_inventory": {
+      "item_count": 6792,
+      "sha256": "f54e3e78a5465986034cdb4fd1936757368490b745fc868d6aef7fe6cb3b82ca"
+    },
+    "verdict": "POSTGRES_CANONICAL_AUDIT_PASS"
+  },
+  "qdrant_compatibility": {
+    "expected_dense_dimension": 1024,
+    "actual_dense_dimension": 1024,
+    "dense_distance": "Cosine",
+    "sparse_vector_present": true,
+    "required_payload_indexes": 16,
+    "missing_payload_indexes": [],
+    "mismatched_payload_indexes": [],
+    "verdict": "QDRANT_COLLECTION_COMPATIBLE"
+  },
+  "qdrant_audit": {
+    "expected_eligible_bindings": 19776,
+    "actual_points": 19776,
+    "missing_points": 0,
+    "orphan_points": 0,
+    "payload_mismatches": 0,
+    "pages_scanned": 20,
+    "points_scanned": 19776,
+    "scan_completed": true,
+    "verdict": "QDRANT_PROJECTION_CONSISTENT"
+  },
+  "evidence_dir": "docs/fix491/evidence/fix491-20260821-225320"
+}

@@ -1,0 +1,35 @@
+{"timestamp":"2026-08-21T17:53:31.421892Z","level":"WARN","fields":{"message":"slow statement: execution time exceeded alert threshold","summary":"WITH active_docs AS ( …","db.statement":"\n\n\nWITH active_docs AS (\n  SELECT access_zone_id, document_id, document_version\n  FROM astravector.document_versions\n  WHERE status='ACTIVE'\n),\nchunk_docs AS (\n  SELECT DISTINCT access_zone_id, document_id, document_version\n  FROM astravector.content_chunks_v004\n),\nbinding_docs AS (\n  SELECT DISTINCT access_zone_id, document_id, document_version\n  FROM astravector.vector_bindings_v004\n),\ncompleted_outbox_docs AS (\n  SELECT DISTINCT b.access_zone_id, b.document_id, b.document_version\n  FROM astravector.vector_outbox o\n  JOIN astravector.vector_bindings_v004 b\n    ON b.access_zone_id=o.binding_access_zone_id\n   AND b.id=o.binding_id\n  WHERE o.operation='UPSERT_POINT'\n    AND o.status='COMPLETED'\n)\nSELECT count(*)\nFROM active_docs d\nLEFT JOIN chunk_docs c\n  ON c.access_zone_id=d.access_zone_id\n AND c.document_id=d.document_id\n AND c.document_version=d.document_version\nLEFT JOIN binding_docs b\n  ON b.access_zone_id=d.access_zone_id\n AND b.document_id=d.document_id\n AND b.document_version=d.document_version\nLEFT JOIN completed_outbox_docs o\n  ON o.access_zone_id=d.access_zone_id\n AND o.document_id=d.document_id\n AND o.document_version=d.document_version\nWHERE c.document_id IS NULL\n   OR b.document_id IS NULL\n   OR o.document_id IS NULL\n\n","rows_affected":1,"rows_returned":1,"elapsed":"1.08989925s","elapsed_secs":1.08989925,"slow_threshold":"1s"},"target":"sqlx::query"}
+{
+  "canonical_fingerprint": {
+    "item_count": 60,
+    "sha256": "a2cb2c30cd982649c26d29035498f0e20aca8339f54e8c15c14cc904e7b44d19"
+  },
+  "canonical_integrity": {
+    "active_searchable_bindings_missing_dense": 0,
+    "active_searchable_bindings_missing_sparse": 24795,
+    "dead_or_failed_outbox": 0,
+    "duplicate_bindings": 0,
+    "duplicate_chunks": 0,
+    "duplicate_outbox_events": 0,
+    "orphan_bindings": 0,
+    "orphan_chunks": 0,
+    "orphan_graph_edges": 0,
+    "orphan_graph_nodes": 0,
+    "orphan_outbox": 0,
+    "partial_active_documents": 0
+  },
+  "migration_history": {
+    "applied_migration_count": 39,
+    "checksum_mismatches": [],
+    "failed_migrations": 0,
+    "pending_migrations": [],
+    "repository_migration_count": 39,
+    "unknown_migrations": []
+  },
+  "read_only": true,
+  "schema_inventory": {
+    "item_count": 6792,
+    "sha256": "f54e3e78a5465986034cdb4fd1936757368490b745fc868d6aef7fe6cb3b82ca"
+  },
+  "verdict": "POSTGRES_CANONICAL_AUDIT_PASS"
+}

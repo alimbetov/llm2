@@ -18,7 +18,12 @@ use astravector_runtime::{
     persistence::Repository,
     provider,
     qdrant::QdrantClient,
-    recovery, retention,
+    reconciliation::Reconciler,
+    recovery::{
+        self,
+        postgres::{postgres_recovery_audit_with_policy, PostgresRecoveryAuditPolicy},
+    },
+    retention,
     scheduler::Scheduler,
     security::ApiKeyAuth,
     tokenizer::CanonicalTokenizer,
@@ -40,6 +45,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = Repository::connect(&loaded.postgres).await?;
         info!("AstraVector migrations completed");
         return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("recovery") {
+        return run_recovery_command(loaded).await;
     }
     let cfg = Arc::new(loaded);
     cfg.validate()?;
@@ -400,4 +408,182 @@ async fn main() -> anyhow::Result<()> {
     }
     grpc_result?;
     Ok(())
+}
+
+async fn run_recovery_command(cfg: AppConfig) -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let command = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!("recovery command required"))?;
+    let batch_size = read_arg_i64(&args, "--batch-size").unwrap_or(500).max(1);
+    let replace_existing = args.iter().any(|arg| arg == "--replace-existing");
+    let include_inventory_items = args.iter().any(|arg| arg == "--include-inventory-items");
+    let repo = Repository::connect(&cfg.postgres).await?;
+    match command {
+        "qdrant-audit" => {
+            let qdrant = recovery_qdrant_client(&cfg)?;
+            let reconciler = Reconciler { repo, qdrant };
+            let summary = reconciler.qdrant_projection_audit(batch_size).await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.verdict == "QDRANT_PROJECTION_CONSISTENT" {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", summary.verdict)
+            }
+        }
+        "qdrant-compatibility" => {
+            let qdrant = recovery_qdrant_client(&cfg)?;
+            let summary = qdrant.collection_compatibility(cfg.dense.dimension).await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.verdict == "QDRANT_COLLECTION_COMPATIBLE" {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", summary.verdict)
+            }
+        }
+        "postgres-audit" => {
+            let summary = postgres_recovery_audit_with_policy(
+                &repo,
+                std::path::Path::new("migrations"),
+                PostgresRecoveryAuditPolicy {
+                    sparse_required: cfg.sparse.required,
+                },
+            )
+            .await?;
+            println!("{}", recovery_pretty_json(&summary, include_inventory_items)?);
+            if summary.verdict == "POSTGRES_CANONICAL_AUDIT_PASS" {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", summary.verdict)
+            }
+        }
+        "qdrant-rebuild" => {
+            let qdrant = recovery_qdrant_client(&cfg)?;
+            let reconciler = Reconciler { repo, qdrant };
+            let summary = reconciler
+                .qdrant_rebuild_from_postgres(&cfg.dense, batch_size, replace_existing)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.verdict == "QDRANT_REBUILD_COMPLETED" {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", summary.verdict)
+            }
+        }
+        "full-proof" => {
+            let qdrant = recovery_qdrant_client(&cfg)?;
+            let reconciler = Reconciler { repo, qdrant };
+            let postgres = postgres_recovery_audit_with_policy(
+                &reconciler.repo,
+                std::path::Path::new("migrations"),
+                PostgresRecoveryAuditPolicy {
+                    sparse_required: cfg.sparse.required,
+                },
+            )
+            .await?;
+            let before = reconciler.qdrant_projection_audit(batch_size).await?;
+            let rebuild = reconciler
+                .qdrant_rebuild_from_postgres(&cfg.dense, batch_size, replace_existing)
+                .await?;
+            let after = reconciler.qdrant_projection_audit(batch_size).await?;
+            let qdrant_lane = if after.verdict == "QDRANT_PROJECTION_CONSISTENT" {
+                "QDRANT_PROJECTION_RECOVERY_PASS"
+            } else {
+                "QDRANT_PROJECTION_RECOVERY_FAIL"
+            };
+            let postgres_bootstrap_proof = "NOT_RUN";
+            let retrieval_parity = "NOT_RUN";
+            let verdict = if postgres.verdict == "POSTGRES_CANONICAL_AUDIT_PASS"
+                && qdrant_lane == "QDRANT_PROJECTION_RECOVERY_PASS"
+                && postgres_bootstrap_proof != "NOT_RUN"
+                && retrieval_parity != "NOT_RUN"
+            {
+                "FIX491_PERSISTENCE_RECOVERY_PASS"
+            } else {
+                "FIX491_PERSISTENCE_RECOVERY_BLOCKED"
+            };
+            let report = serde_json::json!({
+                "verdict": verdict,
+                "postgres": postgres,
+                "qdrant_lane": qdrant_lane,
+                "before": before,
+                "rebuild": rebuild,
+                "after": after,
+                "postgres_bootstrap_proof": postgres_bootstrap_proof,
+                "retrieval_parity": retrieval_parity
+            });
+            println!("{}", recovery_pretty_json(&report, include_inventory_items)?);
+            if verdict == "FIX491_PERSISTENCE_RECOVERY_PASS" {
+                Ok(())
+            } else {
+                anyhow::bail!("{verdict}")
+            }
+        }
+        other => anyhow::bail!(
+            "unsupported recovery command {other}; supported: postgres-audit, qdrant-audit, qdrant-compatibility, qdrant-rebuild, full-proof"
+        ),
+    }
+}
+
+fn recovery_pretty_json<T: serde::Serialize>(
+    value: &T,
+    include_inventory_items: bool,
+) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(value)?;
+    if !include_inventory_items {
+        compact_recovery_inventory(&mut value);
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn compact_recovery_inventory(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if (object.contains_key("sha256") || object.contains_key("verdict"))
+                && object.contains_key("items")
+            {
+                if let Some(items) = object.remove("items") {
+                    let count = items.as_array().map_or(0, Vec::len);
+                    object.insert("item_count".to_string(), serde_json::json!(count));
+                }
+            }
+            for nested in object.values_mut() {
+                compact_recovery_inventory(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                compact_recovery_inventory(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn recovery_qdrant_client(cfg: &AppConfig) -> anyhow::Result<QdrantClient> {
+    QdrantClient::new(
+        cfg.qdrant.url.clone(),
+        (!cfg.qdrant.api_key.is_empty()).then_some(cfg.qdrant.api_key.clone()),
+        cfg.qdrant.collection.clone(),
+        cfg.qdrant.timeout_ms,
+        cfg.qdrant.scroll_page_size,
+        cfg.qdrant.scroll_max_pages,
+        cfg.qdrant.scroll_max_points,
+        cfg.qdrant.scroll_timeout_secs,
+        cfg.qdrant.scroll_max_concurrency,
+        cfg.limits.max_concurrent_qdrant_search,
+        cfg.limits.backpressure_acquire_timeout_ms,
+        None,
+        cfg.resilience.qdrant_retry.reconciliation.clone(),
+    )
+    .map_err(Into::into)
+}
+
+fn read_arg_string(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+fn read_arg_i64(args: &[String], name: &str) -> Option<i64> {
+    read_arg_string(args, name)?.parse().ok()
 }

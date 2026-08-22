@@ -10,9 +10,11 @@ spec:
     metadata:
       labels: { app: astravector-qdrant-publisher }
     spec:
+      imagePullSecrets:
+        - name: astravector-registry-pull
       containers:
         - name: publisher
-          image: astravector-runtime:0.4.1-fix465-p2-production-hardening
+          image: registry.astrabase.asia/astravector:0.4.1-image-contract
           command: ["/usr/local/bin/astravector-qdrant-publisher"]
           envFrom:
             - configMapRef: { name: astravector-config }

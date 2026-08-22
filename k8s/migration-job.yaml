@@ -5,10 +5,12 @@ metadata:
 spec:
   template:
     spec:
+      imagePullSecrets:
+        - name: astravector-registry-pull
       restartPolicy: OnFailure
       containers:
         - name: migrate
-          image: astravector-runtime:0.4.1-fix465-p2-production-hardening
+          image: registry.astrabase.asia/astravector:0.4.1-image-contract
           command: ["/usr/local/bin/astravector-runtime", "migrate"]
           envFrom:
             - secretRef: { name: astravector-secret }

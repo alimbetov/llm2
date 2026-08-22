@@ -1,0 +1,10 @@
+
+running 5 tests
+test fix491_projection_point_reuses_persisted_vectors_without_inference_fallback ... ok
+test fix491_projection_payload_contains_complete_retrieval_contract ... ok
+test fix491_qdrant_collection_compatibility_rejects_missing_payload_index ... ok
+test fix491_qdrant_collection_compatibility_accepts_full_payload_schema ... ok
+test fix491_qdrant_collection_compatibility_rejects_mismatched_payload_index_type ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
