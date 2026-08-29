@@ -31,10 +31,7 @@ fn source_location_from_json(value: &Value) -> Option<pb::SourceLocation> {
             .unwrap_or("")
             .to_string(),
         row_index: obj.get("row_index").and_then(Value::as_u64).unwrap_or(0) as u32,
-        column_index: obj
-            .get("column_index")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+        column_index: obj.get("column_index").and_then(Value::as_u64).unwrap_or(0) as u32,
     })
 }
 
@@ -43,12 +40,7 @@ fn string_map(value: Option<&Value>) -> HashMap<String, String> {
         .and_then(Value::as_object)
         .map(|obj| {
             obj.iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        value.as_str().unwrap_or_default().to_string(),
-                    )
-                })
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
                 .collect()
         })
         .unwrap_or_default()
@@ -102,10 +94,7 @@ fn block_from_json(value: &Value) -> pb::LogicalBlock {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        block_type: value
-            .get("block_type")
-            .and_then(Value::as_i64)
-            .unwrap_or(0) as i32,
+        block_type: value.get("block_type").and_then(Value::as_i64).unwrap_or(0) as i32,
         text: value
             .get("text")
             .and_then(Value::as_str)
@@ -213,5 +202,8 @@ fn astraindexator_and_astravector_share_byte_exact_hash_vectors() {
     let expected_final = fixture["expected"]["finalContentHash"]
         .as_str()
         .expect("expected final hash");
-    assert_eq!(format!("{:x}", Sha256::digest(rendered.as_bytes())), expected_final);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(rendered.as_bytes())),
+        expected_final
+    );
 }
