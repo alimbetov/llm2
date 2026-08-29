@@ -6463,7 +6463,7 @@ impl AstraVectorIngestionFacade for AstraVectorV004ControlService {
             blocks,
             chunking_options: None,
             indexing_options: Some(pb::VectorIndexingOptions {
-                activation_policy: pb::ActivationPolicy::AutoWhenReady as i32,
+                activation_policy: session_finalize_activation_policy() as i32,
                 embedding_mode: pb::EmbeddingModeV005::DenseSparseIfAvailable as i32,
                 publish_mode: pb::PublishModeV005::Outbox as i32,
                 ttl_policy,
@@ -8537,6 +8537,10 @@ fn reject_unsupported_activation_policy(value: i32) -> Result<(), Status> {
         )),
         _ => Ok(()),
     }
+}
+
+fn session_finalize_activation_policy() -> pb::ActivationPolicy {
+    pb::ActivationPolicy::Manual
 }
 
 fn normalized_access_level(value: i32) -> pb::AccessLevel {
@@ -15211,6 +15215,29 @@ fn failed_pb(i: &pb::EncodeItem, e: &AstraError) -> pb::EncodeItemResponse {
 #[cfg(test)]
 mod v007_fix1_tests {
     use super::*;
+
+    #[test]
+    fn session_finalize_selects_manual_activation_policy() {
+        assert_eq!(
+            session_finalize_activation_policy(),
+            pb::ActivationPolicy::Manual
+        );
+        assert!(
+            reject_unsupported_activation_policy(session_finalize_activation_policy() as i32)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn auto_when_ready_remains_rejected_until_lifecycle_worker_exists() {
+        let error =
+            reject_unsupported_activation_policy(pb::ActivationPolicy::AutoWhenReady as i32)
+                .expect_err("AUTO_WHEN_READY must remain unsupported");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error
+            .message()
+            .contains("UNSUPPORTED_ACTIVATION_POLICY_AUTO_WHEN_READY"));
+    }
 
     fn test_result(chunk_id: &str, text: &str, score: f32) -> pb::SearchResultV004 {
         pb::SearchResultV004 {
